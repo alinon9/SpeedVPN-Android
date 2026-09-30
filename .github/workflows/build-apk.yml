@@ -1,0 +1,92 @@
+name: Build SpeedVPN APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools platforms;android-35 build-tools;35.0.0 ndk;30.0.16248370'
+
+      - name: Set up Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '8.11.1'
+          cache-provider: basic
+
+      - name: Set NDK environment
+        run: |
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/30.0.16248370" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/30.0.16248370" >> "$GITHUB_ENV"
+          test -x "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+
+      - name: Bootstrap Gradle wrapper
+        run: |
+          chmod +x ./gradlew
+          if [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
+            curl -fsSL --retry 3 --retry-delay 2 -o gradle/wrapper/gradle-wrapper.jar https://services.gradle.org/distributions/gradle-8.11.1-wrapper.jar
+          fi
+          echo "2db75c40782f5e8ba1fc278a5574bab070adccb2d21ca5a6e5ed840888448046  gradle/wrapper/gradle-wrapper.jar" | sha256sum -c -
+
+      - name: Fetch pinned native tunnel
+        run: bash ./setup.sh
+
+      - name: Verify native pin
+        run: |
+          test "$(git -C app/src/main/jni/hev-socks5-tunnel rev-parse HEAD)" = "d9dca26c7ad0e494492244f0309e80ee583e739e"
+
+      - name: Build debug APK
+        run: ./gradlew :app:assembleDebug --stacktrace --no-daemon
+
+      - name: Verify APK
+        run: |
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          test -f "$APK"
+          ls -lh "$APK"
+
+          # Verify ZIP alignment suitable for 16 KB page-size devices.
+          "$ANDROID_HOME/build-tools/35.0.0/zipalign" -c -P 16 -v 4 "$APK"
+
+          # Verify expected native libraries are packaged for every supported ABI.
+          TMP="$(mktemp -d)"
+          unzip -q "$APK" 'lib/*/*.so' -d "$TMP"
+          test -f "$TMP/lib/arm64-v8a/libhev-socks5-tunnel.so"
+          test -f "$TMP/lib/armeabi-v7a/libhev-socks5-tunnel.so"
+          test -f "$TMP/lib/x86_64/libhev-socks5-tunnel.so"
+
+          # Verify every PT_LOAD segment is 16 KB aligned.
+          READ_ELF="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          test -x "$READ_ELF"
+          find "$TMP/lib" -name '*.so' -print0 | while IFS= read -r -d '' LIB; do
+            echo "Checking $LIB"
+            "$READ_ELF" -lW "$LIB" | awk '
+              $1=="LOAD" { count++; if ($NF != "0x4000") bad=1 }
+              END { if (count == 0 || bad) exit 1 }
+            '
+          done
+          rm -rf "$TMP"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: SpeedVPN-debug-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
