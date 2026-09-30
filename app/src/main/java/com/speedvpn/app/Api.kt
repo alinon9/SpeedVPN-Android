@@ -67,7 +67,7 @@ object Auth {
         http.newCall(req).execute().use { res ->
             val text = res.body?.string().orEmpty()
             if (!res.isSuccessful) {
-                if (grant == "refresh_token") signOut(ctx)
+                if (grant == "refresh_token" && (res.code == 400 || res.code == 401 || res.code == 403)) signOut(ctx)
                 val msg = runCatching { JSONObject(text).optString("error_description", JSONObject(text).optString("msg")) }.getOrNull()
                 throw ApiException(res.code, msg?.ifBlank { null } ?: "Sign-in failed (${res.code})")
             }

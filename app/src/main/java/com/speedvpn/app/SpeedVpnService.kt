@@ -224,7 +224,10 @@ class SpeedVpnService : VpnService() {
             }.getOrNull()
         }
         val compatibility = VpnSettings.read(this)
-        val dnsServers = selectVpnDnsServers(physicalLinkProperties, compatibility.dnsIpv4Only)
+        // IPv6-disabled mode must also avoid advertising IPv6 DNS servers.
+        // This keeps Android's VPN DNS path consistent with the selected IP family.
+        val dnsIpv4Only = compatibility.dnsIpv4Only || !compatibility.ipv6Enabled
+        val dnsServers = selectVpnDnsServers(physicalLinkProperties, dnsIpv4Only)
 
         val pfd = try {
             val builder = Builder()
@@ -334,12 +337,13 @@ class SpeedVpnService : VpnService() {
             appendLine("  username: '${relay.username}'")
             appendLine("  password: '${relay.password}'")
             appendLine("misc:")
-            appendLine("  task-stack-size: 81920")
+            appendLine("  task-stack-size: 86016")
+            appendLine("  tcp-buffer-size: 65536")
             appendLine("  udp-recv-buffer-size: 524288")
             appendLine("  udp-copy-buffer-nums: 16")
             appendLine("  connect-timeout: 15000")
             appendLine("  tcp-read-write-timeout: 600000")
-            appendLine("  udp-read-write-timeout: 120000")
+            appendLine("  udp-read-write-timeout: 60000")
         }
         conf.writeText(configText)
         return conf
@@ -835,7 +839,14 @@ class SpeedVpnService : VpnService() {
                 false
             } else {
                 VpnRuntime.update {
-                    it.copy(status = VpnStatus.ERROR, lastError = reason, tunnel = "down", serviceRunning = false)
+                    it.copy(
+                        status = VpnStatus.ERROR,
+                        lastError = reason,
+                        tunnel = "down",
+                        serviceRunning = false,
+                        downloadBps = 0,
+                        uploadBps = 0,
+                    )
                 }
                 true
             }
@@ -979,7 +990,18 @@ class SpeedVpnService : VpnService() {
         // This final UI/runtime update is also deliberately lock-free with respect to
         // Native. A newer service generation wins and will publish its own state.
         if (activeServiceGeneration.get() == 0L) {
-            VpnRuntime.update { it.copy(status = VpnStatus.DISCONNECTED, tunnel = "down", serviceRunning = false) }
+            // Preserve a real ERROR published by failLocked(). A later CONNECT
+            // explicitly clears ERROR before starting a new generation.
+            VpnRuntime.update { snapshot ->
+                if (snapshot.status == VpnStatus.ERROR) snapshot
+                else snapshot.copy(
+                    status = VpnStatus.DISCONNECTED,
+                    tunnel = "down",
+                    serviceRunning = false,
+                    downloadBps = 0,
+                    uploadBps = 0,
+                )
+            }
         }
         scope.cancel()
         unregisterPhysicalNetworkCallback()

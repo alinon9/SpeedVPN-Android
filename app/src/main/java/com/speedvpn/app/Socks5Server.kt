@@ -47,6 +47,8 @@ class Socks5Server(
 ) {
     companion object {
         private const val MAX_SESSIONS = 64
+        // Each active SOCKS session can use one handler plus two blocking I/O workers.
+        // Keep the cap conservative for Android; health probes use probePool separately.
         private const val MAX_WORKERS = 192
         private const val HANDSHAKE_TIMEOUT_MS = 10_000
         private const val UDP_BUFFER_SIZE = 65_535
@@ -79,6 +81,20 @@ class Socks5Server(
         ThreadPoolExecutor.AbortPolicy(),
     )
 
+    // Health probes use a dedicated worker so a saturated data-plane pool cannot
+    // make a healthy local SOCKS endpoint look dead.
+    private val probePool: ExecutorService = ThreadPoolExecutor(
+        0,
+        1,
+        30L,
+        TimeUnit.SECONDS,
+        SynchronousQueue(),
+        ThreadFactory { r ->
+            Thread(r, "socks-probe").apply { isDaemon = true }
+        },
+        ThreadPoolExecutor.AbortPolicy(),
+    )
+
     fun start() {
         thread(name = "socks-accept", isDaemon = true) {
             while (running) {
@@ -99,8 +115,9 @@ class Socks5Server(
                     continue
                 }
                 track(client)
+                val executor = if (isHealthProbe) probePool else pool
                 try {
-                    pool.execute {
+                    executor.execute {
                         try {
                             handle(client)
                         } finally {
@@ -125,7 +142,9 @@ class Socks5Server(
         openTcp.clear()
         openUdp.clear()
         pool.shutdownNow()
+        probePool.shutdownNow()
         runCatching { pool.awaitTermination(3, TimeUnit.SECONDS) }
+        runCatching { probePool.awaitTermination(3, TimeUnit.SECONDS) }
         // Global pacing lifecycle is owned by SpeedVpnService's session generation.
         // A relay must not reset process-wide schedulers because an older relay can
         // outlive a newer VPN Service instance during asynchronous teardown.
@@ -149,6 +168,7 @@ class Socks5Server(
             socket.connect(InetSocketAddress("127.0.0.1", port), timeoutMs)
             val input = DataInputStream(socket.getInputStream())
             val out = socket.getOutputStream()
+
             out.write(byteArrayOf(5, 1, 2))
             out.flush()
             if (input.readUnsignedByte() != 5 || input.readUnsignedByte() != 2) return false
@@ -160,7 +180,19 @@ class Socks5Server(
             out.write(byteArrayOf(pb.size.toByte()))
             out.write(pb)
             out.flush()
-            input.readUnsignedByte() == 1 && input.readUnsignedByte() == 0
+            if (input.readUnsignedByte() != 1 || input.readUnsignedByte() != 0) return false
+
+            // Send an intentionally unsupported command. The expected 0x07 response
+            // proves the authenticated SOCKS control path is alive without opening
+            // an upstream socket or creating a long-lived UDP association.
+            out.write(byteArrayOf(5, 0, 0, 1, 127, 0, 0, 1, 0, 0))
+            out.flush()
+            val repVersion = input.readUnsignedByte()
+            val repCode = input.readUnsignedByte()
+            input.readUnsignedByte() // RSV
+            input.readUnsignedByte() // ATYP
+            repeat(6) { input.readUnsignedByte() }
+            repVersion == 5 && repCode == 7
         } catch (_: Exception) {
             false
         } finally {
@@ -283,8 +315,6 @@ class Socks5Server(
             try {
                 socket.connect(InetSocketAddress(addr, port), 10_000)
                 socket.tcpNoDelay = true
-                socket.sendBufferSize = 32 * 1024
-                socket.receiveBufferSize = 32 * 1024
                 upstream = socket
                 break
             } catch (_: Exception) {
@@ -415,6 +445,7 @@ class Socks5Server(
         cout.flush()
 
         val clientAddr = AtomicReference<InetAddress?>(null)
+        val clientEndpoint = AtomicReference<InetSocketAddress?>(null)
         val closeOnce = AtomicBoolean(false)
         val closeAll = {
             if (closeOnce.compareAndSet(false, true)) {
@@ -437,8 +468,10 @@ class Socks5Server(
                         val first = clientAddr.compareAndSet(null, sender)
                         // RFC 1928 requires source-IP validation for UDP ASSOCIATE.
                         // Do not pin the ephemeral UDP source port: some clients rotate
-                        // source ports during a single association.
+                        // source ports during a single association. Keep the latest
+                        // source port only as the reply destination.
                         if (!first && clientAddr.get() != sender) continue
+                        clientEndpoint.set(InetSocketAddress(sender, pkt.port))
 
                         val bb = ByteBuffer.wrap(pkt.data, 0, pkt.length)
                         if (bb.remaining() < 4) continue
@@ -473,7 +506,8 @@ class Socks5Server(
                                 pkt.data,
                                 bb.position(),
                                 payloadLen,
-                                InetSocketAddress(addr, port),
+                                addr,
+                                port,
                             )
                         )
                         SpeedLimiter.upload.recordForwarded(payloadLen)
@@ -491,7 +525,7 @@ class Socks5Server(
                     while (running && SpeedLimiter.isGenerationActive(generation) && !outSock.isClosed) {
                         val pkt = DatagramPacket(buf, buf.size)
                         outSock.receive(pkt)
-                        val to = clientAddr.get() ?: continue
+                        val destination: java.net.SocketAddress = clientEndpoint.get() ?: continue
                         if (!SpeedLimiter.acquire(SpeedLimiter.download, pkt.length, generation)) break
                         if (!running || !SpeedLimiter.isGenerationActive(generation)) break
 
@@ -502,7 +536,17 @@ class Socks5Server(
                             .put(address)
                             .putShort(pkt.port.toShort())
                             .put(pkt.data, 0, pkt.length)
-                        relay.send(DatagramPacket(header.array(), header.position(), to))
+                        val replyAddress = (destination as? InetSocketAddress)
+                            ?: continue
+                        relay.send(
+                            DatagramPacket(
+                                header.array(),
+                                0,
+                                header.position(),
+                                replyAddress.address,
+                                replyAddress.port,
+                            )
+                        )
                         SpeedLimiter.download.recordForwarded(pkt.length)
                     }
                 } catch (_: Exception) {

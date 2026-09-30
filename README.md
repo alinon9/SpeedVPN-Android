@@ -1,3 +1,10 @@
+## v1.0.19.3 final pre-upload
+
+- Final compile-oriented fixes for local SOCKS probing/UDP packet handling.
+- Conservative Android relay capacity retained to avoid excessive thread creation.
+- Hev task stack/buffer settings aligned with the upstream configuration.
+- Error state, dashboard authentication loss, persisted speed limits, notifications, and UI status reporting hardened.
+
 ## v1.0.16 process-wide Native safety hardening
 
 - Fixed Unix executable permissions on `gradlew` and `setup.sh` so Linux/macOS builds can run them directly.

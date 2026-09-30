@@ -224,7 +224,7 @@ class MainActivity : ComponentActivity() {
                 shape = RoundedCornerShape(14.dp),
                 border = androidx.compose.foundation.BorderStroke(1.dp, StrokeColor),
             ) {
-                Text("v1.0.19", color = TextSecondary, fontSize = 10.sp, modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp))
+                Text("v${BuildConfig.VERSION_NAME}", color = TextSecondary, fontSize = 10.sp, modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp))
             }
         }
     }
@@ -268,6 +268,7 @@ class MainActivity : ComponentActivity() {
     private fun StatusHero(s: Snapshot, requestPermission: () -> Unit) {
         val connected = s.status == VpnStatus.CONNECTED
         val connecting = s.status == VpnStatus.CONNECTING
+        val disconnecting = s.status == VpnStatus.DISCONNECTING
         val progress by animateFloatAsState(if (connected) 1f else if (connecting) 0.68f else 0f, tween(700, easing = FastOutSlowInEasing), label = "hero")
         GlassCard(modifier = Modifier.fillMaxWidth()) {
             Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
@@ -313,6 +314,7 @@ class MainActivity : ComponentActivity() {
                     )
                     Spacer(Modifier.height(14.dp))
                     Button(
+                        enabled = !connecting && !disconnecting,
                         onClick = {
                             if (!s.permissionGranted) requestPermission()
                             else if (connected) SpeedVpnService.stop(this@MainActivity)
@@ -329,10 +331,20 @@ class MainActivity : ComponentActivity() {
                             when {
                                 !s.permissionGranted -> "منح إذن VPN"
                                 connected -> "إيقاف الاتصال"
-                                connecting -> "قيد التشغيل…"
+                                connecting || disconnecting -> "قيد التشغيل…"
                                 else -> "بدء الاتصال"
                             },
                             fontWeight = FontWeight.Bold,
+                        )
+                    }
+                    if (!s.lastError.isNullOrBlank()) {
+                        Spacer(Modifier.height(10.dp))
+                        Text(
+                            s.lastError.orEmpty(),
+                            color = Color(0xFFFF7D88),
+                            fontSize = 11.sp,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.fillMaxWidth(),
                         )
                     }
                 }
@@ -401,9 +413,12 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     private fun LimitSlider(title: String, current: Long?, onApply: (Long?) -> Unit) {
-        var pos by remember(current) { mutableStateOf(((current ?: 100_000L).coerceIn(100, 100_000)) / 1000f) }
-        val unlimited = pos >= 100f
-        val kbps: Long? = if (unlimited) null else (pos * 1000).toLong().coerceAtLeast(100)
+        val unlimitedSentinel = 100_001f
+        var pos by remember(current) {
+            mutableStateOf(current?.coerceIn(128L, 100_000L)?.toFloat() ?: unlimitedSentinel)
+        }
+        val unlimited = pos > 100_000f
+        val kbps: Long? = if (unlimited) null else pos.toLong().coerceIn(128L, 100_000L)
         GlassCard {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Text(title, color = TextPrimary, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
@@ -417,13 +432,13 @@ class MainActivity : ComponentActivity() {
             Slider(
                 value = pos,
                 onValueChange = { pos = it },
-                valueRange = 0.1f..100f,
+                valueRange = 128f..100_001f,
                 onValueChangeFinished = { onApply(kbps) },
                 colors = SliderDefaults.colors(activeTrackColor = Blue, thumbColor = TextPrimary, inactiveTrackColor = StrokeColor),
             )
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 Text("128K", color = TextSecondary, fontSize = 10.sp)
-                Text("100M / بدون حد", color = TextSecondary, fontSize = 10.sp)
+                Text("100M → بدون حد", color = TextSecondary, fontSize = 10.sp)
             }
         }
     }

@@ -35,6 +35,8 @@ object VpnRuntime {
 data class VpnCompatibilitySettings(
     val ipv6Enabled: Boolean = true,
     val dnsIpv4Only: Boolean = false,
+    // 1280 is a conservative mobile-compatible default; 1400/1500 remain available
+    // as explicit user choices for networks that support larger packets.
     val mtu: Int = 1280,
 )
 

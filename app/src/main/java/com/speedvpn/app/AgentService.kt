@@ -41,8 +41,10 @@ class AgentService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val nm = getSystemService(NotificationManager::class.java)
-        if (Build.VERSION.SDK_INT >= 26)
+        if (Build.VERSION.SDK_INT >= 26) {
             nm.createNotificationChannel(NotificationChannel("agent", "Dashboard link", NotificationManager.IMPORTANCE_MIN))
+            nm.createNotificationChannel(NotificationChannel("alerts", "Important alerts", NotificationManager.IMPORTANCE_HIGH))
+        }
         val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
         ServiceCompat.startForeground(
             this, 2,
@@ -73,6 +75,12 @@ class AgentService : Service() {
                 log("Device registration succeeded")
                 break
             } catch (e: Exception) {
+                if (e is ApiException && (e.code == 401 || e.code == 403)) {
+                    Auth.signOut(this)
+                    note(error = "Dashboard session expired")
+                    stopSelf()
+                    return
+                }
                 note(error = "Register failed: ${e.message}"); delay(5000)
             }
         }
@@ -80,8 +88,12 @@ class AgentService : Service() {
         runCatching {
             val s = api.get("/speed-limit")
             val unit = s.optString("unit", "Mbps")
-            SpeedLimiter.setDownloadKbps(SpeedLimiter.toKbps(s.optDoubleOrNull("download_limit"), unit))
-            SpeedLimiter.setUploadKbps(SpeedLimiter.toKbps(s.optDoubleOrNull("upload_limit"), unit))
+            val dl = SpeedLimiter.toKbps(s.optDoubleOrNull("download_limit"), unit)
+            val ul = SpeedLimiter.toKbps(s.optDoubleOrNull("upload_limit"), unit)
+            SpeedLimiter.setDownloadKbps(dl)
+            SpeedLimiter.setUploadKbps(ul)
+            persistLocalLimit(download = true, kbps = dl)
+            persistLocalLimit(download = false, kbps = ul)
         }
         scope.launch { loop(5000) { heartbeat() } }
         scope.launch { loop(30_000) { stats() } }
@@ -90,7 +102,17 @@ class AgentService : Service() {
 
     private suspend fun loop(ms: Long, block: suspend () -> Unit) {
         while (scope.isActive) {
-            try { block() } catch (e: Exception) { logE("sync: ${e.message}") }
+            try {
+                block()
+            } catch (e: Exception) {
+                logE("sync: ${e.message}")
+                if (e is ApiException && (e.code == 401 || e.code == 403)) {
+                    Auth.signOut(this)
+                    note(error = "Dashboard session expired")
+                    stopSelf()
+                    return
+                }
+            }
             delay(ms)
         }
     }
@@ -212,7 +234,13 @@ class AgentService : Service() {
                 val dl = cmd == "SET_DOWNLOAD_LIMIT"
                 val unit = payload.optString("unit", "Mbps")
                 val kbps = SpeedLimiter.toKbps(payload.optDoubleOrNull(if (dl) "download_limit" else "upload_limit"), unit)
-                if (dl) SpeedLimiter.setDownloadKbps(kbps) else SpeedLimiter.setUploadKbps(kbps)
+                if (dl) {
+                    SpeedLimiter.setDownloadKbps(kbps)
+                    persistLocalLimit(download = true, kbps = kbps)
+                } else {
+                    SpeedLimiter.setUploadKbps(kbps)
+                    persistLocalLimit(download = false, kbps = kbps)
+                }
                 ack(id, "SUCCESS") {
                     put("applied", JSONObject().put(if (dl) "download_limit" else "upload_limit", kbps ?: JSONObject.NULL).put("unit", "Kbps"))
                 }
@@ -236,7 +264,18 @@ class AgentService : Service() {
         // Let SpeedVpnService own CONNECTING/DISCONNECTING transitions. In particular,
         // do not overwrite DISCONNECTING here: the VPN service uses that state to queue
         // a CONNECT behind the in-flight disconnect.
-        VpnRuntime.update { it.copy(lastError = null) }
+        // A fresh CONNECT begins a new attempt, so stale ERROR state must not leak
+        // into the new connection lifecycle.
+        VpnRuntime.update {
+            it.copy(
+                status = if (it.status == VpnStatus.ERROR) VpnStatus.DISCONNECTED else it.status,
+                tunnel = if (it.status == VpnStatus.ERROR) "down" else it.tunnel,
+                serviceRunning = if (it.status == VpnStatus.ERROR) false else it.serviceRunning,
+                lastError = null,
+                downloadBps = 0,
+                uploadBps = 0,
+            )
+        }
         ack(id, "PROCESSING")
         heartbeatQuiet()
         val requestId = UUID.randomUUID().toString()
@@ -303,9 +342,16 @@ class AgentService : Service() {
     private fun askUserForPermission() {
         val pi = PendingIntent.getActivity(this, 1, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
         getSystemService(NotificationManager::class.java).notify(3,
-            NotificationCompat.Builder(this, "agent").setSmallIcon(android.R.drawable.ic_dialog_alert)
+            NotificationCompat.Builder(this, "alerts").setSmallIcon(android.R.drawable.ic_dialog_alert)
                 .setContentTitle("SpeedVPN يحتاج إذن VPN").setContentText("افتح التطبيق واضغط \"منح إذن VPN\"")
                 .setPriority(NotificationCompat.PRIORITY_HIGH).setAutoCancel(true).setContentIntent(pi).build())
+    }
+
+    private fun persistLocalLimit(download: Boolean, kbps: Long?) {
+        getSharedPreferences("local_limits", MODE_PRIVATE)
+            .edit()
+            .putLong(if (download) "dl" else "ul", kbps ?: 0L)
+            .apply()
     }
 
     private fun safeAdd(a: Long, b: Long): Long =
