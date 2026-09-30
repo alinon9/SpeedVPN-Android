@@ -10,6 +10,8 @@
 
     <application
         android:allowBackup="false"
+        android:icon="@drawable/ic_speedvpn"
+        android:roundIcon="@drawable/ic_speedvpn"
         android:label="SpeedVPN"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.Material.NoActionBar">

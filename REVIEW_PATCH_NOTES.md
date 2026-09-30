@@ -1,3 +1,20 @@
+## v1.0.18 — compatibility controls + UDP association hardening
+
+- Fixed SOCKS5 UDP association source validation to pin the client source IP, not the ephemeral UDP source port, matching RFC 1928 behavior and improving compatibility with clients that rotate UDP source ports within one association.
+- Added in-app compatibility controls: IPv6 on/off, DNS IPv4-only mode, and MTU 1280/1400/1500. Settings persist locally and apply to the next VPN connection.
+- Added 10 quick speed presets beside each speed slider: 4 slow (128/256/512/768 Kbps), 4 medium (1/2/4/6 Mbps), and 2 fast (10/20 Mbps).
+- Kept the precise slider for custom values up to 100 Mbps and unlimited at the far right.
+- Bumped version to 1.0.18 / versionCode 18.
+
+Important compatibility note: this is still a local speed-shaping VPN. It does not change the public IP or provide a remote proxy, so it cannot by itself bypass an upstream ISP/service block.
+
+## v1.0.17 compatibility update
+- VPN TUN MTU lowered from 1500 to 1280 and kept identical in the hev config to reduce fragmentation/PMTU sensitivity on mobile paths.
+- VPN DNS servers are now populated from the current underlying network's `LinkProperties.dnsServers` when available; no hard-coded public resolver is introduced.
+- Local SOCKS admission increased from 24 to 64 sessions and worker capacity from 96 to 192 to reduce connection starvation in apps that maintain many concurrent streams.
+- Local UDP relay socket buffers increased to 512 KiB where Android permits it, and hev UDP copy-buffer count increased to 16 for better burst tolerance.
+- Existing process-wide native lifecycle/generation protections are unchanged.
+
 ## v1.0.14 follow-up fix
 
 - Re-audited the uploaded v1.0.13 source independently.

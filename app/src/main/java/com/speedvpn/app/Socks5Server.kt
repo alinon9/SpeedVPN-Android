@@ -46,8 +46,8 @@ class Socks5Server(
     private val currentNetwork: () -> Network?,
 ) {
     companion object {
-        private const val MAX_SESSIONS = 24
-        private const val MAX_WORKERS = 96
+        private const val MAX_SESSIONS = 64
+        private const val MAX_WORKERS = 192
         private const val HANDSHAKE_TIMEOUT_MS = 10_000
         private const val UDP_BUFFER_SIZE = 65_535
     }
@@ -395,6 +395,12 @@ class Socks5Server(
     private fun udpAssociate(client: Socket, cin: InputStream, cout: OutputStream) {
         val relay = track(DatagramSocket(0, InetAddress.getByName("127.0.0.1")))
         val outSock = track(DatagramSocket())
+        runCatching {
+            relay.receiveBufferSize = 512 * 1024
+            relay.sendBufferSize = 512 * 1024
+            outSock.receiveBufferSize = 512 * 1024
+            outSock.sendBufferSize = 512 * 1024
+        }
         if (!protectUdp(outSock)) {
             runCatching { relay.close() }
             runCatching { outSock.close() }
@@ -408,7 +414,7 @@ class Socks5Server(
         cout.write(byteArrayOf(5, 0, 0, 1, 127, 0, 0, 1, (relayPort shr 8).toByte(), relayPort.toByte()))
         cout.flush()
 
-        val clientAddr = AtomicReference<InetSocketAddress?>(null)
+        val clientAddr = AtomicReference<InetAddress?>(null)
         val closeOnce = AtomicBoolean(false)
         val closeAll = {
             if (closeOnce.compareAndSet(false, true)) {
@@ -427,8 +433,11 @@ class Socks5Server(
                     while (running && SpeedLimiter.isGenerationActive(generation) && !relay.isClosed) {
                         val pkt = DatagramPacket(buf, buf.size)
                         relay.receive(pkt)
-                        val sender = InetSocketAddress(pkt.address, pkt.port)
+                        val sender = pkt.address
                         val first = clientAddr.compareAndSet(null, sender)
+                        // RFC 1928 requires source-IP validation for UDP ASSOCIATE.
+                        // Do not pin the ephemeral UDP source port: some clients rotate
+                        // source ports during a single association.
                         if (!first && clientAddr.get() != sender) continue
 
                         val bb = ByteBuffer.wrap(pkt.data, 0, pkt.length)

@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
+import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.VpnService
@@ -29,6 +30,9 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.File
+import java.net.Inet4Address
+import java.net.Inet6Address
+import java.net.InetAddress
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
@@ -48,7 +52,6 @@ class SpeedVpnService : VpnService() {
         private const val NOTIF_ID = 1
         private const val TUN_V4 = "198.18.0.1"
         private const val TUN_V6 = "fc00::1"
-
         // hev-socks5-tunnel exposes process-wide/static native lifecycle calls.
         // A Service instance must therefore not own an instance-local native lock.
         // The generation token prevents teardown from an older Service instance from
@@ -214,18 +217,32 @@ class SpeedVpnService : VpnService() {
             return@withLock
         }
 
+        val physicalNetwork = findUnderlyingNetwork()
+        val physicalLinkProperties = physicalNetwork?.let { network ->
+            runCatching {
+                getSystemService(ConnectivityManager::class.java).getLinkProperties(network)
+            }.getOrNull()
+        }
+        val compatibility = VpnSettings.read(this)
+        val dnsServers = selectVpnDnsServers(physicalLinkProperties, compatibility.dnsIpv4Only)
+
         val pfd = try {
-            Builder()
+            val builder = Builder()
                 .setSession("SpeedVPN")
-                .setMtu(1500)
+                .setMtu(compatibility.mtu)
                 .addAddress(TUN_V4, 32)
                 .addRoute("0.0.0.0", 0)
-                .addAddress(TUN_V6, 128)
-                .addRoute("::", 0)
-                // No hard-coded DNS. Android uses underlying-network DNS when none
-                // is specified; SOCKS domain resolution separately uses currentNetwork.
+                // Feed Android the actual DNS servers from the current physical link.
+                // No public resolver is hard-coded.
+                .apply { dnsServers.forEach { addDnsServer(it) } }
+                .apply {
+                    if (compatibility.ipv6Enabled) {
+                        addAddress(TUN_V6, 128)
+                        addRoute("::", 0)
+                    }
+                }
                 .addDisallowedApplication(packageName)
-                .establish()
+            builder.establish()
         } catch (e: Exception) {
             failLocked("Unable to establish VPN interface", e)
             return@withLock
@@ -248,7 +265,7 @@ class SpeedVpnService : VpnService() {
         }
 
         val conf = try {
-            writeTunnelConfig(relay)
+            writeTunnelConfig(relay, compatibility)
         } catch (e: Exception) {
             if (sessionIsCurrent(mySession)) failLocked("Unable to write tunnel configuration", e)
             else cleanupLocked()
@@ -303,28 +320,41 @@ class SpeedVpnService : VpnService() {
             serviceGeneration != 0L &&
             activeServiceGeneration.get() == serviceGeneration
 
-    private fun writeTunnelConfig(relay: Socks5Server): File {
+    private fun writeTunnelConfig(relay: Socks5Server, compatibility: VpnCompatibilitySettings): File {
         val conf = File(filesDir, "tunnel.yml")
-        conf.writeText(
-            """
-            tunnel:
-              mtu: 1500
-              ipv4: $TUN_V4
-              ipv6: '$TUN_V6'
-            socks5:
-              port: ${relay.port}
-              address: 127.0.0.1
-              udp: 'udp'
-              username: '${relay.username}'
-              password: '${relay.password}'
-            misc:
-              task-stack-size: 81920
-              connect-timeout: 15000
-              tcp-read-write-timeout: 600000
-              udp-read-write-timeout: 120000
-            """.trimIndent(),
-        )
+        val configText = buildString {
+            appendLine("tunnel:")
+            appendLine("  mtu: ${compatibility.mtu}")
+            appendLine("  ipv4: $TUN_V4")
+            if (compatibility.ipv6Enabled) appendLine("  ipv6: '$TUN_V6'")
+            appendLine("socks5:")
+            appendLine("  port: ${relay.port}")
+            appendLine("  address: 127.0.0.1")
+            appendLine("  udp: 'udp'")
+            appendLine("  username: '${relay.username}'")
+            appendLine("  password: '${relay.password}'")
+            appendLine("misc:")
+            appendLine("  task-stack-size: 81920")
+            appendLine("  udp-recv-buffer-size: 524288")
+            appendLine("  udp-copy-buffer-nums: 16")
+            appendLine("  connect-timeout: 15000")
+            appendLine("  tcp-read-write-timeout: 600000")
+            appendLine("  udp-read-write-timeout: 120000")
+        }
+        conf.writeText(configText)
         return conf
+    }
+
+    private fun selectVpnDnsServers(linkProperties: LinkProperties?, ipv4Only: Boolean): List<InetAddress> {
+        if (linkProperties == null) return emptyList()
+        return linkProperties.dnsServers
+            .asSequence()
+            .filter { !it.isLoopbackAddress && !it.isMulticastAddress && !it.isAnyLocalAddress }
+            .filter { it is Inet4Address || it is Inet6Address }
+            .filter { !ipv4Only || it is Inet4Address }
+            .distinctBy { it.hostAddress }
+            .take(4)
+            .toList()
     }
 
     private fun isUsablePhysicalNetwork(cm: ConnectivityManager, network: Network?): Boolean {
@@ -543,7 +573,7 @@ class SpeedVpnService : VpnService() {
         }
 
         val conf = try {
-            writeTunnelConfig(relay)
+            writeTunnelConfig(relay, compatibility)
         } catch (e: Exception) {
             if (sessionIsCurrent(mySession)) failLocked("Unable to write tunnel configuration", e)
             else cleanupLocked()

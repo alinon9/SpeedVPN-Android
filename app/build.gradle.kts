@@ -13,8 +13,8 @@ android {
         applicationId = "com.speedvpn.app"
         minSdk = 24
         targetSdk = 35
-        versionCode = 17
-        versionName = "1.0.16"
+        versionCode = 19
+        versionName = "1.0.19"
 
         // Public values only (same ones the website uses). No secrets here.
         buildConfigField("String", "API_BASE", "\"https://read-fix-build-magic.lovable.app/api/public/vpn\"")

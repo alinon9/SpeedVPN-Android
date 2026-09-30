@@ -134,3 +134,10 @@
 ### v1.0.12 audit fixes
 - In-flight authentication responses are rejected after sign-out, preventing stale refresh/sign-in responses from restoring credentials.
 - Version bumped to 1.0.12 / versionCode 13.
+
+
+### v1.0.18 compatibility
+- Conservative 1280-byte TUN MTU.
+- Uses current underlying-network DNS servers when available.
+- Higher local SOCKS session/worker limits and larger UDP socket buffers.
+- Hev UDP burst buffering increased.

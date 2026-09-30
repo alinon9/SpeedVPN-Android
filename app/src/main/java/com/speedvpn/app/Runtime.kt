@@ -31,3 +31,26 @@ object VpnRuntime {
     val state = MutableStateFlow(Snapshot())
     fun update(f: (Snapshot) -> Snapshot) = state.update(f)
 }
+
+data class VpnCompatibilitySettings(
+    val ipv6Enabled: Boolean = true,
+    val dnsIpv4Only: Boolean = false,
+    val mtu: Int = 1280,
+)
+
+object VpnSettings {
+    const val PREFS = "vpn_settings"
+    const val IPV6_ENABLED = "ipv6_enabled"
+    const val DNS_IPV4_ONLY = "dns_ipv4_only"
+    const val MTU = "mtu"
+
+    fun read(context: android.content.Context): VpnCompatibilitySettings {
+        val p = context.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE)
+        val mtu = p.getInt(MTU, 1280).coerceIn(1280, 1500)
+        return VpnCompatibilitySettings(
+            ipv6Enabled = p.getBoolean(IPV6_ENABLED, true),
+            dnsIpv4Only = p.getBoolean(DNS_IPV4_ONLY, false),
+            mtu = mtu,
+        )
+    }
+}
