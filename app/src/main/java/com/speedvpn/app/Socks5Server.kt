@@ -468,7 +468,14 @@ class Socks5Server(
                         if (payloadLen <= 0) continue
                         if (!SpeedLimiter.acquire(SpeedLimiter.upload, payloadLen, generation)) break
                         if (!running || !SpeedLimiter.isGenerationActive(generation)) break
-                        outSock.send(DatagramPacket(pkt.data, bb.position(), payloadLen, addr, port))
+                        outSock.send(
+                            DatagramPacket(
+                                pkt.data,
+                                bb.position(),
+                                payloadLen,
+                                InetSocketAddress(addr, port),
+                            )
+                        )
                         SpeedLimiter.upload.recordForwarded(payloadLen)
                     }
                 } catch (_: Exception) {

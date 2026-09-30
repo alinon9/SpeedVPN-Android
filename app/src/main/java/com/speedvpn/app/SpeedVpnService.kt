@@ -572,6 +572,7 @@ class SpeedVpnService : VpnService() {
             fresh
         }
 
+        val compatibility = VpnSettings.read(this)
         val conf = try {
             writeTunnelConfig(relay, compatibility)
         } catch (e: Exception) {

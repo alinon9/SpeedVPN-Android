@@ -241,11 +241,11 @@ class MainActivity : ComponentActivity() {
     private fun BrandWordmark() {
         Text(
             AnnotatedString(
-                listOf(
+                text = "SpeedVPN",
+                spanStyles = listOf(
                     AnnotatedString.Range(SpanStyle(color = TextPrimary, fontWeight = FontWeight.ExtraBold, fontStyle = FontStyle.Italic), 0, 5),
                     AnnotatedString.Range(SpanStyle(color = Blue, fontWeight = FontWeight.ExtraBold, fontStyle = FontStyle.Italic), 5, 8),
                 ),
-                "SpeedVPN",
             ),
             fontSize = 22.sp,
             letterSpacing = (-0.8).sp,
