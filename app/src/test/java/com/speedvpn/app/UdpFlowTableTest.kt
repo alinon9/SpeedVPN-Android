@@ -67,12 +67,12 @@ class UdpFlowTableTest {
     fun recentlyTouchedFlowWinsLruEviction() {
         val table = UdpFlowTable(maxFlows = 2, ttlMs = 60_000)
         table.getOrCreate("a", 1, InetSocketAddress("10.0.0.2", 1), listOf(a), 1)
-        val bFlow = table.getOrCreate("b", 2, InetSocketAddress("10.0.0.2", 2), listOf(b), 2)!!
+        table.getOrCreate("b", 2, InetSocketAddress("10.0.0.2", 2), listOf(b), 2)!!
         table.findByDestination(a, 1, 3)
         val cAddr = InetAddress.getByName("3.3.3.3")
         table.getOrCreate("c", 3, InetSocketAddress("10.0.0.2", 3), listOf(cAddr), 4)
-        assertEquals(bFlow, table.findByDestination(b, 2, 4))
-        assertNull(table.findByDestination(a, 1, 4))
+        assertNull(table.findByDestination(b, 2, 4))
+        assertTrue(table.findByDestination(a, 1, 4) != null)
     }
 
     @Test
