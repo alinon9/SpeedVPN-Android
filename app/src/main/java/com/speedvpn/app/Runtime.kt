@@ -11,12 +11,20 @@ fun logE(msg: String, t: Throwable? = null) = Log.e(TAG, msg, t)
 /** Values match the backend's vpn_status enum. */
 enum class VpnStatus { UNKNOWN, DISCONNECTED, CONNECTING, CONNECTED, DISCONNECTING, ERROR }
 
+enum class VpnHealth {
+    DISCONNECTED,
+    CONTROL_READY,
+    UPSTREAM_READY,
+    DEGRADED,
+}
+
 data class Snapshot(
     val status: VpnStatus = VpnStatus.DISCONNECTED,
     val permissionGranted: Boolean = false,
     val agentOnline: Boolean = false,
     val serviceRunning: Boolean = false,
     val tunnel: String = "down",
+    val health: VpnHealth = VpnHealth.DISCONNECTED,
     val lastCommand: String? = null,
     val lastResponse: String? = null,
     val lastError: String? = null,
@@ -24,6 +32,9 @@ data class Snapshot(
     val uploadLimitKbps: Long? = null,
     val downloadBps: Long = 0,
     val uploadBps: Long = 0,
+    val sessionDownloadBytes: Long = 0,
+    val sessionUploadBytes: Long = 0,
+    val connectedAtMillis: Long = 0,
 )
 
 /** Single in-process source of truth for the real VPN state (read by UI + agent). */

@@ -15,12 +15,18 @@ import java.net.SocketException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import java.nio.ByteBuffer
+import java.nio.channels.DatagramChannel
+import java.nio.channels.SelectionKey
+import java.nio.channels.Selector
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.Semaphore
 import java.util.concurrent.SynchronousQueue
@@ -44,14 +50,40 @@ class Socks5Server(
     private val protectTcp: (Socket) -> Boolean,
     private val protectUdp: (DatagramSocket) -> Boolean,
     private val currentNetwork: () -> Network?,
+    private val ipv6Enabled: Boolean,
 ) {
     companion object {
-        private const val MAX_SESSIONS = 64
-        // Each active SOCKS session can use one handler plus two blocking I/O workers.
-        // Keep the cap conservative for Android; health probes use probePool separately.
+        private const val MAX_SESSIONS = 80
+        // TCP relays use the handler thread for one direction and one pool worker for
+        // the reverse direction, so the normal TCP cost is ~2 workers/session rather
+        // than 3. UDP still uses two workers plus its control handler.
         private const val MAX_WORKERS = 192
         private const val HANDSHAKE_TIMEOUT_MS = 10_000
         private const val UDP_BUFFER_SIZE = 65_535
+        private const val MAX_UDP_ASSOCIATIONS = 24
+        private const val UDP_FLOW_TTL_MS = 30_000L
+        private const val UDP_CANDIDATE_FALLBACK_MS = 750L
+        private const val CONNECT_TIMEOUT_MS = 12_000L
+        private const val UDP_DNS_TIMEOUT_MS = 3_000L
+
+        internal fun acceptsUdpAddressType(atyp: Int, ipv6Enabled: Boolean): Boolean = when (atyp) {
+            1 -> true
+            4 -> ipv6Enabled
+            else -> false
+        }
+
+        internal fun udpFlowKey(
+            clientEndpoint: InetSocketAddress,
+            candidates: List<InetAddress>,
+            destinationPort: Int,
+        ): String {
+            val candidateKey = candidates
+                .map { it.hostAddress }
+                .sorted()
+                .joinToString(",")
+            return "src:${clientEndpoint.address.hostAddress}:${clientEndpoint.port}" +
+                "|dst:$candidateKey:$destinationPort"
+        }
     }
 
     private val server = ServerSocket(0, 128, InetAddress.getByName("127.0.0.1"))
@@ -68,7 +100,14 @@ class Socks5Server(
     // admission limit through a source-port reservation, so a full user
     // session table cannot make the health monitor report a false failure.
     private val sessions = Semaphore(MAX_SESSIONS, true)
+    private val udpAssociations = Semaphore(MAX_UDP_ASSOCIATIONS, true)
     private val probeSourcePorts = ConcurrentHashMap.newKeySet<Int>()
+    private val upstreamTcp = Collections.newSetFromMap(ConcurrentHashMap<Socket, Boolean>())
+    private val upstreamUdp = Collections.newSetFromMap(ConcurrentHashMap<DatagramSocket, Boolean>())
+    private val dnsPool: ExecutorService = Executors.newFixedThreadPool(2, ThreadFactory { r ->
+        Thread(r, "socks-dns").apply { isDaemon = true }
+    })
+
     private val pool: ExecutorService = ThreadPoolExecutor(
         0,
         MAX_WORKERS,
@@ -141,8 +180,11 @@ class Socks5Server(
         openUdp.toList().forEach { runCatching { it.close() } }
         openTcp.clear()
         openUdp.clear()
+        upstreamTcp.clear()
+        upstreamUdp.clear()
         pool.shutdownNow()
         probePool.shutdownNow()
+        dnsPool.shutdownNow()
         runCatching { pool.awaitTermination(3, TimeUnit.SECONDS) }
         runCatching { probePool.awaitTermination(3, TimeUnit.SECONDS) }
         // Global pacing lifecycle is owned by SpeedVpnService's session generation.
@@ -203,8 +245,23 @@ class Socks5Server(
 
     private fun track(socket: Socket): Socket = socket.also { openTcp.add(it) }
     private fun untrack(socket: Socket) { openTcp.remove(socket) }
+    private fun trackUpstream(socket: Socket): Socket = socket.also { upstreamTcp.add(it); openTcp.add(it) }
+    private fun untrackUpstream(socket: Socket) { upstreamTcp.remove(socket); openTcp.remove(socket) }
     private fun track(socket: DatagramSocket): DatagramSocket = socket.also { openUdp.add(it) }
     private fun untrack(socket: DatagramSocket) { openUdp.remove(socket) }
+    private fun trackUpstream(socket: DatagramSocket): DatagramSocket = socket.also { upstreamUdp.add(it); openUdp.add(it) }
+    private fun untrackUpstream(socket: DatagramSocket) { upstreamUdp.remove(socket); openUdp.remove(socket) }
+
+    fun onUnderlyingNetworkChanged() {
+        upstreamTcp.toList().forEach { socket ->
+            runCatching { socket.close() }
+            untrackUpstream(socket)
+        }
+        upstreamUdp.toList().forEach { socket ->
+            runCatching { socket.close() }
+            untrackUpstream(socket)
+        }
+    }
 
     private fun handle(client: Socket) {
         try {
@@ -261,8 +318,12 @@ class Socks5Server(
             }
         } catch (_: SocketTimeoutException) {
             // Slow/malformed client during handshake.
-        } catch (_: Exception) {
-            // Connection teardown.
+        } catch (e: Exception) {
+            when (classifySocketError(e)) {
+                SockErrKind.EXPECTED_CLOSE -> Unit
+                SockErrKind.NETWORK_EVENT -> log("SOCKS network event: ${e.message}")
+                SockErrKind.UNKNOWN -> logE("Unexpected SOCKS error", e)
+            }
         } finally {
             untrack(client)
             runCatching { client.close() }
@@ -280,21 +341,41 @@ class Socks5Server(
         else -> throw IllegalArgumentException("bad atyp")
     }
 
-    private fun resolveAll(host: String): List<InetAddress> {
+    private fun resolveAll(host: String, timeoutMs: Long): List<InetAddress> {
         val network = currentNetwork()
+            ?: throw UnknownHostException("No physical network available for DNS resolution: $host")
+        if (timeoutMs <= 0L) throw SocketTimeoutException("DNS deadline exceeded for $host")
+
+        val future: Future<List<InetAddress>> = dnsPool.submit<List<InetAddress>> {
+            network.getAllByName(host).toList()
+        }
         return try {
-            (network?.getAllByName(host) ?: InetAddress.getAllByName(host)).toList()
+            future.get(timeoutMs, TimeUnit.MILLISECONDS)
+                .filter { ipv6Enabled || it is java.net.Inet4Address }
+                .sortedBy { if (it is java.net.Inet4Address) 0 else 1 }
+                .also { if (it.isEmpty()) throw UnknownHostException("No usable DNS address for $host") }
+        } catch (e: TimeoutException) {
+            future.cancel(true)
+            throw SocketTimeoutException("DNS timeout for $host")
         } catch (e: Exception) {
-            throw UnknownHostException("DNS failed for $host: ${e.message}")
+            future.cancel(true)
+            if (e.cause is UnknownHostException) throw e.cause as UnknownHostException
+            throw UnknownHostException("DNS failed for $host: ${e.cause?.message ?: e.message}")
         }
     }
 
     private fun connect(client: Socket, cin: InputStream, cout: OutputStream, target: Any, port: Int) {
+        val deadlineNs = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(CONNECT_TIMEOUT_MS)
         val candidates = when (target) {
             is InetAddress -> listOf(target)
-            is String -> resolveAll(target)
+            is String -> {
+                val remainingMs = TimeUnit.NANOSECONDS.toMillis(deadlineNs - System.nanoTime())
+                resolveAll(target, remainingMs)
+            }
             else -> emptyList()
-        }.sortedBy { if (it.address.size == 4) 0 else 1 }
+        }
+            .filter { ipv6Enabled || it is java.net.Inet4Address }
+            .sortedBy { if (it.address.size == 4) 0 else 1 }
 
         if (candidates.isEmpty()) {
             replyFailure(cout, 4)
@@ -304,21 +385,28 @@ class Socks5Server(
 
         var upstream: Socket? = null
         for (addr in candidates) {
+            val remainingMs = TimeUnit.NANOSECONDS.toMillis(deadlineNs - System.nanoTime())
+                .coerceAtMost(5_000L)
+                .toInt()
+            if (remainingMs <= 0) break
+
             val socket = Socket()
-            track(socket)
-            if (!protectTcp(socket)) {
-                untrack(socket)
-                runCatching { socket.close() }
-                client.close()
-                return
-            }
+            trackUpstream(socket)
             try {
-                socket.connect(InetSocketAddress(addr, port), 10_000)
+                val network = currentNetwork() ?: throw UnknownHostException("No physical network available")
+                network.bindSocket(socket)
+                if (!protectTcp(socket)) throw SocketException("VPN socket protection failed")
+                socket.connect(InetSocketAddress(addr, port), remainingMs)
                 socket.tcpNoDelay = true
                 upstream = socket
                 break
-            } catch (_: Exception) {
-                untrack(socket)
+            } catch (e: Exception) {
+                when (classifySocketError(e)) {
+                    SockErrKind.EXPECTED_CLOSE -> Unit
+                    SockErrKind.NETWORK_EVENT -> log("SOCKS upstream network event: ${e.message}")
+                    SockErrKind.UNKNOWN -> logE("SOCKS upstream connect failed", e)
+                }
+                untrackUpstream(socket)
                 runCatching { socket.close() }
             }
         }
@@ -340,26 +428,15 @@ class Socks5Server(
                 runCatching { client.close() }
                 runCatching { remote.close() }
                 untrack(client)
-                untrack(remote)
+                untrackUpstream(remote)
             }
         }
 
         var submitted = 0
         try {
-            pool.execute {
-                pipe(
-                    src = cin,
-                    dst = remote.getOutputStream(),
-                    destination = remote,
-                    bucket = SpeedLimiter.upload,
-                    generation = generation,
-                    other = client,
-                    remaining = remaining,
-                    done = done,
-                    closeBoth = closeBoth,
-                )
-            }
-            submitted++
+            // The SOCKS handler is already a worker. Reuse it for upload and allocate
+            // only one additional worker for download, reducing per-TCP-session
+            // concurrency from 3 threads to 2 without changing half-close semantics.
             pool.execute {
                 pipe(
                     src = remote.getInputStream(),
@@ -374,6 +451,19 @@ class Socks5Server(
                 )
             }
             submitted++
+            pipe(
+                src = cin,
+                dst = remote.getOutputStream(),
+                destination = remote,
+                bucket = SpeedLimiter.upload,
+                generation = generation,
+                other = client,
+                remaining = remaining,
+                done = done,
+                closeBoth = closeBoth,
+            )
+            // If upload hit EOF while download is still draining, keep the client and
+            // remote pair alive until the reverse direction also completes.
             done.await()
         } catch (_: Exception) {
             closeBoth()
@@ -404,7 +494,7 @@ class Socks5Server(
                 if (!SpeedLimiter.acquire(bucket, n, generation)) break
                 if (!running || !SpeedLimiter.isGenerationActive(generation)) break
                 dst.write(buf, 0, n)
-                bucket.recordForwarded(n)
+                bucket.recordForwarded(n, generation)
             }
             runCatching { dst.flush() }
         } catch (_: SocketException) {
@@ -423,145 +513,371 @@ class Socks5Server(
     }
 
     private fun udpAssociate(client: Socket, cin: InputStream, cout: OutputStream) {
-        val relay = track(DatagramSocket(0, InetAddress.getByName("127.0.0.1")))
-        val outSock = track(DatagramSocket())
-        runCatching {
-            relay.receiveBufferSize = 512 * 1024
-            relay.sendBufferSize = 512 * 1024
-            outSock.receiveBufferSize = 512 * 1024
-            outSock.sendBufferSize = 512 * 1024
-        }
-        if (!protectUdp(outSock)) {
-            runCatching { relay.close() }
-            runCatching { outSock.close() }
+        if (!udpAssociations.tryAcquire()) {
+            replyFailure(cout, 1)
             client.close()
-            untrack(relay)
-            untrack(outSock)
             return
         }
 
-        val relayPort = relay.localPort
-        cout.write(byteArrayOf(5, 0, 0, 1, 127, 0, 0, 1, (relayPort shr 8).toByte(), relayPort.toByte()))
-        cout.flush()
-
-        val clientAddr = AtomicReference<InetAddress?>(null)
-        val clientEndpoint = AtomicReference<InetSocketAddress?>(null)
-        val closeOnce = AtomicBoolean(false)
-        val closeAll = {
-            if (closeOnce.compareAndSet(false, true)) {
-                runCatching { relay.close() }
-                runCatching { outSock.close() }
-                runCatching { client.close() }
-                untrack(relay)
-                untrack(outSock)
-            }
-        }
+        var relay: DatagramSocket? = null
 
         try {
-            pool.execute {
-                val buf = ByteArray(UDP_BUFFER_SIZE)
-                try {
-                    while (running && SpeedLimiter.isGenerationActive(generation) && !relay.isClosed) {
-                        val pkt = DatagramPacket(buf, buf.size)
-                        relay.receive(pkt)
-                        val sender = pkt.address
-                        val first = clientAddr.compareAndSet(null, sender)
-                        // RFC 1928 requires source-IP validation for UDP ASSOCIATE.
-                        // Do not pin the ephemeral UDP source port: some clients rotate
-                        // source ports during a single association. Keep the latest
-                        // source port only as the reply destination.
-                        if (!first && clientAddr.get() != sender) continue
-                        clientEndpoint.set(InetSocketAddress(sender, pkt.port))
+            relay = track(DatagramSocket(0, InetAddress.getByName("127.0.0.1")))
+            val relaySocket = requireNotNull(relay)
 
-                        val bb = ByteBuffer.wrap(pkt.data, 0, pkt.length)
-                        if (bb.remaining() < 4) continue
-                        if (bb.short.toInt() != 0) continue // RSV
-                        if (bb.get().toInt() != 0) continue // FRAG
-                        val addr = when (bb.get().toInt() and 0xff) {
-                            1 -> {
-                                if (bb.remaining() < 4) continue
-                                ByteArray(4).also { bb.get(it) }.let(InetAddress::getByAddress)
+            // Fail closed at association creation time when there is no physical
+            // network. Individual flow sockets also re-check the network before
+            // they are created, because the network can disappear later.
+            if (currentNetwork() == null) {
+                throw UnknownHostException("No physical network available")
+            }
+
+            val relayPort = relaySocket.localPort
+            cout.write(
+                byteArrayOf(
+                    5, 0, 0, 1, 127, 0, 0, 1,
+                    (relayPort shr 8).toByte(), relayPort.toByte()
+                )
+            )
+            cout.flush()
+
+            val clientAddr = AtomicReference<InetAddress?>(null)
+            val udpFlows = UdpFlowTable(maxFlows = 256, ttlMs = UDP_FLOW_TTL_MS)
+            val mux = UdpUpstreamMux(
+                relaySocket = relaySocket,
+                udpFlows = udpFlows,
+                clientAddr = clientAddr,
+            )
+            val closeOnce = AtomicBoolean(false)
+            val closeAll = {
+                if (closeOnce.compareAndSet(false, true)) {
+                    runCatching { mux.close() }
+                    runCatching { relaySocket.close() }
+                    runCatching { client.close() }
+                    untrack(relaySocket)
+                }
+            }
+
+            try {
+                pool.execute {
+                    val buf = ByteArray(UDP_BUFFER_SIZE)
+                    try {
+                        while (running && SpeedLimiter.isGenerationActive(generation) && !relaySocket.isClosed) {
+                            val pkt = DatagramPacket(buf, buf.size)
+                            relaySocket.receive(pkt)
+                            val sender = pkt.address
+                            val first = clientAddr.compareAndSet(null, sender)
+                            // RFC 1928 requires source-IP validation for UDP ASSOCIATE.
+                            // Source ports may rotate during one association; the port is
+                            // part of the logical flow identity and therefore gets its own
+                            // upstream socket when it changes.
+                            val expectedClient = clientAddr.get()
+                            if (!first && (expectedClient == null || !expectedClient.equals(sender))) continue
+                            val senderEndpoint = InetSocketAddress(sender, pkt.port)
+
+                            val bb = ByteBuffer.wrap(pkt.data, 0, pkt.length)
+                            if (bb.remaining() < 4) continue
+                            if (bb.short.toInt() != 0) continue // RSV
+                            if (bb.get().toInt() != 0) continue // FRAG
+
+                            val candidates: List<InetAddress> = when (bb.get().toInt() and 0xff) {
+                                1 -> {
+                                    if (bb.remaining() < 4) continue
+                                    val addr = ByteArray(4).also { bb.get(it) }.let(InetAddress::getByAddress)
+                                    if (!acceptsUdpAddressType(1, ipv6Enabled)) continue
+                                    listOf(addr)
+                                }
+                                4 -> {
+                                    if (!acceptsUdpAddressType(4, ipv6Enabled) || bb.remaining() < 16) continue
+                                    val addr = ByteArray(16).also { bb.get(it) }.let(InetAddress::getByAddress)
+                                    listOf(addr)
+                                }
+                                3 -> {
+                                    if (!bb.hasRemaining()) continue
+                                    val len = bb.get().toInt() and 0xff
+                                    if (bb.remaining() < len) continue
+                                    val host = ByteArray(len).also { bb.get(it) }.toString(Charsets.UTF_8)
+                                    resolveAll(host, UDP_DNS_TIMEOUT_MS)
+                                }
+                                else -> continue
                             }
-                            4 -> {
-                                if (bb.remaining() < 16) continue
-                                ByteArray(16).also { bb.get(it) }.let(InetAddress::getByAddress)
-                            }
-                            3 -> {
-                                if (!bb.hasRemaining()) continue
-                                val len = bb.get().toInt() and 0xff
-                                if (bb.remaining() < len) continue
-                                val host = ByteArray(len).also { bb.get(it) }.toString(Charsets.UTF_8)
-                                resolveAll(host).firstOrNull() ?: continue
-                            }
-                            else -> continue
-                        }
-                        if (bb.remaining() < 2) continue
-                        val port = bb.short.toInt() and 0xffff
-                        val payloadLen = bb.remaining()
-                        if (payloadLen <= 0) continue
-                        if (!SpeedLimiter.acquire(SpeedLimiter.upload, payloadLen, generation)) break
-                        if (!running || !SpeedLimiter.isGenerationActive(generation)) break
-                        outSock.send(
-                            DatagramPacket(
-                                pkt.data,
-                                bb.position(),
-                                payloadLen,
-                                addr,
+                            if (candidates.isEmpty() || bb.remaining() < 2) continue
+
+                            val port = bb.short.toInt() and 0xffff
+                            val payloadLen = bb.remaining()
+                            if (payloadLen <= 0) continue
+
+                            val now = System.currentTimeMillis()
+                            // Each logical flow gets a distinct connected DatagramChannel.
+                            // The upstream socket's local source port is therefore unique
+                            // per flow, making replies deterministic even when two clients
+                            // target the same remote IP:port.
+                            val flowKey = udpFlowKey(senderEndpoint, candidates, port)
+                            val flow = udpFlows.getOrCreate(
+                                flowKey,
                                 port,
-                            )
-                        )
-                        SpeedLimiter.upload.recordForwarded(payloadLen)
+                                senderEndpoint,
+                                candidates,
+                                now,
+                            ) ?: continue
+                            udpFlows.advanceCandidateIfUnanswered(flow, now, UDP_CANDIDATE_FALLBACK_MS)
+                            val addr = flow.candidates.getOrNull(flow.selectedIndex) ?: continue
+
+                            if (!SpeedLimiter.acquire(SpeedLimiter.upload, payloadLen, generation)) break
+                            if (!running || !SpeedLimiter.isGenerationActive(generation)) break
+
+                            if (!mux.send(
+                                    flow = flow,
+                                    address = addr,
+                                    port = port,
+                                    data = pkt.data,
+                                    offset = bb.position(),
+                                    length = payloadLen,
+                                )
+                            ) {
+                                continue
+                            }
+                            SpeedLimiter.upload.recordForwarded(payloadLen, generation)
+                            udpFlows.touchSent(flow, System.currentTimeMillis())
+                            mux.trimClosedFlows(System.currentTimeMillis())
+                        }
+                    } catch (_: Exception) {
+                        // teardown
+                    } finally {
+                        closeAll()
                     }
-                } catch (_: Exception) {
-                    // teardown
-                } finally {
-                    closeAll()
                 }
+
+                while (cin.read() >= 0 && running && SpeedLimiter.isGenerationActive(generation)) { }
+            } catch (_: Exception) {
+                // teardown
+            } finally {
+                udpFlows.clear()
+                closeAll()
             }
-
-            pool.execute {
-                val buf = ByteArray(UDP_BUFFER_SIZE)
-                try {
-                    while (running && SpeedLimiter.isGenerationActive(generation) && !outSock.isClosed) {
-                        val pkt = DatagramPacket(buf, buf.size)
-                        outSock.receive(pkt)
-                        val destination: java.net.SocketAddress = clientEndpoint.get() ?: continue
-                        if (!SpeedLimiter.acquire(SpeedLimiter.download, pkt.length, generation)) break
-                        if (!running || !SpeedLimiter.isGenerationActive(generation)) break
-
-                        val address = pkt.address.address
-                        val type = if (address.size == 4) 1 else 4
-                        val header = ByteBuffer.allocate(4 + address.size + 2 + pkt.length)
-                            .put(byteArrayOf(0, 0, 0, type.toByte()))
-                            .put(address)
-                            .putShort(pkt.port.toShort())
-                            .put(pkt.data, 0, pkt.length)
-                        val replyAddress = (destination as? InetSocketAddress)
-                            ?: continue
-                        relay.send(
-                            DatagramPacket(
-                                header.array(),
-                                0,
-                                header.position(),
-                                replyAddress.address,
-                                replyAddress.port,
-                            )
-                        )
-                        SpeedLimiter.download.recordForwarded(pkt.length)
-                    }
-                } catch (_: Exception) {
-                    // teardown
-                } finally {
-                    closeAll()
-                }
-            }
-
-            while (cin.read() >= 0 && running && SpeedLimiter.isGenerationActive(generation)) { }
         } catch (_: Exception) {
-            // teardown
+            runCatching { client.close() }
         } finally {
-            closeAll()
+            relay?.let {
+                runCatching { it.close() }
+                untrack(it)
+            }
+            udpAssociations.release()
         }
+    }
+
+    private data class UdpBinding(
+        val flow: UdpFlow,
+        val channel: DatagramChannel,
+        @Volatile var remote: InetSocketAddress,
+    )
+
+    /**
+     * Deterministic UDP upstream multiplexer.
+     *
+     * Every logical SOCKS UDP flow owns one connected DatagramChannel. A Selector
+     * services all channels from one worker thread, so we do not trade correctness
+     * for one thread per flow. Because each channel has its own local source port
+     * and is connected to exactly one remote candidate, an incoming datagram can
+     * only belong to that flow; no remote-IP:port heuristic is required.
+     */
+    private inner class UdpUpstreamMux(
+        private val relaySocket: DatagramSocket,
+        private val udpFlows: UdpFlowTable,
+        private val clientAddr: AtomicReference<InetAddress?>,
+    ) : AutoCloseable {
+        private val selector = Selector.open()
+        private val lock = Any()
+        private val bindings = HashMap<String, UdpBinding>()
+        private val runningMux = AtomicBoolean(true)
+        private val worker = thread(name = "socks-udp-mux", isDaemon = true) {
+            runLoop()
+        }
+
+        fun send(
+            flow: UdpFlow,
+            address: InetAddress,
+            port: Int,
+            data: ByteArray,
+            offset: Int,
+            length: Int,
+        ): Boolean {
+            if (!runningMux.get() || !running || !SpeedLimiter.isGenerationActive(generation)) return false
+
+            val remote = InetSocketAddress(address, port)
+            synchronized(lock) {
+                val binding = bindings[flow.logicalKey]
+                    ?.takeUnless { !it.channel.isOpen }
+                    ?: runCatching { createBindingLocked(flow, remote) }.getOrNull()
+                    ?: return false
+
+                if (binding.remote != remote) {
+                    runCatching {
+                        binding.channel.disconnect()
+                        binding.channel.connect(remote)
+                        binding.remote = remote
+                    }.onFailure {
+                        closeBindingLocked(binding)
+                        return false
+                    }
+                }
+
+                return runCatching {
+                    val written = binding.channel.write(ByteBuffer.wrap(data, offset, length))
+                    written == length
+                }.getOrElse {
+                    closeBindingLocked(binding)
+                    false
+                }
+            }
+        }
+
+        fun trimClosedFlows(nowMs: Long) {
+            synchronized(lock) {
+                udpFlows.size(nowMs) // Purges expired flows.
+                val iterator = bindings.entries.iterator()
+                while (iterator.hasNext()) {
+                    val entry = iterator.next()
+                    val binding = entry.value
+                    if (!binding.channel.isOpen || !udpFlows.contains(binding.flow.logicalKey, nowMs)) {
+                        closeBindingLocked(binding)
+                        iterator.remove()
+                    }
+                }
+            }
+        }
+
+        override fun close() {
+            if (!runningMux.compareAndSet(true, false)) return
+            synchronized(lock) {
+                bindings.values.toList().forEach(::closeBindingLocked)
+                bindings.clear()
+            }
+            selector.wakeup()
+            runCatching { worker.join(1_000) }
+            runCatching { selector.close() }
+        }
+
+        private fun createBindingLocked(flow: UdpFlow, remote: InetSocketAddress): UdpBinding {
+            val network = currentNetwork()
+                ?: throw UnknownHostException("No physical network available")
+            val channel = DatagramChannel.open()
+            val socket = channel.socket()
+            try {
+                socket.receiveBufferSize = 64 * 1024
+                socket.sendBufferSize = 64 * 1024
+                network.bindSocket(socket)
+                socket.bind(InetSocketAddress(0))
+                if (!protectUdp(socket)) {
+                    throw SocketException("VPN UDP socket protection failed")
+                }
+                channel.configureBlocking(false)
+                channel.connect(remote)
+                val binding = UdpBinding(flow, channel, remote)
+                synchronized(selector) {
+                    selector.wakeup()
+                    channel.register(selector, SelectionKey.OP_READ, binding)
+                }
+                trackUpstream(socket)
+                bindings[flow.logicalKey] = binding
+                return binding
+            } catch (e: Exception) {
+                runCatching { channel.close() }
+                throw e
+            }
+        }
+
+        private fun closeBindingLocked(binding: UdpBinding) {
+            runCatching { binding.channel.keyFor(selector)?.cancel() }
+            val socket = runCatching { binding.channel.socket() }.getOrNull()
+            runCatching { binding.channel.close() }
+            socket?.let(::untrackUpstream)
+        }
+
+        private fun runLoop() {
+            val buffer = ByteBuffer.allocate(UDP_BUFFER_SIZE)
+            try {
+                while (runningMux.get() && running && SpeedLimiter.isGenerationActive(generation)) {
+                    selector.select(500)
+                    val selected = selector.selectedKeys()
+                    val iterator = selected.iterator()
+                    while (iterator.hasNext()) {
+                        val key = iterator.next()
+                        iterator.remove()
+                        if (!key.isValid) continue
+
+                        val binding = key.attachment() as? UdpBinding ?: continue
+                        try {
+                            buffer.clear()
+                            val count = binding.channel.read(buffer)
+                            if (count <= 0) continue
+                            buffer.flip()
+                            val payload = ByteArray(count)
+                            buffer.get(payload)
+
+                            val destination = binding.flow.clientEndpoint
+                            if (!SpeedLimiter.acquire(SpeedLimiter.download, count, generation)) {
+                                continue
+                            }
+                            if (!running || !SpeedLimiter.isGenerationActive(generation)) continue
+
+                            val address = binding.remote.address.address
+                            val type = if (address.size == 4) 1 else 4
+                            val header = ByteBuffer.allocate(4 + address.size + 2 + count)
+                                .put(byteArrayOf(0, 0, 0, type.toByte()))
+                                .put(address)
+                                .putShort(binding.remote.port.toShort())
+                                .put(payload)
+
+                            relaySocket.send(
+                                DatagramPacket(
+                                    header.array(),
+                                    0,
+                                    header.position(),
+                                    destination.address,
+                                    destination.port,
+                                )
+                            )
+                            udpFlows.markReply(binding.flow, System.currentTimeMillis())
+                            SpeedLimiter.download.recordForwarded(count, generation)
+                        } catch (_: Exception) {
+                            synchronized(lock) {
+                                bindings.remove(binding.flow.logicalKey)
+                                closeBindingLocked(binding)
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+                // association teardown
+            } finally {
+                synchronized(lock) {
+                    bindings.values.toList().forEach(::closeBindingLocked)
+                    bindings.clear()
+                }
+            }
+        }
+    }
+
+    private enum class SockErrKind { EXPECTED_CLOSE, NETWORK_EVENT, UNKNOWN }
+
+    private fun classifySocketError(t: Throwable): SockErrKind = when {
+        t is java.util.concurrent.CancellationException -> SockErrKind.EXPECTED_CLOSE
+        t is java.nio.channels.ClosedChannelException -> SockErrKind.EXPECTED_CLOSE
+        t is SocketException -> {
+            val message = t.message?.lowercase() ?: ""
+            when {
+                message.contains("socket closed") -> SockErrKind.EXPECTED_CLOSE
+                message.contains("connection refused") ||
+                    message.contains("connection reset") ||
+                    message.contains("broken pipe") ||
+                    message.contains("network is unreachable") ||
+                    message.contains("no route to host") -> SockErrKind.NETWORK_EVENT
+                else -> SockErrKind.UNKNOWN
+            }
+        }
+        t is SocketTimeoutException -> SockErrKind.NETWORK_EVENT
+        else -> SockErrKind.UNKNOWN
     }
 
     private fun replyFailure(out: OutputStream, code: Int) {

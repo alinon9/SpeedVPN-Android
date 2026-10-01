@@ -14,6 +14,7 @@ import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
@@ -33,6 +34,12 @@ import java.io.File
 import java.net.Inet4Address
 import java.net.Inet6Address
 import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.Socket
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
@@ -47,9 +54,15 @@ class SpeedVpnService : VpnService() {
     companion object {
         const val ACTION_START = "com.speedvpn.START"
         const val ACTION_STOP = "com.speedvpn.STOP"
+        const val ACTION_RESET_STATS = "com.speedvpn.RESET_STATS"
+        const val ACTION_RESTART_FOR_SETTINGS = "com.speedvpn.RESTART_FOR_SETTINGS"
         private const val EXTRA_EXPECTED_GENERATION = "expected_generation"
         private const val EXTRA_START_REQUEST_ID = "start_request_id"
         private const val NOTIF_ID = 1
+        private const val HEALTH_INTERVAL_MS = 30_000L
+        private const val UPSTREAM_PROBE_TIMEOUT_MS = 3_000
+        private const val UPSTREAM_PROBE_HOST = "connectivitycheck.gstatic.com"
+        private const val UPSTREAM_PROBE_PORT = 80
         private const val TUN_V4 = "198.18.0.1"
         private const val TUN_V6 = "fc00::1"
         // hev-socks5-tunnel exposes process-wide/static native lifecycle calls.
@@ -72,6 +85,17 @@ class SpeedVpnService : VpnService() {
                     if (!requestId.isNullOrBlank()) putExtra(EXTRA_START_REQUEST_ID, requestId)
                 },
             )
+
+        fun resetTraffic(ctx: Context) {
+            ctx.startService(Intent(ctx, SpeedVpnService::class.java).setAction(ACTION_RESET_STATS))
+        }
+
+        fun restartForSettings(ctx: Context) {
+            ContextCompat.startForegroundService(
+                ctx,
+                Intent(ctx, SpeedVpnService::class.java).setAction(ACTION_RESTART_FOR_SETTINGS),
+            )
+        }
 
         fun stop(ctx: Context, expectedGeneration: Long? = null) {
             // Invalidate a connection attempt immediately, before the coroutine
@@ -104,14 +128,20 @@ class SpeedVpnService : VpnService() {
     // Non-zero only after this generation has successfully started Native.
     @Volatile private var nativeGeneration: Long = 0L
     @Volatile private var reconnectAfterDisconnect = false
+    @Volatile private var tunnelConfigFile: File? = null
     @Volatile private var requestedStartRequestId: String? = null
     @Volatile private var tun: ParcelFileDescriptor? = null
     @Volatile private var socks: Socks5Server? = null
     @Volatile private var engineRunning = false
     private val currentPhysicalNetwork = AtomicReference<Network?>(null)
+    @Volatile private var lastDnsSignature = ""
+    private val dnsRebuildPending = AtomicBoolean(false)
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var meter: Job? = null
     private var healthMonitor: Job? = null
+    private val upstreamProbeDnsExecutor: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "vpn-upstream-dns").apply { isDaemon = true }
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -122,6 +152,19 @@ class SpeedVpnService : VpnService() {
         if (destroying.get()) return START_NOT_STICKY
 
         when (intent?.action) {
+            ACTION_RESET_STATS -> {
+                synchronized(processNativeLifecycleLock) {
+                    if (serviceGeneration > 0L && activeServiceGeneration.get() == serviceGeneration) {
+                        SpeedLimiter.resetSessionCounters(serviceGeneration)
+                        VpnRuntime.update { it.copy(sessionDownloadBytes = 0L, sessionUploadBytes = 0L) }
+                    }
+                }
+            }
+            ACTION_RESTART_FOR_SETTINGS -> {
+                reconnectAfterDisconnect = true
+                goForeground()
+                scope.launch { disconnect() }
+            }
             ACTION_STOP -> {
                 val expectedGeneration = intent?.getLongExtra(EXTRA_EXPECTED_GENERATION, 0L) ?: 0L
                 // The generation check must be repeated while holding stateMutex.
@@ -193,12 +236,15 @@ class SpeedVpnService : VpnService() {
             return@withLock
         }
 
+        val compatibility = VpnSettings.read(this)
+        val firewall = VpnAppControl.read(this)
         val relay = try {
             Socks5Server(
                 generation = myServiceGeneration,
                 protectTcp = { protect(it) },
                 protectUdp = { protect(it) },
                 currentNetwork = { findUnderlyingNetwork() },
+                ipv6Enabled = compatibility.ipv6Enabled,
             ).also { it.start() }
         } catch (e: Exception) {
             failLocked("VPN relay failed to start", e)
@@ -223,16 +269,22 @@ class SpeedVpnService : VpnService() {
                 getSystemService(ConnectivityManager::class.java).getLinkProperties(network)
             }.getOrNull()
         }
-        val compatibility = VpnSettings.read(this)
         // IPv6-disabled mode must also avoid advertising IPv6 DNS servers.
         // This keeps Android's VPN DNS path consistent with the selected IP family.
         val dnsIpv4Only = compatibility.dnsIpv4Only || !compatibility.ipv6Enabled
-        val dnsServers = selectVpnDnsServers(physicalLinkProperties, dnsIpv4Only)
+        val dnsServers = try {
+            selectVpnDnsServers(physicalLinkProperties, dnsIpv4Only)
+        } catch (e: IllegalStateException) {
+            failLocked(e.message ?: "Unable to select VPN DNS servers", e)
+            return@withLock
+        }
+        lastDnsSignature = dnsSignature(dnsServers)
 
         val pfd = try {
             val builder = Builder()
                 .setSession("SpeedVPN")
                 .setMtu(compatibility.mtu)
+                .setUnderlyingNetworks(physicalNetwork?.let { arrayOf(it) } ?: emptyArray())
                 .addAddress(TUN_V4, 32)
                 .addRoute("0.0.0.0", 0)
                 // Feed Android the actual DNS servers from the current physical link.
@@ -244,8 +296,34 @@ class SpeedVpnService : VpnService() {
                         addRoute("::", 0)
                     }
                 }
-                .addDisallowedApplication(packageName)
+                .apply {
+                    val firewallRequested = firewall.firewallEnabled && firewall.blockedPackages.isNotEmpty()
+                    val lockdownReady = Build.VERSION.SDK_INT >= 29 && runCatching { isLockdownEnabled }.getOrDefault(false)
+                    if (firewallRequested && !lockdownReady) {
+                        throw IllegalStateException(
+                            "App firewall requires Android VPN Lockdown. Enable Always-on VPN and 'Block connections without VPN' in Android VPN settings."
+                        )
+                    }
+                    if (firewallRequested) {
+                        var installed = 0
+                        firewall.blockedPackages.forEach { pkg ->
+                            if (pkg == packageName) return@forEach
+                            runCatching { addDisallowedApplication(pkg) }
+                                .onSuccess { installed++ }
+                                .onFailure { log("Skipping unavailable blocked package $pkg: ${it.message}") }
+                        }
+                        if (installed == 0) {
+                            throw IllegalStateException("No valid blocked applications were installed")
+                        }
+                        log("App firewall active with Android lockdown: $installed blocked")
+                    }
+                    // The SpeedVPN process must never be routed back through its own TUN.
+                    addDisallowedApplication(packageName)
+                }
             builder.establish()
+        } catch (e: IllegalStateException) {
+            failLocked(e.message ?: "Unable to establish VPN interface", e)
+            return@withLock
         } catch (e: Exception) {
             failLocked("Unable to establish VPN interface", e)
             return@withLock
@@ -275,6 +353,11 @@ class SpeedVpnService : VpnService() {
             return@withLock
         }
 
+        // Restore persistent local limits inside the Service so background/Always-on
+        // starts do not depend on MainActivity having been recreated first.
+        SpeedLimitStore.applyToLimiter(this)
+        log("Restored local speed limits before native data plane start")
+
         log("Starting hev tunnel")
         val started = startNativeIfCurrent(mySession, pfd, conf.absolutePath)
         if (!started) {
@@ -303,7 +386,15 @@ class SpeedVpnService : VpnService() {
                 false
             } else {
                 VpnRuntime.update {
-                    it.copy(status = VpnStatus.CONNECTED, tunnel = "up", lastError = null)
+                    it.copy(
+                        status = VpnStatus.CONNECTED,
+                        tunnel = "up",
+                        health = VpnHealth.CONTROL_READY,
+                        lastError = null,
+                        sessionDownloadBytes = 0L,
+                        sessionUploadBytes = 0L,
+                        connectedAtMillis = System.currentTimeMillis(),
+                    )
                 }
                 true
             }
@@ -324,7 +415,8 @@ class SpeedVpnService : VpnService() {
             activeServiceGeneration.get() == serviceGeneration
 
     private fun writeTunnelConfig(relay: Socks5Server, compatibility: VpnCompatibilitySettings): File {
-        val conf = File(filesDir, "tunnel.yml")
+        val conf = File(filesDir, "tunnel-${serviceGeneration}.yml")
+        tunnelConfigFile = conf
         val configText = buildString {
             appendLine("tunnel:")
             appendLine("  mtu: ${compatibility.mtu}")
@@ -339,9 +431,10 @@ class SpeedVpnService : VpnService() {
             appendLine("misc:")
             appendLine("  task-stack-size: 86016")
             appendLine("  tcp-buffer-size: 65536")
-            appendLine("  udp-recv-buffer-size: 524288")
-            appendLine("  udp-copy-buffer-nums: 16")
-            appendLine("  connect-timeout: 15000")
+            appendLine("  udp-recv-buffer-size: 262144")
+            appendLine("  udp-copy-buffer-nums: 12")
+            appendLine("  max-session-count: 80")
+            appendLine("  connect-timeout: 12000")
             appendLine("  tcp-read-write-timeout: 600000")
             appendLine("  udp-read-write-timeout: 60000")
         }
@@ -349,9 +442,58 @@ class SpeedVpnService : VpnService() {
         return conf
     }
 
+    private fun dnsSignature(servers: List<InetAddress>): String =
+        servers.mapNotNull { it.hostAddress }.sorted().joinToString(",")
+
+    private fun handleLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+        if (destroying.get() || currentPhysicalNetwork.get() != network) return
+
+        val settings = VpnSettings.read(this)
+        val ipv4Only = settings.dnsIpv4Only || !settings.ipv6Enabled
+        val dns = runCatching { selectVpnDnsServers(linkProperties, ipv4Only) }.getOrElse { emptyList() }
+        // Do not replace a known-good DNS set with an empty set during the short
+        // transition window where Android has not published new DNS servers yet.
+        if (dns.isEmpty()) return
+        val signature = dnsSignature(dns)
+        if (signature == lastDnsSignature) return
+
+        lastDnsSignature = signature
+        val connected = tun != null && VpnRuntime.state.value.status == VpnStatus.CONNECTED
+        if (!connected) return
+
+        // Android's VPN Builder does not expose an in-place DNS mutation. Rebuild
+        // the VPN generation so the new DNS servers are installed atomically with
+        // a fresh TUN. Debounce callback bursts and bind the disconnect to the
+        // generation that observed the DNS change; otherwise a second callback can
+        // queue a stale disconnect that tears down the freshly rebuilt generation.
+        val expectedGeneration = serviceGeneration
+        if (!dnsRebuildPending.compareAndSet(false, true)) return
+        log("Physical DNS changed ($signature); scheduling VPN generation rebuild for $expectedGeneration")
+        scope.launch {
+            try {
+                val shouldReconnect = stateMutex.withLock {
+                    if (destroying.get() || serviceGeneration != expectedGeneration ||
+                        VpnRuntime.state.value.status != VpnStatus.CONNECTED || tun == null
+                    ) {
+                        false
+                    } else {
+                        reconnectAfterDisconnect = true
+                        true
+                    }
+                }
+                if (shouldReconnect) disconnect(expectedGeneration)
+            } finally {
+                dnsRebuildPending.set(false)
+            }
+        }
+    }
+
     private fun selectVpnDnsServers(linkProperties: LinkProperties?, ipv4Only: Boolean): List<InetAddress> {
-        if (linkProperties == null) return emptyList()
-        return linkProperties.dnsServers
+        if (linkProperties == null) {
+            if (ipv4Only) throw IllegalStateException("IPv4-only DNS requested but physical DNS is unavailable")
+            return emptyList()
+        }
+        val result = linkProperties.dnsServers
             .asSequence()
             .filter { !it.isLoopbackAddress && !it.isMulticastAddress && !it.isAnyLocalAddress }
             .filter { it is Inet4Address || it is Inet6Address }
@@ -359,6 +501,10 @@ class SpeedVpnService : VpnService() {
             .distinctBy { it.hostAddress }
             .take(4)
             .toList()
+        if (ipv4Only && result.isEmpty()) {
+            throw IllegalStateException("IPv4-only DNS requested but no IPv4 DNS server is available")
+        }
+        return result
     }
 
     private fun isUsablePhysicalNetwork(cm: ConnectivityManager, network: Network?): Boolean {
@@ -399,20 +545,32 @@ class SpeedVpnService : VpnService() {
             .firstOrNull()
     }
 
+    private fun publishPhysicalNetwork(discovered: Network?) {
+        val old = currentPhysicalNetwork.getAndSet(discovered)
+        if (old == discovered) return
+        log("Physical network updated -> ${discovered ?: "none"}")
+        socks?.onUnderlyingNetworkChanged()
+        if (tun != null) {
+            runCatching {
+                setUnderlyingNetworks(discovered?.let { arrayOf(it) } ?: emptyArray())
+            }.onFailure {
+                logE("Unable to publish VPN underlying network", it)
+            }
+        }
+    }
+
     private fun findUnderlyingNetwork(): Network? {
         val cm = getSystemService(ConnectivityManager::class.java)
         val cached = currentPhysicalNetwork.get()
         if (isUsablePhysicalNetwork(cm, cached)) return cached
         val discovered = discoverPhysicalNetwork(cm)
-        currentPhysicalNetwork.set(discovered)
+        publishPhysicalNetwork(discovered)
         return discovered
     }
 
     private fun refreshPhysicalNetwork() {
         val cm = getSystemService(ConnectivityManager::class.java)
-        val discovered = discoverPhysicalNetwork(cm)
-        currentPhysicalNetwork.set(discovered)
-        log("Physical network updated -> ${discovered ?: "none"}")
+        publishPhysicalNetwork(discoverPhysicalNetwork(cm))
     }
 
     private fun registerPhysicalNetworkCallback() {
@@ -433,6 +591,13 @@ class SpeedVpnService : VpnService() {
                     refreshPhysicalNetwork()
                 }
             }
+
+            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+                if (isUsablePhysicalNetwork(cm, network)) {
+                    if (currentPhysicalNetwork.get() != network) refreshPhysicalNetwork()
+                    handleLinkPropertiesChanged(network, linkProperties)
+                }
+            }
         }
         networkCallback = callback
         runCatching {
@@ -451,11 +616,13 @@ class SpeedVpnService : VpnService() {
             getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(callback)
         }
         currentPhysicalNetwork.set(null)
+        lastDnsSignature = ""
+        dnsRebuildPending.set(false)
     }
 
     private fun waitForReady(mySession: Long, relay: Socks5Server, timeoutMs: Long): Boolean {
-        val end = System.currentTimeMillis() + timeoutMs
-        while (System.currentTimeMillis() < end) {
+        val deadline = SystemClock.elapsedRealtime() + timeoutMs
+        while (SystemClock.elapsedRealtime() < deadline) {
             if (!sessionIsCurrent(mySession) || tun == null || !engineRunning) return false
 
             val nativeState = runCatching { probeNativeState(nativeGeneration) }
@@ -478,7 +645,8 @@ class SpeedVpnService : VpnService() {
     private fun startHealthMonitor(mySession: Long) {
         healthMonitor?.cancel()
         healthMonitor = scope.launch {
-            var failedChecks = 0
+            var failedControlChecks = 0
+            var lastUpstreamProbeAt = 0L
             while (isActive) {
                 delay(2_000)
                 val result = stateMutex.withLock {
@@ -490,24 +658,39 @@ class SpeedVpnService : VpnService() {
                     val nativeState = runCatching { probeNativeState(nativeGeneration) }
                         .getOrDefault(NativeProbe.UNKNOWN)
                     if (nativeState == NativeProbe.UNKNOWN) {
-                        // Unknown is not equivalent to stopped. Do not start a
-                        // destructive recovery solely because the process-wide
-                        // native status query failed.
-                        log("Data-plane health indeterminate: native status unavailable")
-                        failedChecks = 0
+                        VpnRuntime.update { it.copy(health = VpnHealth.CONTROL_READY) }
+                        log("VPN health indeterminate: native status unavailable")
+                        failedControlChecks = 0
                         return@withLock HealthResult.RETRY_LATER
                     }
+
                     val nativeOk = nativeState == NativeProbe.RUNNING
                     val relayOk = runCatching { relay?.probe() == true }.getOrDefault(false)
-                    if (nativeOk && relayOk) {
-                        failedChecks = 0
-                        HealthResult.OK
-                    } else {
-                        failedChecks++
-                        log("Data-plane health failed ($failedChecks/3): native=$nativeOk relay=$relayOk")
-                        if (failedChecks < 3) HealthResult.RETRY_LATER
-                        else recoverDataPlaneLocked(mySession)
+                    if (!nativeOk || !relayOk) {
+                        failedControlChecks++
+                        VpnRuntime.update { it.copy(health = VpnHealth.DEGRADED) }
+                        log("VPN control health failed ($failedControlChecks/3): native=$nativeOk relay=$relayOk")
+                        if (failedControlChecks >= 3) {
+                            return@withLock recoverDataPlaneLocked(mySession)
+                        }
+                        return@withLock HealthResult.RETRY_LATER
                     }
+
+                    failedControlChecks = 0
+                    val now = SystemClock.elapsedRealtime()
+                    if (now - lastUpstreamProbeAt >= HEALTH_INTERVAL_MS) {
+                        lastUpstreamProbeAt = now
+                        if (upstreamReachabilityProbe()) {
+                            VpnRuntime.update { it.copy(health = VpnHealth.UPSTREAM_READY) }
+                            log("VPN upstream reachability is ready (data plane not measured by this probe)")
+                        } else {
+                            VpnRuntime.update { it.copy(health = VpnHealth.DEGRADED) }
+                            log("VPN upstream reachability probe failed; TUN data plane is not inferred from this result")
+                        }
+                    } else if (VpnRuntime.state.value.health == VpnHealth.DISCONNECTED) {
+                        VpnRuntime.update { it.copy(health = VpnHealth.CONTROL_READY) }
+                    }
+                    HealthResult.OK
                 }
 
                 when (result) {
@@ -517,6 +700,54 @@ class SpeedVpnService : VpnService() {
                     HealthResult.FAILED -> break
                 }
             }
+        }
+    }
+
+    /**
+     * Measures physical upstream readiness only. It deliberately protects and binds
+     * the socket so the probe cannot re-enter the VPN TUN. It is NOT a TUN-to-Internet
+     * data-plane test; that path must be validated with real client traffic on-device.
+     */
+    private fun upstreamReachabilityProbe(): Boolean {
+        val network = findUnderlyingNetwork() ?: return false
+        return try {
+            val deadline = SystemClock.elapsedRealtime() + UPSTREAM_PROBE_TIMEOUT_MS
+            val dnsRemaining = (deadline - SystemClock.elapsedRealtime()).coerceAtLeast(1L)
+            val dnsFuture: Future<List<InetAddress>> = upstreamProbeDnsExecutor.submit<List<InetAddress>> {
+                network.getAllByName(UPSTREAM_PROBE_HOST).toList()
+            }
+            val addresses = try {
+                dnsFuture.get(dnsRemaining, java.util.concurrent.TimeUnit.MILLISECONDS)
+                    .filter { it is Inet4Address || it is Inet6Address }
+            } catch (_: TimeoutException) {
+                dnsFuture.cancel(true)
+                return false
+            } catch (_: Exception) {
+                dnsFuture.cancel(true)
+                return false
+            }
+            if (addresses.isEmpty()) return false
+
+            for (address in addresses) {
+                val remaining = (deadline - SystemClock.elapsedRealtime()).toInt()
+                if (remaining <= 0) break
+                val socket = Socket()
+                try {
+                    network.bindSocket(socket)
+                    if (!protect(socket)) continue
+                    socket.soTimeout = remaining
+                    socket.connect(InetSocketAddress(address, UPSTREAM_PROBE_PORT), remaining)
+                    return true
+                } catch (_: Throwable) {
+                    // Try the next resolved address while the single overall deadline remains.
+                } finally {
+                    runCatching { socket.close() }
+                }
+            }
+            false
+        } catch (t: Throwable) {
+            log("Upstream probe failed: ${t.message}")
+            false
         }
     }
 
@@ -533,7 +764,7 @@ class SpeedVpnService : VpnService() {
 
         val pfd = tun ?: return HealthResult.STOP
         val oldRelay = socks
-        val nativeStopped = stopNative()
+        val nativeStopped = stopNative(endLimiterSession = false)
         if (!nativeStopped) {
             if (!sessionIsCurrent(mySession)) {
                 cleanupLocked()
@@ -555,6 +786,7 @@ class SpeedVpnService : VpnService() {
                     protectTcp = { protect(it) },
                     protectUdp = { protect(it) },
                     currentNetwork = { findUnderlyingNetwork() },
+                    ipv6Enabled = VpnSettings.read(this@SpeedVpnService).ipv6Enabled,
                 ).also { it.start() }
             }.getOrNull() ?: run {
                 failLocked("SOCKS relay recovery failed")
@@ -589,7 +821,7 @@ class SpeedVpnService : VpnService() {
             return HealthResult.STOP
         }
 
-        val started = startNativeIfCurrent(mySession, pfd, conf.absolutePath)
+        val started = startNativeIfCurrent(mySession, pfd, conf.absolutePath, preserveLimiterSession = true)
         if (!started) {
             if (!sessionIsCurrent(mySession) || tun !== pfd) {
                 cleanupLocked()
@@ -626,10 +858,17 @@ class SpeedVpnService : VpnService() {
                 if (!sessionIsCurrent(mySession)) break
                 val d = SpeedLimiter.download.total.get()
                 val u = SpeedLimiter.upload.total.get()
+                val sessionDown = SpeedLimiter.download.sessionBytes(myServiceGeneration)
+                val sessionUp = SpeedLimiter.upload.sessionBytes(myServiceGeneration)
                 synchronized(processNativeLifecycleLock) {
                     if (activeServiceGeneration.get() == myServiceGeneration) {
                         VpnRuntime.update {
-                            it.copy(downloadBps = (d - lastDown) * 8, uploadBps = (u - lastUp) * 8)
+                            it.copy(
+                                downloadBps = ((d - lastDown).coerceAtLeast(0L)) * 8,
+                                uploadBps = ((u - lastUp).coerceAtLeast(0L)) * 8,
+                                sessionDownloadBytes = sessionDown,
+                                sessionUploadBytes = sessionUp,
+                            )
                         }
                     } else {
                         return@launch
@@ -672,6 +911,7 @@ class SpeedVpnService : VpnService() {
         mySession: Long,
         expectedTun: ParcelFileDescriptor,
         configPath: String,
+        preserveLimiterSession: Boolean = false,
     ): Boolean = synchronized(processNativeLifecycleLock) {
         if (destroying.get() || sessionId.get() != mySession || tun !== expectedTun ||
             serviceGeneration <= 0L || activeServiceGeneration.get() != serviceGeneration
@@ -708,7 +948,9 @@ class SpeedVpnService : VpnService() {
             return@synchronized false
         }
 
-        SpeedLimiter.beginSession(newGeneration)
+        if (!preserveLimiterSession || !SpeedLimiter.isGenerationActive(newGeneration)) {
+            SpeedLimiter.beginSession(newGeneration)
+        }
         val started = runCatching {
             TProxyService.TProxyStartService(configPath, expectedTun.fd)
         }.getOrElse {
@@ -727,7 +969,10 @@ class SpeedVpnService : VpnService() {
     }
 
     /** Stops Native only when this service generation still owns the process-wide engine. */
-    private fun stopNative(expectedGeneration: Long = nativeGeneration): Boolean =
+    private fun stopNative(
+        expectedGeneration: Long = nativeGeneration,
+        endLimiterSession: Boolean = true,
+    ): Boolean =
         synchronized(processNativeLifecycleLock) {
             if (expectedGeneration <= 0L) {
                 if (nativeOwnerGeneration.get() == 0L) engineRunning = false
@@ -739,7 +984,7 @@ class SpeedVpnService : VpnService() {
                     nativeGeneration = 0L
                     engineRunning = false
                 }
-                SpeedLimiter.endSession(expectedGeneration)
+                if (endLimiterSession) SpeedLimiter.endSession(expectedGeneration)
                 return@synchronized false
             }
 
@@ -764,7 +1009,7 @@ class SpeedVpnService : VpnService() {
                         nativeGeneration = 0L
                         engineRunning = false
                     }
-                    SpeedLimiter.endSession(expectedGeneration)
+                    if (endLimiterSession) SpeedLimiter.endSession(expectedGeneration)
                     true
                 }
             }
@@ -776,6 +1021,8 @@ class SpeedVpnService : VpnService() {
     private fun cleanupLocked() {
         meter?.cancel(); meter = null
         healthMonitor?.cancel(); healthMonitor = null
+        val configFile = tunnelConfigFile
+        tunnelConfigFile = null
         val (pfd, relay) = synchronized(resourceLifecycleLock) {
             val detachedTun = tun
             val detachedSocks = socks
@@ -796,6 +1043,7 @@ class SpeedVpnService : VpnService() {
                 if (ownerChanged) {
                     runCatching { pfd?.close() }
                     runCatching { relay?.stop() }
+                    runCatching { configFile?.delete() }
                     return
                 }
                 // Do not close a TUN FD while the native engine may still own it.
@@ -807,6 +1055,7 @@ class SpeedVpnService : VpnService() {
                         if (stopNative(generation)) {
                             runCatching { pfd?.close() }
                             runCatching { relay?.stop() }
+                            runCatching { configFile?.delete() }
                             return@thread
                         }
                         val ownerNow = synchronized(processNativeLifecycleLock) {
@@ -815,6 +1064,7 @@ class SpeedVpnService : VpnService() {
                         if (ownerNow != generation) {
                             runCatching { pfd?.close() }
                             runCatching { relay?.stop() }
+                            runCatching { configFile?.delete() }
                             return@thread
                         }
                     }
@@ -825,6 +1075,8 @@ class SpeedVpnService : VpnService() {
         }
         runCatching { pfd?.close() }
         runCatching { relay?.stop() }
+        runCatching { configFile?.delete() }
+        if (tunnelConfigFile == configFile) tunnelConfigFile = null
     }
 
     private fun failLocked(reason: String, t: Throwable? = null) {
@@ -841,6 +1093,7 @@ class SpeedVpnService : VpnService() {
                 VpnRuntime.update {
                     it.copy(
                         status = VpnStatus.ERROR,
+                        health = VpnHealth.DISCONNECTED,
                         lastError = reason,
                         tunnel = "down",
                         serviceRunning = false,
@@ -875,7 +1128,7 @@ class SpeedVpnService : VpnService() {
         if (wasActiveGeneration && hadResources) {
             synchronized(processNativeLifecycleLock) {
                 if (activeServiceGeneration.get() == generation) {
-                    VpnRuntime.update { it.copy(status = VpnStatus.DISCONNECTING) }
+                    VpnRuntime.update { it.copy(status = VpnStatus.DISCONNECTING, health = VpnHealth.DISCONNECTED) }
                 }
             }
         }
@@ -890,14 +1143,14 @@ class SpeedVpnService : VpnService() {
             lastStartedRequestId.set(null)
             if (shouldReconnect) {
                 if (released) {
-                    VpnRuntime.update { it.copy(status = VpnStatus.DISCONNECTED, tunnel = "down", serviceRunning = true) }
+                    VpnRuntime.update { it.copy(status = VpnStatus.DISCONNECTED, tunnel = "down", health = VpnHealth.DISCONNECTED, serviceRunning = true) }
                 }
                 scope.launch { connect() }
                 return@withLock
             }
             if (released) stopForeground(STOP_FOREGROUND_REMOVE)
             if (released) {
-                VpnRuntime.update { it.copy(status = VpnStatus.DISCONNECTED, tunnel = "down", serviceRunning = false) }
+                VpnRuntime.update { it.copy(status = VpnStatus.DISCONNECTED, tunnel = "down", health = VpnHealth.DISCONNECTED, serviceRunning = false) }
             }
             stopSelf()
             return@withLock
@@ -914,7 +1167,7 @@ class SpeedVpnService : VpnService() {
         if (shouldReconnect) {
             if (released) {
                 VpnRuntime.update {
-                    it.copy(status = VpnStatus.DISCONNECTED, tunnel = "down", serviceRunning = true, downloadBps = 0, uploadBps = 0)
+                    it.copy(status = VpnStatus.DISCONNECTED, tunnel = "down", health = VpnHealth.DISCONNECTED, serviceRunning = true, downloadBps = 0, uploadBps = 0)
                 }
             }
             log("Disconnect completed; queued connect will start next")
@@ -956,6 +1209,8 @@ class SpeedVpnService : VpnService() {
         // atomic/volatile and the CAS ensures an older instance cannot clear a newer
         // service generation.
         val generation = nativeGeneration
+        val configFile = tunnelConfigFile
+        tunnelConfigFile = null
         val ownedGeneration = serviceGeneration
         activeServiceGeneration.compareAndSet(ownedGeneration, 0L)
         serviceGeneration = 0L
@@ -984,6 +1239,7 @@ class SpeedVpnService : VpnService() {
                 }
                 runCatching { pfd?.close() }
                 runCatching { relay?.stop() }
+                runCatching { configFile?.delete() }
             }
         }
 
@@ -997,6 +1253,7 @@ class SpeedVpnService : VpnService() {
                 else snapshot.copy(
                     status = VpnStatus.DISCONNECTED,
                     tunnel = "down",
+                    health = VpnHealth.DISCONNECTED,
                     serviceRunning = false,
                     downloadBps = 0,
                     uploadBps = 0,
@@ -1004,6 +1261,7 @@ class SpeedVpnService : VpnService() {
             }
         }
         scope.cancel()
+        upstreamProbeDnsExecutor.shutdownNow()
         unregisterPhysicalNetworkCallback()
         super.onDestroy()
     }

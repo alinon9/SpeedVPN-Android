@@ -5,3 +5,8 @@ local.properties
 .idea/
 app/.cxx/
 app/src/main/jni/hev-socks5-tunnel/
+*.jks
+*.keystore
+keystore.properties
+# Local compiler diagnostics
+kotlinc.out

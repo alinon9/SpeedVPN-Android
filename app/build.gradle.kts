@@ -13,8 +13,8 @@ android {
         applicationId = "com.speedvpn.app"
         minSdk = 24
         targetSdk = 35
-        versionCode = 21
-        versionName = "1.0.19.3"
+        versionCode = 28
+        versionName = "1.0.26"
 
         // Public values only (same ones the website uses). No secrets here.
         buildConfigField("String", "API_BASE", "\"https://read-fix-build-magic.lovable.app/api/public/vpn\"")
@@ -24,6 +24,7 @@ android {
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
         }
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     // Native tun -> SOCKS5 engine (hev-socks5-tunnel). Run setup.sh / setup.bat once first.
@@ -33,11 +34,34 @@ android {
         }
     }
 
+    signingConfigs {
+        create("release") {
+            val storeFilePath = System.getenv("RELEASE_KEYSTORE_PATH")
+            val storePwd = System.getenv("RELEASE_KEYSTORE_PASSWORD")
+            val keyAliasEnv = System.getenv("RELEASE_KEY_ALIAS")
+            val keyPwd = System.getenv("RELEASE_KEY_PASSWORD")
+            if (!storeFilePath.isNullOrBlank() && !storePwd.isNullOrBlank() &&
+                !keyAliasEnv.isNullOrBlank() && !keyPwd.isNullOrBlank()) {
+                storeFile = file(storeFilePath)
+                storePassword = storePwd
+                keyAlias = keyAliasEnv
+                keyPassword = keyPwd
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
-            // Do not ship a release build signed with the debug key. Configure a real
-            // release signingConfig in the deployment environment when publishing.
+            // R8 stays disabled until a real release build verifies Compose + JNI
+            // reflection/entry points. Release signing is injected only by CI env vars.
+            val hasReleaseSigning = listOf(
+                "RELEASE_KEYSTORE_PATH",
+                "RELEASE_KEYSTORE_PASSWORD",
+                "RELEASE_KEY_ALIAS",
+                "RELEASE_KEY_PASSWORD",
+            ).all { !System.getenv(it).isNullOrBlank() }
+            signingConfig = signingConfigs.getByName("release").takeIf { hasReleaseSigning }
         }
     }
     compileOptions {
@@ -61,4 +85,7 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    testImplementation("junit:junit:4.13.2")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
 }

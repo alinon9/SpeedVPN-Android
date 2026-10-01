@@ -15,13 +15,28 @@ if [ ! -f "$WRAPPER_JAR" ]; then
     echo "ERROR: curl or wget is required to bootstrap Gradle Wrapper." >&2
     exit 1
   fi
-  actual=$(sha256sum "$tmp" 2>/dev/null | awk '{print $1}')
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual=$(sha256sum "$tmp" | awk '{print $1}')
+  elif command -v shasum >/dev/null 2>&1; then
+    actual=$(shasum -a 256 "$tmp" | awk '{print $1}')
+  else
+    echo "ERROR: SHA-256 utility (sha256sum or shasum) is required." >&2
+    rm -f "$tmp"
+    exit 1
+  fi
   [ "$actual" = "$WRAPPER_SHA256" ] || { echo "ERROR: Gradle wrapper JAR checksum mismatch." >&2; rm -f "$tmp"; exit 1; }
   mv "$tmp" "$WRAPPER_JAR" || exit 1
 fi
 
-actual=$(sha256sum "$WRAPPER_JAR" 2>/dev/null | awk '{print $1}')
-if [ -n "$actual" ] && [ "$actual" != "$WRAPPER_SHA256" ]; then
+if command -v sha256sum >/dev/null 2>&1; then
+  actual=$(sha256sum "$WRAPPER_JAR" | awk '{print $1}')
+elif command -v shasum >/dev/null 2>&1; then
+  actual=$(shasum -a 256 "$WRAPPER_JAR" | awk '{print $1}')
+else
+  echo "ERROR: SHA-256 utility (sha256sum or shasum) is required." >&2
+  exit 1
+fi
+if [ "$actual" != "$WRAPPER_SHA256" ]; then
   echo "ERROR: Gradle wrapper JAR checksum mismatch." >&2
   exit 1
 fi

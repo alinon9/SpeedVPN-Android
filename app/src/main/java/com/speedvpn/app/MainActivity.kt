@@ -5,6 +5,8 @@ import android.content.Context
 import android.graphics.Paint
 import android.net.VpnService
 import android.os.Build
+import android.provider.Settings
+import java.util.Locale
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -48,9 +50,19 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.PI
 import kotlin.math.cos
+import kotlin.math.exp
+import kotlin.math.ln
+import kotlin.math.roundToLong
 import kotlin.math.sin
 
 private val Bg = Color(0xFF050914)
@@ -67,15 +79,36 @@ private val TextPrimary = Color(0xFFF3F7FF)
 private val TextSecondary = Color(0xFF95A6C3)
 
 class MainActivity : ComponentActivity() {
-    private val slowPresets = listOf("128K" to 128L, "256K" to 256L, "512K" to 512L, "768K" to 768L)
-    private val mediumPresets = listOf("1M" to 1_000L, "2M" to 2_000L, "4M" to 4_000L, "6M" to 6_000L)
-    private val fastPresets = listOf("10M" to 10_000L, "20M" to 20_000L)
+    // UI speeds are expressed as KB/s and converted to the backend's Kbps representation.
+    private fun kbpsFromKBps(value: Long): Long = value.coerceAtLeast(1L) * 8L
+    private val slowPresets = listOf(
+        "10K" to kbpsFromKBps(10),
+        "25K" to kbpsFromKBps(25),
+        "50K" to kbpsFromKBps(50),
+        "100K" to kbpsFromKBps(100),
+        "128K" to kbpsFromKBps(128),
+        "256K" to kbpsFromKBps(256),
+        "512K" to kbpsFromKBps(512),
+        "768K" to kbpsFromKBps(768),
+    )
+    private val mediumPresets = listOf(
+        "1M" to kbpsFromKBps(1_000),
+        "2M" to kbpsFromKBps(2_000),
+        "4M" to kbpsFromKBps(4_000),
+        "6M" to kbpsFromKBps(6_000),
+    )
+    private val fastPresets = listOf(
+        "10M" to kbpsFromKBps(10_000),
+        "20M" to kbpsFromKBps(20_000),
+    )
+    private val unlimitedPreset = "بدون حد"
     private val vpnPermission = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
         val granted = VpnService.prepare(this) == null
         log(if (granted) "VPN permission granted" else "VPN permission denied")
         VpnRuntime.update { it.copy(permissionGranted = granted, lastError = if (granted) it.lastError else "VPN permission denied") }
     }
     private val notifPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
+    private val usageAccessState = mutableStateOf(false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -104,26 +137,75 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        usageAccessState.value = AppTrafficManager.hasUsageAccess(this)
         VpnRuntime.update { it.copy(permissionGranted = VpnService.prepare(this) == null) }
     }
 
-    private fun limitPrefs() = getSharedPreferences("local_limits", MODE_PRIVATE)
+    private fun loadLocalLimits() = SpeedLimitStore.applyToLimiter(this)
 
-    private fun loadLocalLimits() {
-        val p = limitPrefs()
-        SpeedLimiter.setDownloadKbps(p.getLong("dl", 0).takeIf { it > 0 })
-        SpeedLimiter.setUploadKbps(p.getLong("ul", 0).takeIf { it > 0 })
+    private val settingsWriteMutex = Mutex()
+    private val appControlWriteGeneration = AtomicLong(0L)
+
+    private fun saveAppControlSettings(settings: VpnAppControlSettings) {
+        val generation = appControlWriteGeneration.incrementAndGet()
+        lifecycleScope.launch {
+            val saved = withContext(Dispatchers.IO) {
+                settingsWriteMutex.withLock {
+                    if (generation != appControlWriteGeneration.get()) return@withLock true
+                    VpnAppControl.save(this@MainActivity, settings)
+                }
+            }
+            if (!saved) {
+                log("Failed to persist app firewall settings")
+                return@launch
+            }
+            if (generation == appControlWriteGeneration.get() &&
+                VpnRuntime.state.value.status == VpnStatus.CONNECTED
+            ) {
+                SpeedVpnService.restartForSettings(this@MainActivity)
+            }
+        }
     }
 
     private fun saveLocalLimit(download: Boolean, kbps: Long?) {
-        limitPrefs().edit().putLong(if (download) "dl" else "ul", kbps ?: 0).apply()
-        if (download) SpeedLimiter.setDownloadKbps(kbps) else SpeedLimiter.setUploadKbps(kbps)
+        // SharedPreferences.commit() is synchronous. Keep disk I/O off the main
+        // thread while serializing writes so rapid slider changes cannot reorder
+        // the persisted value.
+        lifecycleScope.launch(Dispatchers.IO) {
+            settingsWriteMutex.withLock {
+                if (download) {
+                    SpeedLimitStore.saveDownload(this@MainActivity, kbps)
+                } else {
+                    SpeedLimitStore.saveUpload(this@MainActivity, kbps)
+                }
+            }
+        }
+        if (download) {
+            SpeedLimiter.setDownloadKbps(kbps)
+        } else {
+            SpeedLimiter.setUploadKbps(kbps)
+        }
     }
 
     private fun fmt(kbps: Long?) = when {
         kbps == null -> "بدون حد"
-        kbps < 1000 -> "$kbps Kbps"
-        else -> String.format("%.1f Mbps", kbps / 1000.0)
+        else -> {
+            val bytesPerSec = kbps * 125.0
+            when {
+                bytesPerSec < 1_000.0 -> String.format(Locale.US, "%.0f B/s", bytesPerSec)
+                bytesPerSec < 1_000_000.0 -> String.format(Locale.US, "%.1f KB/s", bytesPerSec / 1_000.0)
+                else -> String.format(Locale.US, "%.2f MB/s", bytesPerSec / 1_000_000.0)
+            }
+        }
+    }
+
+    private fun fmtRateBits(bitsPerSecond: Long): String {
+        val bytesPerSecond = bitsPerSecond.coerceAtLeast(0L) / 8.0
+        return when {
+            bytesPerSecond < 1_000.0 -> String.format(Locale.US, "%.0f B/s", bytesPerSecond)
+            bytesPerSecond < 1_000_000.0 -> String.format(Locale.US, "%.1f KB/s", bytesPerSecond / 1_000.0)
+            else -> String.format(Locale.US, "%.2f MB/s", bytesPerSecond / 1_000_000.0)
+        }
     }
 
     @Composable
@@ -138,6 +220,7 @@ class MainActivity : ComponentActivity() {
                 when (tab) {
                     0 -> HomeScreen(signedIn, s) { requestVpnPermission() }
                     1 -> SpeedScreen(s)
+                    2 -> AppsScreen(s)
                     else -> SettingsScreen(s, signedIn, onLink, onSignOut)
                 }
             }
@@ -154,6 +237,7 @@ class MainActivity : ComponentActivity() {
             Spacer(Modifier.height(2.dp))
             StatusHero(s, requestPermission)
             LiveTraffic(s)
+            SessionTrafficCard(s)
             QuickSpeedCard(s)
             CompactNetworkCard()
             Text(
@@ -173,7 +257,7 @@ class MainActivity : ComponentActivity() {
             Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(18.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
-            ScreenTitle("التحكم بالسرعة", "اختر مستوى جاهزًا أو اضبطه بدقة بالمؤشر")
+            ScreenTitle("التحكم بالسرعة", "اختر مستوى جاهزًا أو اضبطه بالمؤشر — الوحدات KB/s وMB/s")
             LimitSlider("سرعة التحميل", s.downloadLimitKbps) { saveLocalLimit(true, it) }
             LimitSlider("سرعة الرفع", s.uploadLimitKbps) { saveLocalLimit(false, it) }
             GlassCard {
@@ -305,9 +389,11 @@ class MainActivity : ComponentActivity() {
                     )
                     Text(
                         when {
-                            connected -> "اتصال VPN المحلي نشط"
                             connecting -> "نجهز الاتصال الآمن…"
-                            else -> "جاهز للتحكم في اتصالك"
+                            !connected -> "جاهز للتحكم في اتصالك"
+                            s.health == VpnHealth.UPSTREAM_READY -> "VPN المحلي نشط — الشبكة الفيزيائية جاهزة"
+                            s.health == VpnHealth.DEGRADED -> "VPN المحلي نشط — توجد مشكلة مؤقتة في الشبكة الخارجية"
+                            else -> "VPN المحلي نشط — التحقق من الشبكة الخارجية مستمر"
                         },
                         color = TextSecondary,
                         fontSize = 11.sp,
@@ -355,8 +441,174 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun LiveTraffic(s: Snapshot) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            TrafficCard("↓", "التحميل", "${s.downloadBps / 1000} Kbps", Cyan, Modifier.weight(1f))
-            TrafficCard("↑", "الرفع", "${s.uploadBps / 1000} Kbps", Purple, Modifier.weight(1f))
+            TrafficCard("↓", "التحميل", fmtRateBits(s.downloadBps), Cyan, Modifier.weight(1f))
+            TrafficCard("↑", "الرفع", fmtRateBits(s.uploadBps), Purple, Modifier.weight(1f))
+        }
+    }
+
+    @Composable
+    private fun SessionTrafficCard(s: Snapshot) {
+        GlassCard {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("استهلاك جلسة الـVPN", color = TextPrimary, fontWeight = FontWeight.Bold)
+                    Text("البيانات التي مرّت عبر SpeedVPN في الجلسة الحالية", color = TextSecondary, fontSize = 10.sp)
+                }
+                OutlinedButton(
+                    onClick = { SpeedVpnService.resetTraffic(this@MainActivity) },
+                    enabled = s.status == VpnStatus.CONNECTED,
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier.height(32.dp),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+                ) { Text("تصفير", fontSize = 10.sp) }
+            }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                InfoPill("↓ ${formatDataBytes(s.sessionDownloadBytes)}", Cyan, Modifier.weight(1f))
+                InfoPill("↑ ${formatDataBytes(s.sessionUploadBytes)}", Purple, Modifier.weight(1f))
+            }
+            InfoPill("الإجمالي ${formatDataBytes(s.sessionDownloadBytes + s.sessionUploadBytes)}", Blue, Modifier.fillMaxWidth())
+        }
+    }
+
+    @Composable
+    private fun InfoPill(text: String, accent: Color, modifier: Modifier = Modifier) {
+        Surface(
+            modifier = modifier,
+            shape = RoundedCornerShape(12.dp),
+            color = accent.copy(alpha = 0.08f),
+            border = androidx.compose.foundation.BorderStroke(1.dp, accent.copy(alpha = 0.25f)),
+        ) {
+            Text(text, color = TextPrimary, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp), textAlign = TextAlign.Center)
+        }
+    }
+
+    @Composable
+    private fun AppsScreen(s: Snapshot) {
+        val usageAccess = usageAccessState.value
+        var firewallEnabled by remember { mutableStateOf(VpnAppControl.read(this@MainActivity).firewallEnabled) }
+        var blockedPackages by remember { mutableStateOf(VpnAppControl.read(this@MainActivity).blockedPackages) }
+        var apps by remember { mutableStateOf<List<AppTrafficUsage>>(emptyList()) }
+        var appQuery by remember { mutableStateOf("") }
+
+        LaunchedEffect(s.connectedAtMillis, s.status, usageAccess) {
+            val start = s.connectedAtMillis
+            if (start <= 0L) {
+                apps = AppTrafficManager.installedLaunchableApps(this@MainActivity).map {
+                    AppTrafficUsage(it.packageName, it.loadLabel(packageManager).toString(), it.uid, 0L, 0L)
+                }
+                return@LaunchedEffect
+            }
+            while (isActive) {
+                apps = withContext(Dispatchers.IO) {
+                    AppTrafficManager.querySessionUsage(this@MainActivity, start)
+                }
+                if (s.status != VpnStatus.CONNECTED) break
+                delay(60_000)
+            }
+        }
+
+        Column(
+            Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(18.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            ScreenTitle("التطبيقات", "استهلاك البيانات والتحكم في وصول التطبيقات")
+
+            GlassCard {
+                SectionLabel("إحصاءات التطبيقات", "قد تتأخر أرقام Android قليلًا لأنها مبنية على NetworkStatsManager")
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (!usageAccess) {
+                        Button(
+                            onClick = { startActivity(AppTrafficManager.usageAccessIntent()) },
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.weight(1f),
+                        ) { Text("السماح بالإحصاءات", fontSize = 11.sp) }
+                    } else {
+                        Surface(
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(12.dp),
+                            color = Green.copy(alpha = 0.08f),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, Green.copy(alpha = 0.25f)),
+                        ) {
+                            Text("وصول الإحصاءات مفعّل", color = Green, fontSize = 11.sp, modifier = Modifier.padding(vertical = 10.dp), textAlign = TextAlign.Center)
+                        }
+                    }
+                }
+                Text(
+                    "يُعرض الاستهلاك للجلسة الحالية؛ Android قد لا يحدّث عدادات كل تطبيق لحظيًا.",
+                    color = TextSecondary,
+                    fontSize = 10.sp,
+                )
+            }
+
+            GlassCard {
+                SectionLabel("جدار التطبيقات", "حظر فعلي للتطبيقات المحددة عبر Android VPN Lockdown")
+                SettingSwitch("تفعيل جدار التطبيقات", "الحظر الفعلي عند الاتصال القادم مع Lockdown", firewallEnabled) {
+                    firewallEnabled = it
+                    saveAppControlSettings(VpnAppControlSettings(it, blockedPackages))
+                }
+                if (firewallEnabled) {
+                    Text(
+                        "الحظر الحقيقي يتطلب Always-on VPN + Block connections without VPN. عند تفعيل الجدار لن يسمح SpeedVPN بالاتصال قبل توفر Lockdown، لمنع أي تجاوز صامت.",
+                        color = Amber,
+                        fontSize = 10.sp,
+                    )
+                    OutlinedButton(
+                        onClick = { runCatching { startActivity(AppTrafficManager.vpnSettingsIntent()) } },
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("فتح إعدادات VPN", fontSize = 11.sp) }
+                }
+            }
+
+            GlassCard {
+                SectionLabel("التطبيقات", "الحظر الفعلي يحتاج Lockdown في إعدادات Android")
+                OutlinedTextField(
+                    value = appQuery,
+                    onValueChange = { appQuery = it },
+                    singleLine = true,
+                    label = { Text("بحث عن تطبيق") },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                val shownApps = apps.filter {
+                    appQuery.isBlank() ||
+                        it.label.contains(appQuery, ignoreCase = true) ||
+                        it.packageName.contains(appQuery, ignoreCase = true)
+                }
+                if (shownApps.isEmpty()) {
+                    Text("لا توجد تطبيقات لعرضها.", color = TextSecondary, fontSize = 11.sp)
+                } else {
+                    shownApps.forEach { app ->
+                        Row(
+                            Modifier.fillMaxWidth().padding(vertical = 5.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(app.label, color = TextPrimary, fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
+                                Text(
+                                    "↓ ${formatDataBytes(app.downloadBytes)}  ↑ ${formatDataBytes(app.uploadBytes)}  •  ${formatDataBytes(app.totalBytes)}",
+                                    color = TextSecondary,
+                                    fontSize = 9.sp,
+                                )
+                            }
+                            Switch(
+                                checked = app.packageName in blockedPackages,
+                                onCheckedChange = { blocked ->
+                                    val next = blockedPackages.toMutableSet().apply {
+                                        if (blocked) add(app.packageName) else remove(app.packageName)
+                                    }.toSet()
+                                    blockedPackages = next
+                                    saveAppControlSettings(VpnAppControlSettings(firewallEnabled, next))
+                                },
+                            )
+                        }
+                    }
+                    Text(
+                        "المعروض: ${shownApps.size} من ${apps.size} تطبيق",
+                        color = TextSecondary,
+                        fontSize = 9.sp,
+                    )
+                }
+            }
         }
     }
 
@@ -413,12 +665,27 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     private fun LimitSlider(title: String, current: Long?, onApply: (Long?) -> Unit) {
-        val unlimitedSentinel = 100_001f
+        // A logarithmic slider keeps the low-speed 10–100 KB/s range usable while
+        // still reaching 100 MB/s without compressing all small values into one pixel.
+        val minKBps = 10.0
+        val maxKBps = 100_000.0
+        val minLog = ln(minKBps)
+        val maxLog = ln(maxKBps)
+        val unlimitedSentinel = 1.01f
         var pos by remember(current) {
-            mutableStateOf(current?.coerceIn(128L, 100_000L)?.toFloat() ?: unlimitedSentinel)
+            mutableStateOf(
+                current?.let {
+                    val kb = (it / 8.0).coerceIn(minKBps, maxKBps)
+                    ((ln(kb) - minLog) / (maxLog - minLog)).toFloat()
+                } ?: unlimitedSentinel
+            )
         }
-        val unlimited = pos > 100_000f
-        val kbps: Long? = if (unlimited) null else pos.toLong().coerceIn(128L, 100_000L)
+        val unlimited = pos > 1f
+        val selectedKBps = if (unlimited) null else {
+            exp(minLog + (maxLog - minLog) * pos.coerceIn(0f, 1f)).roundToLong()
+        }
+        val kbps: Long? = selectedKBps?.let { (it * 8L).coerceIn(80L, 800_000L) }
+
         GlassCard {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Text(title, color = TextPrimary, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
@@ -428,17 +695,26 @@ class MainActivity : ComponentActivity() {
             PresetGroup("بطيء", slowPresets, Amber, onApply)
             PresetGroup("متوسط", mediumPresets, Blue, onApply)
             PresetGroup("سريع", fastPresets, Purple, onApply)
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                OutlinedButton(
+                    onClick = { onApply(null) },
+                    shape = RoundedCornerShape(11.dp),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, Green.copy(alpha = 0.45f)),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+                    modifier = Modifier.height(34.dp),
+                ) { Text(unlimitedPreset, fontSize = 11.sp, color = TextPrimary) }
+            }
             Spacer(Modifier.height(4.dp))
             Slider(
                 value = pos,
                 onValueChange = { pos = it },
-                valueRange = 128f..100_001f,
+                valueRange = 0f..unlimitedSentinel,
                 onValueChangeFinished = { onApply(kbps) },
                 colors = SliderDefaults.colors(activeTrackColor = Blue, thumbColor = TextPrimary, inactiveTrackColor = StrokeColor),
             )
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text("128K", color = TextSecondary, fontSize = 10.sp)
-                Text("100M → بدون حد", color = TextSecondary, fontSize = 10.sp)
+                Text("10 KB/s", color = TextSecondary, fontSize = 10.sp)
+                Text("100 MB/s → بدون حد", color = TextSecondary, fontSize = 10.sp)
             }
         }
     }
@@ -474,11 +750,23 @@ class MainActivity : ComponentActivity() {
             SectionLabel("توافق الشبكة", "خيارات لحل مشاكل بعض التطبيقات والشبكات")
             SettingSwitch("IPv6", "السماح باستخدام IPv6 داخل الاتصال", ipv6Enabled) {
                 ipv6Enabled = it
-                prefs.edit().putBoolean(VpnSettings.IPV6_ENABLED, it).apply()
+                lifecycleScope.launch(Dispatchers.IO) {
+                    settingsWriteMutex.withLock {
+                        check(prefs.edit().putBoolean(VpnSettings.IPV6_ENABLED, it).commit()) {
+                            "Failed to persist IPv6 setting"
+                        }
+                    }
+                }
             }
             SettingSwitch("DNS IPv4 فقط", "استخدمه عند عدم استقرار DNS عبر IPv6", dnsIpv4Only) {
                 dnsIpv4Only = it
-                prefs.edit().putBoolean(VpnSettings.DNS_IPV4_ONLY, it).apply()
+                lifecycleScope.launch(Dispatchers.IO) {
+                    settingsWriteMutex.withLock {
+                        check(prefs.edit().putBoolean(VpnSettings.DNS_IPV4_ONLY, it).commit()) {
+                            "Failed to persist DNS IPv4-only setting"
+                        }
+                    }
+                }
             }
             Spacer(Modifier.height(4.dp))
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -490,7 +778,13 @@ class MainActivity : ComponentActivity() {
                     listOf(1280, 1400, 1500).forEach { value ->
                         FilterChip(selected = mtu == value, onClick = {
                             mtu = value
-                            prefs.edit().putInt(VpnSettings.MTU, value).apply()
+                            lifecycleScope.launch(Dispatchers.IO) {
+                                settingsWriteMutex.withLock {
+                                    check(prefs.edit().putInt(VpnSettings.MTU, value).commit()) {
+                                        "Failed to persist MTU setting"
+                                    }
+                                }
+                            }
                         }, label = { Text(value.toString(), fontSize = 10.sp) })
                     }
                 }
@@ -533,8 +827,14 @@ class MainActivity : ComponentActivity() {
                 Text(Auth.email(this@MainActivity) ?: "حساب مرتبط", color = TextPrimary, fontWeight = FontWeight.Bold)
                 TextButton(onClick = {
                     AgentService.stop(this@MainActivity)
-                    Auth.signOut(this@MainActivity)
-                    onSignOut()
+                    lifecycleScope.launch {
+                        try {
+                            Auth.signOut(this@MainActivity)
+                            onSignOut()
+                        } catch (_: Exception) {
+                            // Keep the current account UI if persistence fails.
+                        }
+                    }
                 }) { Text("فك الربط", color = Color(0xFFFF7D88)) }
             } else {
                 Text("التطبيق يعمل محليًا بدون حساب.", color = TextSecondary, fontSize = 12.sp)
@@ -563,6 +863,7 @@ class MainActivity : ComponentActivity() {
                     InfoRow("Agent", if (s.agentOnline) "online" else "offline")
                     InfoRow("Service", if (s.serviceRunning) "running" else "stopped")
                     InfoRow("VPN", s.status.name)
+                    InfoRow("Health", s.health.name)
                     InfoRow("Tunnel", s.tunnel)
                     InfoRow("Last Error", s.lastError ?: "—")
                 }
@@ -598,7 +899,8 @@ class MainActivity : ComponentActivity() {
         NavigationBar(containerColor = Color(0xFF070D19), tonalElevation = 0.dp) {
             NavigationBarItem(selected = tab == 0, onClick = { onTab(0) }, icon = { Text("⌂", fontSize = 20.sp) }, label = { Text("الرئيسية", fontSize = 10.sp) })
             NavigationBarItem(selected = tab == 1, onClick = { onTab(1) }, icon = { Text("↯", fontSize = 20.sp) }, label = { Text("السرعة", fontSize = 10.sp) })
-            NavigationBarItem(selected = tab == 2, onClick = { onTab(2) }, icon = { Text("⚙", fontSize = 19.sp) }, label = { Text("الإعدادات", fontSize = 10.sp) })
+            NavigationBarItem(selected = tab == 2, onClick = { onTab(2) }, icon = { Text("◉", fontSize = 19.sp) }, label = { Text("التطبيقات", fontSize = 10.sp) })
+            NavigationBarItem(selected = tab == 3, onClick = { onTab(3) }, icon = { Text("⚙", fontSize = 19.sp) }, label = { Text("الإعدادات", fontSize = 10.sp) })
         }
     }
 

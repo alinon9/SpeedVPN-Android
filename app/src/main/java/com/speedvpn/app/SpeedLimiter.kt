@@ -1,9 +1,15 @@
 package com.speedvpn.app
 
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 import kotlin.math.max
+
+internal data class SessionCounter(
+    val generation: Long,
+    val bytes: Long,
+)
 
 /**
  * Global device-wide pacing limiter.
@@ -24,6 +30,9 @@ class TokenBucket {
 
     // Counts bytes actually forwarded successfully, not bytes merely requested.
     val total = AtomicLong(0)
+    // Per-generation session accounting lives in one atomic state object so a reset
+    // cannot race with a late write from an older generation.
+    private val sessionCounter = AtomicReference(SessionCounter(0L, 0L))
 
     fun setRate(bytesPerSec: Long) {
         lock.withLock {
@@ -80,13 +89,46 @@ class TokenBucket {
         }
     }
 
-    fun recordForwarded(n: Int) {
-        if (n > 0) {
-            val delta = n.toLong()
-            total.updateAndGet { current ->
-                if (Long.MAX_VALUE - current < delta) Long.MAX_VALUE else current + delta
+    fun beginSession(generation: Long) {
+        if (generation <= 0L) return
+        sessionCounter.set(SessionCounter(generation, 0L))
+    }
+
+    fun resetSession(generation: Long) {
+        if (generation <= 0L) return
+        sessionCounter.updateAndGet { current ->
+            if (current.generation == generation) SessionCounter(generation, 0L) else current
+        }
+    }
+
+    fun endSession(generation: Long) {
+        if (generation <= 0L) return
+        sessionCounter.updateAndGet { current ->
+            if (current.generation == generation) SessionCounter(0L, 0L) else current
+        }
+    }
+
+    /** Records lifetime totals and session totals only for the active generation. */
+    fun recordForwarded(n: Int, generation: Long) {
+        if (n <= 0 || generation <= 0L) return
+        val delta = n.toLong()
+        total.updateAndGet { current ->
+            if (Long.MAX_VALUE - current < delta) Long.MAX_VALUE else current + delta
+        }
+        sessionCounter.updateAndGet { current ->
+            if (current.generation != generation) {
+                current
+            } else {
+                val next = if (Long.MAX_VALUE - current.bytes < delta) Long.MAX_VALUE
+                else current.bytes + delta
+                SessionCounter(generation, next)
             }
         }
+    }
+
+    fun sessionBytes(generation: Long): Long {
+        val current = sessionCounter.get()
+        return if (current.generation == generation) current.bytes else 0L
     }
 
     /**
@@ -118,9 +160,24 @@ object SpeedLimiter {
     fun beginSession(generation: Long) {
         if (generation <= 0L) return
         synchronized(generationLock) {
-            activeSessionGeneration.set(generation)
+            // Publish bucket ownership before exposing the generation to new waiters.
+            // This avoids a new generation acquiring against stale bucket state.
+            download.beginSession(generation)
+            upload.beginSession(generation)
             download.resetScheduler()
             upload.resetScheduler()
+            activeSessionGeneration.set(generation)
+        }
+    }
+
+    /** Resets only the current-session traffic counters; pacing is left untouched. */
+    fun resetSessionCounters(generation: Long) {
+        if (generation <= 0L) return
+        synchronized(generationLock) {
+            if (activeSessionGeneration.get() == generation) {
+                download.resetSession(generation)
+                upload.resetSession(generation)
+            }
         }
     }
 
@@ -130,6 +187,8 @@ object SpeedLimiter {
         synchronized(generationLock) {
             if (activeSessionGeneration.get() == generation) {
                 activeSessionGeneration.set(0L)
+                download.endSession(generation)
+                upload.endSession(generation)
                 download.resetScheduler()
                 upload.resetScheduler()
             }

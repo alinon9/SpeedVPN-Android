@@ -10,9 +10,11 @@ import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
 import android.os.IBinder
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -25,9 +27,19 @@ import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 import java.util.UUID
 
-/** Keeps the phone linked to the dashboard: register, heartbeat 5s, commands 2.5s, stats 30s. */
+/** Keeps the phone linked to the dashboard while backing off command polling during idle periods. */
 class AgentService : Service() {
     companion object {
+        const val KEY_LAST_OBSERVED_DOWN = "last_observed_down"
+        const val KEY_LAST_OBSERVED_UP = "last_observed_up"
+        const val KEY_PENDING_DOWN = "pending_down"
+        const val KEY_PENDING_UP = "pending_up"
+        const val KEY_PENDING_BATCH_ID = "pending_batch_id"
+        const val KEY_PENDING_STATE = "pending_state"
+        const val STATE_IDLE = "IDLE"
+        const val STATE_PENDING = "PENDING"
+        const val STATE_SENT = "SENT"
+
         fun start(ctx: Context) = ContextCompat.startForegroundService(ctx, Intent(ctx, AgentService::class.java))
         fun stop(ctx: Context) = ctx.stopService(Intent(ctx, AgentService::class.java))
     }
@@ -55,8 +67,10 @@ class AgentService : Service() {
         if (!started) {
             started = true
             api = Api(this)
-            deviceId = Auth.deviceId(this)
-            scope.launch { run() }
+            scope.launch {
+                deviceId = Auth.deviceId(this@AgentService)
+                run()
+            }
         }
         return START_STICKY
     }
@@ -92,12 +106,11 @@ class AgentService : Service() {
             val ul = SpeedLimiter.toKbps(s.optDoubleOrNull("upload_limit"), unit)
             SpeedLimiter.setDownloadKbps(dl)
             SpeedLimiter.setUploadKbps(ul)
-            persistLocalLimit(download = true, kbps = dl)
-            persistLocalLimit(download = false, kbps = ul)
+            SpeedLimitStore.save(this, dl, ul)
         }
         scope.launch { loop(5000) { heartbeat() } }
         scope.launch { loop(30_000) { stats() } }
-        loop(2500) { poll() }
+        pollLoop()
     }
 
     private suspend fun loop(ms: Long, block: suspend () -> Unit) {
@@ -133,6 +146,18 @@ class AgentService : Service() {
         }
     }
 
+    private object StatsState {
+        const val KEY_LAST_OBSERVED_DOWN = "last_observed_down"
+        const val KEY_LAST_OBSERVED_UP = "last_observed_up"
+        const val KEY_PENDING_DOWN = "pending_down"
+        const val KEY_PENDING_UP = "pending_up"
+        const val KEY_PENDING_BATCH_ID = "pending_batch_id"
+        const val KEY_PENDING_STATE = "pending_state"
+        const val STATE_IDLE = "IDLE"
+        const val STATE_PENDING = "PENDING"
+        const val STATE_SENT = "SENT"
+    }
+
     private val statsPrefs by lazy { getSharedPreferences("stats_sync", MODE_PRIVATE) }
     private var lastObservedDown = 0L
     private var lastObservedUp = 0L
@@ -143,29 +168,58 @@ class AgentService : Service() {
     private fun initStatsAccounting() {
         val currentDown = SpeedLimiter.download.total.get()
         val currentUp = SpeedLimiter.upload.total.get()
-        val storedDown = statsPrefs.getLong("last_observed_down", currentDown)
-        val storedUp = statsPrefs.getLong("last_observed_up", currentUp)
+        val storedDown = statsPrefs.getLong(StatsState.KEY_LAST_OBSERVED_DOWN, currentDown)
+        val storedUp = statsPrefs.getLong(StatsState.KEY_LAST_OBSERVED_UP, currentUp)
 
         // A process restart resets in-memory totals to zero. Do not turn the old
         // lifetime total into new traffic; preserve only unsent pending deltas.
         lastObservedDown = if (currentDown >= storedDown) storedDown else currentDown
         lastObservedUp = if (currentUp >= storedUp) storedUp else currentUp
-        pendingDown = statsPrefs.getLong("pending_down", 0L)
-        pendingUp = statsPrefs.getLong("pending_up", 0L)
-        pendingBatchId = statsPrefs.getString("pending_batch_id", null)
-        if ((pendingDown > 0L || pendingUp > 0L) && pendingBatchId.isNullOrBlank()) {
-            pendingBatchId = UUID.randomUUID().toString()
+        pendingDown = statsPrefs.getLong(StatsState.KEY_PENDING_DOWN, 0L)
+        pendingUp = statsPrefs.getLong(StatsState.KEY_PENDING_UP, 0L)
+        pendingBatchId = statsPrefs.getString(StatsState.KEY_PENDING_BATCH_ID, null)
+
+        // SENT means the backend accepted this batch before the local cleanup was
+        // interrupted. It is safe to clear locally; PENDING is the only resendable
+        // state. If older v1.0.23 state has bytes but no explicit state, normalize it
+        // to PENDING on the next flush.
+        if (statsPrefs.getString(StatsState.KEY_PENDING_STATE, StatsState.STATE_IDLE) == StatsState.STATE_SENT) {
+            clearPendingSync()
+            pendingDown = 0L
+            pendingUp = 0L
+            pendingBatchId = null
         }
     }
 
-    private fun persistStatsState() {
-        statsPrefs.edit()
-            .putLong("last_observed_down", lastObservedDown)
-            .putLong("last_observed_up", lastObservedUp)
-            .putLong("pending_down", pendingDown)
-            .putLong("pending_up", pendingUp)
-            .putString("pending_batch_id", pendingBatchId)
-            .apply()
+    /** Persist the complete stats state before any network request. */
+    private fun persistStatsStateSync(
+        observedDown: Long,
+        observedUp: Long,
+        pendingDownValue: Long,
+        pendingUpValue: Long,
+        batchId: String?,
+        state: String,
+    ): Boolean {
+        return statsPrefs.edit()
+            .putLong(StatsState.KEY_LAST_OBSERVED_DOWN, observedDown)
+            .putLong(StatsState.KEY_LAST_OBSERVED_UP, observedUp)
+            .putLong(StatsState.KEY_PENDING_DOWN, pendingDownValue)
+            .putLong(StatsState.KEY_PENDING_UP, pendingUpValue)
+            .apply {
+                if (batchId.isNullOrBlank()) remove(StatsState.KEY_PENDING_BATCH_ID)
+                else putString(StatsState.KEY_PENDING_BATCH_ID, batchId)
+            }
+            .putString(StatsState.KEY_PENDING_STATE, state)
+            .commit()
+    }
+
+    private fun clearPendingSync(): Boolean {
+        return statsPrefs.edit()
+            .remove(StatsState.KEY_PENDING_DOWN)
+            .remove(StatsState.KEY_PENDING_UP)
+            .remove(StatsState.KEY_PENDING_BATCH_ID)
+            .putString(StatsState.KEY_PENDING_STATE, StatsState.STATE_IDLE)
+            .commit()
     }
 
     private suspend fun stats() {
@@ -173,40 +227,101 @@ class AgentService : Service() {
         val u = SpeedLimiter.upload.total.get()
         val newDown = if (d >= lastObservedDown) d - lastObservedDown else d
         val newUp = if (u >= lastObservedUp) u - lastObservedUp else u
-        lastObservedDown = d
-        lastObservedUp = u
-        pendingDown = safeAdd(pendingDown, newDown)
-        pendingUp = safeAdd(pendingUp, newUp)
-        persistStatsState()
+        val nextPendingDown = safeAdd(pendingDown, newDown)
+        val nextPendingUp = safeAdd(pendingUp, newUp)
 
-        if (pendingDown == 0L && pendingUp == 0L) {
+        if (nextPendingDown == 0L && nextPendingUp == 0L) {
+            if (lastObservedDown != d || lastObservedUp != u || pendingDown != 0L || pendingUp != 0L || pendingBatchId != null) {
+                if (!persistStatsStateSync(d, u, 0L, 0L, null, StatsState.STATE_IDLE)) {
+                    Log.e(TAG, "Failed to persist empty stats state")
+                    return
+                }
+            }
+            lastObservedDown = d
+            lastObservedUp = u
+            pendingDown = 0L
+            pendingUp = 0L
             pendingBatchId = null
-            persistStatsState()
             return
         }
-        if (pendingBatchId.isNullOrBlank()) pendingBatchId = UUID.randomUUID().toString()
-        persistStatsState()
 
-        api.post(
-            "/stats",
-            JSONObject()
-                .put("device_id", deviceId)
-                .put("stats_batch_id", pendingBatchId)
-                .put("download_bytes", pendingDown)
-                .put("upload_bytes", pendingUp),
-        )
+        val batchId = pendingBatchId ?: UUID.randomUUID().toString()
 
-        // Client delivery is at-least-once. The backend should deduplicate
-        // stats_batch_id to provide exactly-once accounting.
+        // Advance the in-memory accounting only after the durable PENDING record has
+        // been committed. If the commit fails, retry later from the old state instead
+        // of losing a delta by advancing lastObserved* prematurely.
+        if (!persistStatsStateSync(d, u, nextPendingDown, nextPendingUp, batchId, StatsState.STATE_PENDING)) {
+            Log.e(TAG, "Failed to persist PENDING stats state — aborting flush")
+            return
+        }
+        lastObservedDown = d
+        lastObservedUp = u
+        pendingDown = nextPendingDown
+        pendingUp = nextPendingUp
+        pendingBatchId = batchId
+
+        val success = try {
+            api.post(
+                "/stats",
+                JSONObject()
+                    .put("device_id", deviceId)
+                    .put("stats_batch_id", batchId)
+                    .put("download_bytes", pendingDown)
+                    .put("upload_bytes", pendingUp),
+            )
+            true
+        } catch (t: Throwable) {
+            Log.w(TAG, "Stats send failed: ${t.message}")
+            false
+        }
+
+        if (!success) return // PENDING + same batchId remains for idempotent retry.
+
+        // SENT is a durable acknowledgement marker. If the process dies after this
+        // commit but before the final clear, initStatsAccounting() clears it without
+        // resending. If it dies before SENT, the PENDING batch is resent safely only
+        // when the backend deduplicates stats_batch_id.
+        if (!persistStatsStateSync(lastObservedDown, lastObservedUp, pendingDown, pendingUp, batchId, StatsState.STATE_SENT)) {
+            Log.e(TAG, "Stats delivered but SENT marker could not be persisted; batch remains PENDING")
+            return
+        }
+
+        if (!clearPendingSync()) {
+            Log.e(TAG, "Stats delivered and marked SENT, but final local clear failed")
+            return
+        }
         pendingDown = 0L
         pendingUp = 0L
         pendingBatchId = null
-        persistStatsState()
     }
 
-    private suspend fun poll() {
-        val cmds = api.get("/commands?device_id=$deviceId").optJSONArray("commands") ?: return
+    private suspend fun pollLoop() {
+        var delayMs = 2500L
+        while (scope.isActive) {
+            try {
+                val hadCommands = poll()
+                delayMs = if (hadCommands) 2500L else (delayMs * 2L).coerceAtMost(10_000L)
+            } catch (e: ApiException) {
+                if (e.code == 401 || e.code == 403) {
+                    Auth.signOut(this)
+                    note(error = "Dashboard session expired")
+                    stopSelf()
+                    return
+                }
+                logE("poll: ${e.message}")
+                delayMs = (delayMs * 2L).coerceAtMost(30_000L)
+            } catch (e: Exception) {
+                logE("poll: ${e.message}")
+                delayMs = (delayMs * 2L).coerceAtMost(30_000L)
+            }
+            delay(delayMs)
+        }
+    }
+
+    private suspend fun poll(): Boolean {
+        val cmds = api.get("/commands?device_id=$deviceId").optJSONArray("commands") ?: return false
         for (i in 0 until cmds.length()) handle(cmds.getJSONObject(i))
+        return cmds.length() > 0
     }
 
     private suspend fun ack(id: String, status: String, error: String? = null, extra: JSONObject.() -> Unit = {}) {
@@ -348,10 +463,8 @@ class AgentService : Service() {
     }
 
     private fun persistLocalLimit(download: Boolean, kbps: Long?) {
-        getSharedPreferences("local_limits", MODE_PRIVATE)
-            .edit()
-            .putLong(if (download) "dl" else "ul", kbps ?: 0L)
-            .apply()
+        if (download) SpeedLimitStore.saveDownload(this, kbps)
+        else SpeedLimitStore.saveUpload(this, kbps)
     }
 
     private fun safeAdd(a: Long, b: Long): Long =
