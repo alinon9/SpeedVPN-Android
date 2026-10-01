@@ -24,18 +24,13 @@ jobs:
         with:
           packages: 'platform-tools platforms;android-35 build-tools;35.0.0 ndk;30.0.16248370'
 
-      - name: Set up Gradle 8.11.1
-        uses: gradle/actions/setup-gradle@v6
-        with:
-          gradle-version: '8.11.1'
-          cache-provider: basic
 
       - name: Set NDK environment
         run: |
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/30.0.16248370" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/30.0.16248370" >> "$GITHUB_ENV"
 
-      - name: Verify Gradle Wrapper
+      - name: Verify and bootstrap Gradle Wrapper
         run: |
           test -x ./gradlew
           test -s gradle/wrapper/gradle-wrapper.jar.sha256
