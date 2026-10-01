@@ -35,22 +35,11 @@ jobs:
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/30.0.16248370" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/30.0.16248370" >> "$GITHUB_ENV"
 
-      - name: Verify and bootstrap Gradle Wrapper
+      - name: Verify Gradle Wrapper
         run: |
           test -x ./gradlew
           test -s gradle/wrapper/gradle-wrapper.jar.sha256
-          echo "=== BEFORE GRADLE ==="
-          ls -lah gradle/wrapper/
-          git status --short
-          git ls-files -s gradle/wrapper/gradle-wrapper.jar
-          echo "=== RUN GRADLE ==="
           ./gradlew --version
-          echo "=== AFTER GRADLE ==="
-          ls -lah gradle/wrapper/
-          git status --short
-          git ls-files -s gradle/wrapper/gradle-wrapper.jar
-          echo "=== CHECKSUM ==="
-          cd gradle/wrapper && sha256sum -c gradle-wrapper.jar.sha256
 
       - name: Fetch pinned native tunnel
         run: bash ./setup.sh
