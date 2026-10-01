@@ -76,15 +76,14 @@ internal class UdpFlowTable(
         purgeLocked(nowMs)
         val endpoint = endpointKey(address, port)
         val keys = replyIndex[endpoint] ?: return null
-        var matched: UdpFlow? = null
-        var matchCount = 0
-        for (key in keys) {
-            val candidate = flows[key] ?: continue
-            matchCount++
-            if (matchCount > 1) return null
-            matched = candidate
-        }
-        val flow = matched ?: return null
+
+        val activeKeys = keys.filter { flows.containsKey(it) }
+        if (activeKeys.size != 1) return null
+
+        // Access the LinkedHashMap entry only after uniqueness is established.
+        // This updates the true access-order LRU position.
+        val flow = flows[activeKeys.single()] ?: return null
+
         flow.lastSeenMs = nowMs
         flow.lastReplyMs = nowMs
         return flow
