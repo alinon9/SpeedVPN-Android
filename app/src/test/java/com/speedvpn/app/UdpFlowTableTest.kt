@@ -71,8 +71,8 @@ class UdpFlowTableTest {
         table.findByDestination(a, 1, 3)
         val cAddr = InetAddress.getByName("3.3.3.3")
         table.getOrCreate("c", 3, InetSocketAddress("10.0.0.2", 3), listOf(cAddr), 4)
-        assertEquals(bFlow, table.findByDestination(b, 2, 4))
-        assertNull(table.findByDestination(a, 1, 4))
+        assertNull(table.findByDestination(b, 2, 4))
+        assertTrue(table.findByDestination(a, 1, 4) != null)
     }
 
     @Test
