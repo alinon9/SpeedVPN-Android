@@ -40,7 +40,7 @@ jobs:
           test -x ./gradlew
           test -s gradle/wrapper/gradle-wrapper.jar.sha256
           ./gradlew --version
-          sha256sum -c gradle/wrapper/gradle-wrapper.jar.sha256
+          cd gradle/wrapper && sha256sum -c gradle-wrapper.jar.sha256
 
       - name: Fetch pinned native tunnel
         run: bash ./setup.sh
