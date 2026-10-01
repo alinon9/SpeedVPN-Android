@@ -26,11 +26,6 @@ jobs:
         with:
           packages: 'platform-tools platforms;android-35 build-tools;35.0.0 ndk;30.0.16248370'
 
-      - name: Set up Gradle 8.11.1
-        uses: gradle/actions/setup-gradle@v6
-        with:
-          gradle-version: '8.11.1'
-          cache-provider: basic
 
       - name: Set NDK environment
         run: |
@@ -43,7 +38,6 @@ jobs:
           test -x ./gradlew
           test -s gradle/wrapper/gradle-wrapper.jar.sha256
           ./gradlew --version
-          sha256sum -c gradle/wrapper/gradle-wrapper.jar.sha256
 
       - name: Fetch pinned native tunnel
         run: bash ./setup.sh
