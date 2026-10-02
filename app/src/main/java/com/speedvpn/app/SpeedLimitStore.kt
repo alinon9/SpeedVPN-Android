@@ -20,16 +20,26 @@ object SpeedLimitStore {
             .putLong(KEY_DL, downloadKbps?.coerceAtLeast(0L) ?: 0L)
             .putLong(KEY_UL, uploadKbps?.coerceAtLeast(0L) ?: 0L)
             .commit()
+        runCatching {
+            AiRepository.upsertSpeedProfile(
+                context,
+                SpeedProfile(null, true, downloadKbps, uploadKbps, System.currentTimeMillis()),
+            )
+        }
     }
 
     fun saveDownload(context: Context, kbps: Long?) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .edit().putLong(KEY_DL, kbps?.coerceAtLeast(0L) ?: 0L).commit()
+        val (_, upload) = load(context)
+        runCatching { AiRepository.upsertSpeedProfile(context, SpeedProfile(null, true, kbps, upload, System.currentTimeMillis())) }
     }
 
     fun saveUpload(context: Context, kbps: Long?) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .edit().putLong(KEY_UL, kbps?.coerceAtLeast(0L) ?: 0L).commit()
+        val (download, _) = load(context)
+        runCatching { AiRepository.upsertSpeedProfile(context, SpeedProfile(null, true, download, kbps, System.currentTimeMillis())) }
     }
 
     fun applyToLimiter(context: Context) {
