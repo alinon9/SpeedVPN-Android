@@ -123,12 +123,13 @@ jobs:
           ls -lh "$APK"
 
           if [ -n "${{ secrets.RELEASE_KEYSTORE_BASE64 }}" ]; then
-            apksigner verify --print-certs "$APK"
+            apksigner verify --verbose --print-certs "$APK"
           else
             echo "Unsigned release validation only; no signing secrets configured."
           fi
 
       - name: Upload APKs
+        if: ${{ always() }}
         uses: actions/upload-artifact@v7
         with:
           name: SpeedVPN-APKs
