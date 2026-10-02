@@ -305,17 +305,22 @@ class SpeedVpnService : VpnService() {
                         )
                     }
                     if (firewallRequested) {
-                        var installed = 0
-                        firewall.blockedPackages.forEach { pkg ->
-                            if (pkg == packageName) return@forEach
-                            runCatching { addDisallowedApplication(pkg) }
-                                .onSuccess { installed++ }
-                                .onFailure { log("Skipping unavailable blocked package $pkg: ${it.message}") }
+                        // Lockdown prevents bypass. Explicitly allow visible launchable apps
+                        // that are not blocked; blocked apps are omitted from the allow-list.
+                        val blocked = firewall.blockedPackages
+                        val launchable = AppTrafficManager.installedLaunchableApps(this@SpeedVpnService)
+                        var allowed = 0
+                        launchable.forEach { app ->
+                            val pkg = app.packageName
+                            if (pkg == packageName || pkg in blocked) return@forEach
+                            runCatching { addAllowedApplication(pkg) }
+                                .onSuccess { allowed++ }
+                                .onFailure { log("Skipping unavailable allowed package $pkg: ${it.message}") }
                         }
-                        if (installed == 0) {
-                            throw IllegalStateException("No valid blocked applications were installed")
+                        if (allowed == 0) {
+                            throw IllegalStateException("No valid applications are available for the firewall allow-list")
                         }
-                        log("App firewall active with Android lockdown: $installed blocked")
+                        log("App firewall active with Android lockdown: $allowed apps allowed; ${blocked.size} blocked")
                     }
                     // The SpeedVPN process must never be routed back through its own TUN.
                     addDisallowedApplication(packageName)
