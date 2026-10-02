@@ -15,8 +15,8 @@ import java.util.Locale
  *
  * Android's NetworkStatsManager is a historical accounting API. It is useful for
  * session consumption totals, but the platform can update its buckets with delay,
- * so this screen intentionally labels the values as session usage rather than a
- * packet-perfect live counter.
+ * so this screen intentionally labels the values as session usage rather than
+ * a packet-perfect live counter.
  */
 data class AppTrafficUsage(
     val packageName: String,
@@ -64,9 +64,6 @@ object AppTrafficManager {
             .mapNotNull { it.activityInfo?.applicationInfo }
             .toMutableList()
 
-        // Keep already-blocked packages visible even if their launcher activity is
-        // temporarily hidden. Package visibility is still controlled by Android; we
-        // only attempt a direct lookup for packages the user explicitly saved.
         val blocked = VpnAppControl.read(context).blockedPackages
         blocked.forEach { pkg ->
             if (pkg == context.packageName || launchable.any { it.packageName == pkg }) return@forEach
@@ -80,12 +77,6 @@ object AppTrafficManager {
             .sortedBy { it.loadLabel(pm).toString().lowercase(Locale.getDefault()) }
     }
 
-    /**
-     * Returns Android-recorded traffic deltas attributed to application UIDs during
-     * [startTimeMs]..now. This is session accounting, not packet-perfect TUN accounting.
-     * When usage access is unavailable the returned rows remain present with zero
-     * counters so the UI can still provide an app firewall list.
-     */
     fun querySessionUsage(context: Context, startTimeMs: Long, endTimeMs: Long = System.currentTimeMillis()): List<AppTrafficUsage> {
         val pm = context.packageManager
         val apps = installedLaunchableApps(context)
@@ -131,7 +122,6 @@ object AppTrafficManager {
         }.sortedByDescending { it.totalBytes }
     }
 
-
     private fun safeAdd(a: Long, b: Long): Long =
         if (Long.MAX_VALUE - a < b) Long.MAX_VALUE else a + b
 }
@@ -145,30 +135,49 @@ object VpnAppControl {
     const val PREFS = "app_control"
     const val FIREWALL_ENABLED = "firewall_enabled"
     const val BLOCKED_PACKAGES = "blocked_packages"
+    const val QUOTA_BLOCKED_PACKAGES = "quota_blocked_packages"
 
     fun read(context: Context): VpnAppControlSettings {
         val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val manualBlocked = p.getStringSet(BLOCKED_PACKAGES, emptySet()).orEmpty()
+        val quotaBlocked = p.getStringSet(QUOTA_BLOCKED_PACKAGES, emptySet()).orEmpty()
         return VpnAppControlSettings(
             firewallEnabled = p.getBoolean(FIREWALL_ENABLED, false),
-            blockedPackages = p.getStringSet(BLOCKED_PACKAGES, emptySet())?.toSet().orEmpty(),
+            blockedPackages = (manualBlocked + quotaBlocked).toSet(),
         )
     }
 
-    /**
-     * Persists firewall settings synchronously. Callers that run on the UI thread
-     * must invoke this from Dispatchers.IO because commit() performs disk I/O.
-     */
+    /** Persists only user-selected/manual blocks. Quota blocks remain independent. */
     fun save(context: Context, settings: VpnAppControlSettings): Boolean {
-        return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+        val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val quotaBlocked = p.getStringSet(QUOTA_BLOCKED_PACKAGES, emptySet()).orEmpty()
+        val manualBlocked = settings.blockedPackages - quotaBlocked
+        return p.edit()
             .putBoolean(FIREWALL_ENABLED, settings.firewallEnabled)
-            .putStringSet(BLOCKED_PACKAGES, settings.blockedPackages.toSet())
+            .putStringSet(BLOCKED_PACKAGES, manualBlocked.toSet())
             .commit()
     }
 
     fun setBlocked(context: Context, packageName: String, blocked: Boolean) {
-        val current = read(context).blockedPackages.toMutableSet()
-        if (blocked) current.add(packageName) else current.remove(packageName)
-        save(context, read(context).copy(blockedPackages = current))
+        val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val manual = p.getStringSet(BLOCKED_PACKAGES, emptySet()).orEmpty().toMutableSet()
+        if (blocked) manual.add(packageName) else manual.remove(packageName)
+        p.edit().putStringSet(BLOCKED_PACKAGES, manual).commit()
+        runCatching {
+            val app = context.packageManager.getApplicationInfo(packageName, PackageManager.MATCH_ALL)
+            UsageRepository.setBlocked(context, packageName, app.loadLabel(context.packageManager).toString(), app.uid, blocked)
+        }
+    }
+
+    fun quotaBlockedPackages(context: Context): Set<String> =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getStringSet(QUOTA_BLOCKED_PACKAGES, emptySet()).orEmpty().toSet()
+
+    fun setQuotaBlocked(context: Context, packageName: String, blocked: Boolean) {
+        val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val set = p.getStringSet(QUOTA_BLOCKED_PACKAGES, emptySet()).orEmpty().toMutableSet()
+        if (blocked) set.add(packageName) else set.remove(packageName)
+        p.edit().putStringSet(QUOTA_BLOCKED_PACKAGES, set).commit()
     }
 }
 
