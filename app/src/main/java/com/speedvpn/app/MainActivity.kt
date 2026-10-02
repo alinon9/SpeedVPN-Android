@@ -242,6 +242,7 @@ class MainActivity : ComponentActivity() {
                     0 -> HomeScreen(signedIn, s) { requestVpnPermission() }
                     1 -> SpeedScreen(s)
                     2 -> AppsScreen(s)
+                    3 -> SmartScreen(s)
                     else -> SettingsScreen(s, signedIn, onLink, onSignOut)
                 }
             }
@@ -281,6 +282,17 @@ class MainActivity : ComponentActivity() {
             ScreenTitle("التحكم بالسرعة", "اختر مستوى جاهزًا أو اضبطه بالمؤشر — الوحدات KB/s وMB/s")
             LimitSlider("سرعة التحميل", s.downloadLimitKbps) { saveLocalLimit(true, it) }
             LimitSlider("سرعة الرفع", s.uploadLimitKbps) { saveLocalLimit(false, it) }
+            OutlinedButton(
+                onClick = {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this@MainActivity)) {
+                        runCatching { startActivity(android.content.Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, android.net.Uri.parse("package:$packageName"))) }
+                    } else {
+                        SpeedOverlayService.start(this@MainActivity)
+                    }
+                },
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+            ) { Text("فتح نافذة السرعة العامة العائمة") }
             GlassCard {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("💡", fontSize = 20.sp)
@@ -299,13 +311,138 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
+    private fun SmartScreen(s: Snapshot) {
+        var statsEnabled by remember { mutableStateOf(SmartSettings.isStatsEnabled(this@MainActivity)) }
+        var today by remember { mutableStateOf(0L) }
+        var week by remember { mutableStateOf(0L) }
+        var month by remember { mutableStateOf(0L) }
+        var top by remember { mutableStateOf<List<DailyUsageRow>>(emptyList()) }
+        var insights by remember { mutableStateOf<List<AiInsight>>(emptyList()) }
+        var errors24h by remember { mutableStateOf(0L) }
+        var problems by remember { mutableStateOf<List<Pair<String, Int>>>(emptyList()) }
+        var recommendation by remember { mutableStateOf<SpeedProfile?>(null) }
+        var refreshing by remember { mutableStateOf(false) }
+
+        suspend fun refresh() {
+            refreshing = true
+            withContext(Dispatchers.IO) {
+                if (statsEnabled && usageAccessState.value) UsageCollector.collectToday(this@MainActivity)
+                today = UsageRepository.totalUsage(this@MainActivity, UsageDate.today())
+                week = UsageRepository.rangeUsage(this@MainActivity, UsageDate.startOfWeek(), UsageDate.today())
+                month = UsageRepository.rangeUsage(this@MainActivity, UsageDate.startOfMonth(), UsageDate.today())
+                top = UsageRepository.topUsage(this@MainActivity, UsageDate.today(), 8)
+                insights = AiRepository.recentInsights(this@MainActivity, 6)
+                val since = System.currentTimeMillis() - 24L * 60L * 60L * 1000L
+                errors24h = DiagnosticsRepository.countSince(this@MainActivity, since, "ERROR")
+                problems = DiagnosticsRepository.topProblems(this@MainActivity, since, 6)
+                recommendation = AiDiagnosticsEngine.smartGlobalRecommendation(this@MainActivity)
+            }
+            refreshing = false
+        }
+
+        LaunchedEffect(statsEnabled, usageAccessState.value) { refresh() }
+
+        Column(
+            Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(18.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            ScreenTitle("المركز الذكي", "Usage + AI + Diagnostics في طبقات منفصلة")
+
+            GlassCard {
+                SectionLabel("استهلاك الإنترنت", "إحصاءات يومية وأسبوعية وشهرية")
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TrafficCard("↓", "اليوم", formatDataBytes(today), Blue, Modifier.weight(1f))
+                    TrafficCard("↗", "الأسبوع", formatDataBytes(week), Cyan, Modifier.weight(1f))
+                }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TrafficCard("◷", "الشهر", formatDataBytes(month), Purple, Modifier.weight(1f))
+                    TrafficCard("⚠", "أخطاء 24س", errors24h.toString(), Color(0xFFFF7D88), Modifier.weight(1f))
+                }
+                Button(enabled = !refreshing, onClick = { lifecycleScope.launch { refresh() } }, modifier = Modifier.fillMaxWidth()) {
+                    Text(if (refreshing) "جاري التحديث…" else "تحديث البيانات")
+                }
+            }
+
+            GlassCard {
+                SectionLabel("Smart Speed Optimizer", "اقتراح محلي مبني على القياسات السابقة")
+                val rec = recommendation
+                if (rec == null) {
+                    Text("تحتاج عدة قياسات قبل إنشاء اقتراح.", color = TextSecondary, fontSize = 10.sp)
+                } else {
+                    InfoRow("تحميل", rec.downloadKbps?.let { fmt(it) } ?: "بدون حد")
+                    InfoRow("رفع", rec.uploadKbps?.let { fmt(it) } ?: "بدون حد")
+                    Button(onClick = {
+                        saveLocalLimit(true, rec.downloadKbps)
+                        saveLocalLimit(false, rec.uploadKbps)
+                        DiagnosticsRepository.record(this@MainActivity, "INFO", "SmartOptimizer", "SMART_SPEED_APPLIED", "Smart speed recommendation applied")
+                    }, modifier = Modifier.fillMaxWidth()) { Text("تطبيق الاقتراح") }
+                }
+            }
+
+            GlassCard {
+                SectionLabel("AI Diagnostics", "تحليل محلي لأنماط الأخطاء والشبكة")
+                if (problems.isEmpty()) Text("لا توجد أنماط أخطاء ملحوظة خلال آخر 24 ساعة.", color = Green, fontSize = 11.sp)
+                else problems.forEach { (label, count) -> InfoRow(label, "$count حدث") }
+                insights.take(4).forEach { insight ->
+                    Text(insight.title, color = TextPrimary, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                    Text(insight.detail, color = TextSecondary, fontSize = 10.sp)
+                    Text("الثقة: ${(insight.confidence * 100).roundToLong()}% • ${insight.source}", color = Blue, fontSize = 9.sp)
+                }
+            }
+
+            GlassCard {
+                SectionLabel("أكثر التطبيقات استخدامًا اليوم", "من Usage Database")
+                if (top.isEmpty()) Text("لا توجد بيانات بعد.", color = TextSecondary, fontSize = 11.sp)
+                else top.forEach { row -> InfoRow(row.label, formatDataBytes(row.totalBytes)) }
+            }
+
+            GlassCard {
+                SectionLabel("حالة جمع البيانات", "يمكن إيقافها في أي وقت")
+                SettingSwitch("إحصاءات الإنترنت", "حفظ استهلاك التطبيقات محليًا", statsEnabled) {
+                    statsEnabled = it
+                    SmartSettings.setStatsEnabled(this@MainActivity, it)
+                    if (it) UsageCollectionScheduler.schedule(this@MainActivity) else UsageCollectionScheduler.cancel(this@MainActivity)
+                    lifecycleScope.launch(Dispatchers.IO) { if (it) UsageCollector.collectToday(this@MainActivity) }
+                }
+            }
+        }
+    }
+
+    @Composable
+    private fun SmartControlsCard() {
+        var statsEnabled by remember { mutableStateOf(SmartSettings.isStatsEnabled(this@MainActivity)) }
+        var overlayEnabled by remember { mutableStateOf(SmartSettings.isOverlayEnabled(this@MainActivity)) }
+        GlassCard {
+            SectionLabel("البيانات والنافذة العائمة", "إعدادات مستقلة للإحصاءات والتحكم أثناء التصفح")
+            SettingSwitch("إحصاءات الإنترنت", "تسجيل استهلاك التطبيقات يوميًا", statsEnabled) {
+                statsEnabled = it
+                SmartSettings.setStatsEnabled(this@MainActivity, it)
+                if (it) {
+                    UsageCollectionScheduler.schedule(this@MainActivity)
+                    lifecycleScope.launch(Dispatchers.IO) { UsageCollector.collectToday(this@MainActivity) }
+                } else UsageCollectionScheduler.cancel(this@MainActivity)
+            }
+            SettingSwitch("نافذة السرعة العائمة", "تعمل كتحكم عام أو حسب التطبيق الذي فتحت منها", overlayEnabled) {
+                if (it && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this@MainActivity)) {
+                    runCatching { startActivity(android.content.Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, android.net.Uri.parse("package:$packageName"))) }
+                    return@SettingSwitch
+                }
+                overlayEnabled = it
+                SmartSettings.setOverlayEnabled(this@MainActivity, it)
+                if (it) SpeedOverlayService.start(this@MainActivity) else SpeedOverlayService.stop(this@MainActivity)
+            }
+        }
+    }
+
+    @Composable
     private fun SettingsScreen(s: Snapshot, signedIn: Boolean, onLink: () -> Unit, onSignOut: () -> Unit) {
         Column(
             Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(18.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            ScreenTitle("الإعدادات", "التوافق، الحساب والتشخيص")
+            ScreenTitle("الإعدادات", "التوافق، البيانات، النافذة العائمة والحساب")
             CompatibilitySettingsCard()
+            SmartControlsCard()
             AccountCard(signedIn, onLink, onSignOut)
             DiagnosticsCard(s)
         }
@@ -509,19 +646,27 @@ class MainActivity : ComponentActivity() {
         var firewallEnabled by remember { mutableStateOf(VpnAppControl.read(this@MainActivity).firewallEnabled) }
         var blockedPackages by remember { mutableStateOf(VpnAppControl.read(this@MainActivity).blockedPackages) }
         var apps by remember { mutableStateOf<List<AppTrafficUsage>>(emptyList()) }
+        var policies by remember { mutableStateOf<Map<String, AppPolicy>>(emptyMap()) }
         var appQuery by remember { mutableStateOf("") }
+        var editingLimitApp by remember { mutableStateOf<AppTrafficUsage?>(null) }
+        var editingSpeedApp by remember { mutableStateOf<AppTrafficUsage?>(null) }
+        var statsEnabled by remember { mutableStateOf(SmartSettings.isStatsEnabled(this@MainActivity)) }
 
-        LaunchedEffect(s.connectedAtMillis, s.status, usageAccess) {
-            val start = s.connectedAtMillis
-            if (start <= 0L) {
-                apps = AppTrafficManager.installedLaunchableApps(this@MainActivity).map {
-                    AppTrafficUsage(it.packageName, it.loadLabel(packageManager).toString(), it.uid, 0L, 0L)
-                }
-                return@LaunchedEffect
-            }
+        LaunchedEffect(s.connectedAtMillis, s.status, usageAccess, statsEnabled) {
             while (isActive) {
                 apps = withContext(Dispatchers.IO) {
-                    AppTrafficManager.querySessionUsage(this@MainActivity, start)
+                    if (statsEnabled && usageAccess) UsageCollector.collectToday(this@MainActivity)
+                    if (statsEnabled) {
+                        UsageRepository.topUsage(this@MainActivity, UsageDate.today(), 100)
+                            .map { AppTrafficUsage(it.packageName, it.label, it.uid, it.downloadBytes, it.uploadBytes) }
+                    } else {
+                        AppTrafficManager.installedLaunchableApps(this@MainActivity).map {
+                            AppTrafficUsage(it.packageName, it.loadLabel(packageManager).toString(), it.uid, 0L, 0L)
+                        }
+                    }
+                }
+                policies = withContext(Dispatchers.IO) {
+                    UsageRepository.readPolicies(this@MainActivity).associateBy { it.packageName }
                 }
                 if (s.status != VpnStatus.CONNECTED) break
                 delay(60_000)
@@ -532,47 +677,37 @@ class MainActivity : ComponentActivity() {
             Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(18.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            ScreenTitle("التطبيقات", "استهلاك البيانات والتحكم في وصول التطبيقات")
+            ScreenTitle("التطبيقات", "حظر، حدود بيانات، سرعة خاصة، ونسبة الاستهلاك")
 
             GlassCard {
-                SectionLabel("إحصاءات التطبيقات", "قد تتأخر أرقام Android قليلًا لأنها مبنية على NetworkStatsManager")
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    if (!usageAccess) {
-                        Button(
-                            onClick = { startActivity(AppTrafficManager.usageAccessIntent()) },
-                            shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier.weight(1f),
-                        ) { Text("السماح بالإحصاءات", fontSize = 11.sp) }
-                    } else {
-                        Surface(
-                            modifier = Modifier.weight(1f),
-                            shape = RoundedCornerShape(12.dp),
-                            color = Green.copy(alpha = 0.08f),
-                            border = androidx.compose.foundation.BorderStroke(1.dp, Green.copy(alpha = 0.25f)),
-                        ) {
-                            Text("وصول الإحصاءات مفعّل", color = Green, fontSize = 11.sp, modifier = Modifier.padding(vertical = 10.dp), textAlign = TextAlign.Center)
-                        }
-                    }
+                SectionLabel("إحصاءات الإنترنت", "يوميًا لكل تطبيق مع إجمالي أسبوعي وشهري")
+                SettingSwitch("جمع الإحصاءات", "تسجيل استهلاك التطبيقات محليًا", statsEnabled) {
+                    statsEnabled = it
+                    SmartSettings.setStatsEnabled(this@MainActivity, it)
+                    if (it) {
+                        UsageCollectionScheduler.schedule(this@MainActivity)
+                        lifecycleScope.launch(Dispatchers.IO) { UsageCollector.collectToday(this@MainActivity) }
+                    } else UsageCollectionScheduler.cancel(this@MainActivity)
                 }
-                Text(
-                    "يُعرض الاستهلاك للجلسة الحالية؛ Android قد لا يحدّث عدادات كل تطبيق لحظيًا.",
-                    color = TextSecondary,
-                    fontSize = 10.sp,
-                )
+                if (!usageAccess) {
+                    Button(
+                        onClick = { startActivity(AppTrafficManager.usageAccessIntent()) },
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("السماح بإحصاءات التطبيقات", fontSize = 11.sp) }
+                } else {
+                    Text("وصول NetworkStatsManager مفعّل", color = Green, fontSize = 10.sp)
+                }
             }
 
             GlassCard {
-                SectionLabel("جدار التطبيقات", "حظر فعلي للتطبيقات المحددة عبر Android VPN Lockdown")
-                SettingSwitch("تفعيل جدار التطبيقات", "الحظر الفعلي عند الاتصال القادم مع Lockdown", firewallEnabled) {
+                SectionLabel("جدار التطبيقات", "الحظر اليدوي وحد البيانات يعملان كحالتين مستقلتين")
+                SettingSwitch("تفعيل جدار التطبيقات", "الحظر الفعلي يحتاج Always-on VPN + Lockdown", firewallEnabled) {
                     firewallEnabled = it
                     saveAppControlSettings(VpnAppControlSettings(it, blockedPackages))
                 }
                 if (firewallEnabled) {
-                    Text(
-                        "الحظر الحقيقي يتطلب Always-on VPN + Block connections without VPN. عند تفعيل الجدار لن يسمح SpeedVPN بالاتصال قبل توفر Lockdown، لمنع أي تجاوز صامت.",
-                        color = Amber,
-                        fontSize = 10.sp,
-                    )
+                    Text("فعّل Always-on VPN وBlock connections without VPN من إعدادات Android حتى يصبح الحظر فعليًا.", color = Amber, fontSize = 10.sp)
                     OutlinedButton(
                         onClick = { runCatching { startActivity(AppTrafficManager.vpnSettingsIntent()) } },
                         shape = RoundedCornerShape(12.dp),
@@ -582,7 +717,7 @@ class MainActivity : ComponentActivity() {
             }
 
             GlassCard {
-                SectionLabel("التطبيقات", "الحظر الفعلي يحتاج Lockdown في إعدادات Android")
+                SectionLabel("قائمة التطبيقات", "النسبة محسوبة من إجمالي استهلاك التطبيقات المعروضة")
                 OutlinedTextField(
                     value = appQuery,
                     onValueChange = { appQuery = it },
@@ -590,48 +725,190 @@ class MainActivity : ComponentActivity() {
                     label = { Text("بحث عن تطبيق") },
                     modifier = Modifier.fillMaxWidth(),
                 )
+                val totalConsumption = apps.sumOf { it.totalBytes.coerceAtLeast(0L) }
                 val shownApps = apps.filter {
-                    appQuery.isBlank() ||
-                        it.label.contains(appQuery, ignoreCase = true) ||
-                        it.packageName.contains(appQuery, ignoreCase = true)
+                    appQuery.isBlank() || it.label.contains(appQuery, true) || it.packageName.contains(appQuery, true)
                 }
                 if (shownApps.isEmpty()) {
-                    Text("لا توجد تطبيقات لعرضها.", color = TextSecondary, fontSize = 11.sp)
+                    Text("لا توجد بيانات بعد. فعّل الإحصاءات ومنح Usage Access.", color = TextSecondary, fontSize = 11.sp)
                 } else {
                     shownApps.forEach { app ->
-                        Row(
-                            Modifier.fillMaxWidth().padding(vertical = 5.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
+                        val policy = policies[app.packageName]
+                        val limit = policy?.dailyLimitBytes
+                        val used = app.totalBytes
+                        val remaining = limit?.let { (it - used).coerceAtLeast(0L) }
+                        Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
                             Column(Modifier.weight(1f)) {
                                 Text(app.label, color = TextPrimary, fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
                                 Text(
-                                    "↓ ${formatDataBytes(app.downloadBytes)}  ↑ ${formatDataBytes(app.uploadBytes)}  •  ${formatDataBytes(app.totalBytes)}",
+                                    "↓ ${formatDataBytes(app.downloadBytes)} • ↑ ${formatDataBytes(app.uploadBytes)} • ${formatDataBytes(used)} • ${usagePercent(used, totalConsumption)}%",
                                     color = TextSecondary,
                                     fontSize = 9.sp,
                                 )
+                                if (limit != null) {
+                                    Text(
+                                        "الحد اليومي ${formatDataBytes(limit)} • المتبقي ${formatDataBytes(remaining ?: 0L)}",
+                                        color = if ((remaining ?: 0L) == 0L) Color(0xFFFF7D88) else Amber,
+                                        fontSize = 9.sp,
+                                    )
+                                }
                             }
-                            Switch(
-                                checked = app.packageName in blockedPackages,
-                                onCheckedChange = { blocked ->
-                                    val next = blockedPackages.toMutableSet().apply {
-                                        if (blocked) add(app.packageName) else remove(app.packageName)
-                                    }.toSet()
-                                    blockedPackages = next
-                                    saveAppControlSettings(VpnAppControlSettings(firewallEnabled, next))
-                                },
-                            )
+                            Column(horizontalAlignment = Alignment.End) {
+                                Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                                    TextButton(onClick = { editingLimitApp = app }) { Text("حد", color = Amber, fontSize = 10.sp) }
+                                    TextButton(onClick = { editingSpeedApp = app }) { Text("سرعة", color = Blue, fontSize = 10.sp) }
+                                }
+                                Switch(
+                                    checked = app.packageName in blockedPackages,
+                                    onCheckedChange = { blocked ->
+                                        val next = blockedPackages.toMutableSet().apply {
+                                            if (blocked) add(app.packageName) else remove(app.packageName)
+                                        }.toSet()
+                                        blockedPackages = next
+                                        saveAppControlSettings(VpnAppControlSettings(firewallEnabled, next))
+                                    },
+                                )
+                            }
                         }
                     }
-                    Text(
-                        "المعروض: ${shownApps.size} من ${apps.size} تطبيق",
-                        color = TextSecondary,
-                        fontSize = 9.sp,
-                    )
+                    Text("المعروض: ${shownApps.size} من ${apps.size}", color = TextSecondary, fontSize = 9.sp)
+                    Text("حد البيانات يعاد تقييمه يوميًا. الحظر اليدوي لا يُزال عند وصول التطبيق إلى الحد أو عند إعادة الضبط اليومية.", color = Amber, fontSize = 9.sp)
                 }
             }
         }
+
+        editingLimitApp?.let { app ->
+            AppLimitDialog(
+                app = app,
+                currentLimitBytes = policies[app.packageName]?.dailyLimitBytes,
+                onDismiss = { editingLimitApp = null },
+                onSave = { bytes ->
+                    lifecycleScope.launch(Dispatchers.IO) {
+                        UsageRepository.setDailyLimitBytes(this@MainActivity, app.packageName, app.label, app.uid, bytes)
+                        UsageCollector.enforceDailyLimits(this@MainActivity)
+                        policies = UsageRepository.readPolicies(this@MainActivity).associateBy { it.packageName }
+                    }
+                    editingLimitApp = null
+                },
+            )
+        }
+
+        editingSpeedApp?.let { app ->
+            val profile = remember(app.packageName) { mutableStateOf<SpeedProfile?>(null) }
+            LaunchedEffect(app.packageName) {
+                profile.value = withContext(Dispatchers.IO) { AiRepository.getSpeedProfile(this@MainActivity, app.packageName) }
+            }
+            AppSpeedDialog(
+                app = app,
+                existing = profile.value,
+                onDismiss = { editingSpeedApp = null },
+                onSave = { enabled, down, up ->
+                    lifecycleScope.launch(Dispatchers.IO) {
+                        AppSpeedProfiles(this@MainActivity).save(app.packageName, enabled, down, up)
+                    }
+                    editingSpeedApp = null
+                },
+            )
+        }
     }
+
+    @Composable
+    private fun AppLimitDialog(
+        app: AppTrafficUsage,
+        currentLimitBytes: Long?,
+        onDismiss: () -> Unit,
+        onSave: (Long?) -> Unit,
+    ) {
+        var mbText by remember(currentLimitBytes) {
+            mutableStateOf(currentLimitBytes?.let { String.format(Locale.US, "%.0f", it / 1_000_000.0) } ?: "")
+        }
+        AlertDialog(
+            onDismissRequest = onDismiss,
+            title = { Text("حد بيانات ${app.label}") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("أدخل الحد اليومي بالميجابايت. مثال: 1000 MB. اتركه فارغًا لإلغاء الحد.", fontSize = 12.sp)
+                    OutlinedTextField(
+                        value = mbText,
+                        onValueChange = { mbText = it.filter { ch -> ch.isDigit() || ch == '.' } },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        label = { Text("MB يوميًا") },
+                    )
+                    Text("الاستهلاك الحالي: ${formatDataBytes(app.totalBytes)}", color = TextSecondary, fontSize = 10.sp)
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    val mb = mbText.toDoubleOrNull()
+                    onSave(mb?.takeIf { it > 0 }?.let { (it * 1_000_000.0).toLong() })
+                }) { Text("حفظ") }
+            },
+            dismissButton = { TextButton(onClick = onDismiss) { Text("إلغاء") } },
+        )
+    }
+
+    @Composable
+    private fun AppSpeedDialog(
+        app: AppTrafficUsage,
+        existing: SpeedProfile?,
+        onDismiss: () -> Unit,
+        onSave: (Boolean, Long?, Long?) -> Unit,
+    ) {
+        var enabled by remember(existing) { mutableStateOf(existing?.enabled ?: false) }
+        var down by remember(existing) { mutableStateOf(existing?.downloadKbps?.let { (it / 1000.0).toString() } ?: "") }
+        var up by remember(existing) { mutableStateOf(existing?.uploadKbps?.let { (it / 1000.0).toString() } ?: "") }
+        AlertDialog(
+            onDismissRequest = onDismiss,
+            title = { Text("ملف سرعة ${app.label}") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    SettingSwitch("تفعيل ملف خاص", "حفظ إعداد مستقل لهذا التطبيق", enabled) { enabled = it }
+                    OutlinedTextField(
+                        value = down,
+                        onValueChange = { down = it.filter { ch -> ch.isDigit() || ch == '.' } },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        label = { Text("تحميل Mbps") },
+                    )
+                    OutlinedTextField(
+                        value = up,
+                        onValueChange = { up = it.filter { ch -> ch.isDigit() || ch == '.' } },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        label = { Text("رفع Mbps") },
+                    )
+                    Text(
+                        "الملف مستقل عن السرعة العامة. النافذة العائمة التي تفتح من هنا تستهدف هذا التطبيق. تطبيق خنق مختلف لكل UID داخل TUN يحتاج تصنيف UID في طبقة النفق.",
+                        color = TextSecondary,
+                        fontSize = 10.sp,
+                    )
+                    OutlinedButton(
+                        onClick = {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this@MainActivity)) {
+                                runCatching { startActivity(android.content.Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, android.net.Uri.parse("package:$packageName"))) }
+                            } else {
+                                SpeedOverlayService.startForApp(this@MainActivity, app.packageName, app.label)
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp),
+                    ) { Text("فتح نافذة السرعة لهذا التطبيق") }
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    val dl = down.toDoubleOrNull()?.takeIf { it > 0 }?.let { (it * 1000.0).toLong() }
+                    val ul = up.toDoubleOrNull()?.takeIf { it > 0 }?.let { (it * 1000.0).toLong() }
+                    onSave(enabled, dl, ul)
+                }) { Text("حفظ") }
+            },
+            dismissButton = { TextButton(onClick = onDismiss) { Text("إلغاء") } },
+        )
+    }
+
+    private fun usagePercent(used: Long, total: Long): String =
+        if (total <= 0L) "0.0" else String.format(Locale.US, "%.1f", used.toDouble() * 100.0 / total.toDouble())
 
     @Composable
     private fun TrafficCard(symbol: String, title: String, value: String, accent: Color, modifier: Modifier) {
@@ -921,7 +1198,8 @@ class MainActivity : ComponentActivity() {
             NavigationBarItem(selected = tab == 0, onClick = { onTab(0) }, icon = { Text("⌂", fontSize = 20.sp) }, label = { Text("الرئيسية", fontSize = 10.sp) })
             NavigationBarItem(selected = tab == 1, onClick = { onTab(1) }, icon = { Text("↯", fontSize = 20.sp) }, label = { Text("السرعة", fontSize = 10.sp) })
             NavigationBarItem(selected = tab == 2, onClick = { onTab(2) }, icon = { Text("◉", fontSize = 19.sp) }, label = { Text("التطبيقات", fontSize = 10.sp) })
-            NavigationBarItem(selected = tab == 3, onClick = { onTab(3) }, icon = { Text("⚙", fontSize = 19.sp) }, label = { Text("الإعدادات", fontSize = 10.sp) })
+            NavigationBarItem(selected = tab == 3, onClick = { onTab(3) }, icon = { Text("🧠", fontSize = 17.sp) }, label = { Text("الذكي", fontSize = 10.sp) })
+            NavigationBarItem(selected = tab == 4, onClick = { onTab(4) }, icon = { Text("⚙", fontSize = 19.sp) }, label = { Text("الإعدادات", fontSize = 10.sp) })
         }
     }
 
