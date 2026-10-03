@@ -44,10 +44,8 @@ internal object QuotaPeriod {
             when (type) {
                 QuotaType.DAILY -> Unit
                 QuotaType.WEEKLY -> {
-                    set(Calendar.DAY_OF_WEEK, Calendar.MONDAY)
-                    if (get(Calendar.DAY_OF_WEEK) != Calendar.MONDAY) {
-                        add(Calendar.DAY_OF_MONTH, -1)
-                    }
+                    val daysSinceMonday = (get(Calendar.DAY_OF_WEEK) + 5) % 7
+                    add(Calendar.DAY_OF_MONTH, -daysSinceMonday)
                 }
                 QuotaType.MONTHLY -> set(Calendar.DAY_OF_MONTH, 1)
             }
