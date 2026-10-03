@@ -17,9 +17,9 @@ android {
         versionName = "1.1.0"
 
         // Public values only (same ones the website uses). No secrets here.
-        buildConfigField("String", "API_BASE", "\"https://read-fix-build-magic.lovable.app/api/public/vpn\"")
-        buildConfigField("String", "AUTH_URL", "\"https://abzykxcudjnceqdqurrc.supabase.co/auth/v1\"")
-        buildConfigField("String", "AUTH_KEY", "\"sb_publishable_SoW7idGma-3aqlx-pIMrTw_sK3nex2h\"")
+        buildConfigField("String", "API_BASE", ""https://read-fix-build-magic.lovable.app/api/public/vpn"")
+        buildConfigField("String", "AUTH_URL", ""https://abzykxcudjnceqdqurrc.supabase.co/auth/v1"")
+        buildConfigField("String", "AUTH_KEY", ""sb_publishable_SoW7idGma-3aqlx-pIMrTw_sK3nex2h"")
 
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
@@ -90,6 +90,7 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.robolectric:robolectric:4.17")
+    testImplementation("androidx.test:core:1.6.1")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:runner:1.6.2")
 }
