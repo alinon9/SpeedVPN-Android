@@ -4,9 +4,62 @@ import android.content.ContentValues
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
+import java.util.Calendar
 
 private const val USAGE_DB_NAME = "speedvpn_usage.db"
-private const val USAGE_DB_VERSION = 1
+private const val USAGE_DB_VERSION = 2
+
+internal enum class QuotaType {
+    DAILY,
+    WEEKLY,
+    MONTHLY,
+}
+
+internal enum class ResetBehavior {
+    AUTO_RESET,
+    BLOCK_UNTIL_RESET,
+}
+
+internal data class AppQuotaPolicy(
+    val packageName: String,
+    val quotaType: QuotaType,
+    val limitBytes: Long,
+    val periodStartMillis: Long,
+    val periodEndMillis: Long,
+    val usedBytes: Long,
+    val resetBehavior: ResetBehavior,
+)
+
+internal object QuotaPeriod {
+    data class Bounds(val startMillis: Long, val endMillis: Long)
+
+    fun current(type: QuotaType, nowMillis: Long = System.currentTimeMillis()): Bounds {
+        val start = Calendar.getInstance().apply {
+            timeInMillis = nowMillis
+            set(Calendar.HOUR_OF_DAY, 0)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+            when (type) {
+                QuotaType.DAILY -> Unit
+                QuotaType.WEEKLY -> {
+                    val daysSinceMonday = (get(Calendar.DAY_OF_WEEK) + 5) % 7
+                    add(Calendar.DAY_OF_MONTH, -daysSinceMonday)
+                }
+                QuotaType.MONTHLY -> set(Calendar.DAY_OF_MONTH, 1)
+            }
+        }
+        val end = (start.clone() as Calendar).apply {
+            when (type) {
+                QuotaType.DAILY -> add(Calendar.DAY_OF_MONTH, 1)
+                QuotaType.WEEKLY -> add(Calendar.DAY_OF_MONTH, 7)
+                QuotaType.MONTHLY -> add(Calendar.MONTH, 1)
+            }
+            add(Calendar.MILLISECOND, -1)
+        }
+        return Bounds(start.timeInMillis, end.timeInMillis)
+    }
+}
 
 internal data class AppPolicy(
     val packageName: String,
@@ -31,7 +84,11 @@ internal data class DailyUsageRow(
         if (Long.MAX_VALUE - a < b) Long.MAX_VALUE else a + b
 }
 
-private class UsageDbHelper(context: Context) : SQLiteOpenHelper(context, USAGE_DB_NAME, null, USAGE_DB_VERSION) {
+internal class UsageDbHelper(
+    context: Context,
+    dbName: String = USAGE_DB_NAME,
+    dbVersion: Int = USAGE_DB_VERSION,
+) : SQLiteOpenHelper(context, dbName, null, dbVersion) {
     override fun onConfigure(db: SQLiteDatabase) {
         super.onConfigure(db)
         db.setForeignKeyConstraintsEnabled(true)
@@ -49,6 +106,7 @@ private class UsageDbHelper(context: Context) : SQLiteOpenHelper(context, USAGE_
             )
             """.trimIndent(),
         )
+        createQuotaTable(db)
         db.execSQL(
             """
             CREATE TABLE daily_usage (
@@ -66,8 +124,48 @@ private class UsageDbHelper(context: Context) : SQLiteOpenHelper(context, USAGE_
         db.execSQL("CREATE INDEX idx_daily_usage_date_total ON daily_usage(date, download_bytes, upload_bytes)")
     }
 
+    private fun createQuotaTable(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS app_quota_policy (
+                package_name TEXT NOT NULL,
+                quota_type TEXT NOT NULL CHECK (quota_type IN ('DAILY', 'WEEKLY', 'MONTHLY')),
+                limit_bytes INTEGER NOT NULL CHECK (limit_bytes > 0),
+                period_start_millis INTEGER NOT NULL,
+                period_end_millis INTEGER NOT NULL,
+                used_bytes INTEGER NOT NULL DEFAULT 0 CHECK (used_bytes >= 0),
+                reset_behavior TEXT NOT NULL DEFAULT 'AUTO_RESET'
+                    CHECK (reset_behavior IN ('AUTO_RESET', 'BLOCK_UNTIL_RESET')),
+                updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000),
+                PRIMARY KEY (package_name, quota_type),
+                FOREIGN KEY (package_name) REFERENCES app_policy(package_name) ON DELETE CASCADE
+            )
+            """.trimIndent(),
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_app_quota_type ON app_quota_policy(package_name, quota_type)")
+    }
+
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        // Versioned migrations are intentionally additive. No schema changes exist yet.
+        if (oldVersion < 2) {
+            db.beginTransaction()
+            try {
+                createQuotaTable(db)
+                val daily = QuotaPeriod.current(QuotaType.DAILY)
+                db.execSQL(
+                    """
+                    INSERT OR IGNORE INTO app_quota_policy
+                    (package_name, quota_type, limit_bytes, period_start_millis, period_end_millis, used_bytes, reset_behavior, updated_at)
+                    SELECT package_name, 'DAILY', daily_limit_bytes, ?, ?, 0, 'AUTO_RESET', ?
+                    FROM app_policy
+                    WHERE daily_limit_bytes IS NOT NULL AND daily_limit_bytes > 0
+                    """.trimIndent(),
+                    arrayOf(daily.startMillis, daily.endMillis, System.currentTimeMillis()),
+                )
+                db.setTransactionSuccessful()
+            } finally {
+                db.endTransaction()
+            }
+        }
     }
 }
 
@@ -108,6 +206,9 @@ internal object UsageRepository {
             }
             db.insertWithOnConflict("app_policy", null, values, SQLiteDatabase.CONFLICT_REPLACE)
         }
+        if (dailyLimitBytes != null) {
+            setQuotaPolicy(context, packageName, label, uid, QuotaType.DAILY, dailyLimitBytes)
+        }
     }
 
     fun setBlocked(context: Context, packageName: String, label: String, uid: Int, blocked: Boolean) {
@@ -130,7 +231,115 @@ internal object UsageRepository {
             }
             h.writableDatabase.update("app_policy", values, "package_name = ?", arrayOf(packageName))
         }
+        if (limitBytes == null || limitBytes <= 0L) {
+            deleteQuotaPolicy(context, packageName, QuotaType.DAILY)
+        } else {
+            setQuotaPolicy(context, packageName, label, uid, QuotaType.DAILY, limitBytes)
+        }
     }
+
+    fun setQuotaPolicy(
+        context: Context,
+        packageName: String,
+        label: String,
+        uid: Int,
+        quotaType: QuotaType,
+        limitBytes: Long?,
+        resetBehavior: ResetBehavior = ResetBehavior.AUTO_RESET,
+    ) {
+        ensureApp(context, packageName, label, uid)
+        if (limitBytes == null || limitBytes <= 0L) {
+            deleteQuotaPolicy(context, packageName, quotaType)
+            if (quotaType == QuotaType.DAILY) {
+                helper(context).use { h ->
+                    h.writableDatabase.update(
+                        "app_policy",
+                        ContentValues().apply { putNull("daily_limit_bytes") },
+                        "package_name = ?",
+                        arrayOf(packageName),
+                    )
+                }
+            }
+            return
+        }
+        val bounds = QuotaPeriod.current(quotaType)
+        helper(context).use { h ->
+            val values = ContentValues().apply {
+                put("package_name", packageName)
+                put("quota_type", quotaType.name)
+                put("limit_bytes", limitBytes)
+                put("period_start_millis", bounds.startMillis)
+                put("period_end_millis", bounds.endMillis)
+                put("used_bytes", 0L)
+                put("reset_behavior", resetBehavior.name)
+                put("updated_at", System.currentTimeMillis())
+            }
+            h.writableDatabase.insertWithOnConflict(
+                "app_quota_policy",
+                null,
+                values,
+                SQLiteDatabase.CONFLICT_REPLACE,
+            )
+            if (quotaType == QuotaType.DAILY) {
+                h.writableDatabase.update(
+                    "app_policy",
+                    ContentValues().apply { put("daily_limit_bytes", limitBytes) },
+                    "package_name = ?",
+                    arrayOf(packageName),
+                )
+            }
+        }
+    }
+
+    fun deleteQuotaPolicy(context: Context, packageName: String, quotaType: QuotaType) {
+        helper(context).use { h ->
+            h.writableDatabase.delete(
+                "app_quota_policy",
+                "package_name = ? AND quota_type = ?",
+                arrayOf(packageName, quotaType.name),
+            )
+        }
+    }
+
+    fun readQuotaPolicies(context: Context, packageName: String? = null): List<AppQuotaPolicy> {
+        helper(context).use { h ->
+            val selection = packageName?.let { "package_name = ?" }
+            val args = packageName?.let { arrayOf(it) }
+            return h.readableDatabase.query(
+                "app_quota_policy",
+                arrayOf(
+                    "package_name", "quota_type", "limit_bytes",
+                    "period_start_millis", "period_end_millis", "used_bytes", "reset_behavior",
+                ),
+                selection,
+                args,
+                null,
+                null,
+                "package_name COLLATE NOCASE ASC, quota_type ASC",
+            ).use { c ->
+                buildList {
+                    while (c.moveToNext()) {
+                        val type = runCatching { QuotaType.valueOf(c.getString(1)) }.getOrNull() ?: continue
+                        val reset = runCatching { ResetBehavior.valueOf(c.getString(6)) }.getOrDefault(ResetBehavior.AUTO_RESET)
+                        add(
+                            AppQuotaPolicy(
+                                packageName = c.getString(0),
+                                quotaType = type,
+                                limitBytes = c.getLong(2),
+                                periodStartMillis = c.getLong(3),
+                                periodEndMillis = c.getLong(4),
+                                usedBytes = c.getLong(5),
+                                resetBehavior = reset,
+                            ),
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    fun readQuotaPolicyMap(context: Context): Map<String, List<AppQuotaPolicy>> =
+        readQuotaPolicies(context).groupBy { it.packageName }
 
     fun ensureApp(context: Context, packageName: String, label: String, uid: Int) {
         helper(context).use { h ->
@@ -235,31 +444,31 @@ internal object UsageRepository {
 }
 
 internal object UsageDate {
-    private fun format(cal: java.util.Calendar): String =
+    private fun format(cal: Calendar): String =
         java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(cal.time)
 
-    fun today(): String = format(java.util.Calendar.getInstance())
+    fun today(): String = format(Calendar.getInstance())
 
-    fun startOfWeek(): String = java.util.Calendar.getInstance().apply {
-        set(java.util.Calendar.DAY_OF_WEEK, firstDayOfWeek)
-        set(java.util.Calendar.HOUR_OF_DAY, 0)
-        set(java.util.Calendar.MINUTE, 0)
-        set(java.util.Calendar.SECOND, 0)
-        set(java.util.Calendar.MILLISECOND, 0)
+    fun startOfWeek(): String = Calendar.getInstance().apply {
+        set(Calendar.DAY_OF_WEEK, firstDayOfWeek)
+        set(Calendar.HOUR_OF_DAY, 0)
+        set(Calendar.MINUTE, 0)
+        set(Calendar.SECOND, 0)
+        set(Calendar.MILLISECOND, 0)
     }.let(::format)
 
-    fun startOfMonth(): String = java.util.Calendar.getInstance().apply {
-        set(java.util.Calendar.DAY_OF_MONTH, 1)
-        set(java.util.Calendar.HOUR_OF_DAY, 0)
-        set(java.util.Calendar.MINUTE, 0)
-        set(java.util.Calendar.SECOND, 0)
-        set(java.util.Calendar.MILLISECOND, 0)
+    fun startOfMonth(): String = Calendar.getInstance().apply {
+        set(Calendar.DAY_OF_MONTH, 1)
+        set(Calendar.HOUR_OF_DAY, 0)
+        set(Calendar.MINUTE, 0)
+        set(Calendar.SECOND, 0)
+        set(Calendar.MILLISECOND, 0)
     }.let(::format)
 }
 
 internal object UsageDateOffset {
     fun value(offsetDays: Int): String {
-        val cal = java.util.Calendar.getInstance().apply { add(java.util.Calendar.DAY_OF_YEAR, offsetDays) }
+        val cal = Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, offsetDays) }
         return java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(cal.time)
     }
 }
