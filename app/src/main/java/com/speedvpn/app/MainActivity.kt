@@ -647,6 +647,7 @@ class MainActivity : ComponentActivity() {
         var blockedPackages by remember { mutableStateOf(VpnAppControl.read(this@MainActivity).blockedPackages) }
         var apps by remember { mutableStateOf<List<AppTrafficUsage>>(emptyList()) }
         var policies by remember { mutableStateOf<Map<String, AppPolicy>>(emptyMap()) }
+        var quotaPolicies by remember { mutableStateOf<Map<String, List<AppQuotaPolicy>>>(emptyMap()) }
         var appQuery by remember { mutableStateOf("") }
         var editingLimitApp by remember { mutableStateOf<AppTrafficUsage?>(null) }
         var editingSpeedApp by remember { mutableStateOf<AppTrafficUsage?>(null) }
@@ -667,6 +668,9 @@ class MainActivity : ComponentActivity() {
                 }
                 policies = withContext(Dispatchers.IO) {
                     UsageRepository.readPolicies(this@MainActivity).associateBy { it.packageName }
+                }
+                quotaPolicies = withContext(Dispatchers.IO) {
+                    UsageRepository.readQuotaPolicyMap(this@MainActivity)
                 }
                 if (s.status != VpnStatus.CONNECTED) break
                 delay(60_000)
@@ -734,7 +738,11 @@ class MainActivity : ComponentActivity() {
                 } else {
                     shownApps.forEach { app ->
                         val policy = policies[app.packageName]
-                        val limit = policy?.dailyLimitBytes
+                        val appQuotas = quotaPolicies[app.packageName].orEmpty()
+                        val dailyQuota = appQuotas.firstOrNull { it.quotaType == QuotaType.DAILY }
+                        val weeklyQuota = appQuotas.firstOrNull { it.quotaType == QuotaType.WEEKLY }
+                        val monthlyQuota = appQuotas.firstOrNull { it.quotaType == QuotaType.MONTHLY }
+                        val limit = dailyQuota?.limitBytes ?: policy?.dailyLimitBytes
                         val used = app.totalBytes
                         val remaining = limit?.let { (it - used).coerceAtLeast(0L) }
                         Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -749,6 +757,13 @@ class MainActivity : ComponentActivity() {
                                     Text(
                                         "الحد اليومي ${formatDataBytes(limit)} • المتبقي ${formatDataBytes(remaining ?: 0L)}",
                                         color = if ((remaining ?: 0L) == 0L) Color(0xFFFF7D88) else Amber,
+                                        fontSize = 9.sp,
+                                    )
+                                }
+                                if (weeklyQuota != null || monthlyQuota != null) {
+                                    Text(
+                                        "أسبوعي: ${weeklyQuota?.let { formatDataBytes(it.limitBytes) } ?: "—"} • شهري: ${monthlyQuota?.let { formatDataBytes(it.limitBytes) } ?: "—"}",
+                                        color = TextSecondary,
                                         fontSize = 9.sp,
                                     )
                                 }
@@ -772,7 +787,7 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                     Text("المعروض: ${shownApps.size} من ${apps.size}", color = TextSecondary, fontSize = 9.sp)
-                    Text("حد البيانات يعاد تقييمه يوميًا. الحظر اليدوي لا يُزال عند وصول التطبيق إلى الحد أو عند إعادة الضبط اليومية.", color = Amber, fontSize = 9.sp)
+                    Text("يمكن حفظ حد يومي/أسبوعي/شهري مستقل لكل تطبيق. هذا الإصدار يضيف النموذج والتخزين فقط؛ الـWeekly/Monthly enforcement سيأتي في PR2.", color = Amber, fontSize = 9.sp)
                 }
             }
         }
@@ -780,13 +795,18 @@ class MainActivity : ComponentActivity() {
         editingLimitApp?.let { app ->
             AppLimitDialog(
                 app = app,
-                currentLimitBytes = policies[app.packageName]?.dailyLimitBytes,
+                currentPolicies = quotaPolicies[app.packageName].orEmpty(),
                 onDismiss = { editingLimitApp = null },
-                onSave = { bytes ->
+                onSave = { quotaType, bytes ->
                     lifecycleScope.launch(Dispatchers.IO) {
-                        UsageRepository.setDailyLimitBytes(this@MainActivity, app.packageName, app.label, app.uid, bytes)
-                        UsageCollector.enforceDailyLimits(this@MainActivity)
+                        if (quotaType == QuotaType.DAILY) {
+                            UsageRepository.setDailyLimitBytes(this@MainActivity, app.packageName, app.label, app.uid, bytes)
+                            UsageCollector.enforceDailyLimits(this@MainActivity)
+                        } else {
+                            UsageRepository.setQuotaPolicy(this@MainActivity, app.packageName, app.uid, quotaType, bytes)
+                        }
                         policies = UsageRepository.readPolicies(this@MainActivity).associateBy { it.packageName }
+                        quotaPolicies = UsageRepository.readQuotaPolicyMap(this@MainActivity)
                     }
                     editingLimitApp = null
                 },
@@ -815,39 +835,67 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun AppLimitDialog(
         app: AppTrafficUsage,
-        currentLimitBytes: Long?,
+        currentPolicies: List<AppQuotaPolicy>,
         onDismiss: () -> Unit,
-        onSave: (Long?) -> Unit,
+        onSave: (QuotaType, Long?) -> Unit,
     ) {
-        var mbText by remember(currentLimitBytes) {
-            mutableStateOf(currentLimitBytes?.let { String.format(Locale.US, "%.0f", it / 1_000_000.0) } ?: "")
+        var selectedType by remember(currentPolicies) {
+            mutableStateOf(currentPolicies.firstOrNull()?.quotaType ?: QuotaType.DAILY)
+        }
+        val selectedPolicy = currentPolicies.firstOrNull { it.quotaType == selectedType }
+        var mbText by remember(selectedType, selectedPolicy?.limitBytes) {
+            mutableStateOf(selectedPolicy?.limitBytes?.let {
+                String.format(Locale.US, "%.0f", it / 1_000_000.0)
+            } ?: "")
         }
         AlertDialog(
             onDismissRequest = onDismiss,
             title = { Text("حد بيانات ${app.label}") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("أدخل الحد اليومي بالميجابايت. مثال: 1000 MB. اتركه فارغًا لإلغاء الحد.", fontSize = 12.sp)
+                    Text("اختر نوع الحد. يمكن للتطبيق نفسه حمل Daily + Weekly + Monthly معًا.", fontSize = 12.sp)
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        listOf(
+                            QuotaType.DAILY to "يومي",
+                            QuotaType.WEEKLY to "أسبوعي",
+                            QuotaType.MONTHLY to "شهري",
+                        ).forEach { (type, label) ->
+                            FilterChip(
+                                selected = selectedType == type,
+                                onClick = {
+                                    selectedType = type
+                                    mbText = currentPolicies.firstOrNull { it.quotaType == type }?.limitBytes?.let {
+                                        String.format(Locale.US, "%.0f", it / 1_000_000.0)
+                                    } ?: ""
+                                },
+                                label = { Text(label, fontSize = 11.sp) },
+                                modifier = Modifier.weight(1f),
+                            )
+                        }
+                    }
                     OutlinedTextField(
                         value = mbText,
                         onValueChange = { mbText = it.filter { ch -> ch.isDigit() || ch == '.' } },
                         singleLine = true,
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                        label = { Text("MB يوميًا") },
+                        label = { Text("MB") },
                     )
-                    Text("الاستهلاك الحالي: ${formatDataBytes(app.totalBytes)}", color = TextSecondary, fontSize = 10.sp)
+                    Text("الاستهلاك الحالي اليوم: ${formatDataBytes(app.totalBytes)}", color = TextSecondary, fontSize = 10.sp)
+                    Text("اتركه فارغًا لإلغاء هذا النوع من الحد.", color = TextSecondary, fontSize = 10.sp)
                 }
             },
             confirmButton = {
                 Button(onClick = {
                     val mb = mbText.toDoubleOrNull()
-                    onSave(mb?.takeIf { it > 0 }?.let { (it * 1_000_000.0).toLong() })
+                    onSave(selectedType, mb?.takeIf { it > 0 }?.let { (it * 1_000_000.0).toLong() })
                 }) { Text("حفظ") }
             },
             dismissButton = { TextButton(onClick = onDismiss) { Text("إلغاء") } },
         )
     }
-
     @Composable
     private fun AppSpeedDialog(
         app: AppTrafficUsage,
