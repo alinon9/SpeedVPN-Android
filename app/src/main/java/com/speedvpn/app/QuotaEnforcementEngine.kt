@@ -46,7 +46,7 @@ internal object QuotaEnforcementEngine {
         UsageRepository.readQuotaPolicies(context).forEach { policy ->
             val bounds = QuotaPeriod.current(policy.quotaType, nowMillis)
             val startDate = formatDate(bounds.startMillis)
-            val endDate = formatDate(bounds.endMillis)
+            // periodEndMillis is exclusive; daily_usage stores whole calendar dates.\n            // Use the last instant of the period so the next period's date is not counted.\n            val endDate = formatDate(bounds.endMillis - 1L)
             val usedBytes = UsageRepository.sumUsageInPeriod(
                 context = context,
                 packageName = policy.packageName,
