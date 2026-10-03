@@ -48,7 +48,18 @@ internal object UsageCollector {
         val now = System.currentTimeMillis()
         collectDay(context, UsageDate.today(), startOfDayMillis(0), now)
         collectDay(context, UsageDateOffset.value(-1), startOfDayMillis(-1), startOfDayMillis(0))
-        enforceDailyLimits(context)
+        runCatching {
+            enforceDailyLimits(context)
+        }.onFailure {
+            DiagnosticsRepository.record(
+                context,
+                "WARN",
+                "Quota",
+                "COLLECTOR_ENFORCEMENT_FAILED",
+                it.stackTraceToString(),
+            )
+            log("Quota enforcement failed during usage collection: " + it.message)
+        }
         maybeAnalyze(context)
     }
 
