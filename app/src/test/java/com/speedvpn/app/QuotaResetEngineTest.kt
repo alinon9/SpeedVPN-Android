@@ -52,6 +52,14 @@ class QuotaResetEngineTest {
         val p="com.example.block"
         UsageRepository.setQuotaPolicy(context,p,"Block",1004,QuotaType.DAILY,100L,ResetBehavior.BLOCK_UNTIL_RESET)
         val policy=UsageRepository.readQuotaPolicies(context,p).single()
+        UsageDbHelper(context).use { db ->
+            db.writableDatabase.update(
+                "app_quota_policy",
+                android.content.ContentValues().apply { put("used_bytes", 999L) },
+                "package_name = ? AND quota_type = ?",
+                arrayOf(p, QuotaType.DAILY.name),
+            )
+        }
         assertEquals(1,QuotaResetEngine.resetExpiredPolicies(context,policy.periodEndMillis+1L))
         val reset=UsageRepository.readQuotaPolicies(context,p).single()
         assertEquals(0L,reset.usedBytes)
