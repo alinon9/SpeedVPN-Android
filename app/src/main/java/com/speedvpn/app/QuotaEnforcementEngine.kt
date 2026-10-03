@@ -14,7 +14,7 @@ internal object QuotaEnforcementEngine {
         lastRestartAtMillis.set(Long.MIN_VALUE)
     }
 
-    internal fun tryAcquireRestartForTests(nowMillis: Long): Boolean {
+    internal fun tryAcquireRestart(nowMillis: Long): Boolean {
         while (true) {
             val previous = lastRestartAtMillis.get()
             if (previous != Long.MIN_VALUE && nowMillis - previous < RESTART_THROTTLE_MS) {
