@@ -121,6 +121,42 @@ class QuotaEnforcementEngineTest {
     }
 
     @Test
+    fun deferredRestartRunsOnceAfterThrottleWindow() {
+        QuotaEnforcementEngine.resetRestartThrottleForTests()
+        val base = 1_000_000L
+        var restarts = 0
+        var scheduledDelay = -1L
+        var scheduledAction: (() -> Unit)? = null
+
+        QuotaEnforcementEngine.requestRestartForTests(
+            context = context,
+            nowMillis = base,
+            restart = { restarts++ },
+            postDelayed = { delay, action ->
+                scheduledDelay = delay
+                scheduledAction = action
+            },
+            clock = { base + 5_000L },
+        )
+        assertEquals(1, restarts)
+
+        QuotaEnforcementEngine.requestRestartForTests(
+            context = context,
+            nowMillis = base + 1_000L,
+            restart = { restarts++ },
+            postDelayed = { delay, action ->
+                scheduledDelay = delay
+                scheduledAction = action
+            },
+            clock = { base + 5_000L },
+        )
+
+        assertEquals(4_000L, scheduledDelay)
+        scheduledAction!!.invoke()
+        assertEquals(2, restarts)
+    }
+
+    @Test
     fun lazyResetClearsExpiredPolicyOnFirstEnforcement() {
         val packageName = "com.example.lazy"
         UsageRepository.setQuotaPolicy(
