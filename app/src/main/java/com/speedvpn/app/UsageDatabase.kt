@@ -249,6 +249,29 @@ internal object UsageRepository {
         }
     }
 
+    fun resetQuotaPeriod(
+        context: Context,
+        packageName: String,
+        quotaType: QuotaType,
+        periodStartMillis: Long,
+        periodEndMillis: Long,
+    ): Boolean {
+        helper(context).use { h ->
+            val values = ContentValues().apply {
+                put("period_start_millis", periodStartMillis)
+                put("period_end_millis", periodEndMillis)
+                put("used_bytes", 0L)
+                put("updated_at", System.currentTimeMillis())
+            }
+            return h.writableDatabase.update(
+                "app_quota_policy",
+                values,
+                "package_name = ? AND quota_type = ?",
+                arrayOf(packageName, quotaType.name),
+            ) == 1
+        }
+    }
+
     fun readQuotaPolicies(context: Context, packageName: String? = null): List<AppQuotaPolicy> {
         helper(context).use { h ->
             val selection = packageName?.let { "package_name = ?" }
