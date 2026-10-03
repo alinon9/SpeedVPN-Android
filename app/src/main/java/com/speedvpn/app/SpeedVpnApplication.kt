@@ -6,7 +6,10 @@ import android.os.Process
 class SpeedVpnApplication : Application() {
     override fun onCreate() {
         super.onCreate()
-        if (SmartSettings.isStatsEnabled(this)) UsageCollectionScheduler.schedule(this)
+        if (SmartSettings.isStatsEnabled(this)) {
+            UsageCollectionScheduler.schedule(this)
+            QuotaWorkScheduler.schedule(this)
+        }
         val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
             runCatching {
