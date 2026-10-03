@@ -119,6 +119,109 @@ class QuotaEnforcementEngineTest {
         )
     }
 
+    @Test
+    fun lazyResetClearsExpiredPolicyOnFirstEnforcement() {
+        val packageName = "com.example.lazy"
+        UsageRepository.setQuotaPolicy(
+            context, packageName, "Lazy", 2011, QuotaType.DAILY, 1_000L,
+        )
+        val now = System.currentTimeMillis()
+        val current = QuotaPeriod.current(QuotaType.DAILY, now)
+        val oldStart = current.startMillis - 86_400_000L
+        val oldEnd = current.endMillis - 86_400_000L
+
+        UsageRepository.resetQuotaPeriod(
+            context, packageName, QuotaType.DAILY, oldStart, oldEnd,
+        )
+        UsageDatabaseTestSupport.setQuotaUsedBytes(context, packageName, QuotaType.DAILY, 999L)
+
+        QuotaEnforcementEngine.evaluateBlockedPackages(context, now)
+
+        val policy = UsageRepository.readQuotaPolicies(context, packageName).single()
+        assertEquals(0L, policy.usedBytes)
+        assertEquals(current.startMillis, policy.periodStartMillis)
+        assertEquals(current.endMillis, policy.periodEndMillis)
+    }
+
+    @Test
+    fun policyIsNotResetInsideCurrentPeriod() {
+        val packageName = "com.example.stable"
+        UsageRepository.setQuotaPolicy(
+            context, packageName, "Stable", 2012, QuotaType.DAILY, 1_000L,
+        )
+        val now = System.currentTimeMillis()
+        val current = QuotaPeriod.current(QuotaType.DAILY, now)
+        UsageDatabaseTestSupport.setQuotaUsedBytes(context, packageName, QuotaType.DAILY, 999L)
+
+        val resets = QuotaResetEngine.resetExpiredPolicies(context, now)
+
+        val policy = UsageRepository.readQuotaPolicies(context, packageName).single()
+        assertEquals(0, resets)
+        assertEquals(999L, policy.usedBytes)
+        assertEquals(current.startMillis, policy.periodStartMillis)
+        assertEquals(current.endMillis, policy.periodEndMillis)
+    }
+
+    @Test
+    fun unchangedQuotaBlockSetDoesNotTriggerEnforcementChange() {
+        val packageName = "com.example.unchanged"
+        UsageRepository.setQuotaPolicy(
+            context, packageName, "Unchanged", 2013, QuotaType.DAILY, 1_000L,
+        )
+
+        var restarts = 0
+        assertEquals(
+            false,
+            QuotaEnforcementEngine.enforce(
+                context,
+                System.currentTimeMillis(),
+                restart = { restarts++ },
+            ),
+        )
+        assertEquals(0, restarts)
+    }
+
+    @Test
+    fun duplicateEnforcementIsIdempotent() {
+        val packageName = "com.example.idempotent"
+        UsageRepository.setQuotaPolicy(
+            context, packageName, "Idempotent", 2014, QuotaType.DAILY, 1_000L,
+        )
+        val now = System.currentTimeMillis()
+        UsageRepository.upsertDailyUsage(
+            context,
+            DailyUsageRow(date(now), packageName, "Idempotent", 2014, 700L, 400L),
+        )
+
+        assertEquals(
+            true,
+            QuotaEnforcementEngine.enforce(context, now, restart = {}),
+        )
+        assertEquals(
+            false,
+            QuotaEnforcementEngine.enforce(context, now, restart = {}),
+        )
+        assertEquals(
+            setOf(packageName),
+            VpnAppControl.quotaBlockedPackages(context),
+        )
+    }
+
+    @Test
+    fun quotaBlockedPackagesPersistAcrossReads() {
+        val packageName = "com.example.persist"
+        VpnAppControl.replaceQuotaBlockedPackages(context, setOf(packageName))
+
+        assertEquals(
+            setOf(packageName),
+            VpnAppControl.quotaBlockedPackages(context),
+        )
+        assertEquals(
+            setOf(packageName),
+            VpnAppControl.quotaBlockedPackages(context),
+        )
+    }
+
     private fun date(millis: Long): String =
         SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date(millis))
 }
