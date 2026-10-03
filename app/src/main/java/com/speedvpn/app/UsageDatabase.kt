@@ -22,7 +22,6 @@ internal enum class ResetBehavior {
 
 internal data class AppQuotaPolicy(
     val packageName: String,
-    val uid: Int,
     val quotaType: QuotaType,
     val limitBytes: Long,
     val periodStartMillis: Long,
@@ -126,7 +125,6 @@ private class UsageDbHelper(context: Context) : SQLiteOpenHelper(context, USAGE_
             """
             CREATE TABLE IF NOT EXISTS app_quota_policy (
                 package_name TEXT NOT NULL,
-                uid INTEGER NOT NULL,
                 quota_type TEXT NOT NULL CHECK (quota_type IN ('DAILY', 'WEEKLY', 'MONTHLY')),
                 limit_bytes INTEGER NOT NULL CHECK (limit_bytes > 0),
                 period_start_millis INTEGER NOT NULL,
@@ -134,7 +132,7 @@ private class UsageDbHelper(context: Context) : SQLiteOpenHelper(context, USAGE_
                 used_bytes INTEGER NOT NULL DEFAULT 0 CHECK (used_bytes >= 0),
                 reset_behavior TEXT NOT NULL DEFAULT 'AUTO_RESET'
                     CHECK (reset_behavior IN ('AUTO_RESET', 'BLOCK_UNTIL_RESET')),
-                updated_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000),
                 PRIMARY KEY (package_name, quota_type),
                 FOREIGN KEY (package_name) REFERENCES app_policy(package_name) ON DELETE CASCADE
             )
@@ -152,8 +150,8 @@ private class UsageDbHelper(context: Context) : SQLiteOpenHelper(context, USAGE_
                 db.execSQL(
                     """
                     INSERT OR IGNORE INTO app_quota_policy
-                    (package_name, uid, quota_type, limit_bytes, period_start_millis, period_end_millis, used_bytes, reset_behavior, updated_at)
-                    SELECT package_name, uid, 'DAILY', daily_limit_bytes, ?, ?, 0, 'AUTO_RESET', ?
+                    (package_name, quota_type, limit_bytes, period_start_millis, period_end_millis, used_bytes, reset_behavior, updated_at)
+                    SELECT package_name, 'DAILY', daily_limit_bytes, ?, ?, 0, 'AUTO_RESET', ?
                     FROM app_policy
                     WHERE daily_limit_bytes IS NOT NULL AND daily_limit_bytes > 0
                     """.trimIndent(),
@@ -264,7 +262,6 @@ internal object UsageRepository {
         helper(context).use { h ->
             val values = ContentValues().apply {
                 put("package_name", packageName)
-                put("uid", uid)
                 put("quota_type", quotaType.name)
                 put("limit_bytes", limitBytes)
                 put("period_start_millis", bounds.startMillis)
@@ -307,7 +304,7 @@ internal object UsageRepository {
             return h.readableDatabase.query(
                 "app_quota_policy",
                 arrayOf(
-                    "package_name", "uid", "quota_type", "limit_bytes",
+                    "package_name", "quota_type", "limit_bytes",
                     "period_start_millis", "period_end_millis", "used_bytes", "reset_behavior",
                 ),
                 selection,
@@ -318,17 +315,16 @@ internal object UsageRepository {
             ).use { c ->
                 buildList {
                     while (c.moveToNext()) {
-                        val type = runCatching { QuotaType.valueOf(c.getString(2)) }.getOrNull() ?: continue
-                        val reset = runCatching { ResetBehavior.valueOf(c.getString(7)) }.getOrDefault(ResetBehavior.AUTO_RESET)
+                        val type = runCatching { QuotaType.valueOf(c.getString(1)) }.getOrNull() ?: continue
+                        val reset = runCatching { ResetBehavior.valueOf(c.getString(6)) }.getOrDefault(ResetBehavior.AUTO_RESET)
                         add(
                             AppQuotaPolicy(
                                 packageName = c.getString(0),
-                                uid = c.getInt(1),
                                 quotaType = type,
-                                limitBytes = c.getLong(3),
-                                periodStartMillis = c.getLong(4),
-                                periodEndMillis = c.getLong(5),
-                                usedBytes = c.getLong(6),
+                                limitBytes = c.getLong(2),
+                                periodStartMillis = c.getLong(3),
+                                periodEndMillis = c.getLong(4),
+                                usedBytes = c.getLong(5),
                                 resetBehavior = reset,
                             ),
                         )
