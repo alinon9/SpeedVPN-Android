@@ -205,7 +205,7 @@ internal object UsageRepository {
             db.insertWithOnConflict("app_policy", null, values, SQLiteDatabase.CONFLICT_REPLACE)
         }
         if (dailyLimitBytes != null) {
-            setQuotaPolicy(context, packageName, uid, QuotaType.DAILY, dailyLimitBytes)
+            setQuotaPolicy(context, packageName, label, uid, QuotaType.DAILY, dailyLimitBytes)
         }
     }
 
@@ -232,19 +232,20 @@ internal object UsageRepository {
         if (limitBytes == null || limitBytes <= 0L) {
             deleteQuotaPolicy(context, packageName, QuotaType.DAILY)
         } else {
-            setQuotaPolicy(context, packageName, uid, QuotaType.DAILY, limitBytes)
+            setQuotaPolicy(context, packageName, label, uid, QuotaType.DAILY, limitBytes)
         }
     }
 
     fun setQuotaPolicy(
         context: Context,
         packageName: String,
+        label: String,
         uid: Int,
         quotaType: QuotaType,
         limitBytes: Long?,
         resetBehavior: ResetBehavior = ResetBehavior.AUTO_RESET,
     ) {
-        ensureApp(context, packageName, packageName, uid)
+        ensureApp(context, packageName, label, uid)
         if (limitBytes == null || limitBytes <= 0L) {
             deleteQuotaPolicy(context, packageName, quotaType)
             if (quotaType == QuotaType.DAILY) {
