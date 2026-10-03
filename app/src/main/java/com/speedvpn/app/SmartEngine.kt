@@ -86,39 +86,7 @@ internal object UsageCollector {
     }
 
     fun enforceDailyLimits(context: Context) {
-        val policies = UsageRepository.readPolicies(context)
-        val today = UsageDate.today()
-        val usage = UsageRepository.topUsage(context, today, max(20, policies.size))
-            .associateBy { it.packageName }
-        val firewall = VpnAppControl.read(context)
-        var changed = false
-        val blocked = firewall.blockedPackages.toMutableSet()
-        val quotaBlocked = VpnAppControl.quotaBlockedPackages(context).toMutableSet()
-        policies.filter { !it.dailyLimitBytes.isNullOrBlankLimit() }.forEach { policy ->
-            val used = usage[policy.packageName]?.totalBytes ?: 0L
-            val exceeded = used >= (policy.dailyLimitBytes ?: Long.MAX_VALUE)
-            if (exceeded && !policy.blocked && policy.packageName !in quotaBlocked) {
-                quotaBlocked.add(policy.packageName)
-                blocked.add(policy.packageName)
-                changed = true
-                DiagnosticsRepository.record(context, "WARN", "DataLimit", "APP_DATA_LIMIT_REACHED", "${policy.label} reached its daily limit")
-            } else if (!exceeded && policy.packageName in quotaBlocked) {
-                quotaBlocked.remove(policy.packageName)
-                blocked.remove(policy.packageName)
-                changed = true
-                DiagnosticsRepository.record(context, "INFO", "DataLimit", "APP_DATA_LIMIT_RESET", "${policy.label} quota reset for a new day")
-            }
-        }
-        if (changed) {
-            val quotaPrefs = context.getSharedPreferences("app_control", Context.MODE_PRIVATE)
-            quotaPrefs.edit().putStringSet("quota_blocked_packages", quotaBlocked).commit()
-            val settings = firewall.copy(blockedPackages = blocked)
-            if (VpnAppControl.save(context, settings)) {
-                if (VpnRuntime.state.value.status == VpnStatus.CONNECTED) {
-                    SpeedVpnService.restartForSettings(context)
-                }
-            }
-        }
+        QuotaEnforcementEngine.enforce(context)
     }
 
     private fun Long?.isNullOrBlankLimit(): Boolean = this != null && this > 0L

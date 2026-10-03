@@ -179,6 +179,13 @@ object VpnAppControl {
         if (blocked) set.add(packageName) else set.remove(packageName)
         p.edit().putStringSet(QUOTA_BLOCKED_PACKAGES, set).commit()
     }
+
+    fun replaceQuotaBlockedPackages(context: Context, packages: Set<String>) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putStringSet(QUOTA_BLOCKED_PACKAGES, packages.toSet())
+            .commit()
+    }
 }
 
 fun formatDataBytes(bytes: Long): String = when {
