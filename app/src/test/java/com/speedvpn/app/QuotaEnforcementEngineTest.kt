@@ -222,6 +222,26 @@ class QuotaEnforcementEngineTest {
         )
     }
 
+    private object UsageDatabaseTestSupport {
+        fun setQuotaUsedBytes(
+            context: Context,
+            packageName: String,
+            quotaType: QuotaType,
+            usedBytes: Long,
+        ) {
+            UsageDbHelper(context).use { helper ->
+                helper.writableDatabase.update(
+                    "app_quota_policy",
+                    android.content.ContentValues().apply {
+                        put("used_bytes", usedBytes)
+                    },
+                    "package_name = ? AND quota_type = ?",
+                    arrayOf(packageName, quotaType.name),
+                )
+            }
+        }
+    }
+
     private fun date(millis: Long): String =
         SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date(millis))
 }
