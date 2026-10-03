@@ -100,6 +100,42 @@ class QuotaEnforcementEngineTest {
         assertEquals(setOf(packageName), QuotaEnforcementEngine.evaluateBlockedPackages(context, now))
     }
 
+
+    @Test
+    fun restartIsThrottledForFiveSeconds() {
+        val packageName = "com.example.restart"
+        UsageRepository.setQuotaPolicy(
+            context, packageName, "Restart", 2010, QuotaType.DAILY, 1_000L,
+        )
+        val now = System.currentTimeMillis()
+        UsageRepository.upsertDailyUsage(
+            context,
+            DailyUsageRow(date(now), packageName, "Restart", 2010, 700L, 400L),
+        )
+
+        QuotaEnforcementEngine.resetRestartThrottleForTests()
+        var restarts = 0
+
+        assertEquals(
+            true,
+            QuotaEnforcementEngine.enforce(context, now, restart = { restarts++ }),
+        )
+        assertEquals(1, restarts)
+
+        assertEquals(
+            false,
+            QuotaEnforcementEngine.enforce(context, now + 4_999L, restart = { restarts++ }),
+        )
+        assertEquals(1, restarts)
+
+        VpnAppControl.replaceQuotaBlockedPackages(context, emptySet())
+        assertEquals(
+            true,
+            QuotaEnforcementEngine.enforce(context, now + 5_000L, restart = { restarts++ }),
+        )
+        assertEquals(2, restarts)
+    }
+
     private fun date(millis: Long): String =
         SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date(millis))
 }
