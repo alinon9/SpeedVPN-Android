@@ -6,7 +6,7 @@ import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 
 private const val USAGE_DB_NAME = "speedvpn_usage.db"
-private const val USAGE_DB_VERSION = 1
+private const val USAGE_DB_VERSION = 2
 
 internal data class AppPolicy(
     val packageName: String,
@@ -64,10 +64,61 @@ private class UsageDbHelper(context: Context) : SQLiteOpenHelper(context, USAGE_
             """.trimIndent(),
         )
         db.execSQL("CREATE INDEX idx_daily_usage_date_total ON daily_usage(date, download_bytes, upload_bytes)")
+        createQuotaTable(db)
+        migrateLegacyDailyLimits(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        // Versioned migrations are intentionally additive. No schema changes exist yet.
+        if (oldVersion < 2) {
+            createQuotaTable(db)
+            migrateLegacyDailyLimits(db)
+        }
+    }
+
+    private fun createQuotaTable(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS app_quota_policy (
+                package_name TEXT NOT NULL,
+                uid INTEGER NOT NULL,
+                quota_type TEXT NOT NULL,
+                limit_bytes INTEGER NOT NULL,
+                period_start_millis INTEGER NOT NULL,
+                period_end_millis INTEGER NOT NULL,
+                used_bytes INTEGER NOT NULL DEFAULT 0,
+                reset_behavior TEXT NOT NULL DEFAULT 'AUTO_RESET',
+                PRIMARY KEY (package_name, quota_type),
+                CHECK (quota_type IN ('DAILY', 'WEEKLY', 'MONTHLY')),
+                CHECK (limit_bytes > 0),
+                CHECK (reset_behavior IN ('AUTO_RESET', 'BLOCK_UNTIL_RESET')),
+                FOREIGN KEY (package_name) REFERENCES app_policy(package_name) ON DELETE CASCADE
+            )
+            """.trimIndent(),
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_app_quota_uid_type ON app_quota_policy(uid, quota_type)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_app_quota_period_end ON app_quota_policy(period_end_millis)")
+    }
+
+    private fun migrateLegacyDailyLimits(db: SQLiteDatabase) {
+        val (periodStart, periodEnd) = QuotaPeriod.current(QuotaType.DAILY)
+        db.rawQuery(
+            "SELECT package_name, uid, daily_limit_bytes FROM app_policy WHERE daily_limit_bytes IS NOT NULL AND daily_limit_bytes > 0",
+            null,
+        ).use { cursor ->
+            while (cursor.moveToNext()) {
+                val values = ContentValues().apply {
+                    put("package_name", cursor.getString(0))
+                    put("uid", cursor.getInt(1))
+                    put("quota_type", QuotaType.DAILY.name)
+                    put("limit_bytes", cursor.getLong(2))
+                    put("period_start_millis", periodStart)
+                    put("period_end_millis", periodEnd)
+                    put("used_bytes", 0L)
+                    put("reset_behavior", QuotaResetBehavior.AUTO_RESET.name)
+                }
+                db.insertWithOnConflict("app_quota_policy", null, values, SQLiteDatabase.CONFLICT_IGNORE)
+            }
+        }
     }
 }
 
@@ -129,6 +180,82 @@ internal object UsageRepository {
                 if (limitBytes == null || limitBytes <= 0L) putNull("daily_limit_bytes") else put("daily_limit_bytes", limitBytes)
             }
             h.writableDatabase.update("app_policy", values, "package_name = ?", arrayOf(packageName))
+        }
+    }
+
+    fun upsertQuotaPolicy(
+        context: Context,
+        packageName: String,
+        label: String,
+        uid: Int,
+        quotaType: QuotaType,
+        limitBytes: Long?,
+        resetBehavior: QuotaResetBehavior = QuotaResetBehavior.AUTO_RESET,
+    ) {
+        ensureApp(context, packageName, label, uid)
+        helper(context).use { h ->
+            val db = h.writableDatabase
+            if (limitBytes == null || limitBytes <= 0L) {
+                db.delete("app_quota_policy", "package_name = ? AND quota_type = ?", arrayOf(packageName, quotaType.name))
+                if (quotaType == QuotaType.DAILY) {
+                    db.update("app_policy", ContentValues().apply { putNull("daily_limit_bytes") }, "package_name = ?", arrayOf(packageName))
+                }
+                return
+            }
+            val existing = db.query(
+                "app_quota_policy",
+                arrayOf("period_start_millis", "period_end_millis", "used_bytes"),
+                "package_name = ? AND quota_type = ?",
+                arrayOf(packageName, quotaType.name),
+                null, null, null,
+            ).use { c ->
+                if (!c.moveToFirst()) null else Triple(c.getLong(0), c.getLong(1), c.getLong(2))
+            }
+            val period = existing?.let { it.first to it.second } ?: QuotaPeriod.current(quotaType)
+            val values = ContentValues().apply {
+                put("package_name", packageName)
+                put("uid", uid)
+                put("quota_type", quotaType.name)
+                put("limit_bytes", limitBytes)
+                put("period_start_millis", period.first)
+                put("period_end_millis", period.second)
+                put("used_bytes", existing?.third ?: 0L)
+                put("reset_behavior", resetBehavior.name)
+            }
+            db.insertWithOnConflict("app_quota_policy", null, values, SQLiteDatabase.CONFLICT_REPLACE)
+            if (quotaType == QuotaType.DAILY) {
+                db.update("app_policy", ContentValues().apply { put("daily_limit_bytes", limitBytes) }, "package_name = ?", arrayOf(packageName))
+            }
+        }
+    }
+
+    fun readQuotaPolicies(context: Context, packageName: String? = null): List<AppQuotaPolicy> {
+        helper(context).use { h ->
+            val selection = packageName?.let { "package_name = ?" }
+            val args = packageName?.let { arrayOf(it) }
+            return h.readableDatabase.query(
+                "app_quota_policy",
+                arrayOf("package_name", "uid", "quota_type", "limit_bytes", "period_start_millis", "period_end_millis", "used_bytes", "reset_behavior"),
+                selection, args, null, null,
+                "package_name COLLATE NOCASE ASC, quota_type ASC",
+            ).use { c ->
+                buildList {
+                    while (c.moveToNext()) {
+                        add(
+                            AppQuotaPolicy(
+                                packageName = c.getString(0),
+                                uid = c.getInt(1),
+                                quotaType = runCatching { QuotaType.valueOf(c.getString(2)) }.getOrDefault(QuotaType.DAILY),
+                                limitBytes = c.getLong(3),
+                                periodStartMillis = c.getLong(4),
+                                periodEndMillis = c.getLong(5),
+                                usedBytes = c.getLong(6).coerceAtLeast(0L),
+                                resetBehavior = runCatching { QuotaResetBehavior.valueOf(c.getString(7)) }.getOrDefault(QuotaResetBehavior.AUTO_RESET),
+                            ),
+                        )
+                    }
+                }
+            }
         }
     }
 
