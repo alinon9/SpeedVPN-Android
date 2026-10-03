@@ -803,7 +803,7 @@ class MainActivity : ComponentActivity() {
                             UsageRepository.setDailyLimitBytes(this@MainActivity, app.packageName, app.label, app.uid, bytes)
                             UsageCollector.enforceDailyLimits(this@MainActivity)
                         } else {
-                            UsageRepository.setQuotaPolicy(this@MainActivity, app.packageName, app.uid, quotaType, bytes)
+                            UsageRepository.setQuotaPolicy(this@MainActivity, app.packageName, app.label, app.uid, quotaType, bytes)
                         }
                         policies = UsageRepository.readPolicies(this@MainActivity).associateBy { it.packageName }
                         quotaPolicies = UsageRepository.readQuotaPolicyMap(this@MainActivity)
