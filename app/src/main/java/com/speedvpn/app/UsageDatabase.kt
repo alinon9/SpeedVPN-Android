@@ -112,7 +112,7 @@ private class UsageDbHelper(context: Context) : SQLiteOpenHelper(context, USAGE_
                 uid INTEGER NOT NULL,
                 download_bytes INTEGER NOT NULL DEFAULT 0,
                 upload_bytes INTEGER NOT NULL DEFAULT 0,
-                updated_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000),
                 PRIMARY KEY (date, package_name)
             )
             """.trimIndent(),
