@@ -47,6 +47,7 @@ class QuotaDatabaseTest {
             put("uid", 12345)
             put("daily_limit_bytes", 500_000_000L)
         })
+        old.execSQL("PRAGMA user_version = 1")
         old.close()
 
         db = UsageDbHelper(context, dbName, 2)
@@ -78,6 +79,7 @@ class QuotaDatabaseTest {
             put("uid", 12346)
             put("daily_limit_bytes", 0L)
         })
+        old.execSQL("PRAGMA user_version = 1")
         old.close()
 
         db = UsageDbHelper(context, dbName, 2)
