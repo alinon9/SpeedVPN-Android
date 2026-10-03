@@ -15,6 +15,8 @@ internal object QuotaEnforcementEngine {
     private val mainHandler = Handler(Looper.getMainLooper())
 
     internal fun resetRestartThrottleForTests() {
+        mainHandler.removeCallbacksAndMessages(null)
+        restartPending.set(0L)
         lastRestartAtMillis.set(Long.MIN_VALUE)
     }
 
@@ -100,6 +102,8 @@ internal object QuotaEnforcementEngine {
 
     private fun requestRestart(context: Context, nowMillis: Long, restart: (Context) -> Unit) {
         if (tryAcquireRestart(nowMillis)) {
+            mainHandler.removeCallbacksAndMessages(null)
+            restartPending.set(0L)
             restart(context)
             return
         }
