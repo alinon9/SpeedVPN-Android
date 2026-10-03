@@ -17,7 +17,15 @@ internal object SmartSettings {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(STATS_ENABLED, false)
 
     fun setStatsEnabled(context: Context, enabled: Boolean) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(STATS_ENABLED, enabled).apply()
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit().putBoolean(STATS_ENABLED, enabled).apply()
+        if (enabled) {
+            UsageCollectionScheduler.schedule(context)
+            QuotaWorkScheduler.schedule(context)
+        } else {
+            UsageCollectionScheduler.cancel(context)
+            QuotaWorkScheduler.cancel(context)
+        }
     }
 
     fun isOverlayEnabled(context: Context): Boolean =
