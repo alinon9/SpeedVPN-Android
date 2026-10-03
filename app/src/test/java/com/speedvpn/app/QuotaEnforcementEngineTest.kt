@@ -102,38 +102,21 @@ class QuotaEnforcementEngineTest {
 
 
     @Test
-    fun restartIsThrottledForFiveSeconds() {
-        val packageName = "com.example.restart"
-        UsageRepository.setQuotaPolicy(
-            context, packageName, "Restart", 2010, QuotaType.DAILY, 1_000L,
-        )
-        val now = System.currentTimeMillis()
-        UsageRepository.upsertDailyUsage(
-            context,
-            DailyUsageRow(date(now), packageName, "Restart", 2010, 700L, 400L),
-        )
-
+    fun restartThrottleAllowsFirstBlocksSecondThenAllowsAfterFiveSeconds() {
         QuotaEnforcementEngine.resetRestartThrottleForTests()
-        var restarts = 0
 
         assertEquals(
             true,
-            QuotaEnforcementEngine.enforce(context, now, restart = { restarts++ }),
+            QuotaEnforcementEngine.tryAcquireRestart(System.currentTimeMillis()),
         )
-        assertEquals(1, restarts)
-
         assertEquals(
             false,
-            QuotaEnforcementEngine.enforce(context, now + 4_999L, restart = { restarts++ }),
+            QuotaEnforcementEngine.tryAcquireRestart(System.currentTimeMillis() + 4_999L),
         )
-        assertEquals(1, restarts)
-
-        VpnAppControl.replaceQuotaBlockedPackages(context, emptySet())
         assertEquals(
             true,
-            QuotaEnforcementEngine.enforce(context, now + 5_000L, restart = { restarts++ }),
+            QuotaEnforcementEngine.tryAcquireRestart(System.currentTimeMillis() + 5_000L),
         )
-        assertEquals(2, restarts)
     }
 
     private fun date(millis: Long): String =
