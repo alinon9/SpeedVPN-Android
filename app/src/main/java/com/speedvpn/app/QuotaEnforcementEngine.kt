@@ -4,8 +4,28 @@ import android.content.Context
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicLong
 
 internal object QuotaEnforcementEngine {
+    private const val RESTART_THROTTLE_MS = 5_000L
+    private val lastRestartAtMillis = AtomicLong(Long.MIN_VALUE)
+
+    internal fun resetRestartThrottleForTests() {
+        lastRestartAtMillis.set(Long.MIN_VALUE)
+    }
+
+    private fun tryAcquireRestart(nowMillis: Long): Boolean {
+        while (true) {
+            val previous = lastRestartAtMillis.get()
+            if (previous != Long.MIN_VALUE && nowMillis - previous < RESTART_THROTTLE_MS) {
+                return false
+            }
+            if (lastRestartAtMillis.compareAndSet(previous, nowMillis)) {
+                return true
+            }
+        }
+    }
+
     /**
      * Evaluates every configured quota against NetworkStats-derived daily_usage.
      * Lazy reset is performed first so a new period starts from clean policy state.
@@ -41,6 +61,7 @@ internal object QuotaEnforcementEngine {
     fun enforce(
         context: Context,
         nowMillis: Long = System.currentTimeMillis(),
+        restart: (Context) -> Unit = SpeedVpnService::restartForSettings,
     ): Boolean {
         val evaluated = evaluateBlockedPackages(context, nowMillis)
         val current = VpnAppControl.quotaBlockedPackages(context)
@@ -67,8 +88,10 @@ internal object QuotaEnforcementEngine {
             )
         }
 
-        if (VpnRuntime.state.value.status == VpnStatus.CONNECTED) {
-            SpeedVpnService.restartForSettings(context)
+        if (VpnRuntime.state.value.status == VpnStatus.CONNECTED &&
+            tryAcquireRestart(nowMillis)
+        ) {
+            restart(context)
         }
         return true
     }
