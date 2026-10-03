@@ -104,18 +104,19 @@ class QuotaEnforcementEngineTest {
     @Test
     fun restartThrottleAllowsFirstBlocksSecondThenAllowsAfterFiveSeconds() {
         QuotaEnforcementEngine.resetRestartThrottleForTests()
+        val base = System.currentTimeMillis()
 
         assertEquals(
             true,
-            QuotaEnforcementEngine.tryAcquireRestart(System.currentTimeMillis()),
+            QuotaEnforcementEngine.tryAcquireRestart(base),
         )
         assertEquals(
             false,
-            QuotaEnforcementEngine.tryAcquireRestart(System.currentTimeMillis() + 4_999L),
+            QuotaEnforcementEngine.tryAcquireRestart(base + 4_999L),
         )
         assertEquals(
             true,
-            QuotaEnforcementEngine.tryAcquireRestart(System.currentTimeMillis() + 5_000L),
+            QuotaEnforcementEngine.tryAcquireRestart(base + 5_000L),
         )
     }
 
