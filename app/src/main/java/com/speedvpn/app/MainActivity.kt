@@ -821,7 +821,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    @Composable
     private fun quotaTypeLabel(type: QuotaType): String = when (type) {
         QuotaType.DAILY -> "يومي"
         QuotaType.WEEKLY -> "أسبوعي"
