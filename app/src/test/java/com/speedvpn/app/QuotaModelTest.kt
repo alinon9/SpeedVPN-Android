@@ -64,9 +64,9 @@ class QuotaModelTest {
     @Test
     fun quotaTypesAreIndependent() {
         val policies = listOf(
-            AppQuotaPolicy("com.example", 10001, QuotaType.DAILY, 100L, 1L, 2L, 0L, ResetBehavior.AUTO_RESET),
-            AppQuotaPolicy("com.example", 10001, QuotaType.WEEKLY, 200L, 3L, 4L, 0L, ResetBehavior.BLOCK_UNTIL_RESET),
-            AppQuotaPolicy("com.example", 10001, QuotaType.MONTHLY, 300L, 5L, 6L, 0L, ResetBehavior.AUTO_RESET),
+            AppQuotaPolicy("com.example", QuotaType.DAILY, 100L, 1L, 2L, 0L, ResetBehavior.AUTO_RESET),
+            AppQuotaPolicy("com.example", QuotaType.WEEKLY, 200L, 3L, 4L, 0L, ResetBehavior.BLOCK_UNTIL_RESET),
+            AppQuotaPolicy("com.example", QuotaType.MONTHLY, 300L, 5L, 6L, 0L, ResetBehavior.AUTO_RESET),
         )
 
         assertEquals(3, policies.distinctBy { it.quotaType }.size)
