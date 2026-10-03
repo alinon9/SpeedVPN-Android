@@ -389,6 +389,25 @@ internal object UsageRepository {
             ).use { c -> if (c.moveToFirst() && !c.isNull(0)) c.getLong(0) else 0L }
         }
     }
+
+    fun sumUsageInPeriod(
+        context: Context,
+        packageName: String,
+        startDate: String,
+        endDate: String,
+    ): Long {
+        helper(context).use { h ->
+            return h.readableDatabase.query(
+                "daily_usage",
+                arrayOf("SUM(download_bytes + upload_bytes)"),
+                "package_name = ? AND date >= ? AND date <= ?",
+                arrayOf(packageName, startDate, endDate),
+                null,
+                null,
+                null,
+            ).use { c -> if (c.moveToFirst() && !c.isNull(0)) c.getLong(0) else 0L }
+        }
+    }
 }
 
 internal object UsageDate {
