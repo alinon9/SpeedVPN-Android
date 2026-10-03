@@ -84,7 +84,11 @@ internal data class DailyUsageRow(
         if (Long.MAX_VALUE - a < b) Long.MAX_VALUE else a + b
 }
 
-private class UsageDbHelper(context: Context) : SQLiteOpenHelper(context, USAGE_DB_NAME, null, USAGE_DB_VERSION) {
+internal class UsageDbHelper(
+    context: Context,
+    dbName: String = USAGE_DB_NAME,
+    dbVersion: Int = USAGE_DB_VERSION,
+) : SQLiteOpenHelper(context, dbName, null, dbVersion) {
     override fun onConfigure(db: SQLiteDatabase) {
         super.onConfigure(db)
         db.setForeignKeyConstraintsEnabled(true)
@@ -138,7 +142,7 @@ private class UsageDbHelper(context: Context) : SQLiteOpenHelper(context, USAGE_
             )
             """.trimIndent(),
         )
-        db.execSQL("CREATE INDEX IF NOT EXISTS idx_app_quota_uid_type ON app_quota_policy(uid, quota_type)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_app_quota_type ON app_quota_policy(package_name, quota_type)")
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
