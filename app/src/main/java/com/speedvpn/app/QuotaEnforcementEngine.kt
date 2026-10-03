@@ -101,8 +101,46 @@ internal object QuotaEnforcementEngine {
     }
 
     private fun requestRestart(context: Context, nowMillis: Long, restart: (Context) -> Unit) {
+        requestRestartInternal(
+            context = context,
+            nowMillis = nowMillis,
+            restart = restart,
+            isConnected = { VpnRuntime.state.value.status == VpnStatus.CONNECTED },
+            postDelayed = { delay, action -> mainHandler.postDelayed(action, delay) },
+            clock = System::currentTimeMillis,
+        )
+    }
+
+    /**
+     * Deterministic seam for JVM tests. It exercises the same coalescing path used by Android,
+     * without requiring a real VpnService connection or sleeping for five seconds.
+     */
+    internal fun requestRestartForTests(
+        context: Context,
+        nowMillis: Long,
+        restart: (Context) -> Unit,
+        postDelayed: (Long, () -> Unit) -> Unit,
+        clock: () -> Long,
+    ) {
+        requestRestartInternal(
+            context = context,
+            nowMillis = nowMillis,
+            restart = restart,
+            isConnected = { true },
+            postDelayed = postDelayed,
+            clock = clock,
+        )
+    }
+
+    private fun requestRestartInternal(
+        context: Context,
+        nowMillis: Long,
+        restart: (Context) -> Unit,
+        isConnected: () -> Boolean,
+        postDelayed: (Long, () -> Unit) -> Unit,
+        clock: () -> Long,
+    ) {
         if (tryAcquireRestart(nowMillis)) {
-            mainHandler.removeCallbacksAndMessages(null)
             restartPending.set(0L)
             restart(context)
             return
@@ -111,15 +149,13 @@ internal object QuotaEnforcementEngine {
         if (restartPending.compareAndSet(0L, 1L)) {
             val delay = (RESTART_THROTTLE_MS - (nowMillis - lastRestartAtMillis.get()))
                 .coerceAtLeast(1L)
-            mainHandler.postDelayed({
+            postDelayed(delay) {
                 restartPending.set(0L)
-                val retryNow = System.currentTimeMillis()
-                if (VpnRuntime.state.value.status == VpnStatus.CONNECTED &&
-                    tryAcquireRestart(retryNow)
-                ) {
+                val retryNow = clock()
+                if (isConnected() && tryAcquireRestart(retryNow)) {
                     restart(context)
                 }
-            }, delay)
+            }
         }
     }
 
