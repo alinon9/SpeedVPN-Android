@@ -383,7 +383,7 @@ class MainActivity : ComponentActivity() {
 
             lastVerification?.let { result ->
                 GlassCard {
-                    SectionLabel("نتيجة التحقق", "الشبكة الأصلية ← VPN ← الحكم النهائي")
+                    SectionLabel("نتيجة التحقق", "الأصلية ← السرعة المحجوزة ← السرعة الفعلية داخل VPN")
                     Text(
                         "الحكم النهائي: " + speedStatusLabel(result.overallStatus),
                         color = speedStatusColor(result.overallStatus),
@@ -1112,10 +1112,10 @@ class MainActivity : ComponentActivity() {
     private fun SpeedMetricResult(title: String, metric: SpeedMetricVerification) {
         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(title, color = TextPrimary, fontWeight = FontWeight.Bold, fontSize = 12.sp)
-            InfoRow("الخطة المحددة", formatPlanBits(metric.planKbps))
-            InfoRow("سرعة الشبكة الأصلية", metric.baselineBps?.let(::formatBitRate) ?: "فشل القياس")
-            InfoRow("السرعة عبر VPN", metric.vpnBps?.let(::formatBitRate) ?: "فشل القياس")
-            InfoRow("الدقة", metric.accuracyPercent?.let { String.format(Locale.US, "%.1f%%", it) } ?: "—")
+            InfoRow("🌐 سرعة الإنترنت الأصلية", metric.baselineBps?.let(::formatBitRate) ?: "فشل القياس")
+            InfoRow("🔒 السرعة المحجوزة / المحددة", formatPlanBits(metric.planKbps))
+            InfoRow("🚀 السرعة الفعلية داخل VPN", metric.vpnBps?.let(::formatBitRate) ?: "فشل القياس")
+            InfoRow("الدقة مقارنة بالخيار", metric.accuracyPercent?.let { String.format(Locale.US, "%.1f%%", it) } ?: "—")
             Text(speedStatusLabel(metric.status), color = speedStatusColor(metric.status), fontSize = 11.sp, fontWeight = FontWeight.Bold)
             metric.reason?.let { Text(it, color = TextSecondary, fontSize = 10.sp) }
         }
