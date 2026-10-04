@@ -1179,6 +1179,42 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
+    private fun PresetGroup(
+        label: String,
+        values: List<Long>,
+        accent: Color,
+        onApply: (Long?) -> Unit,
+    ) {
+        Column(Modifier.fillMaxWidth()) {
+            Text(label, color = accent, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(4.dp))
+            Row(
+                Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                values.forEach { value ->
+                    OutlinedButton(
+                        onClick = { onApply(value * 8L) },
+                        shape = RoundedCornerShape(9.dp),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, accent.copy(alpha = 0.45f)),
+                        contentPadding = PaddingValues(horizontal = 9.dp, vertical = 0.dp),
+                        modifier = Modifier.height(32.dp),
+                    ) {
+                        Text(formatPresetSpeed(value), fontSize = 10.sp, color = TextPrimary)
+                    }
+                }
+            }
+            Spacer(Modifier.height(6.dp))
+        }
+    }
+
+    private fun formatPresetSpeed(kbps: Long): String =
+        if (kbps >= 1000L) {
+            val mb = kbps / 1000.0
+            if (mb == mb.toLong().toDouble()) "${mb.toLong()} MB/s" else String.format(Locale.US, "%.1f MB/s", mb)
+        } else "${kbps} KB/s"
+
+    @Composable
     private fun LimitSlider(title: String, current: Long?, onApply: (Long?) -> Unit) {
         // 1 KB/s → 100 MB/s on a logarithmic scale. Preset buttons provide exact
         // business-friendly values; the slider remains continuous for fine tuning.
