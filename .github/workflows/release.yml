@@ -51,6 +51,12 @@ jobs:
           echo "$RELEASE_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/speedvpn-release.jks"
           chmod 600 "$RUNNER_TEMP/speedvpn-release.jks"
 
+      - name: Run unit tests
+        run: ./gradlew :app:testDebugUnitTest --stacktrace --no-daemon
+
+      - name: Run lint
+        run: ./gradlew :app:lintDebug --stacktrace --no-daemon
+
       - name: Build signed release APK
         env:
           RELEASE_KEYSTORE_PATH: ${{ runner.temp }}/speedvpn-release.jks
