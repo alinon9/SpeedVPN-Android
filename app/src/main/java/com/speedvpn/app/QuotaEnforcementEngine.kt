@@ -113,6 +113,23 @@ internal object QuotaEnforcementEngine {
         }
 
         if (VpnRuntime.state.value.status == VpnStatus.CONNECTED) {
+            // Android requires recreating the VPN connection when the per-app
+            // allow/disallow set changes. Make that behavior explicit to the UI
+            // and rely on the existing 5s coalescing/debounce guard.
+            val newlyBlocked = evaluated.minus(current)
+            if (newlyBlocked.isNotEmpty()) {
+                VpnRuntime.update {
+                    it.copy(
+                        lastResponse = "تم بلوغ حد استخدام التطبيق — سيتم إعادة الاتصال لتطبيق الحظر",
+                    )
+                }
+            } else if (current.minus(evaluated).isNotEmpty()) {
+                VpnRuntime.update {
+                    it.copy(
+                        lastResponse = "تمت إعادة ضبط حد استخدام التطبيق — سيتم إعادة الاتصال",
+                    )
+                }
+            }
             requestRestart(context, nowMillis, restart)
         }
         return true
