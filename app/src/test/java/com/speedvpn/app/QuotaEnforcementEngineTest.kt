@@ -2,6 +2,8 @@ package com.speedvpn.app
 
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
+import androidx.work.ListenableWorker
+import androidx.work.testing.TestListenableWorkerBuilder
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Before
@@ -12,6 +14,7 @@ import org.robolectric.annotation.Config
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlinx.coroutines.runBlocking
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34])
@@ -23,6 +26,8 @@ class QuotaEnforcementEngineTest {
     fun setUp() {
         context.deleteDatabase("speedvpn_usage.db")
         context.getSharedPreferences(VpnAppControl.PREFS, Context.MODE_PRIVATE)
+            .edit().clear().commit()
+        context.getSharedPreferences("smart_settings", Context.MODE_PRIVATE)
             .edit().clear().commit()
     }
 
@@ -284,6 +289,30 @@ class QuotaEnforcementEngineTest {
             setOf(packageName),
             VpnAppControl.quotaBlockedPackages(context),
         )
+    }
+
+    @Test
+    fun workerIsIdempotentForUnchangedQuotaState() = runBlocking {
+        val packageName = "com.example.worker"
+        UsageRepository.setQuotaPolicy(
+            context, packageName, "Worker", 2015, QuotaType.DAILY, 1_000L,
+        )
+        val now = System.currentTimeMillis()
+        UsageRepository.upsertDailyUsage(
+            context,
+            DailyUsageRow(date(now), packageName, "Worker", 2015, 700L, 400L),
+        )
+        context.getSharedPreferences("smart_settings", Context.MODE_PRIVATE)
+            .edit().putBoolean("stats_enabled", true).commit()
+
+        val first = TestListenableWorkerBuilder<QuotaEnforcementWorker>(context).build()
+        val second = TestListenableWorkerBuilder<QuotaEnforcementWorker>(context).build()
+
+        assertEquals(ListenableWorker.Result.success().toString(), first.doWork().toString())
+        assertEquals(setOf(packageName), VpnAppControl.quotaBlockedPackages(context))
+
+        assertEquals(ListenableWorker.Result.success().toString(), second.doWork().toString())
+        assertEquals(setOf(packageName), VpnAppControl.quotaBlockedPackages(context))
     }
 
     @Test
