@@ -44,6 +44,11 @@
             </intent-filter>
         </activity>
 
+        <!-- Diagnostic-only: MainActivity remains declared so StartupActivity can launch it explicitly. -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="false" />
+
         <!-- Real android.net.VpnService: owns the TUN interface. -->
         <service
             android:name=".SpeedVpnService"
