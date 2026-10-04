@@ -33,7 +33,7 @@ internal object QuotaEnforcementEngine {
     }
 
     /**
-     * Evaluates every configured quota against NetworkStats-derived daily_usage.
+     * Evaluates every configured quota against Android UID/App Usage statistics.
      * Lazy reset is performed first so a new period starts from clean policy state.
      */
     fun evaluateBlockedPackages(
@@ -99,7 +99,7 @@ internal object QuotaEnforcementEngine {
                 "WARN",
                 "DataLimit",
                 "APP_QUOTA_REACHED",
-                "$packageName reached its configured quota",
+                "$packageName reached its configured app-usage quota",
             )
         }
         current.minus(evaluated).forEach { packageName ->
