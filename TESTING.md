@@ -2,6 +2,10 @@
 
 This document records tests that must be executed on real Android devices before calling a build Release-Verified. Source inspection alone is not sufficient.
 
+## Android 16 / API 36 gate
+
+The project targets Android 16 (API 36). Before Release-Verified, execute the full functional matrix on at least one Android 16 device/emulator and re-run the VPN, foreground-service, DNS/IPv6, overlay, quota, and network-handoff tests.
+
 ## Background CONNECT matrix
 
 | Scenario | Android 12 | Android 13 | Android 14 | Android 15 |
