@@ -105,9 +105,8 @@ class Socks5Server(
     private val probeSourcePorts = ConcurrentHashMap.newKeySet<Int>()
     private val upstreamTcp = Collections.newSetFromMap(ConcurrentHashMap<Socket, Boolean>())
     private val upstreamUdp = Collections.newSetFromMap(ConcurrentHashMap<DatagramSocket, Boolean>())
-    // DNS resolution uses Android Network.getAllByName(), which is blocking.
-    // Keep a small bounded pool with no waiting queue so stalled resolutions cannot
-    // build an unbounded backlog or starve later lookups behind timed-out Futures.
+    // User-domain DNS resolution is encrypted DoH. The bounded pool prevents
+    // stalled encrypted lookups from building an unbounded backlog.
     private val dnsPool: ExecutorService = ThreadPoolExecutor(
         0,
         UDP_DNS_WORKERS,
@@ -117,6 +116,25 @@ class Socks5Server(
         ThreadFactory { r -> Thread(r, "socks-dns").apply { isDaemon = true } },
         ThreadPoolExecutor.AbortPolicy(),
     )
+
+    @Volatile private var encryptedDnsNetwork: Network? = null
+    @Volatile private var encryptedDnsResolver: EncryptedDnsResolver? = null
+
+    private fun encryptedResolver(network: Network): EncryptedDnsResolver {
+        val cached = encryptedDnsResolver
+        if (cached != null && encryptedDnsNetwork == network) return cached
+        return synchronized(this) {
+            val current = encryptedDnsResolver
+            if (current != null && encryptedDnsNetwork == network) {
+                current
+            } else {
+                EncryptedDnsResolver(network, protectTcp, ipv6Enabled).also {
+                    encryptedDnsNetwork = network
+                    encryptedDnsResolver = it
+                }
+            }
+        }
+    }
 
     private val pool: ExecutorService = ThreadPoolExecutor(
         0,
@@ -353,27 +371,25 @@ class Socks5Server(
 
     private fun resolveAll(host: String, timeoutMs: Long): List<InetAddress> {
         val network = currentNetwork()
-            ?: throw UnknownHostException("No physical network available for DNS resolution: $host")
+            ?: throw UnknownHostException("No physical network available for encrypted DNS resolution: $host")
         if (timeoutMs <= 0L) throw SocketTimeoutException("DNS deadline exceeded for $host")
 
-        val future: Future<List<InetAddress>> = dnsPool.submit<List<InetAddress>> {
-            network.getAllByName(host).toList()
+        val future = dnsPool.submit<List<InetAddress>> {
+            encryptedResolver(network).resolve(host)
         }
         return try {
             future.get(timeoutMs, TimeUnit.MILLISECONDS)
                 .filter { ipv6Enabled || it is java.net.Inet4Address }
-                .sortedBy { if (it is java.net.Inet4Address) 0 else 1 }
                 .also { if (it.isEmpty()) throw UnknownHostException("No usable DNS address for $host") }
         } catch (e: TimeoutException) {
             future.cancel(true)
-            throw SocketTimeoutException("DNS timeout for $host")
+            throw SocketTimeoutException("Encrypted DNS timeout for $host")
         } catch (e: Exception) {
             future.cancel(true)
             if (e.cause is UnknownHostException) throw e.cause as UnknownHostException
-            throw UnknownHostException("DNS failed for $host: ${e.cause?.message ?: e.message}")
+            throw UnknownHostException("Encrypted DNS failed for $host: ${e.cause?.message ?: e.message}")
         }
     }
-
     private fun connect(client: Socket, cin: InputStream, cout: OutputStream, target: Any, port: Int) {
         val deadlineNs = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(CONNECT_TIMEOUT_MS)
         val candidates = when (target) {
