@@ -9,18 +9,18 @@ import java.io.IOException
 import java.net.InetAddress
 import java.net.Socket
 import java.net.SocketException
-import java.net.SocketFactory
+import javax.net.SocketFactory
 import java.net.InetSocketAddress
 import java.util.concurrent.TimeUnit
 import org.json.JSONObject
 
 class EncryptedDnsResolver(private val network: Network, private val protect: (Socket) -> Boolean, private val ipv6Enabled: Boolean) {
     companion object { private const val DOH_HOST = "cloudflare-dns.com"; private const val DOH_IP_V4 = "1.1.1.1"; private const val TIMEOUT_MS = 3_000L }
-    private val client = OkHttpClient.Builder().dns(Dns { listOf(InetAddress.getByName(DOH_IP_V4)) }).socketFactory(ProtectedNetworkSocketFactory(network, protect)).connectTimeout(TIMEOUT_MS, TimeUnit.MILLISECONDS).readTimeout(TIMEOUT_MS, TimeUnit.MILLISECONDS).writeTimeout(TIMEOUT_MS, TimeUnit.MILLISECONDS).retryOnConnectionFailure(false).build()
+    private val client = OkHttpClient.Builder().dns(object : Dns { override fun lookup(hostname: String): List<InetAddress> = listOf(InetAddress.getByName(DOH_IP_V4)) }).socketFactory(ProtectedNetworkSocketFactory(network, protect)).connectTimeout(TIMEOUT_MS, TimeUnit.MILLISECONDS).readTimeout(TIMEOUT_MS, TimeUnit.MILLISECONDS).writeTimeout(TIMEOUT_MS, TimeUnit.MILLISECONDS).retryOnConnectionFailure(false).build()
     fun resolve(host: String): List<InetAddress> {
         require(host.isNotBlank()) { "empty host" }
         if (isNumericAddress(host)) return listOf(InetAddress.getByName(host)).filter { ipv6Enabled || it.address.size == 4 }
-        val base = "https://" + DOH_HOST).toHttpUrl().newBuilder().addPathSegment("dns-query").addQueryParameter("name", host).addQueryParameter("type", "A").build()
+        val base = ("https://" + DOH_HOST).toHttpUrl().newBuilder().addPathSegment("dns-query").addQueryParameter("name", host).addQueryParameter("type", "A").build()
         val addresses = mutableListOf<InetAddress>(); query(base, addresses, 4)
         if (ipv6Enabled) query(base.newBuilder().setQueryParameter("type", "AAAA").build(), addresses, 6)
         if (addresses.isEmpty()) throw IOException("Encrypted DNS returned no usable address for $host")
