@@ -109,6 +109,7 @@ internal object QuotaEnforcementEngine {
             restart = restart,
             isConnected = { VpnRuntime.state.value.status == VpnStatus.CONNECTED },
             postDelayed = { delay, action -> mainHandler.postDelayed(action, delay) },
+            cancelPending = { mainHandler.removeCallbacksAndMessages(null) },
             clock = System::currentTimeMillis,
         )
     }
@@ -122,6 +123,7 @@ internal object QuotaEnforcementEngine {
         nowMillis: Long,
         restart: (Context) -> Unit,
         postDelayed: (Long, () -> Unit) -> Unit,
+        cancelPending: () -> Unit = {},
         clock: () -> Long,
     ) {
         requestRestartInternal(
@@ -130,6 +132,7 @@ internal object QuotaEnforcementEngine {
             restart = restart,
             isConnected = { true },
             postDelayed = postDelayed,
+            cancelPending = cancelPending,
             clock = clock,
         )
     }
@@ -140,9 +143,11 @@ internal object QuotaEnforcementEngine {
         restart: (Context) -> Unit,
         isConnected: () -> Boolean,
         postDelayed: (Long, () -> Unit) -> Unit,
+        cancelPending: () -> Unit,
         clock: () -> Long,
     ) {
         if (tryAcquireRestart(nowMillis)) {
+            cancelPending()
             restartPending.set(0L)
             restart(context)
             return
