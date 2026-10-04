@@ -163,8 +163,9 @@ class SpeedVpnService : VpnService() {
             }
             ACTION_RESTART_FOR_SETTINGS -> {
                 reconnectAfterDisconnect = true
-                goForeground()
-                scope.launch { disconnect() }
+                if (goForeground()) {
+                    scope.launch { disconnect() }
+                }
             }
             ACTION_STOP -> {
                 val expectedGeneration = intent?.getLongExtra(EXTRA_EXPECTED_GENERATION, 0L) ?: 0L
@@ -175,34 +176,52 @@ class SpeedVpnService : VpnService() {
             }
             else -> {
                 requestedStartRequestId = intent?.getStringExtra(EXTRA_START_REQUEST_ID)
-                goForeground()
-                scope.launch { connect() }
+                if (goForeground()) {
+                    scope.launch { connect() }
+                }
             }
         }
         return START_NOT_STICKY
     }
 
-    private fun goForeground() {
-        val nm = getSystemService(NotificationManager::class.java)
-        if (Build.VERSION.SDK_INT >= 26) {
-            nm.createNotificationChannel(
-                NotificationChannel("vpn", "VPN", NotificationManager.IMPORTANCE_LOW),
+    private fun goForeground(): Boolean {
+        return try {
+            val nm = getSystemService(NotificationManager::class.java)
+            if (Build.VERSION.SDK_INT >= 26) {
+                nm.createNotificationChannel(
+                    NotificationChannel("vpn", "VPN", NotificationManager.IMPORTANCE_LOW),
+                )
+            }
+            val open = PendingIntent.getActivity(
+                this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE,
             )
+            val notification: Notification = NotificationCompat.Builder(this, "vpn")
+                .setSmallIcon(android.R.drawable.ic_lock_lock)
+                .setContentTitle("SpeedVPN")
+                .setContentText("التحكم بسرعة الإنترنت يعمل")
+                .setOngoing(true)
+                .setContentIntent(open)
+                .build()
+            ServiceCompat.startForeground(
+                this, NOTIF_ID, notification,
+                if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0,
+            )
+            true
+        } catch (t: Throwable) {
+            logE("Unable to promote VPN service to foreground", t)
+            VpnRuntime.update {
+                it.copy(
+                    status = VpnStatus.ERROR,
+                    serviceRunning = false,
+                    tunnel = "down",
+                    health = VpnHealth.DISCONNECTED,
+                    lastError = "VPN foreground service could not start: " +
+                        (t.message ?: t.javaClass.simpleName),
+                )
+            }
+            runCatching { stopSelf() }
+            false
         }
-        val open = PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE,
-        )
-        val notification: Notification = NotificationCompat.Builder(this, "vpn")
-            .setSmallIcon(android.R.drawable.ic_lock_lock)
-            .setContentTitle("SpeedVPN")
-            .setContentText("التحكم بسرعة الإنترنت يعمل")
-            .setOngoing(true)
-            .setContentIntent(open)
-            .build()
-        ServiceCompat.startForeground(
-            this, NOTIF_ID, notification,
-            if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0,
-        )
     }
 
     private suspend fun connect() = stateMutex.withLock {
