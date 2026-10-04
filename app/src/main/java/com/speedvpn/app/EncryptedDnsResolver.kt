@@ -20,7 +20,7 @@ class EncryptedDnsResolver(private val network: Network, private val protect: (S
     fun resolve(host: String): List<InetAddress> {
         require(host.isNotBlank()) { "empty host" }
         if (isNumericAddress(host)) return listOf(InetAddress.getByName(host)).filter { ipv6Enabled || it.address.size == 4 }
-        val base = DOH_HOST.toHttpUrl().newBuilder().addPathSegment("dns-query").addQueryParameter("name", host).addQueryParameter("type", "A").build()
+        val base = "https://" + DOH_HOST).toHttpUrl().newBuilder().addPathSegment("dns-query").addQueryParameter("name", host).addQueryParameter("type", "A").build()
         val addresses = mutableListOf<InetAddress>(); query(base, addresses, 4)
         if (ipv6Enabled) query(base.newBuilder().setQueryParameter("type", "AAAA").build(), addresses, 6)
         if (addresses.isEmpty()) throw IOException("Encrypted DNS returned no usable address for $host")
