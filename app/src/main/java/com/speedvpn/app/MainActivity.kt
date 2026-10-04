@@ -113,6 +113,7 @@ class MainActivity : ComponentActivity() {
     }
     private val notifPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
     private val usageAccessState = mutableStateOf(false)
+    private val showVpnDisclosure = mutableStateOf(false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -241,6 +242,30 @@ class MainActivity : ComponentActivity() {
             containerColor = Bg,
             bottomBar = { BottomBar(tab, onTab = { tab = it }) },
         ) { padding ->
+            if (showVpnDisclosure.value) {
+                AlertDialog(
+                    onDismissRequest = { showVpnDisclosure.value = false },
+                    title = { Text("لماذا يحتاج SpeedVPN إلى إذن VPN؟") },
+                    text = {
+                        Text(
+                            "يستخدم SpeedVPN واجهة Android VpnService لإنشاء نفق TUN محلي على الجهاز حتى يتمكن من التحكم في سرعة الاتصال، وإدارة الحظر وحدود استخدام التطبيقات. لا يعني ذلك أن التطبيق يوفر إخفاء هوية أو خادم VPN بعيدًا في الوضع المحلي الحالي. إذا فعّلت إحصاءات التطبيقات ومنحت Usage Access، تُستخدم إحصاءات Android لعرض استخدام التطبيقات وتطبيق حدودها."
+                        )
+                    },
+                    confirmButton = {
+                        TextButton(
+                            onClick = {
+                                showVpnDisclosure.value = false
+                                val intent = VpnService.prepare(this@MainActivity)
+                                if (intent != null) vpnPermission.launch(intent)
+                                else VpnRuntime.update { it.copy(permissionGranted = true) }
+                            },
+                        ) { Text("أوافق والمتابعة") }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { showVpnDisclosure.value = false }) { Text("إلغاء") }
+                    },
+                )
+            }
             Box(Modifier.fillMaxSize().padding(padding)) {
                 when (tab) {
                     0 -> HomeScreen(signedIn, s) { requestVpnPermission() }
@@ -1503,8 +1528,11 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun requestVpnPermission() {
-        val intent = VpnService.prepare(this)
-        if (intent != null) vpnPermission.launch(intent) else VpnRuntime.update { it.copy(permissionGranted = true) }
+        if (VpnService.prepare(this) == null) {
+            VpnRuntime.update { it.copy(permissionGranted = true) }
+            return
+        }
+        showVpnDisclosure.value = true
     }
 
     @Composable
