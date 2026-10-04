@@ -30,6 +30,10 @@ object SpeedVerificationEngine {
         }
 
         val initiallyConnected = VpnRuntime.state.value.status == VpnStatus.CONNECTED
+        // The limiter is process-wide. Disable it during the baseline measurement
+        // so "internet speed without VPN" is never accidentally capped by the
+        // user's previous VPN plan.
+        val savedLimits = SpeedLimitStore.load(context)
         var baseline: SpeedTestResult? = null
         var vpn: SpeedTestResult? = null
         var note: String? = null
@@ -43,6 +47,9 @@ object SpeedVerificationEngine {
                 }
             }
 
+            SpeedLimiter.setDownloadKbps(null)
+            SpeedLimiter.setUploadKbps(null)
+
             onProgress("قياس Download للشبكة الأصلية…")
             baseline = SpeedTestEngine.measure { phase ->
                 onProgress(if (phase == SpeedTestPhase.DOWNLOAD) "قياس Download للشبكة الأصلية…" else "قياس Upload للشبكة الأصلية…")
@@ -51,6 +58,12 @@ object SpeedVerificationEngine {
             if (baseline.downloadBps == null && baseline.uploadBps == null) {
                 return unavailable(started, "فشل قياس الشبكة الأصلية.", planDownloadKbps, planUploadKbps)
             }
+
+            // Restore the selected plan before the VPN-side measurement. The VPN
+            // service also reapplies persisted limits during startup, but restoring
+            // here closes the race between service start and the first measurement.
+            SpeedLimiter.setDownloadKbps(planDownloadKbps ?: savedLimits.first)
+            SpeedLimiter.setUploadKbps(planUploadKbps ?: savedLimits.second)
 
             onProgress("تشغيل VPN للتحقق من الخطة…")
             SpeedVpnService.start(context)
@@ -94,6 +107,10 @@ object SpeedVerificationEngine {
         } catch (t: Throwable) {
             return unavailable(started, "فشل التحقق: " + (t.message ?: t.javaClass.simpleName), planDownloadKbps, planUploadKbps)
         } finally {
+            // Always restore the user's persistent limiter state, even if the
+            // verification exits early or the VPN cannot reconnect.
+            SpeedLimiter.setDownloadKbps(savedLimits.first)
+            SpeedLimiter.setUploadKbps(savedLimits.second)
             onProgress("استعادة حالة VPN السابقة…")
             if (initiallyConnected) {
                 if (VpnRuntime.state.value.status != VpnStatus.CONNECTED) {
