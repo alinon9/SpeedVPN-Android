@@ -79,27 +79,16 @@ private val TextPrimary = Color(0xFFF3F7FF)
 private val TextSecondary = Color(0xFF95A6C3)
 
 class MainActivity : ComponentActivity() {
-    // UI speeds are expressed as KB/s and converted to the backend's Kbps representation.
-    private fun kbpsFromKBps(value: Long): Long = value.coerceAtLeast(1L) * 8L
-    private val slowPresets = listOf(
-        "10K" to kbpsFromKBps(10),
-        "25K" to kbpsFromKBps(25),
-        "50K" to kbpsFromKBps(50),
-        "100K" to kbpsFromKBps(100),
-        "128K" to kbpsFromKBps(128),
-        "256K" to kbpsFromKBps(256),
-        "512K" to kbpsFromKBps(512),
-        "768K" to kbpsFromKBps(768),
+    // Presets are expressed directly in Kbps, matching the backend contract.
+    private val kbpsPresets = listOf(
+        "128K" to 128L,
+        "256K" to 256L,
+        "512K" to 512L,
     )
-    private val mediumPresets = listOf(
-        "1M" to kbpsFromKBps(1_000),
-        "2M" to kbpsFromKBps(2_000),
-        "4M" to kbpsFromKBps(4_000),
-        "6M" to kbpsFromKBps(6_000),
-    )
-    private val fastPresets = listOf(
-        "10M" to kbpsFromKBps(10_000),
-        "20M" to kbpsFromKBps(20_000),
+    private val mbpsPresets = listOf(
+        "1M" to 1_000L,
+        "2M" to 2_000L,
+        "5M" to 5_000L,
     )
     private val unlimitedPreset = "بدون حد"
     private val vpnPermission = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
@@ -210,14 +199,8 @@ class MainActivity : ComponentActivity() {
 
     private fun fmt(kbps: Long?) = when {
         kbps == null -> "بدون حد"
-        else -> {
-            val bytesPerSec = kbps * 125.0
-            when {
-                bytesPerSec < 1_000.0 -> String.format(Locale.US, "%.0f B/s", bytesPerSec)
-                bytesPerSec < 1_000_000.0 -> String.format(Locale.US, "%.1f KB/s", bytesPerSec / 1_000.0)
-                else -> String.format(Locale.US, "%.2f MB/s", bytesPerSec / 1_000_000.0)
-            }
-        }
+        kbps < 1_000L -> "$kbps Kbps"
+        else -> String.format(Locale.US, "%.2f Mbps", kbps / 1_000.0)
     }
 
     private fun fmtRateBits(bitsPerSecond: Long): String {
@@ -279,7 +262,7 @@ class MainActivity : ComponentActivity() {
             Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(18.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
-            ScreenTitle("التحكم بالسرعة", "اختر مستوى جاهزًا أو اضبطه بالمؤشر — الوحدات KB/s وMB/s")
+            ScreenTitle("التحكم بالسرعة", "تحكم عام في Download وUpload — الوحدات Kbps وMbps")
             LimitSlider("سرعة التحميل", s.downloadLimitKbps) { saveLocalLimit(true, it) }
             LimitSlider("سرعة الرفع", s.uploadLimitKbps) { saveLocalLimit(false, it) }
             OutlinedButton(
@@ -1011,26 +994,24 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     private fun LimitSlider(title: String, current: Long?, onApply: (Long?) -> Unit) {
-        // A logarithmic slider keeps the low-speed 10–100 KB/s range usable while
-        // still reaching 100 MB/s without compressing all small values into one pixel.
-        val minKBps = 10.0
-        val maxKBps = 100_000.0
-        val minLog = ln(minKBps)
-        val maxLog = ln(maxKBps)
+        // The backend contract is Kbps. Keep the slider logarithmic so low rates remain usable.
+        val minKbps = 128.0
+        val maxKbps = 100_000.0
+        val minLog = ln(minKbps)
+        val maxLog = ln(maxKbps)
         val unlimitedSentinel = 1.01f
         var pos by remember(current) {
             mutableStateOf(
                 current?.let {
-                    val kb = (it / 8.0).coerceIn(minKBps, maxKBps)
-                    ((ln(kb) - minLog) / (maxLog - minLog)).toFloat()
+                    val kbps = it.toDouble().coerceIn(minKbps, maxKbps)
+                    ((ln(kbps) - minLog) / (maxLog - minLog)).toFloat()
                 } ?: unlimitedSentinel
             )
         }
         val unlimited = pos > 1f
-        val selectedKBps = if (unlimited) null else {
+        val kbps: Long? = if (unlimited) null else {
             exp(minLog + (maxLog - minLog) * pos.coerceIn(0f, 1f)).roundToLong()
         }
-        val kbps: Long? = selectedKBps?.let { (it * 8L).coerceIn(80L, 800_000L) }
 
         GlassCard {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -1038,9 +1019,8 @@ class MainActivity : ComponentActivity() {
                 Text(fmt(kbps), color = Blue, fontWeight = FontWeight.ExtraBold, fontSize = 15.sp)
             }
             Spacer(Modifier.height(10.dp))
-            PresetGroup("بطيء", slowPresets, Amber, onApply)
-            PresetGroup("متوسط", mediumPresets, Blue, onApply)
-            PresetGroup("سريع", fastPresets, Purple, onApply)
+            PresetGroup("Kbps", kbpsPresets, Amber, onApply)
+            PresetGroup("Mbps", mbpsPresets, Blue, onApply)
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                 OutlinedButton(
                     onClick = { onApply(null) },
@@ -1059,8 +1039,8 @@ class MainActivity : ComponentActivity() {
                 colors = SliderDefaults.colors(activeTrackColor = Blue, thumbColor = TextPrimary, inactiveTrackColor = StrokeColor),
             )
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text("10 KB/s", color = TextSecondary, fontSize = 10.sp)
-                Text("100 MB/s → بدون حد", color = TextSecondary, fontSize = 10.sp)
+                Text("128 Kbps", color = TextSecondary, fontSize = 10.sp)
+                Text("100 Mbps → بدون حد", color = TextSecondary, fontSize = 10.sp)
             }
         }
     }
