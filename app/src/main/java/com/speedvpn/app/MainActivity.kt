@@ -235,8 +235,24 @@ class MainActivity : ComponentActivity() {
     }
     override fun onResume() {
         super.onResume()
-        usageAccessState.value = AppTrafficManager.hasUsageAccess(this)
-        VpnRuntime.update { it.copy(permissionGranted = VpnService.prepare(this) == null) }
+
+        // Resume can run immediately after process recreation and OEMs sometimes
+        // expose transient framework/service errors here. Keep those errors local
+        // to the status UI instead of allowing an uncaught exception to kill the app.
+        usageAccessState.value = runCatching {
+            AppTrafficManager.hasUsageAccess(this)
+        }.getOrElse {
+            logE("Unable to read usage-access state", it)
+            false
+        }
+
+        val vpnPermissionGranted = runCatching {
+            VpnService.prepare(this) == null
+        }.getOrElse {
+            logE("Unable to query VPN permission state", it)
+            false
+        }
+        VpnRuntime.update { it.copy(permissionGranted = vpnPermissionGranted) }
     }
 
     private fun loadLocalLimits() = SpeedLimitStore.applyToLimiter(this)
