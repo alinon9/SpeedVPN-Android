@@ -1,6 +1,7 @@
 package com.speedvpn.app
 
 import android.content.Context
+import kotlinx.coroutines.CancellationException
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
 
@@ -10,16 +11,18 @@ internal class QuotaEnforcementWorker(
 ) : CoroutineWorker(appContext, params) {
     override suspend fun doWork(): Result {
         if (!SmartSettings.isStatsEnabled(applicationContext)) return Result.success()
-        return runCatching {
+        return try {
             QuotaEnforcementEngine.enforce(applicationContext)
             Result.success()
-        }.getOrElse {
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
             DiagnosticsRepository.record(
                 applicationContext,
                 "WARN",
                 "Quota",
                 "WORKMANAGER_ENFORCEMENT_FAILED",
-                it.stackTraceToString(),
+                error.stackTraceToString(),
             )
             Result.retry()
         }
