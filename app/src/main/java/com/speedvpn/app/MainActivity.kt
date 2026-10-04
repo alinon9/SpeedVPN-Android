@@ -275,6 +275,14 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     private fun SpeedScreen(s: Snapshot) {
+        var testBusy by remember { mutableStateOf(false) }
+        var testProgress by remember { mutableStateOf<String?>(null) }
+        var lastTest by remember { mutableStateOf<SpeedTestResult?>(null) }
+        var verifyBusy by remember { mutableStateOf(false) }
+        var verifyProgress by remember { mutableStateOf<String?>(null) }
+        var lastVerification by remember { mutableStateOf<SpeedVerificationResult?>(null) }
+        var verificationHistory by remember { mutableStateOf(SpeedVerificationStore.loadRecent(this@MainActivity, 8)) }
+
         Column(
             Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(18.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp),
@@ -282,34 +290,143 @@ class MainActivity : ComponentActivity() {
             ScreenTitle("التحكم بالسرعة", "اختر مستوى جاهزًا أو اضبطه بالمؤشر — الوحدات KB/s وMB/s")
             LimitSlider("سرعة التحميل", s.downloadLimitKbps) { saveLocalLimit(true, it) }
             LimitSlider("سرعة الرفع", s.uploadLimitKbps) { saveLocalLimit(false, it) }
-            OutlinedButton(
-                onClick = {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this@MainActivity)) {
-                        runCatching { startActivity(android.content.Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, android.net.Uri.parse("package:$packageName"))) }
-                    } else {
-                        SpeedOverlayService.start(this@MainActivity)
+
+            GlassCard {
+                SectionLabel("اختبارات الاعتماد • Stage 0", "قياس فعلي قبل بناء الخطط على التحكم بالسرعة")
+
+                Button(
+                    enabled = !testBusy && !verifyBusy,
+                    onClick = {
+                        lifecycleScope.launch {
+                            testBusy = true
+                            testProgress = "جاري بدء الفحص…"
+                            lastTest = SpeedTestEngine.measure { phase ->
+                                val label = if (phase == SpeedTestPhase.DOWNLOAD) "جاري قياس Download…" else "جاري قياس Upload…"
+                                lifecycleScope.launch(Dispatchers.Main.immediate) { testProgress = label }
+                            }
+                            testBusy = false
+                            testProgress = null
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(14.dp),
+                ) {
+                    Text(if (testBusy) "جاري فحص السرعة…" else "🚀 فحص السرعة")
+                }
+
+                Button(
+                    enabled = !testBusy && !verifyBusy,
+                    onClick = {
+                        if (!s.permissionGranted) {
+                            requestVpnPermission()
+                        } else {
+                            lifecycleScope.launch {
+                                verifyBusy = true
+                                verifyProgress = "جاري تحضير التحقق…"
+                                lastVerification = SpeedVerificationEngine.verify(
+                                    context = this@MainActivity,
+                                    planDownloadKbps = s.downloadLimitKbps,
+                                    planUploadKbps = s.uploadLimitKbps,
+                                    onProgress = { message ->
+                                        lifecycleScope.launch(Dispatchers.Main.immediate) { verifyProgress = message }
+                                    },
+                                )
+                                SpeedVerificationStore.save(this@MainActivity, lastVerification!!)
+                                verificationHistory = SpeedVerificationStore.loadRecent(this@MainActivity, 8)
+                                verifyBusy = false
+                                verifyProgress = null
+                            }
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(14.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = Blue2),
+                ) {
+                    Text(if (verifyBusy) "جاري التحقق من الخطة…" else "✅ تحقق من السرعة")
+                }
+
+                OutlinedButton(
+                    onClick = {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this@MainActivity)) {
+                            runCatching { startActivity(android.content.Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, android.net.Uri.parse("package:$packageName"))) }
+                        } else {
+                            SpeedOverlayService.start(this@MainActivity)
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(14.dp),
+                ) { Text("📊 نافذة السرعة الدائمة") }
+
+                if (testBusy) {
+                    Text(testProgress ?: "جاري الفحص…", color = Blue, fontSize = 11.sp)
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                }
+                if (verifyBusy) {
+                    Text(verifyProgress ?: "جاري التحقق…", color = Cyan, fontSize = 11.sp)
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                }
+            }
+
+            lastTest?.let { result ->
+                GlassCard {
+                    SectionLabel("نتيجة فحص السرعة", "القياس على المسار الحالي بدون تغيير حالة VPN")
+                    InfoRow("Download", result.downloadBps?.let(::fmtRateBits) ?: "فشل القياس")
+                    InfoRow("Upload", result.uploadBps?.let(::fmtRateBits) ?: "فشل القياس")
+                    InfoRow("المدة", "${result.durationMs / 1000.0} ثانية")
+                    result.error?.let { Text("ملاحظة: $it", color = Amber, fontSize = 10.sp) }
+                }
+            }
+
+            lastVerification?.let { result ->
+                GlassCard {
+                    SectionLabel("نتيجة التحقق", "الشبكة الأصلية ← VPN ← الحكم النهائي")
+                    Text(
+                        "الحكم النهائي: " + speedStatusLabel(result.overallStatus),
+                        color = speedStatusColor(result.overallStatus),
+                        fontWeight = FontWeight.ExtraBold,
+                        fontSize = 15.sp,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    SpeedMetricResult("Download", result.download)
+                    Spacer(Modifier.height(8.dp))
+                    SpeedMetricResult("Upload", result.upload)
+                    result.note?.let {
+                        Spacer(Modifier.height(5.dp))
+                        Text(it, color = TextSecondary, fontSize = 10.sp)
                     }
-                },
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(12.dp),
-            ) { Text("فتح نافذة السرعة العامة العائمة") }
+                }
+            }
+
+            if (verificationHistory.isNotEmpty()) {
+                GlassCard {
+                    SectionLabel("سجل الاعتماد المحلي", "آخر القياسات المحفوظة على الجهاز")
+                    verificationHistory.forEach { result ->
+                        val plan = result.download.planKbps ?: result.upload.planKbps
+                        val accuracy = result.download.accuracyPercent ?: result.upload.accuracyPercent
+                        InfoRow(
+                            speedStatusLabel(result.overallStatus) + " • " + (plan?.let(::formatPlanBits) ?: "بدون حد"),
+                            accuracy?.let { String.format(Locale.US, "%.1f%%", it) } ?: "—",
+                        )
+                    }
+                }
+            }
+
             GlassCard {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("💡", fontSize = 20.sp)
                     Spacer(Modifier.width(10.dp))
                     Column(Modifier.weight(1f)) {
-                        Text("ملاحظة", color = TextPrimary, fontWeight = FontWeight.Bold)
+                        Text("ملاحظة موثوقية", color = TextPrimary, fontWeight = FontWeight.Bold)
                         Text(
-                            "السرعة تحدد سقف الترافيك العام للتطبيقات التي تمر عبر الـVPN.",
+                            "المقارنة تستخدم هامش سماح ±20%. وإذا كانت الشبكة الأصلية أبطأ من الخطة، تكون النتيجة ⚠️ لا يمكن الحكم بدل اتهام الخطة بالفشل.",
                             color = TextSecondary,
-                            fontSize = 12.sp,
+                            fontSize = 11.sp,
                         )
                     }
                 }
             }
         }
     }
-
     @Composable
     private fun SmartScreen(s: Snapshot) {
         var statsEnabled by remember { mutableStateOf(SmartSettings.isStatsEnabled(this@MainActivity)) }
