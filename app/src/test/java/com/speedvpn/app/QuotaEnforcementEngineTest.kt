@@ -208,6 +208,7 @@ class QuotaEnforcementEngineTest {
         val packageName = "com.example.lazy"
         UsageRepository.setQuotaPolicy(
             context, packageName, "Lazy", 2011, QuotaType.DAILY, 1_000L,
+            resetBehavior = ResetBehavior.BLOCK_UNTIL_RESET,
         )
         val now = System.currentTimeMillis()
         val current = QuotaPeriod.current(QuotaType.DAILY, now)
@@ -225,6 +226,7 @@ class QuotaEnforcementEngineTest {
         assertEquals(0L, policy.usedBytes)
         assertEquals(current.startMillis, policy.periodStartMillis)
         assertEquals(current.endMillis, policy.periodEndMillis)
+        assertEquals(ResetBehavior.BLOCK_UNTIL_RESET, policy.resetBehavior)
     }
 
     @Test
