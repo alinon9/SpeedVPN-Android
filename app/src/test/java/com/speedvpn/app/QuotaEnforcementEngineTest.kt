@@ -157,6 +157,48 @@ class QuotaEnforcementEngineTest {
     }
 
     @Test
+    fun newerImmediateRestartCancelsStaleDeferredRestart() {
+        QuotaEnforcementEngine.resetRestartThrottleForTests()
+        val base = 2_000_000L
+        var restarts = 0
+        var cancellations = 0
+        var staleAction: (() -> Unit)? = null
+
+        QuotaEnforcementEngine.requestRestartForTests(
+            context = context,
+            nowMillis = base,
+            restart = { restarts++ },
+            postDelayed = { _, action -> staleAction = action },
+            clock = { base + 5_000L },
+        )
+
+        QuotaEnforcementEngine.requestRestartForTests(
+            context = context,
+            nowMillis = base + 1_000L,
+            restart = { restarts++ },
+            postDelayed = { _, action -> staleAction = action },
+            clock = { base + 5_000L },
+        )
+        assertEquals(1, restarts)
+
+        QuotaEnforcementEngine.requestRestartForTests(
+            context = context,
+            nowMillis = base + 5_000L,
+            restart = { restarts++ },
+            postDelayed = { _, action -> staleAction = action },
+            cancelPending = { cancellations++ },
+            clock = { base + 5_000L },
+        )
+
+        assertEquals(2, restarts)
+        assertEquals(1, cancellations)
+
+        // Simulate a stale callback that was already dequeued before cancellation.
+        staleAction!!.invoke()
+        assertEquals(2, restarts)
+    }
+
+    @Test
     fun lazyResetClearsExpiredPolicyOnFirstEnforcement() {
         val packageName = "com.example.lazy"
         UsageRepository.setQuotaPolicy(
