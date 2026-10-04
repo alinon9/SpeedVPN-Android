@@ -951,6 +951,9 @@ class SpeedVpnService : VpnService() {
                 if (SmartSettings.isStatsEnabled(this@SpeedVpnService) &&
                     AppTrafficManager.hasUsageAccess(this@SpeedVpnService)
                 ) {
+                    if (UsageRepository.readQuotaPolicies(this@SpeedVpnService).isEmpty()) {
+                        continue
+                    }
                     runCatching {
                         // Collect the freshest platform usage available, then enforce
                         // immediately in the same 5s cycle. Previously this loop only
@@ -1243,7 +1246,10 @@ class SpeedVpnService : VpnService() {
                 true
             }
         }
-        if (ownsRuntime) stopForeground(STOP_FOREGROUND_REMOVE)
+        if (ownsRuntime) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            SpeedOverlayService.stop(this)
+        }
         serviceGeneration = 0L
         stopSelf()
     }
@@ -1287,8 +1293,9 @@ class SpeedVpnService : VpnService() {
                 scope.launch { connect() }
                 return@withLock
             }
-            if (released) stopForeground(STOP_FOREGROUND_REMOVE)
             if (released) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                SpeedOverlayService.stop(this)
                 VpnRuntime.update { it.copy(status = VpnStatus.DISCONNECTED, tunnel = "down", health = VpnHealth.DISCONNECTED, serviceRunning = false) }
             }
             stopSelf()
@@ -1316,6 +1323,7 @@ class SpeedVpnService : VpnService() {
 
         if (released) {
             stopForeground(STOP_FOREGROUND_REMOVE)
+            SpeedOverlayService.stop(this)
             VpnRuntime.update {
                 it.copy(status = VpnStatus.DISCONNECTED, tunnel = "down", serviceRunning = false, downloadBps = 0, uploadBps = 0)
             }
