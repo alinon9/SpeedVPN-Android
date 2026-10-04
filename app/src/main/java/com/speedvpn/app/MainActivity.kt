@@ -276,6 +276,7 @@ class MainActivity : ComponentActivity() {
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(12.dp),
             ) { Text("فتح نافذة السرعة العامة العائمة") }
+            SpeedDiagnosticCard(s)
             GlassCard {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("💡", fontSize = 20.sp)
@@ -293,6 +294,61 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    @Composable
+    private fun SpeedDiagnosticCard(s: Snapshot) {
+        var running by remember { mutableStateOf(false) }
+        var direct by remember { mutableStateOf<SpeedTestResult?>(null) }
+        var vpn by remember { mutableStateOf<SpeedTestResult?>(null) }
+
+        GlassCard {
+            SectionLabel("اختبار دقة التحكم بالسرعة", "يقيس الإنترنت مباشرة ثم عبر الـVPN من داخل التطبيق")
+            Text("الاختبار يستخدم تنزيل ورفع حقيقيين، وليس YouTube. شغّل الـVPN أولًا لاختبار المسار المقيد.", color = TextSecondary, fontSize = 11.sp)
+            Button(
+                enabled = !running,
+                onClick = {
+                    running = true
+                    direct = null
+                    vpn = null
+                    lifecycleScope.launch(Dispatchers.IO) {
+                        val directResult = SpeedTestEngine.run(useVpn = false)
+                        withContext(Dispatchers.Main) { direct = directResult }
+                        val vpnResult = SpeedTestEngine.run(useVpn = true)
+                        withContext(Dispatchers.Main) {
+                            vpn = vpnResult
+                            running = false
+                        }
+                    }
+                },
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text(if (running) "جاري القياس… (حوالي 20 ثانية)" else "بدء اختبار السرعة") }
+            direct?.let { SpeedTestResultCard(it, null) }
+            vpn?.let { SpeedTestResultCard(it, s.downloadLimitKbps) }
+        }
+    }
+
+    @Composable
+    private fun SpeedTestResultCard(result: SpeedTestResult, expectedDownloadKbps: Long?) {
+        Spacer(Modifier.height(6.dp))
+        Text(if (result.mode == "VPN") "نتيجة عبر VPN" else "نتيجة مباشرة بدون VPN", color = TextPrimary, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+        if (result.error != null) {
+            Text("❌ ${result.error}", color = Color(0xFFFF7D88), fontSize = 11.sp)
+            return
+        }
+        InfoRow("Download", SpeedTestEngine.format(result.downloadMbps))
+        InfoRow("Upload", SpeedTestEngine.format(result.uploadMbps))
+        InfoRow("البيانات", formatDataBytes(result.downloadBytes + result.uploadBytes))
+        if (expectedDownloadKbps != null && result.downloadMbps != null) {
+            val expectedMbps = expectedDownloadKbps / 1_000.0
+            val ratio = if (expectedMbps > 0.0) result.downloadMbps / expectedMbps * 100.0 else 0.0
+            val status = when {
+                ratio in 80.0..130.0 -> "✅ قريب جدًا من الحد المطلوب"
+                ratio in 60.0..160.0 -> "🟡 الشبكة/الاختبار متذبذب"
+                else -> "🔴 يحتاج تشخيص"
+            }
+            InfoRow("الحد المختار", fmt(expectedDownloadKbps))
+            InfoRow("مقارنة الحد", String.format(Locale.US, "%.1f%% • %s", ratio, status))
+        }
+    }
     @Composable
     private fun SmartScreen(s: Snapshot) {
         var statsEnabled by remember { mutableStateOf(SmartSettings.isStatsEnabled(this@MainActivity)) }
