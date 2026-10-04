@@ -31,8 +31,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.File
-import java.net.Inet4Address
-import java.net.Inet6Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
@@ -138,8 +136,6 @@ class SpeedVpnService : VpnService() {
     @Volatile private var socks: Socks5Server? = null
     @Volatile private var engineRunning = false
     private val currentPhysicalNetwork = AtomicReference<Network?>(null)
-    @Volatile private var lastDnsSignature = ""
-    private val dnsRebuildPending = AtomicBoolean(false)
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var meter: Job? = null
     private var healthMonitor: Job? = null
@@ -269,16 +265,9 @@ class SpeedVpnService : VpnService() {
         }
 
         val physicalNetwork = findUnderlyingNetwork()
-        val physicalLinkProperties = physicalNetwork?.let { network ->
-            runCatching {
-                getSystemService(ConnectivityManager::class.java).getLinkProperties(network)
-            }.getOrNull()
-        }
-        // IPv6-disabled mode must also avoid advertising IPv6 DNS servers.
-        // This keeps Android's VPN DNS path consistent with the selected IP family.
-        // DNS is terminated inside the TUN by hev MapDNS.
+        // DNS is terminated inside the TUN by hev MapDNS. Physical DNS changes must not
+        // trigger a VPN generation rebuild because the VPN-facing resolver is fixed.
         val dnsServers = listOf(InetAddress.getByName(MAP_DNS_V4))
-        lastDnsSignature = MAP_DNS_V4
 
         val pfd = try {
             val builder = Builder()
@@ -502,71 +491,6 @@ class SpeedVpnService : VpnService() {
         return conf
     }
 
-    private fun dnsSignature(servers: List<InetAddress>): String =
-        servers.mapNotNull { it.hostAddress }.sorted().joinToString(",")
-
-    private fun handleLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
-        if (destroying.get() || currentPhysicalNetwork.get() != network) return
-
-        val settings = VpnSettings.read(this)
-        val ipv4Only = settings.dnsIpv4Only || !settings.ipv6Enabled
-        val dns = runCatching { selectVpnDnsServers(linkProperties, ipv4Only) }.getOrElse { emptyList() }
-        // Do not replace a known-good DNS set with an empty set during the short
-        // transition window where Android has not published new DNS servers yet.
-        if (dns.isEmpty()) return
-        val signature = dnsSignature(dns)
-        if (signature == lastDnsSignature) return
-
-        lastDnsSignature = signature
-        val connected = tun != null && VpnRuntime.state.value.status == VpnStatus.CONNECTED
-        if (!connected) return
-
-        // Android's VPN Builder does not expose an in-place DNS mutation. Rebuild
-        // the VPN generation so the new DNS servers are installed atomically with
-        // a fresh TUN. Debounce callback bursts and bind the disconnect to the
-        // generation that observed the DNS change; otherwise a second callback can
-        // queue a stale disconnect that tears down the freshly rebuilt generation.
-        val expectedGeneration = serviceGeneration
-        if (!dnsRebuildPending.compareAndSet(false, true)) return
-        log("Physical DNS changed ($signature); scheduling VPN generation rebuild for $expectedGeneration")
-        scope.launch {
-            try {
-                val shouldReconnect = stateMutex.withLock {
-                    if (destroying.get() || serviceGeneration != expectedGeneration ||
-                        VpnRuntime.state.value.status != VpnStatus.CONNECTED || tun == null
-                    ) {
-                        false
-                    } else {
-                        reconnectAfterDisconnect = true
-                        true
-                    }
-                }
-                if (shouldReconnect) disconnect(expectedGeneration)
-            } finally {
-                dnsRebuildPending.set(false)
-            }
-        }
-    }
-
-    private fun selectVpnDnsServers(linkProperties: LinkProperties?, ipv4Only: Boolean): List<InetAddress> {
-        if (linkProperties == null) {
-            if (ipv4Only) throw IllegalStateException("IPv4-only DNS requested but physical DNS is unavailable")
-            return emptyList()
-        }
-        val result = linkProperties.dnsServers
-            .asSequence()
-            .filter { !it.isLoopbackAddress && !it.isMulticastAddress && !it.isAnyLocalAddress }
-            .filter { it is Inet4Address || it is Inet6Address }
-            .filter { !ipv4Only || it is Inet4Address }
-            .distinctBy { it.hostAddress }
-            .take(4)
-            .toList()
-        if (ipv4Only && result.isEmpty()) {
-            throw IllegalStateException("IPv4-only DNS requested but no IPv4 DNS server is available")
-        }
-        return result
-    }
-
     private fun isUsablePhysicalNetwork(cm: ConnectivityManager, network: Network?): Boolean {
         if (network == null) return false
         val caps = cm.getNetworkCapabilities(network) ?: return false
@@ -655,7 +579,6 @@ class SpeedVpnService : VpnService() {
             override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
                 if (isUsablePhysicalNetwork(cm, network)) {
                     if (currentPhysicalNetwork.get() != network) refreshPhysicalNetwork()
-                    handleLinkPropertiesChanged(network, linkProperties)
                 }
             }
         }
@@ -676,8 +599,6 @@ class SpeedVpnService : VpnService() {
             getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(callback)
         }
         currentPhysicalNetwork.set(null)
-        lastDnsSignature = ""
-        dnsRebuildPending.set(false)
     }
 
     private fun waitForReady(mySession: Long, relay: Socks5Server, timeoutMs: Long): Boolean {
