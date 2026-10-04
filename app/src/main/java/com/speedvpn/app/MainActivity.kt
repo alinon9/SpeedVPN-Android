@@ -1181,7 +1181,7 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun PresetGroup(
         label: String,
-        values: List<Long>,
+        values: List<Pair<String, Long>>,
         accent: Color,
         onApply: (Long?) -> Unit,
     ) {
@@ -1192,15 +1192,15 @@ class MainActivity : ComponentActivity() {
                 Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                values.forEach { value ->
+                values.forEach { (labelText, speedKbps) ->
                     OutlinedButton(
-                        onClick = { onApply(value * 8L) },
+                        onClick = { onApply(speedKbps) },
                         shape = RoundedCornerShape(9.dp),
                         border = androidx.compose.foundation.BorderStroke(1.dp, accent.copy(alpha = 0.45f)),
                         contentPadding = PaddingValues(horizontal = 9.dp, vertical = 0.dp),
                         modifier = Modifier.height(32.dp),
                     ) {
-                        Text(formatPresetSpeed(value), fontSize = 10.sp, color = TextPrimary)
+                        Text(labelText, fontSize = 10.sp, color = TextPrimary)
                     }
                 }
             }
