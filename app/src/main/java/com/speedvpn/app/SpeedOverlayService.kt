@@ -195,8 +195,8 @@ internal class SpeedOverlayService : Service() {
         val (dl, ul) = current()
         val runtime = VpnRuntime.state.value
         title?.text = "SpeedVPN • ${if (targetPackage == null) "عام" else targetLabel}"
-        downloadValue?.text = "↓ فعلي ${formatBitRate(runtime.downloadBps)} • حد ${formatRate(dl)}"
-        uploadValue?.text = "↑ فعلي ${formatBitRate(runtime.uploadBps)} • حد ${formatRate(ul)}"
+        downloadValue?.text = "↓ VPN فعلي ${formatBitRate(runtime.downloadBps)} • محجوز ${formatRate(dl)}"
+        uploadValue?.text = "↑ VPN فعلي ${formatBitRate(runtime.uploadBps)} • محجوز ${formatRate(ul)}"
     }
 
     private fun formatRate(kbps: Long?): String {
