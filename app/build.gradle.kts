@@ -17,9 +17,10 @@ android {
         versionName = "1.1.1"
 
         // Public values only (same ones the website uses). No secrets here.
-        buildConfigField("String", "API_BASE", "\"https://read-fix-build-magic.lovable.app/api/public/vpn\"")
-        buildConfigField("String", "AUTH_URL", "\"https://abzykxcudjnceqdqurrc.supabase.co/auth/v1\"")
-        buildConfigField("String", "AUTH_KEY", "\"sb_publishable_SoW7idGma-3aqlx-pIMrTw_sK3nex2h\"")
+        buildConfigField("String", "API_BASE", "\"${System.getenv("SPEEDVPN_API_BASE") ?: "https://read-fix-build-magic.lovable.app/api/public/vpn"}\"")
+        buildConfigField("String", "AUTH_URL", "\"${System.getenv("SPEEDVPN_AUTH_URL") ?: "https://abzykxcudjnceqdqurrc.supabase.co/auth/v1"}\"")
+        buildConfigField("String", "AUTH_KEY", "\"${System.getenv("SPEEDVPN_AUTH_KEY") ?: "sb_publishable_SoW7idGma-3aqlx-pIMrTw_sK3nex2h"}\"")
+        buildConfigField("String", "SENTRY_DSN", "\"${System.getenv("SPEEDVPN_SENTRY_DSN") ?: ""}\"")
 
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
@@ -51,7 +52,11 @@ android {
     }
 
     buildTypes {
+        debug {
+            buildConfigField("String", "BUILD_ENV", "\"debug\"")
+        }
         release {
+            buildConfigField("String", "BUILD_ENV", "\"production\"")
             isMinifyEnabled = false
             // R8 stays disabled until a real release build verifies Compose + JNI
             // reflection/entry points. Release signing is injected only by CI env vars.
@@ -88,6 +93,7 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("androidx.work:work-runtime-ktx:2.9.1")
+    implementation("io.sentry:sentry-android:7.22.0")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.robolectric:robolectric:4.17")
