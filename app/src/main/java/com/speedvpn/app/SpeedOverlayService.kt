@@ -10,6 +10,8 @@ import android.graphics.Color
 import android.graphics.PixelFormat
 import android.os.Build
 import android.os.IBinder
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.view.Gravity
 import android.view.MotionEvent
@@ -57,6 +59,13 @@ internal class SpeedOverlayService : Service() {
     private var uploadValue: TextView? = null
     private var targetPackage: String? = null
     private var targetLabel: String = "التحكم العام"
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val refreshTask = object : Runnable {
+        override fun run() {
+            refresh()
+            if (root != null) mainHandler.postDelayed(this, 1000L)
+        }
+    }
     private val increments = listOf(128L, 256L, 512L, 1000L, 2000L, 5000L, 10000L)
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -72,6 +81,8 @@ internal class SpeedOverlayService : Service() {
         startForegroundCompat()
         if (root == null) addOverlay()
         refresh()
+        mainHandler.removeCallbacks(refreshTask)
+        mainHandler.post(refreshTask)
         return START_STICKY
     }
 
@@ -182,9 +193,10 @@ internal class SpeedOverlayService : Service() {
 
     private fun refresh() {
         val (dl, ul) = current()
+        val runtime = VpnRuntime.state.value
         title?.text = "SpeedVPN • ${if (targetPackage == null) "عام" else targetLabel}"
-        downloadValue?.text = "↓ ${formatRate(dl)}"
-        uploadValue?.text = "↑ ${formatRate(ul)}"
+        downloadValue?.text = "↓ فعلي ${formatBitRate(runtime.downloadBps)} • حد ${formatRate(dl)}"
+        uploadValue?.text = "↑ فعلي ${formatBitRate(runtime.uploadBps)} • حد ${formatRate(ul)}"
     }
 
     private fun formatRate(kbps: Long?): String {
@@ -194,6 +206,16 @@ internal class SpeedOverlayService : Service() {
             bytes < 1_000 -> String.format(Locale.US, "%.0f B/s", bytes)
             bytes < 1_000_000 -> String.format(Locale.US, "%.1f KB/s", bytes / 1_000.0)
             else -> String.format(Locale.US, "%.2f MB/s", bytes / 1_000_000.0)
+        }
+    }
+
+    private fun formatBitRate(bitsPerSecond: Long): String {
+        val bps = bitsPerSecond.coerceAtLeast(0L)
+        return when {
+            bps < 1_000L -> bps.toString() + " bps"
+            bps < 1_000_000L -> String.format(Locale.US, "%.0f Kbps", bps / 1_000.0)
+            bps < 1_000_000_000L -> String.format(Locale.US, "%.2f Mbps", bps / 1_000_000.0)
+            else -> String.format(Locale.US, "%.2f Gbps", bps / 1_000_000_000.0)
         }
     }
 
@@ -216,6 +238,7 @@ internal class SpeedOverlayService : Service() {
     }
 
     override fun onDestroy() {
+        mainHandler.removeCallbacks(refreshTask)
         root?.let { view -> runCatching { wm.removeView(view) } }
         root = null
         super.onDestroy()
