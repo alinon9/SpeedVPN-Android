@@ -18,7 +18,7 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <application
-        android:name=".SpeedVpnApplication"
+        android:name=".StartupApplication"
         android:allowBackup="false"
         android:usesCleartextTraffic="false"
         android:networkSecurityConfig="@xml/network_security_config"
@@ -35,7 +35,7 @@
             android:value="false" />
 
         <activity
-            android:name=".MainActivity"
+            android:name=".StartupActivity"
             android:exported="true"
             android:launchMode="singleTop">
             <intent-filter>
@@ -44,9 +44,9 @@
             </intent-filter>
         </activity>
 
-        <!-- Kept as an internal startup diagnostic; not exposed as the launcher. -->
+        <!-- Main UI is kept declared for the safe startup diagnostic. -->
         <activity
-            android:name=".StartupActivity"
+            android:name=".MainActivity"
             android:exported="false"
             android:launchMode="singleTop" />
 
