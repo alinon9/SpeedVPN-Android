@@ -978,19 +978,30 @@ class SpeedVpnService : VpnService() {
         meter = scope.launch {
             var lastDown = SpeedLimiter.download.total.get()
             var lastUp = SpeedLimiter.upload.total.get()
+            var previousDownBps = 0L
+            var previousUpBps = 0L
+            var firstSample = true
             while (isActive && sessionId.get() == mySession) {
                 delay(1_000)
                 if (!sessionIsCurrent(mySession)) break
                 val d = SpeedLimiter.download.total.get()
                 val u = SpeedLimiter.upload.total.get()
+                val rawDownBps = ((d - lastDown).coerceAtLeast(0L)) * 8
+                val rawUpBps = ((u - lastUp).coerceAtLeast(0L)) * 8
+                // Two-sample moving average: enough to suppress one-second packet
+                // bursts without hiding real speed changes for long periods.
+                val smoothDownBps = if (firstSample) rawDownBps else
+                    ((previousDownBps + rawDownBps) / 2L).coerceAtLeast(0L)
+                val smoothUpBps = if (firstSample) rawUpBps else
+                    ((previousUpBps + rawUpBps) / 2L).coerceAtLeast(0L)
                 val sessionDown = SpeedLimiter.download.sessionBytes(myServiceGeneration)
                 val sessionUp = SpeedLimiter.upload.sessionBytes(myServiceGeneration)
                 synchronized(processNativeLifecycleLock) {
                     if (activeServiceGeneration.get() == myServiceGeneration) {
                         VpnRuntime.update {
                             it.copy(
-                                downloadBps = ((d - lastDown).coerceAtLeast(0L)) * 8,
-                                uploadBps = ((u - lastUp).coerceAtLeast(0L)) * 8,
+                                downloadBps = smoothDownBps,
+                                uploadBps = smoothUpBps,
                                 sessionDownloadBytes = sessionDown,
                                 sessionUploadBytes = sessionUp,
                             )
@@ -1001,6 +1012,9 @@ class SpeedVpnService : VpnService() {
                 }
                 lastDown = d
                 lastUp = u
+                previousDownBps = rawDownBps
+                previousUpBps = rawUpBps
+                firstSample = false
             }
         }
     }
