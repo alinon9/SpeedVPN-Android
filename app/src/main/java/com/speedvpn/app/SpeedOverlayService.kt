@@ -57,6 +57,8 @@ internal class SpeedOverlayService : Service() {
     private var title: TextView? = null
     private var downloadValue: TextView? = null
     private var uploadValue: TextView? = null
+    private var downloadReserved: TextView? = null
+    private var uploadReserved: TextView? = null
     private var targetPackage: String? = null
     private var targetLabel: String = "التحكم العام"
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -66,7 +68,7 @@ internal class SpeedOverlayService : Service() {
             if (root != null) mainHandler.postDelayed(this, 1000L)
         }
     }
-    private val increments = listOf(128L, 256L, 512L, 1000L, 2000L, 5000L, 10000L)
+    private val increments = listOf(1L, 10L, 25L, 50L, 75L, 100L, 130L, 250L, 500L, 750L, 950L, 1_000L, 2_000L, 3_000L, 4_000L, 5_000L, 9_000L, 10_000L, 11_000L, 100_000L).map { it * 8L }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -107,27 +109,39 @@ internal class SpeedOverlayService : Service() {
 
     private fun addOverlay() {
         wm = getSystemService(WindowManager::class.java)
-        val parent = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(18, 14, 18, 14)
-            setBackgroundColor(Color.rgb(9, 17, 33))
+        val size = (238 * resources.displayMetrics.density).toInt()
+        val parent = FrameLayout(this).apply {
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.rgb(7, 15, 30))
+                setStroke((1.5f * resources.displayMetrics.density).toInt(), Color.rgb(53, 184, 255))
+            }
+            elevation = 18f
+            setPadding(18, 18, 18, 18)
         }
-        title = TextView(this).apply { setTextColor(Color.WHITE); textSize = 14f }
-        downloadValue = TextView(this).apply { setTextColor(Color.rgb(53, 184, 255)); textSize = 16f; setPadding(0, 8, 0, 3) }
-        uploadValue = TextView(this).apply { setTextColor(Color.rgb(66, 240, 228)); textSize = 16f; setPadding(0, 0, 0, 6) }
-        parent.addView(title)
-        parent.addView(downloadValue)
-        parent.addView(uploadValue)
-        parent.addView(controlRow(true))
-        parent.addView(controlRow(false))
-        val close = button("إغلاق") { stopSelf() }
-        parent.addView(close, LinearLayout.LayoutParams(-1, 42).apply { topMargin = 6 })
+        val column = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+        }
+        title = TextView(this).apply { setTextColor(Color.WHITE); textSize = 11f; gravity = Gravity.CENTER }
+        downloadValue = TextView(this).apply { setTextColor(Color.rgb(53, 184, 255)); textSize = 14f; gravity = Gravity.CENTER }
+        uploadValue = TextView(this).apply { setTextColor(Color.rgb(66, 240, 228)); textSize = 14f; gravity = Gravity.CENTER }
+        downloadReserved = TextView(this).apply { setTextColor(Color.LTGRAY); textSize = 9f; gravity = Gravity.CENTER }
+        uploadReserved = TextView(this).apply { setTextColor(Color.LTGRAY); textSize = 9f; gravity = Gravity.CENTER }
+        column.addView(title, LinearLayout.LayoutParams(-1, 28))
+        column.addView(downloadValue, LinearLayout.LayoutParams(-1, 28))
+        column.addView(downloadReserved, LinearLayout.LayoutParams(-1, 20))
+        column.addView(controlRow(true), LinearLayout.LayoutParams(-1, 44))
+        column.addView(uploadValue, LinearLayout.LayoutParams(-1, 28))
+        column.addView(uploadReserved, LinearLayout.LayoutParams(-1, 20))
+        column.addView(controlRow(false), LinearLayout.LayoutParams(-1, 44))
+        parent.addView(column, FrameLayout.LayoutParams(-1, -1))
+        val close = button("×") { stopSelf() }.apply { textSize = 18f; background = circleButtonBackground(Color.rgb(70, 25, 40)) }
+        parent.addView(close, FrameLayout.LayoutParams(38, 38, Gravity.TOP or Gravity.END))
         parent.setOnTouchListener(DragListener())
         root = parent
-
         val params = WindowManager.LayoutParams(
-            (280 * resources.displayMetrics.density).toInt(),
-            WindowManager.LayoutParams.WRAP_CONTENT,
+            size, size,
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT,
@@ -145,10 +159,21 @@ internal class SpeedOverlayService : Service() {
 
     private fun controlRow(download: Boolean): LinearLayout = LinearLayout(this).apply {
         orientation = LinearLayout.HORIZONTAL
-        addView(button("−") { change(download, -1) }, weightParams())
-        addView(button("1M") { set(download, 1000L) }, weightParams())
-        addView(button("+") { change(download, 1) }, weightParams())
-        addView(button("∞") { set(download, null) }, weightParams())
+        gravity = Gravity.CENTER
+        addView(button("−") { change(download, -1) }.apply {
+            textSize = 22f
+            background = circleButtonBackground(Color.rgb(35, 48, 75))
+        }, LinearLayout.LayoutParams(48, 40).apply { marginEnd = 12 })
+        addView(TextView(this@SpeedOverlayService).apply {
+            text = if (download) "↓" else "↑"
+            setTextColor(if (download) Color.rgb(53, 184, 255) else Color.rgb(66, 240, 228))
+            textSize = 18f
+            gravity = Gravity.CENTER
+        }, LinearLayout.LayoutParams(34, 40))
+        addView(button("+") { change(download, 1) }.apply {
+            textSize = 22f
+            background = circleButtonBackground(Color.rgb(35, 48, 75))
+        }, LinearLayout.LayoutParams(48, 40).apply { marginStart = 12 })
     }
 
     private fun button(label: String, action: () -> Unit) = Button(this).apply {
@@ -156,9 +181,15 @@ internal class SpeedOverlayService : Service() {
         textSize = 11f
         setOnClickListener { action() }
         isAllCaps = false
+        setTextColor(Color.WHITE)
+        background = circleButtonBackground(Color.rgb(28, 42, 68))
     }
 
-    private fun weightParams() = LinearLayout.LayoutParams(0, 42, 1f).apply { marginEnd = 4 }
+    private fun circleButtonBackground(color: Int) = GradientDrawable().apply {
+        shape = GradientDrawable.OVAL
+        setColor(color)
+        setStroke(1, Color.rgb(65, 95, 135))
+    }
 
     private fun current(): Pair<Long?, Long?> = if (targetPackage == null) {
         SpeedLimitStore.load(this)
@@ -195,8 +226,10 @@ internal class SpeedOverlayService : Service() {
         val (dl, ul) = current()
         val runtime = VpnRuntime.state.value
         title?.text = "SpeedVPN • ${if (targetPackage == null) "عام" else targetLabel}"
-        downloadValue?.text = "↓ VPN فعلي ${formatBitRate(runtime.downloadBps)} • محجوز ${formatRate(dl)}"
-        uploadValue?.text = "↑ VPN فعلي ${formatBitRate(runtime.uploadBps)} • محجوز ${formatRate(ul)}"
+        downloadValue?.text = "↓ VPN ${formatBitRate(runtime.downloadBps)}"
+        downloadReserved?.text = "محجوز: ${formatRate(dl)}"
+        uploadValue?.text = "↑ VPN ${formatBitRate(runtime.uploadBps)}"
+        uploadReserved?.text = "محجوز: ${formatRate(ul)}"
     }
 
     private fun formatRate(kbps: Long?): String {
