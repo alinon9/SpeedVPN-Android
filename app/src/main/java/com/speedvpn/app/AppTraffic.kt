@@ -60,20 +60,44 @@ object AppTrafficManager {
     fun installedLaunchableApps(context: Context): List<ApplicationInfo> {
         val pm = context.packageManager
         val launcher = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
-        val launchable = pm.queryIntentActivities(launcher, PackageManager.MATCH_ALL)
-            .mapNotNull { it.activityInfo?.applicationInfo }
-            .toMutableList()
+        val candidates = LinkedHashMap<String, ApplicationInfo>()
 
-        val blocked = VpnAppControl.read(context).blockedPackages
-        blocked.forEach { pkg ->
-            if (pkg == context.packageName || launchable.any { it.packageName == pkg }) return@forEach
-            runCatching { pm.getApplicationInfo(pkg, PackageManager.MATCH_ALL) }
-                .onSuccess { launchable += it }
+        // Keep launcher apps for the normal user-facing list.
+        pm.queryIntentActivities(launcher, PackageManager.MATCH_ALL)
+            .mapNotNull { it.activityInfo?.applicationInfo }
+            .forEach { app ->
+                if (app.packageName != context.packageName && app.enabled) {
+                    candidates[app.packageName] = app
+                }
+            }
+
+        // Quota/firewall controls are UID/package based. Launcher-only discovery
+        // silently omitted background/system packages that can still generate traffic.
+        // Add installed packages that explicitly request INTERNET as well.
+        runCatching {
+            @Suppress("DEPRECATION")
+            pm.getInstalledPackages(PackageManager.GET_PERMISSIONS)
+        }.getOrDefault(emptyList()).forEach { info ->
+            val app = info.applicationInfo ?: return@forEach
+            val hasInternet = info.requestedPermissions?.any {
+                it == android.Manifest.permission.INTERNET
+            } == true
+            if (app.packageName != context.packageName && app.enabled && hasInternet) {
+                candidates[app.packageName] = app
+            }
         }
 
-        return launchable
-            .filter { it.packageName != context.packageName }
-            .distinctBy { it.packageName }
+        // Always preserve explicitly blocked packages even if their manifest does
+        // not advertise INTERNET, so a saved policy never disappears from the UI.
+        VpnAppControl.read(context).blockedPackages.forEach { pkg ->
+            if (pkg == context.packageName || candidates.containsKey(pkg)) return@forEach
+            runCatching { pm.getApplicationInfo(pkg, PackageManager.MATCH_ALL) }
+                .onSuccess { app ->
+                    if (app.enabled) candidates[pkg] = app
+                }
+        }
+
+        return candidates.values
             .sortedBy { it.loadLabel(pm).toString().lowercase(Locale.getDefault()) }
     }
 
