@@ -1,6 +1,6 @@
 # SpeedVPN Android
 
-Current version: **v1.0.26** (versionCode 28)
+Current version: **v1.1.1** (versionCode 30)
 
 ## Overview
 
@@ -230,7 +230,7 @@ See `FIXES_V1.0.22.md` for the P0/P1 treatment and acceptance tests.
 See `CHANGELOG.md` for the version history and `TESTING.md` for the device-test matrix and evidence requirements.
 
 
-### v1.0.26 final repair notes
+### v1.1.1 final hardening notes
 - Fixed `UdpFlowTableTest` scope so all UDP flow-key tests compile inside the test class.
 - Moved synchronous SharedPreferences persistence in `MainActivity` off the UI thread while serializing writes.
 - UDP reply correlation remains fail-closed for an intrinsically indistinguishable identical UDP 5-tuple; this is not safely solvable by heuristics.
