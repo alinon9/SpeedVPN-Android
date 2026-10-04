@@ -297,34 +297,82 @@ class SpeedVpnService : VpnService() {
                     }
                 }
                 .apply {
-                    val firewallRequested = firewall.firewallEnabled && firewall.blockedPackages.isNotEmpty()
-                    val lockdownReady = Build.VERSION.SDK_INT >= 29 && runCatching { isLockdownEnabled }.getOrDefault(false)
-                    if (firewallRequested && !lockdownReady) {
-                        throw IllegalStateException(
-                            "App firewall requires Android VPN Lockdown. Enable Always-on VPN and 'Block connections without VPN' in Android VPN settings."
-                        )
+                    // Quota-blocked apps are enforced independently from the manual App Firewall.
+                    val quotaBlocked = VpnAppControl.quotaBlockedPackages(this@SpeedVpnService)
+                    val manualBlocked = if (firewall.firewallEnabled) {
+                        firewall.blockedPackages - quotaBlocked
+                    } else {
+                        emptySet()
                     }
-                    if (firewallRequested) {
-                        // Lockdown prevents bypass. Explicitly allow visible launchable apps
-                        // that are not blocked; blocked apps are omitted from the allow-list.
-                        val blocked = firewall.blockedPackages
-                        val launchable = AppTrafficManager.installedLaunchableApps(this@SpeedVpnService)
+                    val effectiveBlocked = manualBlocked + quotaBlocked
+
+                    val firewallRequested = firewall.firewallEnabled && manualBlocked.isNotEmpty()
+                    val quotaEnforcementRequested = quotaBlocked.isNotEmpty()
+                    val needsAllowList = firewallRequested || quotaEnforcementRequested
+
+                    val lockdownReady =
+                        Build.VERSION.SDK_INT >= 29 &&
+                            runCatching { isLockdownEnabled }.getOrDefault(false)
+
+                    if (needsAllowList && !lockdownReady) {
+                        val message = when {
+                            quotaEnforcementRequested && firewallRequested ->
+                                "Quota enforcement and app firewall require Android VPN Lockdown. " +
+                                    "Enable Always-on VPN and 'Block connections without VPN' in Android VPN settings."
+                            quotaEnforcementRequested ->
+                                "Quota enforcement requires Android VPN Lockdown. " +
+                                    "Enable Always-on VPN and 'Block connections without VPN' in Android VPN settings."
+                            else ->
+                                "App firewall requires Android VPN Lockdown. " +
+                                    "Enable Always-on VPN and 'Block connections without VPN' in Android VPN settings."
+                        }
+                        throw IllegalStateException(message)
+                    }
+
+                    if (needsAllowList) {
+                        val launchable =
+                            AppTrafficManager.installedLaunchableApps(this@SpeedVpnService)
                         var allowed = 0
+
                         launchable.forEach { app ->
                             val pkg = app.packageName
-                            if (pkg == packageName || pkg in blocked) return@forEach
-                            runCatching { addAllowedApplication(pkg) }
-                                .onSuccess { allowed++ }
-                                .onFailure { log("Skipping unavailable allowed package $pkg: ${it.message}") }
+
+                            if (pkg == packageName || pkg in effectiveBlocked) {
+                                return@forEach
+                            }
+
+                            runCatching {
+                                addAllowedApplication(pkg)
+                            }.onSuccess {
+                                allowed++
+                            }.onFailure {
+                                log(
+                                    "Skipping unavailable allowed package $pkg: ${it.message}"
+                                )
+                            }
                         }
+
                         if (allowed == 0) {
-                            throw IllegalStateException("No valid applications are available for the firewall allow-list")
+                            throw IllegalStateException(
+                                "No valid applications are available for the VPN allow-list"
+                            )
                         }
-                        log("App firewall active with Android lockdown: $allowed apps allowed; ${blocked.size} blocked")
+
+                        val reason = when {
+                            quotaEnforcementRequested && firewallRequested -> "quota+firewall"
+                            quotaEnforcementRequested -> "quota"
+                            else -> "firewall"
+                        }
+                        log(
+                            "VPN allow-list active ($reason): " +
+                                "$allowed apps allowed; ${effectiveBlocked.size} blocked"
+                        )
                     }
-                    // The SpeedVPN process must never be routed back through its own TUN.
+
+                    // SpeedVPN itself must never be routed back through its own TUN.
                     addDisallowedApplication(packageName)
                 }
+
             builder.establish()
         } catch (e: IllegalStateException) {
             failLocked(e.message ?: "Unable to establish VPN interface", e)
