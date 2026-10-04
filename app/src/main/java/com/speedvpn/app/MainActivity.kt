@@ -117,67 +117,105 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        loadLocalLimits()
-        val startupCrash = getSharedPreferences("crash_recovery", MODE_PRIVATE).getString("last_crash", null)
-        setContent {
-            if (!startupCrash.isNullOrBlank()) {
-                StartupCrashScreen(
-                    details = startupCrash,
-                    onClear = {
-                        getSharedPreferences("crash_recovery", MODE_PRIVATE).edit().clear().commit()
-                        recreate()
-                    },
-                )
-            } else {
-                SpeedVpnTheme {
-                    var signedIn by remember { mutableStateOf<Boolean?>(null) }
-                var showLogin by remember { mutableStateOf(false) }
 
-                LaunchedEffect(Unit) {
-                    if (Build.VERSION.SDK_INT >= 33) {
-                        runCatching { notifPermission.launch(Manifest.permission.POST_NOTIFICATIONS) }
-                            .onFailure { logE("Notification permission request failed", it) }
-                    }
-                    val signedInNow = runCatching {
-                        withContext(Dispatchers.IO) { Auth.isSignedIn(this@MainActivity) }
-                    }.getOrDefault(false)
-                    signedIn = signedInNow
-                    if (signedInNow) {
-                        runCatching { AgentService.start(this@MainActivity) }
-                            .onFailure { logE("Agent startup failed", it) }
-                    }
-                }
+        // Keep optional startup work out of the fatal launch path. A broken local
+        // preference, device-specific API, or optional dependency must not close the
+        // entire application before the user can see a diagnostic screen.
+        runCatching { loadLocalLimits() }
+            .onFailure { logE("Failed to restore local speed limits during startup", it) }
 
-                when (signedIn) {
-                    null -> Box(
-                        modifier = Modifier.fillMaxSize(),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        CircularProgressIndicator()
-                    }
-                    false -> {
-                        if (showLogin) {
-                            LoginScreen(
-                                onDone = { signedIn = true; showLogin = false },
-                                onCancel = { showLogin = false },
-                            )
-                        } else {
-                            SpeedVpnApp(
-                                signedIn = false,
-                                onLink = { showLogin = true },
+        val startupCrash = runCatching {
+            getSharedPreferences("crash_recovery", MODE_PRIVATE).getString("last_crash", null)
+        }.getOrNull()
+
+        try {
+            setContent {
+                if (!startupCrash.isNullOrBlank()) {
+                    StartupCrashScreen(
+                        details = startupCrash,
+                        onClear = {
+                            runCatching {
+                                getSharedPreferences("crash_recovery", MODE_PRIVATE)
+                                    .edit().clear().commit()
+                            }
+                            recreate()
+                        },
+                    )
+                } else {
+                    SpeedVpnTheme {
+                        var signedIn by remember { mutableStateOf<Boolean?>(null) }
+                        var showLogin by remember { mutableStateOf(false) }
+
+                        LaunchedEffect(Unit) {
+                            if (Build.VERSION.SDK_INT >= 33) {
+                                runCatching { notifPermission.launch(Manifest.permission.POST_NOTIFICATIONS) }
+                                    .onFailure { logE("Notification permission request failed", it) }
+                            }
+
+                            val signedInNow = runCatching {
+                                withContext(Dispatchers.IO) { Auth.isSignedIn(this@MainActivity) }
+                            }.getOrDefault(false)
+                            signedIn = signedInNow
+
+                            // AgentService is optional. Never let a foreground-service
+                            // startup failure crash the UI process.
+                            if (signedInNow) {
+                                runCatching { AgentService.start(this@MainActivity) }
+                                    .onFailure { logE("Agent startup failed; UI will continue", it) }
+                            }
+                        }
+
+                        when (signedIn) {
+                            null -> Box(
+                                modifier = Modifier.fillMaxSize(),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                CircularProgressIndicator()
+                            }
+                            false -> {
+                                if (showLogin) {
+                                    LoginScreen(
+                                        onDone = { signedIn = true; showLogin = false },
+                                        onCancel = { showLogin = false },
+                                    )
+                                } else {
+                                    SpeedVpnApp(
+                                        signedIn = false,
+                                        onLink = { showLogin = true },
+                                        onSignOut = { signedIn = false },
+                                    )
+                                }
+                            }
+                            true -> SpeedVpnApp(
+                                signedIn = true,
+                                onLink = { showLogin = false },
                                 onSignOut = { signedIn = false },
                             )
                         }
                     }
-                    true -> SpeedVpnApp(
-                        signedIn = true,
-                        onLink = { showLogin = false },
-                        onSignOut = { signedIn = false },
-                    )
-                }
                 }
             }
+        } catch (t: Throwable) {
+            // Last-resort native Android fallback. If Compose/resources fail during
+            // initialization, keep the process alive long enough to expose the exact
+            // exception instead of immediately returning to the launcher.
+            logE("MainActivity UI initialization failed", t)
+            showStartupFallback(t)
         }
+    }
+
+    private fun showStartupFallback(t: Throwable) {
+        val details = t.stackTraceToString().take(16000)
+        val root = android.widget.ScrollView(this)
+        val text = android.widget.TextView(this).apply {
+            setTextColor(android.graphics.Color.WHITE)
+            setBackgroundColor(android.graphics.Color.rgb(5, 9, 20))
+            textSize = 12f
+            setPadding(24, 32, 24, 32)
+            text = "SpeedVPN could not initialize its UI.\n\n$details"
+        }
+        root.addView(text)
+        setContentView(root)
     }
 
 
