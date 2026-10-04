@@ -147,9 +147,19 @@ class MainActivity : ComponentActivity() {
                         var showLogin by remember { mutableStateOf(false) }
 
                         LaunchedEffect(Unit) {
+                            // Keep runtime permissions and optional background services out
+                            // of the first frame. A device-specific permission/service failure
+                            // must never prevent the main UI from becoming visible.
+                            delay(400)
+
                             if (Build.VERSION.SDK_INT >= 33) {
-                                runCatching { notifPermission.launch(Manifest.permission.POST_NOTIFICATIONS) }
-                                    .onFailure { logE("Notification permission request failed", it) }
+                                runCatching {
+                                    if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                                        notifPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+                                    }
+                                }.onFailure {
+                                    logE("Notification permission request failed", it)
+                                }
                             }
 
                             val signedInNow = runCatching {
@@ -157,9 +167,11 @@ class MainActivity : ComponentActivity() {
                             }.getOrDefault(false)
                             signedIn = signedInNow
 
-                            // AgentService is optional. Never let a foreground-service
-                            // startup failure crash the UI process.
+                            // AgentService is optional. Start it only after the UI has
+                            // reached a stable state, and contain failures inside the
+                            // coroutine as well as inside the service itself.
                             if (signedInNow) {
+                                delay(1000)
                                 runCatching { AgentService.start(this@MainActivity) }
                                     .onFailure { logE("Agent startup failed; UI will continue", it) }
                             }
