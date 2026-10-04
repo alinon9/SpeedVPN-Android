@@ -40,6 +40,19 @@ object SpeedTestEngine {
             return SpeedTestResult(mode, null, null, 0, 0, null, null, "شغّل الـVPN أولًا وانتظر حالة Connected")
         }
 
+        val previousAuthenticator = Authenticator.getDefault()
+        if (relay != null) {
+            Authenticator.setDefault(object : Authenticator() {
+                override fun getPasswordAuthentication(): PasswordAuthentication? {
+                    if (requestingProtocol.equals("SOCKS5", true) ||
+                        requestingProtocol.equals("SOCKS", true)
+                    ) {
+                        return PasswordAuthentication(relay.username, relay.password.toCharArray())
+                    }
+                    return previousAuthenticator?.let { PasswordAuthentication("", CharArray(0)) }
+                }
+            })
+        }
         return try {
             val download = measureDownload(relay)
             val upload = measureUpload(relay)
@@ -54,6 +67,8 @@ object SpeedTestEngine {
             )
         } catch (t: Throwable) {
             SpeedTestResult(mode, null, null, 0, 0, null, null, t.message ?: t.javaClass.simpleName)
+        } finally {
+            if (relay != null) Authenticator.setDefault(previousAuthenticator)
         }
     }
 
@@ -123,33 +138,8 @@ object SpeedTestEngine {
         val proxy = relay?.let {
             Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", it.port))
         }
-        val authenticatorBefore = Authenticator.getDefault()
-        if (relay != null) {
-            Authenticator.setDefault(object : Authenticator() {
-                override fun getPasswordAuthentication(): PasswordAuthentication? {
-                    if (requestingProtocol.equals("SOCKS5", true) ||
-                        requestingProtocol.equals("SOCKS", true)
-                    ) {
-                        return PasswordAuthentication(
-                            relay.username,
-                            relay.password.toCharArray(),
-                        )
-                    }
-                    return authenticatorBefore?.let { PasswordAuthentication("", CharArray(0)) }
-                }
-            })
-        }
-        return try {
-            val connection = if (proxy == null) URL(url).openConnection() else URL(url).openConnection(proxy)
-            connection as HttpURLConnection
-        } catch (t: Throwable) {
-            if (relay != null) Authenticator.setDefault(authenticatorBefore)
-            throw t
-        } finally {
-            // The JVM authenticator is process-wide. Keep it only long enough to
-            // construct the connection; SOCKS authentication happens during connect.
-            if (relay != null) Authenticator.setDefault(authenticatorBefore)
-        }
+        val connection = if (proxy == null) URL(url).openConnection() else URL(url).openConnection(proxy)
+        return connection as HttpURLConnection
     }
 
     fun format(mbps: Double?): String =
