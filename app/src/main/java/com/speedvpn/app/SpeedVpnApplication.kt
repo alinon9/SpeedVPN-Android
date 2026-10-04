@@ -1,11 +1,20 @@
 package com.speedvpn.app
 
 import android.app.Application
+import io.sentry.android.core.SentryAndroid
 import android.os.Process
 
 class SpeedVpnApplication : Application() {
     override fun onCreate() {
         super.onCreate()
+        if (BuildConfig.SENTRY_DSN.isNotBlank()) {
+            SentryAndroid.init(this) { options ->
+                options.dsn = BuildConfig.SENTRY_DSN
+                options.isSendDefaultPii = false
+                options.environment = BuildConfig.BUILD_ENV
+                options.release = "com.speedvpn.app@${BuildConfig.VERSION_NAME}+${BuildConfig.VERSION_CODE}"
+            }
+        }
         if (SmartSettings.isStatsEnabled(this)) {
             UsageCollectionScheduler.schedule(this)
             QuotaWorkScheduler.schedule(this)
