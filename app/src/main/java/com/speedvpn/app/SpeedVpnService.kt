@@ -61,7 +61,8 @@ class SpeedVpnService : VpnService() {
         private const val NOTIF_ID = 1
         private const val HEALTH_INTERVAL_MS = 30_000L
         private const val UPSTREAM_PROBE_TIMEOUT_MS = 3_000
-        private const val UPSTREAM_PROBE_IPS = arrayOf("1.1.1.1", "1.0.0.1")
+        private const val UPSTREAM_PROBE_IP_1 = "1.1.1.1"
+        private const val UPSTREAM_PROBE_IP_2 = "1.0.0.1"
         private const val UPSTREAM_PROBE_PORT = 443
         private const val TUN_V4 = "198.18.0.1"
         private const val TUN_V6 = "fc00::1"
@@ -820,7 +821,7 @@ class SpeedVpnService : VpnService() {
     private fun upstreamReachabilityProbe(): Boolean {
         val network = findUnderlyingNetwork() ?: return false
         val deadline = SystemClock.elapsedRealtime() + UPSTREAM_PROBE_TIMEOUT_MS
-        for (ip in UPSTREAM_PROBE_IPS) {
+        for (ip in arrayOf(UPSTREAM_PROBE_IP_1, UPSTREAM_PROBE_IP_2)) {
             val remaining = (deadline - SystemClock.elapsedRealtime()).toInt()
             if (remaining <= 0) break
             val socket = Socket()
