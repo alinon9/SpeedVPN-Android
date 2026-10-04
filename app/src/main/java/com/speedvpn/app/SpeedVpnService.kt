@@ -946,7 +946,7 @@ class SpeedVpnService : VpnService() {
         quotaMonitor?.cancel()
         quotaMonitor = scope.launch {
             while (isActive && sessionId.get() == mySession) {
-                delay(15_000)
+                delay(5_000)
                 if (!sessionIsCurrent(mySession)) break
                 if (SmartSettings.isStatsEnabled(this@SpeedVpnService) &&
                     AppTrafficManager.hasUsageAccess(this@SpeedVpnService)
