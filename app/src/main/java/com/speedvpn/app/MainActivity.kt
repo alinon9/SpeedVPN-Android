@@ -794,7 +794,7 @@ class MainActivity : ComponentActivity() {
                     UsageRepository.readQuotaPolicyMap(this@MainActivity)
                 }
                 if (s.status != VpnStatus.CONNECTED) break
-                delay(60_000)
+                delay(if (statsEnabled && usageAccess) 10_000L else 30_000L)
             }
         }
 
@@ -908,7 +908,7 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                     Text("المعروض: ${shownApps.size} من ${apps.size}", color = TextSecondary, fontSize = 9.sp)
-                    Text("يمكن حفظ حد يومي/أسبوعي/شهري مستقل لكل تطبيق. هذا الإصدار يضيف النموذج والتخزين فقط؛ الـWeekly/Monthly enforcement سيأتي في PR2.", color = Amber, fontSize = 9.sp)
+                    Text("التطبيقات تظهر مباشرة، والبحث بالأعلى لتصفية القائمة. عند تعديل الحد يتم تحديث الاستهلاك وإعادة تقييم الحظر فورًا.", color = TextSecondary, fontSize = 9.sp)
                 }
             }
         }
@@ -922,12 +922,16 @@ class MainActivity : ComponentActivity() {
                     lifecycleScope.launch(Dispatchers.IO) {
                         if (quotaType == QuotaType.DAILY) {
                             UsageRepository.setDailyLimitBytes(this@MainActivity, app.packageName, app.label, app.uid, bytes)
-                            UsageCollector.enforceDailyLimits(this@MainActivity)
                         } else {
                             UsageRepository.setQuotaPolicy(this@MainActivity, app.packageName, app.label, app.uid, quotaType, bytes)
                         }
+                        UsageCollector.collectToday(this@MainActivity)
                         policies = UsageRepository.readPolicies(this@MainActivity).associateBy { it.packageName }
                         quotaPolicies = UsageRepository.readQuotaPolicyMap(this@MainActivity)
+                        if (statsEnabled && usageAccess) {
+                            apps = UsageRepository.topUsage(this@MainActivity, UsageDate.today(), 100)
+                                .map { AppTrafficUsage(it.packageName, it.label, it.uid, it.downloadBytes, it.uploadBytes) }
+                        }
                     }
                     editingLimitApp = null
                 },
