@@ -52,29 +52,48 @@ class AgentService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val nm = getSystemService(NotificationManager::class.java)
-        if (Build.VERSION.SDK_INT >= 26) {
-            nm.createNotificationChannel(NotificationChannel("agent", "Dashboard link", NotificationManager.IMPORTANCE_MIN))
-            nm.createNotificationChannel(NotificationChannel("alerts", "Important alerts", NotificationManager.IMPORTANCE_HIGH))
+        // Android can reject foreground-service promotion. Never let that
+        // asynchronous service failure crash the application process.
+        try {
+            val nm = getSystemService(NotificationManager::class.java)
+                ?: throw IllegalStateException("NotificationManager unavailable")
+            if (Build.VERSION.SDK_INT >= 26) {
+                nm.createNotificationChannel(NotificationChannel("agent", "Dashboard link", NotificationManager.IMPORTANCE_MIN))
+                nm.createNotificationChannel(NotificationChannel("alerts", "Important alerts", NotificationManager.IMPORTANCE_HIGH))
+            }
+            val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+            ServiceCompat.startForeground(
+                this, 2,
+                NotificationCompat.Builder(this, "agent")
+                    .setSmallIcon(android.R.drawable.stat_notify_sync)
+                    .setContentTitle("SpeedVPN").setContentText("متصل بلوحة التحكم")
+                    .setContentIntent(open).setOngoing(true).build(),
+                if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0,
+            )
+        } catch (t: Throwable) {
+            Log.e(TAG, "Agent foreground startup rejected; stopping service safely", t)
+            VpnRuntime.update { it.copy(agentOnline = false, lastError = "Agent service unavailable: ${t.message ?: t.javaClass.simpleName}") }
+            runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
+            stopSelfResult(startId)
+            return START_NOT_STICKY
         }
-        val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
-        ServiceCompat.startForeground(
-            this, 2,
-            NotificationCompat.Builder(this, "agent").setSmallIcon(android.R.drawable.stat_notify_sync)
-                .setContentTitle("SpeedVPN").setContentText("متصل بلوحة التحكم").setContentIntent(open).build(),
-            if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0,
-        )
+
         if (!started) {
             started = true
             api = Api(this)
             scope.launch {
-                deviceId = Auth.deviceId(this@AgentService)
-                run()
+                runCatching {
+                    deviceId = Auth.deviceId(this@AgentService)
+                    run()
+                }.onFailure {
+                    Log.e(TAG, "Agent worker failed", it)
+                    VpnRuntime.update { state -> state.copy(agentOnline = false, lastError = "Agent failed: ${it.message ?: it.javaClass.simpleName}") }
+                    stopSelf()
+                }
             }
         }
         return START_STICKY
     }
-
     override fun onDestroy() {
         VpnRuntime.update { it.copy(agentOnline = false) }
         scope.cancel()
