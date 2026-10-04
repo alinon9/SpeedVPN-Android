@@ -836,7 +836,7 @@ class MainActivity : ComponentActivity() {
             }
 
             GlassCard {
-                SectionLabel("جدار التطبيقات", "الحظر اليدوي وحد البيانات يعملان كحالتين مستقلتين")
+                SectionLabel("جدار التطبيقات", "الحظر اليدوي وحد استخدام التطبيق يعملان كحالتين مستقلتين")
                 SettingSwitch("تفعيل جدار التطبيقات", "الحظر الفعلي يحتاج Always-on VPN + Lockdown", firewallEnabled) {
                     firewallEnabled = it
                     saveAppControlSettings(VpnAppControlSettings(it, blockedPackages))
@@ -886,14 +886,14 @@ class MainActivity : ComponentActivity() {
                                 )
                                 if (limit != null) {
                                     Text(
-                                        "الحد اليومي ${formatDataBytes(limit)} • المتبقي ${formatDataBytes(remaining ?: 0L)}",
+                                        "حد استخدام التطبيق اليومي ${formatDataBytes(limit)} • المتبقي ${formatDataBytes(remaining ?: 0L)}",
                                         color = if ((remaining ?: 0L) == 0L) Color(0xFFFF7D88) else Amber,
                                         fontSize = 9.sp,
                                     )
                                 }
                                 if (weeklyQuota != null || monthlyQuota != null) {
                                     Text(
-                                        "أسبوعي: ${weeklyQuota?.let { formatDataBytes(it.limitBytes) } ?: "—"} • شهري: ${monthlyQuota?.let { formatDataBytes(it.limitBytes) } ?: "—"}",
+                                        "استخدام التطبيق — أسبوعي: ${weeklyQuota?.let { formatDataBytes(it.limitBytes) } ?: "—"} • شهري: ${monthlyQuota?.let { formatDataBytes(it.limitBytes) } ?: "—"}",
                                         color = TextSecondary,
                                         fontSize = 9.sp,
                                     )
