@@ -55,7 +55,7 @@ internal class SpeedOverlayService : Service() {
     }
 
     private lateinit var wm: WindowManager
-    private var root: LinearLayout? = null
+    private var root: ViewGroup? = null
     private var title: TextView? = null
     private var downloadValue: TextView? = null
     private var uploadValue: TextView? = null
