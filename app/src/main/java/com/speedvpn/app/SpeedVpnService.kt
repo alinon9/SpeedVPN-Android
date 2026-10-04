@@ -292,10 +292,12 @@ class SpeedVpnService : VpnService() {
                 // No public resolver is hard-coded.
                 .apply { dnsServers.forEach { addDnsServer(it) } }
                 .apply {
-                    if (compatibility.ipv6Enabled) {
-                        addAddress(TUN_V6, 128)
-                        addRoute("::", 0)
-                    }
+                    // IPv6 OFF means fail-closed for IPv6: keep the family inside
+                    // the VPN interface so apps cannot fall back to the physical
+                    // network and leak IPv6 traffic. The native relay may then drop
+                    // IPv6 because ipv6Enabled=false, which is intentional.
+                    addAddress(TUN_V6, 128)
+                    addRoute("::", 0)
                 }
                 .apply {
                     // Quota-blocked apps are enforced independently from the manual App Firewall.
@@ -981,16 +983,24 @@ class SpeedVpnService : VpnService() {
         meter = scope.launch {
             var lastDown = SpeedLimiter.download.total.get()
             var lastUp = SpeedLimiter.upload.total.get()
+            var lastSampleNs = System.nanoTime()
             var previousDownBps = 0L
             var previousUpBps = 0L
             var firstSample = true
             while (isActive && sessionId.get() == mySession) {
                 delay(1_000)
                 if (!sessionIsCurrent(mySession)) break
+                val nowNs = System.nanoTime()
+                val elapsedNs = (nowNs - lastSampleNs).coerceAtLeast(1L)
                 val d = SpeedLimiter.download.total.get()
                 val u = SpeedLimiter.upload.total.get()
-                val rawDownBps = ((d - lastDown).coerceAtLeast(0L)) * 8
-                val rawUpBps = ((u - lastUp).coerceAtLeast(0L)) * 8
+                // Use monotonic elapsed time instead of assuming delay(1000) woke up
+                // exactly one second later. This removes scheduler-jitter error from
+                // the displayed bps value.
+                val rawDownBps = (((d - lastDown).coerceAtLeast(0L).toDouble() * 8.0 * 1_000_000_000.0) /
+                    elapsedNs.toDouble()).toLong().coerceAtLeast(0L)
+                val rawUpBps = (((u - lastUp).coerceAtLeast(0L).toDouble() * 8.0 * 1_000_000_000.0) /
+                    elapsedNs.toDouble()).toLong().coerceAtLeast(0L)
                 // Two-sample moving average: enough to suppress one-second packet
                 // bursts without hiding real speed changes for long periods.
                 val smoothDownBps = if (firstSample) rawDownBps else
@@ -1015,6 +1025,7 @@ class SpeedVpnService : VpnService() {
                 }
                 lastDown = d
                 lastUp = u
+                lastSampleNs = nowNs
                 previousDownBps = rawDownBps
                 previousUpBps = rawUpBps
                 firstSample = false
