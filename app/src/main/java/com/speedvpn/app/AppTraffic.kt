@@ -101,6 +101,48 @@ object AppTrafficManager {
             .sortedBy { it.loadLabel(pm).toString().lowercase(Locale.getDefault()) }
     }
 
+    /**
+     * Reads one UID's usage directly from NetworkStatsManager for the requested
+     * period. This bypasses the app's daily_usage snapshot when making a quota
+     * decision, so enforcement is based on the freshest platform accounting
+     * available at that moment.
+     *
+     * The accounting scope is Android UID traffic on mobile/Wi-Fi/Ethernet.
+     * Android does not expose a packet-perfect per-UID counter for the TUN path.
+     */
+    fun queryUidUsage(
+        context: Context,
+        uid: Int,
+        startTimeMs: Long,
+        endTimeMs: Long = System.currentTimeMillis(),
+    ): Long? {
+        if (uid < 0 || endTimeMs <= startTimeMs || !hasUsageAccess(context)) return null
+        val manager = context.getSystemService(NetworkStatsManager::class.java) ?: return null
+        var total = 0L
+        var queried = false
+        for (networkType in NETWORK_TYPES) {
+            runCatching {
+                manager.queryDetailsForUid(
+                    networkType,
+                    null,
+                    startTimeMs.coerceAtLeast(0L),
+                    endTimeMs,
+                    uid,
+                ).use { stream ->
+                    queried = true
+                    val bucket = NetworkStats.Bucket()
+                    while (stream.hasNextBucket()) {
+                        stream.getNextBucket(bucket)
+                        total = safeAdd(total, safeAdd(bucket.rxBytes, bucket.txBytes))
+                    }
+                }
+            }.onFailure {
+                log("UID quota query failed for uid=" + uid + " type=" + networkType + ": " + it.message)
+            }
+        }
+        return if (queried) total else null
+    }
+
     fun querySessionUsage(context: Context, startTimeMs: Long, endTimeMs: Long = System.currentTimeMillis()): List<AppTrafficUsage> {
         val pm = context.packageManager
         val apps = installedLaunchableApps(context)
