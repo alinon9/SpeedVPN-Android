@@ -77,6 +77,18 @@ class SpeedVpnService : VpnService() {
         private val activeServiceGeneration = AtomicLong(0L)
         private val nativeOwnerGeneration = AtomicLong(0L)
         private val lastStartedRequestId = AtomicReference<String?>(null)
+        private val activeRelayForDiagnostics = AtomicReference<Socks5Server?>(null)
+
+        data class RelayAccess(
+            val port: Int,
+            val username: String,
+            val password: String,
+        )
+
+        fun activeRelayAccess(): RelayAccess? =
+            activeRelayForDiagnostics.get()?.let {
+                RelayAccess(it.port, it.username, it.password)
+            }
 
         fun start(ctx: Context, requestId: String? = null) =
             ContextCompat.startForegroundService(
@@ -255,6 +267,7 @@ class SpeedVpnService : VpnService() {
                 false
             } else {
                 socks = relay
+                activeRelayForDiagnostics.set(relay)
                 true
             }
         }
@@ -853,6 +866,7 @@ class SpeedVpnService : VpnService() {
                     false
                 } else {
                     socks = fresh
+                    activeRelayForDiagnostics.set(fresh)
                     true
                 }
             }
@@ -1074,6 +1088,7 @@ class SpeedVpnService : VpnService() {
             socks = null
             detachedTun to detachedSocks
         }
+        detachedSocks?.let { activeRelayForDiagnostics.compareAndSet(it, null) }
 
         // Snapshot only this Service instance's native generation. Never read the
         // process-wide native generation here: a newer Service instance may already
