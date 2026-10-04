@@ -61,10 +61,13 @@ class SpeedVpnService : VpnService() {
         private const val NOTIF_ID = 1
         private const val HEALTH_INTERVAL_MS = 30_000L
         private const val UPSTREAM_PROBE_TIMEOUT_MS = 3_000
-        private const val UPSTREAM_PROBE_HOST = "connectivitycheck.gstatic.com"
-        private const val UPSTREAM_PROBE_PORT = 80
+        private const val UPSTREAM_PROBE_IPS = arrayOf("1.1.1.1", "1.0.0.1")
+        private const val UPSTREAM_PROBE_PORT = 443
         private const val TUN_V4 = "198.18.0.1"
         private const val TUN_V6 = "fc00::1"
+        private const val MAP_DNS_V4 = "198.18.0.2"
+        private const val MAP_DNS_FAKE_NETWORK = "100.64.0.0"
+        private const val MAP_DNS_FAKE_NETMASK = "255.192.0.0"
         // hev-socks5-tunnel exposes process-wide/static native lifecycle calls.
         // A Service instance must therefore not own an instance-local native lock.
         // The generation token prevents teardown from an older Service instance from
@@ -272,14 +275,9 @@ class SpeedVpnService : VpnService() {
         }
         // IPv6-disabled mode must also avoid advertising IPv6 DNS servers.
         // This keeps Android's VPN DNS path consistent with the selected IP family.
-        val dnsIpv4Only = compatibility.dnsIpv4Only || !compatibility.ipv6Enabled
-        val dnsServers = try {
-            selectVpnDnsServers(physicalLinkProperties, dnsIpv4Only)
-        } catch (e: IllegalStateException) {
-            failLocked(e.message ?: "Unable to select VPN DNS servers", e)
-            return@withLock
-        }
-        lastDnsSignature = dnsSignature(dnsServers)
+        // DNS is terminated inside the TUN by hev MapDNS.
+        val dnsServers = listOf(InetAddress.getByName(MAP_DNS_V4))
+        lastDnsSignature = MAP_DNS_V4
 
         val pfd = try {
             val builder = Builder()
@@ -292,12 +290,10 @@ class SpeedVpnService : VpnService() {
                 // No public resolver is hard-coded.
                 .apply { dnsServers.forEach { addDnsServer(it) } }
                 .apply {
-                    // IPv6 OFF means fail-closed for IPv6: keep the family inside
-                    // the VPN interface so apps cannot fall back to the physical
-                    // network and leak IPv6 traffic. The native relay may then drop
-                    // IPv6 because ipv6Enabled=false, which is intentional.
-                    addAddress(TUN_V6, 128)
-                    addRoute("::", 0)
+                    if (compatibility.ipv6Enabled) {
+                        addAddress(TUN_V6, 128)
+                        addRoute("::", 0)
+                    }
                 }
                 .apply {
                     // Quota-blocked apps are enforced independently from the manual App Firewall.
@@ -483,6 +479,12 @@ class SpeedVpnService : VpnService() {
             appendLine("  port: ${relay.port}")
             appendLine("  address: 127.0.0.1")
             appendLine("  udp: 'udp'")
+            appendLine("mapdns:")
+            appendLine("  address: $MAP_DNS_V4")
+            appendLine("  port: 53")
+            appendLine("  network: $MAP_DNS_FAKE_NETWORK")
+            appendLine("  netmask: $MAP_DNS_FAKE_NETMASK")
+            appendLine("  cache-size: 10000")
             appendLine("  username: '${relay.username}'")
             appendLine("  password: '${relay.password}'")
             appendLine("misc:")
@@ -817,45 +819,22 @@ class SpeedVpnService : VpnService() {
      */
     private fun upstreamReachabilityProbe(): Boolean {
         val network = findUnderlyingNetwork() ?: return false
-        return try {
-            val deadline = SystemClock.elapsedRealtime() + UPSTREAM_PROBE_TIMEOUT_MS
-            val dnsRemaining = (deadline - SystemClock.elapsedRealtime()).coerceAtLeast(1L)
-            val dnsFuture: Future<List<InetAddress>> = upstreamProbeDnsExecutor.submit<List<InetAddress>> {
-                network.getAllByName(UPSTREAM_PROBE_HOST).toList()
-            }
-            val addresses = try {
-                dnsFuture.get(dnsRemaining, java.util.concurrent.TimeUnit.MILLISECONDS)
-                    .filter { it is Inet4Address || it is Inet6Address }
-            } catch (_: TimeoutException) {
-                dnsFuture.cancel(true)
-                return false
-            } catch (_: Exception) {
-                dnsFuture.cancel(true)
-                return false
-            }
-            if (addresses.isEmpty()) return false
-
-            for (address in addresses) {
-                val remaining = (deadline - SystemClock.elapsedRealtime()).toInt()
-                if (remaining <= 0) break
-                val socket = Socket()
-                try {
-                    network.bindSocket(socket)
-                    if (!protect(socket)) continue
-                    socket.soTimeout = remaining
-                    socket.connect(InetSocketAddress(address, UPSTREAM_PROBE_PORT), remaining)
-                    return true
-                } catch (_: Throwable) {
-                    // Try the next resolved address while the single overall deadline remains.
-                } finally {
-                    runCatching { socket.close() }
-                }
-            }
-            false
-        } catch (t: Throwable) {
-            log("Upstream probe failed: ${t.message}")
-            false
+        val deadline = SystemClock.elapsedRealtime() + UPSTREAM_PROBE_TIMEOUT_MS
+        for (ip in UPSTREAM_PROBE_IPS) {
+            val remaining = (deadline - SystemClock.elapsedRealtime()).toInt()
+            if (remaining <= 0) break
+            val socket = Socket()
+            try {
+                network.bindSocket(socket)
+                if (!protect(socket)) continue
+                socket.soTimeout = remaining
+                socket.connect(InetSocketAddress(ip, UPSTREAM_PROBE_PORT), remaining)
+                return true
+            } catch (_: Throwable) {
+                // Try the redundant resolver address within the same deadline.
+            } finally { runCatching { socket.close() } }
         }
+        return false
     }
 
     private enum class HealthResult { STOP, OK, RETRY_LATER, RECOVERY_STARTED, FAILED }
