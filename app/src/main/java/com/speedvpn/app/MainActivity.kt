@@ -117,7 +117,6 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        if (Build.VERSION.SDK_INT >= 33) notifPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
         loadLocalLimits()
         setContent {
             SpeedVpnTheme {
@@ -125,9 +124,18 @@ class MainActivity : ComponentActivity() {
                 var showLogin by remember { mutableStateOf(false) }
 
                 LaunchedEffect(Unit) {
-                    val signedInNow = withContext(Dispatchers.IO) { Auth.isSignedIn(this@MainActivity) }
+                    if (Build.VERSION.SDK_INT >= 33) {
+                        runCatching { notifPermission.launch(Manifest.permission.POST_NOTIFICATIONS) }
+                            .onFailure { logE("Notification permission request failed", it) }
+                    }
+                    val signedInNow = runCatching {
+                        withContext(Dispatchers.IO) { Auth.isSignedIn(this@MainActivity) }
+                    }.getOrDefault(false)
                     signedIn = signedInNow
-                    if (signedInNow) AgentService.start(this@MainActivity)
+                    if (signedInNow) {
+                        runCatching { AgentService.start(this@MainActivity) }
+                            .onFailure { logE("Agent startup failed", it) }
+                    }
                 }
 
                 when (signedIn) {
