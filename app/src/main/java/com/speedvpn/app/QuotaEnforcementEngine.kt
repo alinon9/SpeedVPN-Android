@@ -49,12 +49,28 @@ internal object QuotaEnforcementEngine {
             // periodEndMillis is exclusive; daily_usage stores whole calendar dates.
             // Use the last instant of the period so the next period's date is not counted.
             val endDate = formatDate(bounds.endMillis - 1L)
-            val usedBytes = UsageRepository.sumUsageInPeriod(
+            val fallbackBytes = UsageRepository.sumUsageInPeriod(
                 context = context,
                 packageName = policy.packageName,
                 startDate = startDate,
                 endDate = endDate,
             )
+            val liveBytes = runCatching {
+                val uid = context.packageManager
+                    .getApplicationInfo(policy.packageName, android.content.pm.PackageManager.MATCH_ALL)
+                    .uid
+                AppTrafficManager.queryUidUsage(
+                    context = context,
+                    uid = uid,
+                    startTimeMs = bounds.startMillis,
+                    endTimeMs = nowMillis,
+                )
+            }.getOrNull()
+
+            // Prefer the direct UID query for the decision. Keep the persisted
+            // snapshot as a conservative fallback when Usage Access is unavailable
+            // or the platform query fails.
+            val usedBytes = liveBytes ?: fallbackBytes
             if (usedBytes >= policy.limitBytes) {
                 blocked += policy.packageName
             }
