@@ -952,7 +952,12 @@ class SpeedVpnService : VpnService() {
                     AppTrafficManager.hasUsageAccess(this@SpeedVpnService)
                 ) {
                     runCatching {
+                        // Collect the freshest platform usage available, then enforce
+                        // immediately in the same 5s cycle. Previously this loop only
+                        // refreshed the database, leaving the actual block decision to
+                        // a slower/background path.
                         UsageCollector.collectToday(this@SpeedVpnService)
+                        QuotaEnforcementEngine.enforce(this@SpeedVpnService)
                     }.onFailure {
                         DiagnosticsRepository.record(
                             this@SpeedVpnService,
