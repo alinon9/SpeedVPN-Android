@@ -20,6 +20,9 @@
     <application
         android:name=".SpeedVpnApplication"
         android:allowBackup="false"
+        android:usesCleartextTraffic="false"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:icon="@drawable/ic_speedvpn"
         android:roundIcon="@drawable/ic_speedvpn"
         android:label="SpeedVPN"
