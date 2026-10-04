@@ -370,8 +370,8 @@ class MainActivity : ComponentActivity() {
             lastTest?.let { result ->
                 GlassCard {
                     SectionLabel("نتيجة فحص السرعة", "القياس على المسار الحالي بدون تغيير حالة VPN")
-                    InfoRow("Download", result.downloadBps?.let(::fmtRateBits) ?: "فشل القياس")
-                    InfoRow("Upload", result.uploadBps?.let(::fmtRateBits) ?: "فشل القياس")
+                    InfoRow("Download", result.downloadBps?.let(::formatBitRate) ?: "فشل القياس")
+                    InfoRow("Upload", result.uploadBps?.let(::formatBitRate) ?: "فشل القياس")
                     InfoRow("المدة", "${result.durationMs / 1000.0} ثانية")
                     result.error?.let { Text("ملاحظة: $it", color = Amber, fontSize = 10.sp) }
                 }
@@ -1072,6 +1072,50 @@ class MainActivity : ComponentActivity() {
         )
     }
 
+    private fun formatBitRate(bitsPerSecond: Long): String {
+        val bps = bitsPerSecond.coerceAtLeast(0L)
+        return when {
+            bps < 1_000L -> bps.toString() + " bps"
+            bps < 1_000_000L -> String.format(Locale.US, "%.0f Kbps", bps / 1_000.0)
+            bps < 1_000_000_000L -> String.format(Locale.US, "%.2f Mbps", bps / 1_000_000.0)
+            else -> String.format(Locale.US, "%.2f Gbps", bps / 1_000_000_000.0)
+        }
+    }
+
+    private fun formatPlanBits(kbps: Long?): String {
+        if (kbps == null) return "بدون حد"
+        return when {
+            kbps < 1_000L -> kbps.toString() + " Kbps"
+            kbps < 1_000_000L -> String.format(Locale.US, "%.2f Mbps", kbps / 1_000.0)
+            else -> String.format(Locale.US, "%.2f Gbps", kbps / 1_000_000.0)
+        }
+    }
+
+    private fun speedStatusLabel(status: SpeedVerificationStatus): String = when (status) {
+        SpeedVerificationStatus.MATCH -> "✅ السرعة متطابقة"
+        SpeedVerificationStatus.MISMATCH -> "❌ السرعة غير متطابقة"
+        SpeedVerificationStatus.NOT_VERIFIABLE -> "⚠️ لا يمكن الحكم"
+        SpeedVerificationStatus.UNLIMITED_OK -> "✅ لا يظهر سقف واضح"
+    }
+
+    private fun speedStatusColor(status: SpeedVerificationStatus): Color = when (status) {
+        SpeedVerificationStatus.MATCH, SpeedVerificationStatus.UNLIMITED_OK -> Green
+        SpeedVerificationStatus.MISMATCH -> Color(0xFFFF7D88)
+        SpeedVerificationStatus.NOT_VERIFIABLE -> Amber
+    }
+
+    @Composable
+    private fun SpeedMetricResult(title: String, metric: SpeedMetricVerification) {
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(title, color = TextPrimary, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+            InfoRow("الخطة المحددة", formatPlanBits(metric.planKbps))
+            InfoRow("سرعة الشبكة الأصلية", metric.baselineBps?.let(::formatBitRate) ?: "فشل القياس")
+            InfoRow("السرعة عبر VPN", metric.vpnBps?.let(::formatBitRate) ?: "فشل القياس")
+            InfoRow("الدقة", metric.accuracyPercent?.let { String.format(Locale.US, "%.1f%%", it) } ?: "—")
+            Text(speedStatusLabel(metric.status), color = speedStatusColor(metric.status), fontSize = 11.sp, fontWeight = FontWeight.Bold)
+            metric.reason?.let { Text(it, color = TextSecondary, fontSize = 10.sp) }
+        }
+    }
     private fun usagePercent(used: Long, total: Long): String =
         if (total <= 0L) "0.0" else String.format(Locale.US, "%.1f", used.toDouble() * 100.0 / total.toDouble())
 
