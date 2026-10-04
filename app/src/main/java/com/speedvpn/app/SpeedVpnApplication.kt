@@ -11,6 +11,8 @@ class SpeedVpnApplication : Application() {
             SentryAndroid.init(this) { options ->
                 options.dsn = BuildConfig.SENTRY_DSN
                 options.isSendDefaultPii = false
+                options.isEnableAutoSessionTracking = true
+                options.tracesSampleRate = 0.0
                 options.environment = BuildConfig.BUILD_ENV
                 options.release = "com.speedvpn.app@${BuildConfig.VERSION_NAME}+${BuildConfig.VERSION_CODE}"
             }
