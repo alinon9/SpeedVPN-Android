@@ -778,14 +778,24 @@ class MainActivity : ComponentActivity() {
             while (isActive) {
                 apps = withContext(Dispatchers.IO) {
                     if (statsEnabled && usageAccess) UsageCollector.collectToday(this@MainActivity)
-                    if (statsEnabled) {
-                        UsageRepository.topUsage(this@MainActivity, UsageDate.today(), 100)
-                            .map { AppTrafficUsage(it.packageName, it.label, it.uid, it.downloadBytes, it.uploadBytes) }
-                    } else {
-                        AppTrafficManager.installedLaunchableApps(this@MainActivity).map {
-                            AppTrafficUsage(it.packageName, it.loadLabel(packageManager).toString(), it.uid, 0L, 0L)
-                        }
-                    }
+                    val installed = AppTrafficManager.installedLaunchableApps(this@MainActivity)
+                    val usageByPackage = if (statsEnabled) {
+                        UsageRepository.topUsage(this@MainActivity, UsageDate.today(), 500)
+                            .associateBy { it.packageName }
+                    } else emptyMap()
+                    installed.map { app ->
+                        val row = usageByPackage[app.packageName]
+                        AppTrafficUsage(
+                            packageName = app.packageName,
+                            label = app.loadLabel(packageManager).toString(),
+                            uid = app.uid,
+                            downloadBytes = row?.downloadBytes ?: 0L,
+                            uploadBytes = row?.uploadBytes ?: 0L,
+                        )
+                    }.sortedWith(
+                        compareByDescending<AppTrafficUsage> { it.totalBytes }
+                            .thenBy { it.label.lowercase(java.util.Locale.getDefault()) }
+                    )
                 }
                 policies = withContext(Dispatchers.IO) {
                     UsageRepository.readPolicies(this@MainActivity).associateBy { it.packageName }
@@ -794,7 +804,7 @@ class MainActivity : ComponentActivity() {
                     UsageRepository.readQuotaPolicyMap(this@MainActivity)
                 }
                 if (s.status != VpnStatus.CONNECTED) break
-                delay(if (statsEnabled && usageAccess) 10_000L else 30_000L)
+                delay(if (s.status == VpnStatus.CONNECTED && statsEnabled && usageAccess) 5_000L else 15_000L)
             }
         }
 
@@ -929,8 +939,22 @@ class MainActivity : ComponentActivity() {
                         policies = UsageRepository.readPolicies(this@MainActivity).associateBy { it.packageName }
                         quotaPolicies = UsageRepository.readQuotaPolicyMap(this@MainActivity)
                         if (statsEnabled && usageAccess) {
-                            apps = UsageRepository.topUsage(this@MainActivity, UsageDate.today(), 100)
-                                .map { AppTrafficUsage(it.packageName, it.label, it.uid, it.downloadBytes, it.uploadBytes) }
+                            val installed = AppTrafficManager.installedLaunchableApps(this@MainActivity)
+                            val usageByPackage = UsageRepository.topUsage(this@MainActivity, UsageDate.today(), 500)
+                                .associateBy { it.packageName }
+                            apps = installed.map { installedApp ->
+                                val row = usageByPackage[installedApp.packageName]
+                                AppTrafficUsage(
+                                    installedApp.packageName,
+                                    installedApp.loadLabel(packageManager).toString(),
+                                    installedApp.uid,
+                                    row?.downloadBytes ?: 0L,
+                                    row?.uploadBytes ?: 0L,
+                                )
+                            }.sortedWith(
+                                compareByDescending<AppTrafficUsage> { it.totalBytes }
+                                    .thenBy { it.label.lowercase(java.util.Locale.getDefault()) }
+                            )
                         }
                     }
                     editingLimitApp = null
