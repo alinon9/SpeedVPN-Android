@@ -139,6 +139,7 @@ class SpeedVpnService : VpnService() {
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var meter: Job? = null
     private var healthMonitor: Job? = null
+    private var quotaMonitor: Job? = null
     private val upstreamProbeDnsExecutor: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "vpn-upstream-dns").apply { isDaemon = true }
     }
@@ -458,6 +459,7 @@ class SpeedVpnService : VpnService() {
         }
         log("VPN session $mySession connected")
         startMeter(mySession, myServiceGeneration)
+        startQuotaMonitor(mySession)
         startHealthMonitor(mySession)
     }
 
@@ -940,8 +942,34 @@ class SpeedVpnService : VpnService() {
         return HealthResult.RECOVERY_STARTED
     }
 
+    private fun startQuotaMonitor(mySession: Long) {
+        quotaMonitor?.cancel()
+        quotaMonitor = scope.launch {
+            while (isActive && sessionId.get() == mySession) {
+                delay(15_000)
+                if (!sessionIsCurrent(mySession)) break
+                if (SmartSettings.isStatsEnabled(this@SpeedVpnService) &&
+                    AppTrafficManager.hasUsageAccess(this@SpeedVpnService)
+                ) {
+                    runCatching {
+                        UsageCollector.collectToday(this@SpeedVpnService)
+                    }.onFailure {
+                        DiagnosticsRepository.record(
+                            this@SpeedVpnService,
+                            "WARN",
+                            "Quota",
+                            "FOREGROUND_QUOTA_CHECK_FAILED",
+                            it.message ?: "quota check failed",
+                        )
+                    }
+                }
+            }
+        }
+    }
+
     private fun startMeter(mySession: Long, myServiceGeneration: Long) {
         meter?.cancel()
+        quotaMonitor?.cancel()
         meter = scope.launch {
             var lastDown = SpeedLimiter.download.total.get()
             var lastUp = SpeedLimiter.upload.total.get()
