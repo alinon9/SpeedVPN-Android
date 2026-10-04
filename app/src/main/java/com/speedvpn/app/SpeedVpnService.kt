@@ -201,7 +201,7 @@ class SpeedVpnService : VpnService() {
             .build()
         ServiceCompat.startForeground(
             this, NOTIF_ID, notification,
-            if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED else 0,
+            if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0,
         )
     }
 
