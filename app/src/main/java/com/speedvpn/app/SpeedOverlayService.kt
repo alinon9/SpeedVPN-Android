@@ -202,9 +202,21 @@ internal class SpeedOverlayService : Service() {
     }
 
     private fun change(download: Boolean, direction: Int) {
-        val current = (if (download) current().first else current().second) ?: 1000L
-        val next = if (direction > 0) increments.firstOrNull { it > current } else increments.lastOrNull { it < current }
-        set(download, next ?: if (direction < 0) increments.first() else null)
+        val current = if (download) current().first else current().second
+
+        // Unlimited is a real state, not "0". From Unlimited, minus moves to the
+        // highest bounded preset; plus keeps Unlimited. This avoids the old jump
+        // from Unlimited to 2 MB/s caused by treating null as 1,000 Kbps.
+        val next = if (current == null) {
+            if (direction < 0) increments.lastOrNull() else null
+        } else if (direction > 0) {
+            increments.firstOrNull { it > current }
+                ?: null
+        } else {
+            increments.lastOrNull { it < current } ?: increments.firstOrNull()
+        }
+
+        set(download, next)
     }
 
     private fun set(download: Boolean, kbps: Long?) {
