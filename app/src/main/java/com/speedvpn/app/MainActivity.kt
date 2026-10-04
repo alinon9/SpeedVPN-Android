@@ -118,9 +118,19 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         loadLocalLimits()
+        val startupCrash = getSharedPreferences("crash_recovery", MODE_PRIVATE).getString("last_crash", null)
         setContent {
-            SpeedVpnTheme {
-                var signedIn by remember { mutableStateOf<Boolean?>(null) }
+            if (!startupCrash.isNullOrBlank()) {
+                StartupCrashScreen(
+                    details = startupCrash,
+                    onClear = {
+                        getSharedPreferences("crash_recovery", MODE_PRIVATE).edit().clear().commit()
+                        recreate()
+                    },
+                )
+            } else {
+                SpeedVpnTheme {
+                    var signedIn by remember { mutableStateOf<Boolean?>(null) }
                 var showLogin by remember { mutableStateOf(false) }
 
                 LaunchedEffect(Unit) {
@@ -165,10 +175,26 @@ class MainActivity : ComponentActivity() {
                         onSignOut = { signedIn = false },
                     )
                 }
+                }
             }
         }
     }
 
+
+    @Composable
+    private fun StartupCrashScreen(details: String, onClear: () -> Unit) {
+        MaterialTheme(colorScheme = darkColorScheme(background = Bg, onBackground = TextPrimary)) {
+            Column(
+                Modifier.fillMaxSize().background(Bg).padding(18.dp).verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Text("تعذر تشغيل SpeedVPN", color = Color(0xFFFF7D88), fontSize = 22.sp, fontWeight = FontWeight.ExtraBold)
+                Text("تم حفظ سبب الانهيار الأخير حتى نحدد المشكلة بدل التخمين.", color = TextSecondary)
+                Text(details, color = TextPrimary, fontSize = 10.sp)
+                Button(onClick = onClear, modifier = Modifier.fillMaxWidth()) { Text("مسح التقرير وإعادة التجربة") }
+            }
+        }
+    }
     override fun onResume() {
         super.onResume()
         usageAccessState.value = AppTrafficManager.hasUsageAccess(this)
