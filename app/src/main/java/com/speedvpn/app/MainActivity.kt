@@ -82,24 +82,28 @@ class MainActivity : ComponentActivity() {
     // UI speeds are expressed as KB/s and converted to the backend's Kbps representation.
     private fun kbpsFromKBps(value: Long): Long = value.coerceAtLeast(1L) * 8L
     private val slowPresets = listOf(
-        "10K" to kbpsFromKBps(10),
-        "25K" to kbpsFromKBps(25),
-        "50K" to kbpsFromKBps(50),
-        "100K" to kbpsFromKBps(100),
-        "128K" to kbpsFromKBps(128),
-        "256K" to kbpsFromKBps(256),
-        "512K" to kbpsFromKBps(512),
-        "768K" to kbpsFromKBps(768),
+        "10 KB" to kbpsFromKBps(10),
+        "25 KB" to kbpsFromKBps(25),
+        "50 KB" to kbpsFromKBps(50),
+        "75 KB" to kbpsFromKBps(75),
+        "100 KB" to kbpsFromKBps(100),
+        "130 KB" to kbpsFromKBps(130),
+        "250 KB" to kbpsFromKBps(250),
+        "500 KB" to kbpsFromKBps(500),
+        "750 KB" to kbpsFromKBps(750),
+        "950 KB" to kbpsFromKBps(950),
     )
     private val mediumPresets = listOf(
-        "1M" to kbpsFromKBps(1_000),
-        "2M" to kbpsFromKBps(2_000),
-        "4M" to kbpsFromKBps(4_000),
-        "6M" to kbpsFromKBps(6_000),
+        "1 MB" to kbpsFromKBps(1_000),
+        "2 MB" to kbpsFromKBps(2_000),
+        "3 MB" to kbpsFromKBps(3_000),
+        "4 MB" to kbpsFromKBps(4_000),
+        "5 MB" to kbpsFromKBps(5_000),
     )
     private val fastPresets = listOf(
-        "10M" to kbpsFromKBps(10_000),
-        "20M" to kbpsFromKBps(20_000),
+        "9 MB" to kbpsFromKBps(9_000),
+        "10 MB" to kbpsFromKBps(10_000),
+        "11 MB" to kbpsFromKBps(11_000),
     )
     private val unlimitedPreset = "بدون حد"
     private val vpnPermission = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
@@ -1172,9 +1176,9 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     private fun LimitSlider(title: String, current: Long?, onApply: (Long?) -> Unit) {
-        // A logarithmic slider keeps the low-speed 10–100 KB/s range usable while
-        // still reaching 100 MB/s without compressing all small values into one pixel.
-        val minKBps = 10.0
+        // 1 KB/s → 100 MB/s on a logarithmic scale. Preset buttons provide exact
+        // business-friendly values; the slider remains continuous for fine tuning.
+        val minKBps = 1.0
         val maxKBps = 100_000.0
         val minLog = ln(minKBps)
         val maxLog = ln(maxKBps)
@@ -1189,9 +1193,9 @@ class MainActivity : ComponentActivity() {
         }
         val unlimited = pos > 1f
         val selectedKBps = if (unlimited) null else {
-            exp(minLog + (maxLog - minLog) * pos.coerceIn(0f, 1f)).roundToLong()
+            exp(minLog + (maxLog - minLog) * pos.coerceIn(0f, 1f)).roundToLong().coerceIn(1L, 100_000L)
         }
-        val kbps: Long? = selectedKBps?.let { (it * 8L).coerceIn(80L, 800_000L) }
+        val kbps: Long? = selectedKBps?.let { it * 8L }
 
         GlassCard {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -1199,9 +1203,9 @@ class MainActivity : ComponentActivity() {
                 Text(fmt(kbps), color = Blue, fontWeight = FontWeight.ExtraBold, fontSize = 15.sp)
             }
             Spacer(Modifier.height(10.dp))
-            PresetGroup("بطيء", slowPresets, Amber, onApply)
+            PresetGroup("منخفض", slowPresets, Amber, onApply)
             PresetGroup("متوسط", mediumPresets, Blue, onApply)
-            PresetGroup("سريع", fastPresets, Purple, onApply)
+            PresetGroup("مرتفع", fastPresets, Purple, onApply)
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                 OutlinedButton(
                     onClick = { onApply(null) },
@@ -1217,32 +1221,17 @@ class MainActivity : ComponentActivity() {
                 onValueChange = { pos = it },
                 valueRange = 0f..unlimitedSentinel,
                 onValueChangeFinished = { onApply(kbps) },
-                colors = SliderDefaults.colors(activeTrackColor = Blue, thumbColor = TextPrimary, inactiveTrackColor = StrokeColor),
+                colors = SliderDefaults.colors(
+                    activeTrackColor = Blue,
+                    thumbColor = TextPrimary,
+                    inactiveTrackColor = StrokeColor,
+                ),
             )
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text("10 KB/s", color = TextSecondary, fontSize = 10.sp)
-                Text("100 MB/s → بدون حد", color = TextSecondary, fontSize = 10.sp)
+                Text("1 KB/s", color = TextSecondary, fontSize = 10.sp)
+                Text("100 MB/s", color = TextSecondary, fontSize = 10.sp)
             }
         }
-    }
-
-    @Composable
-    private fun PresetGroup(title: String, presets: List<Pair<String, Long>>, accent: Color, onApply: (Long?) -> Unit) {
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Text(title, color = accent, fontSize = 11.sp, fontWeight = FontWeight.Bold, modifier = Modifier.width(44.dp))
-            Row(Modifier.weight(1f).horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                presets.forEach { (label, value) ->
-                    OutlinedButton(
-                        onClick = { onApply(value) },
-                        shape = RoundedCornerShape(11.dp),
-                        border = androidx.compose.foundation.BorderStroke(1.dp, accent.copy(alpha = 0.45f)),
-                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
-                        modifier = Modifier.height(34.dp),
-                    ) { Text(label, fontSize = 11.sp, color = TextPrimary) }
-                }
-            }
-        }
-        Spacer(Modifier.height(6.dp))
     }
 
     @Composable
