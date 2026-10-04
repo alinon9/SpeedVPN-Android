@@ -44,12 +44,6 @@
             </intent-filter>
         </activity>
 
-        <!-- Kept as an internal startup diagnostic; not exposed as the launcher. -->
-        <activity
-            android:name=".StartupActivity"
-            android:exported="false"
-            android:launchMode="singleTop" />
-
         <!-- Real android.net.VpnService: owns the TUN interface. -->
         <service
             android:name=".SpeedVpnService"
