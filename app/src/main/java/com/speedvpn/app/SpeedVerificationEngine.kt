@@ -26,7 +26,7 @@ object SpeedVerificationEngine {
         val started = System.currentTimeMillis()
 
         if (VpnService.prepare(context) != null) {
-            return unavailable(started, "إذن VPN غير متاح. امنح الإذن أولًا ثم أعد التحقق.")
+            return unavailable(started, "إذن VPN غير متاح. امنح الإذن أولًا ثم أعد التحقق.", planDownloadKbps, planUploadKbps)
         }
 
         val initiallyConnected = VpnRuntime.state.value.status == VpnStatus.CONNECTED
@@ -39,7 +39,7 @@ object SpeedVerificationEngine {
             if (VpnRuntime.state.value.status != VpnStatus.DISCONNECTED) {
                 SpeedVpnService.stop(context)
                 if (!waitForStatus(VpnStatus.DISCONNECTED)) {
-                    return unavailable(started, "تعذر فصل VPN قبل الاختبار.")
+                    return unavailable(started, "تعذر فصل VPN قبل الاختبار.", planDownloadKbps, planUploadKbps)
                 }
             }
 
@@ -49,13 +49,13 @@ object SpeedVerificationEngine {
             }
 
             if (baseline.downloadBps == null && baseline.uploadBps == null) {
-                return unavailable(started, "فشل قياس الشبكة الأصلية.")
+                return unavailable(started, "فشل قياس الشبكة الأصلية.", planDownloadKbps, planUploadKbps)
             }
 
             onProgress("تشغيل VPN للتحقق من الخطة…")
             SpeedVpnService.start(context)
             if (!waitForStatus(VpnStatus.CONNECTED)) {
-                return unavailable(started, "تعذر الوصول إلى حالة VPN متصل.")
+                return unavailable(started, "تعذر الوصول إلى حالة VPN متصل.", planDownloadKbps, planUploadKbps)
             }
 
             onProgress("قياس Download عبر VPN…")
@@ -64,7 +64,7 @@ object SpeedVerificationEngine {
             }
 
             if (vpn.downloadBps == null && vpn.uploadBps == null) {
-                return unavailable(started, "فشل القياس أثناء مرور الترافيك عبر VPN.")
+                return unavailable(started, "فشل القياس أثناء مرور الترافيك عبر VPN.", planDownloadKbps, planUploadKbps)
             }
 
             note = listOfNotNull(
@@ -92,7 +92,7 @@ object SpeedVerificationEngine {
                 note = note,
             )
         } catch (t: Throwable) {
-            return unavailable(started, "فشل التحقق: " + (t.message ?: t.javaClass.simpleName))
+            return unavailable(started, "فشل التحقق: " + (t.message ?: t.javaClass.simpleName), planDownloadKbps, planUploadKbps)
         } finally {
             onProgress("استعادة حالة VPN السابقة…")
             if (initiallyConnected) {
@@ -119,20 +119,21 @@ object SpeedVerificationEngine {
         return false
     }
 
-    private fun unavailable(started: Long, note: String): SpeedVerificationResult {
-        val metric = SpeedMetricVerification(
-            planKbps = null,
+    private fun unavailable(started: Long, note: String, planDownloadKbps: Long? = null, planUploadKbps: Long? = null): SpeedVerificationResult {
+        val downloadMetric = SpeedMetricVerification(
+            planKbps = planDownloadKbps,
             baselineBps = null,
             vpnBps = null,
             status = SpeedVerificationStatus.NOT_VERIFIABLE,
             accuracyPercent = null,
             reason = note,
         )
+        val uploadMetric = downloadMetric.copy(planKbps = planUploadKbps)
         return SpeedVerificationResult(
             startedAtMillis = started,
             durationMs = System.currentTimeMillis() - started,
-            download = metric,
-            upload = metric,
+            download = downloadMetric,
+            upload = uploadMetric,
             overallStatus = SpeedVerificationStatus.NOT_VERIFIABLE,
             note = note,
         )
