@@ -24,6 +24,12 @@ class SpeedVpnApplication : Application() {
         val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
             runCatching {
+                getSharedPreferences("crash_recovery", MODE_PRIVATE).edit()
+                    .putString("last_crash", throwable.stackTraceToString().take(12000))
+                    .putLong("last_crash_at", System.currentTimeMillis())
+                    .commit()
+            }
+            runCatching {
                 DiagnosticsRepository.record(this, level = "ERROR", component = thread.name.take(120), eventType = "UNCAUGHT_EXCEPTION", message = throwable.stackTraceToString())
             }
             defaultHandler?.uncaughtException(thread, throwable) ?: Process.killProcess(Process.myPid())
