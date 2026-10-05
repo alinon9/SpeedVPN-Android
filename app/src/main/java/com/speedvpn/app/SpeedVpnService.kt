@@ -858,11 +858,10 @@ class SpeedVpnService : VpnService() {
                         continue
                     }
                     runCatching {
-                        // Collect the freshest platform usage available, then enforce
-                        // immediately in the same 5s cycle. Previously this loop only
-                        // refreshed the database, leaving the actual block decision to
-                        // a slower/background path.
-                        UsageCollector.collectToday(this@SpeedVpnService)
+                        // Enforcement reads NetworkStatsManager directly for each
+                        // configured UID. Do not run the heavier daily snapshot collector
+                        // here: that collector is for UI/reporting and can delay the
+                        // actual quota decision.
                         QuotaEnforcementEngine.enforce(this@SpeedVpnService)
                     }.onFailure {
                         DiagnosticsRepository.record(
