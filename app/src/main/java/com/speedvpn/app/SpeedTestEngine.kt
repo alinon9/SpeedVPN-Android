@@ -29,6 +29,7 @@ data class SpeedTestResult(
 object SpeedTestEngine {
     private const val DOWNLOAD_URL = "https://speed.cloudflare.com/__down"
     private const val UPLOAD_URL = "https://speed.cloudflare.com/__up"
+    private const val REFERER = "https://speed.cloudflare.com/"
     private val RAMP_UP_SIZES = longArrayOf(
         100_000L, 1_000_000L, 10_000_000L, 25_000_000L,
     )
