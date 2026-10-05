@@ -792,6 +792,7 @@ class MainActivity : ComponentActivity() {
         var firewallEnabled by remember { mutableStateOf(VpnAppControl.read(this@MainActivity).firewallEnabled) }
         var blockedPackages by remember { mutableStateOf(VpnAppControl.read(this@MainActivity).blockedPackages) }
         var apps by remember { mutableStateOf<List<AppTrafficUsage>>(emptyList()) }
+        var appCatalog by remember { mutableStateOf<List<android.content.pm.ApplicationInfo>>(emptyList()) }
         var policies by remember { mutableStateOf<Map<String, AppPolicy>>(emptyMap()) }
         var quotaPolicies by remember { mutableStateOf<Map<String, List<AppQuotaPolicy>>>(emptyMap()) }
         var appQuery by remember { mutableStateOf("") }
@@ -799,16 +800,30 @@ class MainActivity : ComponentActivity() {
         var editingSpeedApp by remember { mutableStateOf<AppTrafficUsage?>(null) }
         var statsEnabled by remember { mutableStateOf(SmartSettings.isStatsEnabled(this@MainActivity)) }
 
+        LaunchedEffect(Unit) {
+            appCatalog = withContext(Dispatchers.IO) {
+                AppTrafficManager.installedLaunchableApps(this@MainActivity)
+            }
+            apps = appCatalog.map { app ->
+                AppTrafficUsage(
+                    packageName = app.packageName,
+                    label = app.loadLabel(packageManager).toString(),
+                    uid = app.uid,
+                    downloadBytes = 0L,
+                    uploadBytes = 0L,
+                )
+            }
+        }
+
         LaunchedEffect(s.connectedAtMillis, s.status, usageAccess, statsEnabled) {
             while (isActive) {
                 apps = withContext(Dispatchers.IO) {
                     if (statsEnabled && usageAccess) UsageCollector.collectToday(this@MainActivity)
-                    val installed = AppTrafficManager.installedLaunchableApps(this@MainActivity)
                     val usageByPackage = if (statsEnabled) {
                         UsageRepository.topUsage(this@MainActivity, UsageDate.today(), 100)
                             .associateBy { it.packageName }
                     } else emptyMap()
-                    installed.map { app ->
+                    appCatalog.map { app ->
                         val row = usageByPackage[app.packageName]
                         AppTrafficUsage(
                             packageName = app.packageName,
@@ -829,7 +844,7 @@ class MainActivity : ComponentActivity() {
                     UsageRepository.readQuotaPolicyMap(this@MainActivity)
                 }
                 if (s.status != VpnStatus.CONNECTED) break
-                delay(if (s.status == VpnStatus.CONNECTED && statsEnabled && usageAccess) 30_000L else 60_000L)
+                delay(if (statsEnabled && usageAccess) 5_000L else 15_000L)
             }
         }
 
