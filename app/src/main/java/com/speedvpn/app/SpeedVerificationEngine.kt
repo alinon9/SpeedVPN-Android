@@ -51,7 +51,7 @@ object SpeedVerificationEngine {
             SpeedLimiter.setUploadKbps(null)
 
             onProgress("قياس Download للشبكة الأصلية…")
-            baseline = SpeedTestEngine.measure { phase ->
+            baseline = SpeedTestEngine.measure(context) { phase ->
                 onProgress(if (phase == SpeedTestPhase.DOWNLOAD) "قياس Download للشبكة الأصلية…" else "قياس Upload للشبكة الأصلية…")
             }
 
@@ -72,7 +72,7 @@ object SpeedVerificationEngine {
             }
 
             onProgress("قياس Download عبر VPN…")
-            vpn = SpeedTestEngine.measure { phase ->
+            vpn = SpeedTestEngine.measure(context) { phase ->
                 onProgress(if (phase == SpeedTestPhase.DOWNLOAD) "قياس Download عبر VPN…" else "قياس Upload عبر VPN…")
             }
 
