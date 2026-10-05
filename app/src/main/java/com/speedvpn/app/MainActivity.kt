@@ -329,7 +329,7 @@ class MainActivity : ComponentActivity() {
                         lifecycleScope.launch {
                             testBusy = true
                             testProgress = "جاري بدء الفحص…"
-                            lastTest = SpeedTestEngine.measure { phase ->
+                            lastTest = SpeedTestEngine.measure(this@MainActivity) { phase ->
                                 val label = if (phase == SpeedTestPhase.DOWNLOAD) "جاري قياس Download…" else "جاري قياس Upload…"
                                 lifecycleScope.launch(Dispatchers.Main.immediate) { testProgress = label }
                             }
