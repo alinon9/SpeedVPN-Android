@@ -38,7 +38,7 @@ object SpeedTestEngine {
     private val client: OkHttpClient by lazy {
         OkHttpClient.Builder()
             .connectTimeout(8, TimeUnit.SECONDS)
-            .readTimeout(MAX_REQUEST_DURATION_MS + 2_000L, TimeUnit.MILLISECONDS)
+            .readTimeout(PROBE_MAX_DURATION_MS + 2_000L, TimeUnit.MILLISECONDS)
             .writeTimeout(MAX_REQUEST_DURATION_MS + 2_000L, TimeUnit.MILLISECONDS)
             .callTimeout(MAX_REQUEST_DURATION_MS + 5_000L, TimeUnit.MILLISECONDS)
             .retryOnConnectionFailure(false)
