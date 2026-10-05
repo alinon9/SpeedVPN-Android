@@ -24,10 +24,10 @@ object SpeedTestEngine {
     private const val DOWNLOAD_URL = "https://speed.cloudflare.com/__down"
     private const val UPLOAD_URL = "https://speed.cloudflare.com/__up"
     private const val TEST_WINDOW_MS = 5_000L
-    // Large enough to sustain the full 5-second measurement window even on
-    // high-speed mobile/Wi-Fi links. The stream is still stopped by the deadline,
-    // so this is a safety ceiling, not the amount the test must download.
-    private const val MAX_TRANSFER_BYTES = 1L * 1024L * 1024L * 1024L
+    // Cloudflare currently requires a browser-like Referer for larger download
+    // probes. 200 MB is enough to sustain the 5-second measurement window on
+    // typical mobile/Wi-Fi links while staying within Cloudflare Speed Test usage.
+    private const val MAX_TRANSFER_BYTES = 200L * 1024L * 1024L
     private const val CHUNK_BYTES = 64 * 1024
 
     private val client: OkHttpClient by lazy {
@@ -70,7 +70,9 @@ object SpeedTestEngine {
             .header("Cache-Control", "no-cache, no-store")
             .header("Pragma", "no-cache")
             .header("Accept-Encoding", "identity")
-            .header("User-Agent", "SpeedVPN-Stage0/1.2")
+            .header("User-Agent", "Mozilla/5.0 (Linux; Android) AppleWebKit/537.36 Chrome/131.0 Mobile Safari/537.36")
+            .header("Referer", "https://speed.cloudflare.com/")
+            .header("Accept", "*/*")
             .build()
 
         val started = System.nanoTime()
@@ -103,7 +105,9 @@ object SpeedTestEngine {
             .url(UPLOAD_URL + "?cacheBust=" + System.nanoTime())
             .header("Cache-Control", "no-cache, no-store")
             .header("Pragma", "no-cache")
-            .header("User-Agent", "SpeedVPN-Stage0/1.1")
+            .header("User-Agent", "Mozilla/5.0 (Linux; Android) AppleWebKit/537.36 Chrome/131.0 Mobile Safari/537.36")
+            .header("Referer", "https://speed.cloudflare.com/")
+            .header("Accept", "*/*")
             .post(body)
             .build()
 
