@@ -112,47 +112,76 @@ internal class SpeedOverlayService : Service() {
 
     private fun addOverlay() {
         wm = getSystemService(WindowManager::class.java)
-        val size = (238 * resources.displayMetrics.density).toInt()
-        val parent = FrameLayout(this).apply {
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(Color.rgb(7, 15, 30))
-                setStroke((1.5f * resources.displayMetrics.density).toInt(), Color.rgb(53, 184, 255))
-            }
-            elevation = 18f
-            setPadding(18, 18, 18, 18)
-        }
-        val column = LinearLayout(this).apply {
+        val dm = resources.displayMetrics
+        val width = dp(206)
+        val height = dp(178)
+
+        val parent = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = dp(18).toFloat()
+                setColor(Color.rgb(10, 18, 34))
+                setStroke(dp(1), Color.rgb(55, 83, 120))
+            }
+            elevation = dp(10).toFloat()
+        }
+
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        title = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            textSize = 12f
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            maxLines = 1
+        }
+        header.addView(title, LinearLayout.LayoutParams(0, dp(28), 1f))
+
+        val close = TextView(this).apply {
+            text = "×"
+            setTextColor(Color.rgb(220, 230, 242))
+            textSize = 20f
+            gravity = Gravity.CENTER
+            background = roundedBackground(Color.rgb(28, 42, 66), dp(12))
+            setOnClickListener { stopSelf() }
+        }
+        header.addView(close, LinearLayout.LayoutParams(dp(28), dp(28)))
+        parent.addView(header, LinearLayout.LayoutParams(-1, dp(30)))
+
+        downloadValue = metricText(Color.rgb(53, 184, 255))
+        uploadValue = metricText(Color.rgb(66, 240, 228))
+        downloadReserved = reservedText()
+        uploadReserved = reservedText()
+
+        parent.addView(controlRow(true), LinearLayout.LayoutParams(-1, dp(54)))
+        parent.addView(controlRow(false), LinearLayout.LayoutParams(-1, dp(54)))
+
+        val footer = TextView(this).apply {
+            text = "اسحب النافذة لتحريكها"
+            setTextColor(Color.rgb(130, 150, 176))
+            textSize = 8.5f
             gravity = Gravity.CENTER
         }
-        title = TextView(this).apply { setTextColor(Color.WHITE); textSize = 11f; gravity = Gravity.CENTER }
-        downloadValue = TextView(this).apply { setTextColor(Color.rgb(53, 184, 255)); textSize = 14f; gravity = Gravity.CENTER }
-        uploadValue = TextView(this).apply { setTextColor(Color.rgb(66, 240, 228)); textSize = 14f; gravity = Gravity.CENTER }
-        downloadReserved = TextView(this).apply { setTextColor(Color.LTGRAY); textSize = 9f; gravity = Gravity.CENTER }
-        uploadReserved = TextView(this).apply { setTextColor(Color.LTGRAY); textSize = 9f; gravity = Gravity.CENTER }
-        column.addView(title, LinearLayout.LayoutParams(-1, 28))
-        column.addView(downloadValue, LinearLayout.LayoutParams(-1, 28))
-        column.addView(downloadReserved, LinearLayout.LayoutParams(-1, 20))
-        column.addView(controlRow(true), LinearLayout.LayoutParams(-1, 44))
-        column.addView(uploadValue, LinearLayout.LayoutParams(-1, 28))
-        column.addView(uploadReserved, LinearLayout.LayoutParams(-1, 20))
-        column.addView(controlRow(false), LinearLayout.LayoutParams(-1, 44))
-        parent.addView(column, FrameLayout.LayoutParams(-1, -1))
-        val close = button("×") { stopSelf() }.apply { textSize = 18f; background = circleButtonBackground(Color.rgb(70, 25, 40)) }
-        parent.addView(close, FrameLayout.LayoutParams(38, 38, Gravity.TOP or Gravity.END))
+        parent.addView(footer, LinearLayout.LayoutParams(-1, dp(18)))
+
         parent.setOnTouchListener(DragListener())
         root = parent
+
         val params = WindowManager.LayoutParams(
-            size, size,
+            width, height,
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT,
         ).apply {
             gravity = Gravity.TOP or Gravity.END
-            x = 14
-            y = 140
+            x = dp(10)
+            y = dp(110)
         }
+
         runCatching { wm.addView(parent, params) }.onFailure {
             root = null
             DiagnosticsRepository.record(this, "ERROR", "SpeedOverlay", "OVERLAY_ATTACH_FAILED", it.message ?: "unable to attach overlay")
@@ -162,22 +191,58 @@ internal class SpeedOverlayService : Service() {
 
     private fun controlRow(download: Boolean): LinearLayout = LinearLayout(this).apply {
         orientation = LinearLayout.HORIZONTAL
-        gravity = Gravity.CENTER
+        gravity = Gravity.CENTER_VERTICAL
+        setPadding(0, dp(2), 0, dp(2))
+
         addView(button("−") { change(download, -1) }.apply {
-            textSize = 22f
-            background = circleButtonBackground(Color.rgb(35, 48, 75))
-        }, LinearLayout.LayoutParams(48, 40).apply { marginEnd = 12 })
-        addView(TextView(this@SpeedOverlayService).apply {
-            text = if (download) "↓" else "↑"
-            setTextColor(if (download) Color.rgb(53, 184, 255) else Color.rgb(66, 240, 228))
             textSize = 18f
+            background = roundedBackground(Color.rgb(24, 38, 62), dp(10))
+        }, LinearLayout.LayoutParams(dp(34), dp(38)))
+
+        val center = LinearLayout(this@SpeedOverlayService).apply {
+            orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
-        }, LinearLayout.LayoutParams(34, 40))
+        }
+        val value = if (download) downloadReserved else uploadReserved
+        val live = if (download) downloadValue else uploadValue
+        center.addView(TextView(this@SpeedOverlayService).apply {
+            text = if (download) "↓ Download" else "↑ Upload"
+            setTextColor(if (download) Color.rgb(53, 184, 255) else Color.rgb(66, 240, 228))
+            textSize = 9f
+            gravity = Gravity.CENTER
+        }, LinearLayout.LayoutParams(-1, dp(16)))
+        center.addView(live, LinearLayout.LayoutParams(-1, dp(19)))
+        center.addView(value, LinearLayout.LayoutParams(-1, dp(15)))
+        addView(center, LinearLayout.LayoutParams(0, dp(50), 1f))
+
         addView(button("+") { change(download, 1) }.apply {
-            textSize = 22f
-            background = circleButtonBackground(Color.rgb(35, 48, 75))
-        }, LinearLayout.LayoutParams(48, 40).apply { marginStart = 12 })
+            textSize = 18f
+            background = roundedBackground(Color.rgb(24, 38, 62), dp(10))
+        }, LinearLayout.LayoutParams(dp(34), dp(38)))
     }
+
+    private fun metricText(color: Int) = TextView(this).apply {
+        setTextColor(color)
+        textSize = 11f
+        setTypeface(typeface, android.graphics.Typeface.BOLD)
+        gravity = Gravity.CENTER
+    }
+
+    private fun reservedText() = TextView(this).apply {
+        setTextColor(Color.rgb(150, 165, 188))
+        textSize = 8.5f
+        gravity = Gravity.CENTER
+    }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+
+    private fun roundedBackground(color: Int, radius: Int) = GradientDrawable().apply {
+        shape = GradientDrawable.RECTANGLE
+        cornerRadius = radius.toFloat()
+        setColor(color)
+        setStroke(dp(1), Color.rgb(55, 78, 108))
+    }
+
 
     private fun button(label: String, action: () -> Unit) = Button(this).apply {
         text = label
