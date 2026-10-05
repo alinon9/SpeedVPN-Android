@@ -238,7 +238,7 @@ object SpeedTestEngine {
             private set
 
         override fun contentType() = mediaType
-        override fun contentLength() = sizeBytes
+        override fun contentLength() = -1L
 
         override fun writeTo(sink: BufferedSink) {
             transferStartedNanos = System.nanoTime()
