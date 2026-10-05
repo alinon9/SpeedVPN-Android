@@ -30,13 +30,9 @@ object SpeedTestEngine {
     private const val DOWNLOAD_URL = "https://speed.cloudflare.com/__down"
     private const val UPLOAD_URL = "https://speed.cloudflare.com/__up"
     private const val REFERER = "https://speed.cloudflare.com/"
-    private val RAMP_UP_SIZES = longArrayOf(
-        100_000L, 1_000_000L, 10_000_000L, 25_000_000L,
-    )
-    private const val MIN_REQUEST_DURATION_MS = 200L
-    private const val FINISH_REQUEST_DURATION_MS = 1_500L
-    private const val MAX_REQUEST_DURATION_MS = 5_000L
-    private const val TARGET_PERCENTILE = 0.90
+    private val RAMP_UP_SIZES = longArrayOf(100_000L, 1_000_000L, 10_000_000L, 25_000_000L)
+    private const val MIN_PROBE_DURATION_MS = 200L
+    private const val PROBE_MAX_DURATION_MS = 5_000L
     private const val CHUNK_BYTES = 64 * 1024
 
     private val client: OkHttpClient by lazy {
@@ -85,97 +81,81 @@ object SpeedTestEngine {
         data class IoError(val message: String) : MeasurementOutcome()
     }
 
-    private fun measureDownload(client: OkHttpClient): Long? {
-        val valid = mutableListOf<Measurement>()
-        var lastError: String? = null
+    private fun measureDownload(client: OkHttpClient): Long {
+        var lastSpeed = 0L
         for (sizeBytes in RAMP_UP_SIZES) {
-            when (val outcome = downloadProbe(client, sizeBytes)) {
-                is MeasurementOutcome.Success -> {
-                    val measurement = outcome.measurement
-                    if (measurement.durationMs >= MIN_REQUEST_DURATION_MS) valid += measurement
-                    if (measurement.durationMs >= FINISH_REQUEST_DURATION_MS) break
-                }
-                is MeasurementOutcome.HttpError -> { lastError = "Download HTTP " + outcome.code }
-                is MeasurementOutcome.IoError -> { lastError = outcome.message; break }
-            }
+            val speed = runCatching { downloadProbe(client, sizeBytes) }.getOrNull()
+            if (speed != null) lastSpeed = speed
         }
-        return percentile(valid, TARGET_PERCENTILE)?.speedBps ?: if (lastError != null) throw IOException(lastError) else null
+        if (lastSpeed <= 0L) throw IOException("No valid download measurement")
+        return lastSpeed
     }
 
-    private fun measureUpload(client: OkHttpClient): Long? {
-        val valid = mutableListOf<Measurement>()
-        var lastError: String? = null
-        for (sizeBytes in RAMP_UP_SIZES) {
-            when (val outcome = uploadProbe(client, sizeBytes)) {
-                is MeasurementOutcome.Success -> {
-                    val measurement = outcome.measurement
-                    if (measurement.durationMs >= MIN_REQUEST_DURATION_MS) valid += measurement
-                    if (measurement.durationMs >= FINISH_REQUEST_DURATION_MS) break
-                }
-                is MeasurementOutcome.HttpError -> { lastError = "Upload HTTP " + outcome.code }
-                is MeasurementOutcome.IoError -> { lastError = outcome.message; break }
-            }
-        }
-        return percentile(valid, TARGET_PERCENTILE)?.speedBps ?: if (lastError != null) throw IOException(lastError) else null
-    }
-
-    private fun downloadProbe(client: OkHttpClient, sizeBytes: Long): MeasurementOutcome {
+    private fun downloadProbe(client: OkHttpClient, sizeBytes: Long): Long {
         val request = Request.Builder()
             .url(DOWNLOAD_URL + "?bytes=" + sizeBytes + "&cacheBust=" + System.nanoTime())
             .header("Cache-Control", "no-cache, no-store")
             .header("Pragma", "no-cache")
             .header("Accept-Encoding", "identity")
             .header("User-Agent", "Mozilla/5.0 (Linux; Android) AppleWebKit/537.36 Chrome/131.0 Mobile Safari/537.36")
-            .header("Referer", REFERER).header("Accept", "*/*").build()
+            .header("Referer", "https://speed.cloudflare.com/")
+            .header("Accept", "*/*")
+            .build()
         val started = System.nanoTime()
-        return try {
-            client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) return MeasurementOutcome.HttpError(response.code)
-                val body = response.body ?: return MeasurementOutcome.IoError("Download body unavailable")
-                body.byteStream().use { input ->
-                    val buffer = ByteArray(CHUNK_BYTES)
-                    var total = 0L
-                    val deadline = started + MAX_REQUEST_DURATION_MS * 1_000_000L
-                    while (System.nanoTime() < deadline && total < sizeBytes) {
-                        val remaining = sizeBytes - total
-                        val read = input.read(buffer, 0, min(buffer.size.toLong(), remaining).toInt())
-                        if (read <= 0) break
-                        total += read
-                    }
-                    val elapsed = (System.nanoTime() - started).coerceAtLeast(1L)
-                    if (total <= 0L) return MeasurementOutcome.IoError("No download data received")
-                    MeasurementOutcome.Success(Measurement(bitsPerSecond(total, elapsed), elapsed / 1_000_000L, total, sizeBytes))
+        client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) throw IOException("Download HTTP " + response.code)
+            val body = response.body ?: throw IOException("Download body unavailable")
+            body.byteStream().use { input ->
+                val buffer = ByteArray(CHUNK_BYTES)
+                var total = 0L
+                val deadline = started + PROBE_MAX_DURATION_MS * 1_000_000L
+                while (System.nanoTime() < deadline && total < sizeBytes) {
+                    val remaining = sizeBytes - total
+                    val read = input.read(buffer, 0, min(buffer.size.toLong(), remaining).toInt())
+                    if (read <= 0) break
+                    total += read
                 }
+                val elapsed = (System.nanoTime() - started).coerceAtLeast(1L)
+                if (total <= 0L || elapsed / 1_000_000L < MIN_PROBE_DURATION_MS) {
+                    throw IOException("Download probe too short")
+                }
+                return bitsPerSecond(total, elapsed)
             }
-        } catch (t: Throwable) { MeasurementOutcome.IoError(t.message ?: t.javaClass.simpleName) }
+        }
     }
 
-    private fun uploadProbe(client: OkHttpClient, sizeBytes: Long): MeasurementOutcome {
-        val body = TimedUploadBody(sizeBytes, MAX_REQUEST_DURATION_MS)
+    private fun measureUpload(client: OkHttpClient): Long {
+        var lastSpeed = 0L
+        for (sizeBytes in RAMP_UP_SIZES) {
+            val speed = runCatching { uploadProbe(client, sizeBytes) }.getOrNull()
+            if (speed != null) lastSpeed = speed
+        }
+        if (lastSpeed <= 0L) throw IOException("No valid upload measurement")
+        return lastSpeed
+    }
+
+    private fun uploadProbe(client: OkHttpClient, sizeBytes: Long): Long {
+        val started = System.nanoTime()
+        val body = TimedUploadBody(started + PROBE_MAX_DURATION_MS * 1_000_000L, sizeBytes)
         val request = Request.Builder()
             .url(UPLOAD_URL + "?bytes=" + sizeBytes + "&cacheBust=" + System.nanoTime())
-            .header("Cache-Control", "no-cache, no-store").header("Pragma", "no-cache")
+            .header("Cache-Control", "no-cache, no-store")
+            .header("Pragma", "no-cache")
             .header("User-Agent", "Mozilla/5.0 (Linux; Android) AppleWebKit/537.36 Chrome/131.0 Mobile Safari/537.36")
-            .header("Referer", REFERER).header("Accept", "*/*").post(body).build()
-        return try {
-            client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) return MeasurementOutcome.HttpError(response.code)
-                val bytes = body.bytesWritten
-                val start = body.transferStartedNanos
-                val end = body.transferFinishedNanos
-                if (bytes <= 0L || start == 0L || end <= start) return MeasurementOutcome.IoError("No upload data sent")
-                val elapsed = (end - start).coerceAtLeast(1L)
-                MeasurementOutcome.Success(Measurement(bitsPerSecond(bytes, elapsed), elapsed / 1_000_000L, bytes, sizeBytes))
+            .header("Referer", "https://speed.cloudflare.com/")
+            .header("Accept", "*/*")
+            .post(body)
+            .build()
+        client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) throw IOException("Upload HTTP " + response.code)
+            val elapsed = (System.nanoTime() - started).coerceAtLeast(1L)
+            if (body.bytesWritten <= 0L || elapsed / 1_000_000L < MIN_PROBE_DURATION_MS) {
+                throw IOException("Upload probe too short")
             }
-        } catch (t: Throwable) { MeasurementOutcome.IoError(t.message ?: t.javaClass.simpleName) }
+            return bitsPerSecond(body.bytesWritten, elapsed)
+        }
     }
 
-    private fun percentile(measurements: List<Measurement>, percentile: Double): Measurement? {
-        if (measurements.isEmpty()) return null
-        val sorted = measurements.sortedBy { it.speedBps }
-        val index = floor((sorted.lastIndex.toDouble() * percentile).coerceIn(0.0, sorted.lastIndex.toDouble())).toInt()
-        return sorted[index]
-    }
     /**
      * Resolve the speed-test hostname on the physical network, not through the
      * VPN TUN. The HTTP connection itself is still created by OkHttp normally,
