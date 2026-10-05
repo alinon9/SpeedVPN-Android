@@ -1,11 +1,16 @@
 package com.speedvpn.app
 
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
+import okhttp3.Dns
 import okio.BufferedSink
 import java.io.IOException
 import java.util.concurrent.TimeUnit
@@ -41,23 +46,28 @@ object SpeedTestEngine {
             .build()
     }
 
-    suspend fun measure(onProgress: (SpeedTestPhase) -> Unit = {}): SpeedTestResult =
+    suspend fun measure(
+        context: Context,
+        onProgress: (SpeedTestPhase) -> Unit = {},
+    ): SpeedTestResult =
         withContext(Dispatchers.IO) {
             val startedAt = System.currentTimeMillis()
             var download: Long? = null
             var upload: Long? = null
             var firstError: String? = null
 
+            val testClient = buildTestClient(context)
+
             try {
                 onProgress(SpeedTestPhase.DOWNLOAD)
-                download = measureDownload()
+                download = measureDownload(testClient)
             } catch (t: Throwable) {
                 firstError = t.message ?: t.javaClass.simpleName
             }
 
             try {
                 onProgress(SpeedTestPhase.UPLOAD)
-                upload = measureUpload()
+                upload = measureUpload(testClient)
             } catch (t: Throwable) {
                 if (firstError == null) firstError = t.message ?: t.javaClass.simpleName
             }
@@ -65,7 +75,7 @@ object SpeedTestEngine {
             SpeedTestResult(download, upload, System.currentTimeMillis() - startedAt, firstError)
         }
 
-    private fun measureDownload(): Long {
+    private fun measureDownload(client: OkHttpClient): Long {
         val request = Request.Builder()
             .url(DOWNLOAD_URL + "?bytes=" + DOWNLOAD_MAX_BYTES + "&cacheBust=" + System.nanoTime())
             .header("Cache-Control", "no-cache, no-store")
@@ -99,7 +109,7 @@ object SpeedTestEngine {
         }
     }
 
-    private fun measureUpload(): Long {
+    private fun measureUpload(client: OkHttpClient): Long {
         val started = System.nanoTime()
         val body = TimedUploadBody(started + TEST_WINDOW_MS * 1_000_000L)
         val request = Request.Builder()
@@ -117,6 +127,50 @@ object SpeedTestEngine {
             val elapsedNanos = (System.nanoTime() - started).coerceAtLeast(1L)
             if (body.bytesWritten <= 0L) throw IOException("No upload data sent")
             return bitsPerSecond(body.bytesWritten, elapsedNanos)
+        }
+    }
+
+    /**
+     * Resolve the speed-test hostname on the physical network, not through the
+     * VPN TUN. The HTTP connection itself is still created by OkHttp normally,
+     * so after DNS resolution its packets follow the app's current VPN routing.
+     * This avoids the VPN's synthetic DNS address (198.18.0.2) breaking the
+     * speed test while keeping the measured data path inside the VPN.
+     */
+    private fun buildTestClient(context: Context): OkHttpClient {
+        val connectivity = context.getSystemService(ConnectivityManager::class.java)
+        val physicalNetwork = findPhysicalNetwork(connectivity)
+
+        val dns = object : Dns {
+            override fun lookup(hostname: String): List<java.net.InetAddress> {
+                if (physicalNetwork == null) {
+                    return runCatching { java.net.InetAddress.getAllByName(hostname).toList() }
+                        .getOrElse { throw IOException("DNS resolution failed for $hostname: ${it.message}") }
+                }
+
+                return runCatching {
+                    physicalNetwork.getAllByName(hostname).toList()
+                }.getOrElse {
+                    throw IOException("Physical DNS resolution failed for $hostname: ${it.message}")
+                }
+            }
+        }
+
+        return client.newBuilder()
+            .dns(dns)
+            .build()
+    }
+
+    private fun findPhysicalNetwork(connectivity: ConnectivityManager): Network? {
+        return connectivity.allNetworks.firstOrNull { network ->
+            val caps = connectivity.getNetworkCapabilities(network) ?: return@firstOrNull false
+            !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
+                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+        } ?: connectivity.allNetworks.firstOrNull { network ->
+            val caps = connectivity.getNetworkCapabilities(network) ?: return@firstOrNull false
+            !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
+                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
         }
     }
 
