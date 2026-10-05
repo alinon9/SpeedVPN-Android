@@ -39,8 +39,8 @@ object SpeedTestEngine {
         OkHttpClient.Builder()
             .connectTimeout(8, TimeUnit.SECONDS)
             .readTimeout(PROBE_MAX_DURATION_MS + 2_000L, TimeUnit.MILLISECONDS)
-            .writeTimeout(MAX_REQUEST_DURATION_MS + 2_000L, TimeUnit.MILLISECONDS)
-            .callTimeout(MAX_REQUEST_DURATION_MS + 5_000L, TimeUnit.MILLISECONDS)
+            .writeTimeout(PROBE_MAX_DURATION_MS + 2_000L, TimeUnit.MILLISECONDS)
+            .callTimeout(PROBE_MAX_DURATION_MS + 5_000L, TimeUnit.MILLISECONDS)
             .retryOnConnectionFailure(false)
             .build()
     }
