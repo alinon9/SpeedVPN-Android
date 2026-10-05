@@ -805,7 +805,7 @@ class MainActivity : ComponentActivity() {
                     if (statsEnabled && usageAccess) UsageCollector.collectToday(this@MainActivity)
                     val installed = AppTrafficManager.installedLaunchableApps(this@MainActivity)
                     val usageByPackage = if (statsEnabled) {
-                        UsageRepository.topUsage(this@MainActivity, UsageDate.today(), 500)
+                        UsageRepository.topUsage(this@MainActivity, UsageDate.today(), 100)
                             .associateBy { it.packageName }
                     } else emptyMap()
                     installed.map { app ->
@@ -829,7 +829,7 @@ class MainActivity : ComponentActivity() {
                     UsageRepository.readQuotaPolicyMap(this@MainActivity)
                 }
                 if (s.status != VpnStatus.CONNECTED) break
-                delay(if (s.status == VpnStatus.CONNECTED && statsEnabled && usageAccess) 5_000L else 15_000L)
+                delay(if (s.status == VpnStatus.CONNECTED && statsEnabled && usageAccess) 30_000L else 60_000L)
             }
         }
 
