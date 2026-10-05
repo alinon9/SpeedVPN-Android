@@ -35,7 +35,7 @@ object SpeedVerificationPolicy {
                 SpeedMetricVerification(
                     null, baselineBps, vpnBps, SpeedVerificationStatus.UNLIMITED_OK,
                     min(100.0, retention * 100.0),
-                    "لا يظهر سقف رقمي واضح مقارنة بسرعة الشبكة الأصلية.",
+                    "لا يظهر تدهور يتجاوز هامش الاختبار مقارنة بسرعة الشبكة الأصلية.",
                 )
             } else {
                 SpeedMetricVerification(
@@ -57,25 +57,34 @@ object SpeedVerificationPolicy {
         if (baselineBps < targetBps) {
             return SpeedMetricVerification(
                 planKbps, baselineBps, vpnBps, SpeedVerificationStatus.NOT_VERIFIABLE, null,
-                "سرعة الشبكة الأصلية أقل من الخطة المحددة.",
+                "سرعة الشبكة الأصلية أقل من الخطة؛ لا يمكن الحكم على التحديد.",
             )
         }
 
         val relativeError = abs(vpnBps.toDouble() - targetBps.toDouble()) / targetBps.toDouble()
         val accuracy = (100.0 - relativeError * 100.0).coerceIn(0.0, 100.0)
-        val status = if (relativeError <= TOLERANCE) {
-            SpeedVerificationStatus.MATCH
-        } else {
-            SpeedVerificationStatus.MISMATCH
+        val lowerBound = targetBps.toDouble() * (1.0 - TOLERANCE)
+        val upperBound = targetBps.toDouble() * (1.0 + TOLERANCE)
+
+        val status: SpeedVerificationStatus
+        val reason: String
+        when {
+            vpnBps.toDouble() in lowerBound..upperBound -> {
+                status = SpeedVerificationStatus.MATCH
+                reason = "السرعة داخل VPN ضمن ±20% من السرعة المحددة."
+            }
+            vpnBps > upperBound -> {
+                status = SpeedVerificationStatus.MISMATCH
+                reason = "السرعة داخل VPN أعلى من الحد المحدد بأكثر من 20%؛ لم يثبت تطبيق السقف."
+            }
+            else -> {
+                status = SpeedVerificationStatus.MISMATCH
+                reason = "السرعة داخل VPN أقل من الحد المحدد بأكثر من 20%."
+            }
         }
 
         return SpeedMetricVerification(
-            planKbps, baselineBps, vpnBps, status, accuracy,
-            if (status == SpeedVerificationStatus.MATCH) {
-                "السرعة ضمن هامش السماح ±20%."
-            } else {
-                "السرعة عبر VPN خارج هامش السماح ±20%."
-            },
+            planKbps, baselineBps, vpnBps, status, accuracy, reason,
         )
     }
 
