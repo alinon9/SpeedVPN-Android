@@ -27,7 +27,8 @@ object SpeedTestEngine {
     // Cloudflare currently requires a browser-like Referer for larger download
     // probes. 200 MB is enough to sustain the 5-second measurement window on
     // typical mobile/Wi-Fi links while staying within Cloudflare Speed Test usage.
-    private const val MAX_TRANSFER_BYTES = 200L * 1024L * 1024L
+    private const val DOWNLOAD_MAX_BYTES = 95_000_000L
+    private const val UPLOAD_MAX_BYTES = 50L * 1024L * 1024L
     private const val CHUNK_BYTES = 64 * 1024
 
     private val client: OkHttpClient by lazy {
@@ -66,7 +67,7 @@ object SpeedTestEngine {
 
     private fun measureDownload(): Long {
         val request = Request.Builder()
-            .url(DOWNLOAD_URL + "?bytes=" + MAX_TRANSFER_BYTES + "&cacheBust=" + System.nanoTime())
+            .url(DOWNLOAD_URL + "?bytes=" + DOWNLOAD_MAX_BYTES + "&cacheBust=" + System.nanoTime())
             .header("Cache-Control", "no-cache, no-store")
             .header("Pragma", "no-cache")
             .header("Accept-Encoding", "identity")
@@ -84,8 +85,8 @@ object SpeedTestEngine {
                 var total = 0L
                 val deadline = started + TEST_WINDOW_MS * 1_000_000L
 
-                while (System.nanoTime() < deadline && total < MAX_TRANSFER_BYTES) {
-                    val remaining = MAX_TRANSFER_BYTES - total
+                while (System.nanoTime() < deadline && total < DOWNLOAD_MAX_BYTES) {
+                    val remaining = DOWNLOAD_MAX_BYTES - total
                     val read = input.read(buffer, 0, min(buffer.size.toLong(), remaining).toInt())
                     if (read <= 0) break
                     total += read
@@ -136,8 +137,8 @@ object SpeedTestEngine {
         override fun contentLength() = -1L
 
         override fun writeTo(sink: BufferedSink) {
-            while (System.nanoTime() < deadlineNanos && bytesWritten < MAX_TRANSFER_BYTES) {
-                val remaining = MAX_TRANSFER_BYTES - bytesWritten
+            while (System.nanoTime() < deadlineNanos && bytesWritten < UPLOAD_MAX_BYTES) {
+                val remaining = UPLOAD_MAX_BYTES - bytesWritten
                 val count = min(chunk.size.toLong(), remaining).toInt()
                 sink.write(chunk, 0, count)
                 bytesWritten += count
