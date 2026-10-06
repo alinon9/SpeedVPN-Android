@@ -160,6 +160,7 @@ jobs:
   emulator-smoke-test:
     needs: build-apk
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -184,15 +185,25 @@ jobs:
       - name: Run Android Emulator smoke test
         run: |
           set -euo pipefail
-          echo "no" | avdmanager create avd             -n speedvpn-ci             -k "system-images;android-35;google_apis;x86_64"             --force
+          export ANDROID_AVD_HOME="$RUNNER_TEMP/android-avd"
+          mkdir -p "$ANDROID_AVD_HOME"
 
-          nohup emulator             -avd speedvpn-ci             -no-window             -no-audio             -no-boot-anim             -no-snapshot             -gpu swiftshader_indirect             -accel on             -cores 2             -memory 2048             > emulator-console.log 2>&1 &
+          echo "Checking emulator system image..."
+          test -f "$ANDROID_SDK_ROOT/system-images/android-35/google_apis/x86_64/package.xml"
+          test -f "$ANDROID_SDK_ROOT/system-images/android-35/google_apis/x86_64/system.img"
+
+          echo "Creating AVD..."
+          timeout 120s bash -c 'echo no | avdmanager create avd -n speedvpn-ci -k "system-images;android-35;google_apis;x86_64" --force'
+          test -f "$ANDROID_AVD_HOME/speedvpn-ci.avd/config.ini"
+
+          echo "Starting emulator..."
+          nohup emulator -avd speedvpn-ci -no-window -no-audio -no-boot-anim -no-snapshot -no-snapshot-save -gpu swiftshader_indirect -accel on -cores 2 -memory 2048 > emulator-console.log 2>&1 &
           EMULATOR_PID=$!
           trap 'adb -s emulator-5554 emu kill >/dev/null 2>&1 || true; kill "$EMULATOR_PID" >/dev/null 2>&1 || true' EXIT
 
           adb start-server
-          adb wait-for-device
-          timeout 300 bash -c 'until adb -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null | tr -d "\r" | grep -q "^1$"; do sleep 2; done'
+          timeout 120s adb -s emulator-5554 wait-for-device
+          timeout 300s bash -c 'until adb -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null | tr -d "" | grep -q "^1$"; do sleep 2; done'
 
           adb -s emulator-5554 shell settings put global window_animation_scale 0
           adb -s emulator-5554 shell settings put global transition_animation_scale 0
