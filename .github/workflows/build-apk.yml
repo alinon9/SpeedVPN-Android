@@ -57,7 +57,39 @@ jobs:
       - name: Build debug APK
         run: ./gradlew :app:assembleDebug --stacktrace --no-daemon
 
+      - name: Enable KVM
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cpu-checker
+          sudo kvm-ok
+
       - name: Smoke test on Android Emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          target: google_apis
+          profile: pixel_6
+          force-avd-creation: true
+          emulator-options: -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect
+          disable-animations: true
+          cores: 2
+          ram-size: 2048M
+          heap-size: 512M
+          script: |
+            set -euo pipefail
+            adb wait-for-device
+            adb shell getprop sys.boot_completed | grep -q 1
+            adb install -r app/build/outputs/apk/debug/app-debug.apk
+            adb shell am force-stop com.speedvpn.app
+            adb shell monkey -p com.speedvpn.app 1
+            sleep 5
+            adb shell pidof com.speedvpn.app
+            adb shell dumpsys activity activities | grep -m 1 "com.speedvpn.app"
+            adb logcat -d -t 300 > emulator-logcat.txt
+            ! grep -Eiq "FATAL EXCEPTION|AndroidRuntime.*FATAL" emulator-logcat.txt
+
+
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 35
