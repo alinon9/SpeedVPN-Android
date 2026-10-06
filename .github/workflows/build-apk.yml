@@ -343,6 +343,100 @@ jobs:
           ! grep -Eiq "FATAL EXCEPTION|AndroidRuntime.*FATAL" emulator-logcat.txt
           echo "Android Emulator smoke test passed."
 
+      - name: Run Build 197 speed test on emulator
+        run: |
+          set -euo pipefail
+
+          tap_text() {
+            local wanted="$1"
+            local xml="ui-dump.xml"
+            adb -s emulator-5554 shell uiautomator dump "/sdcard/$xml" >/dev/null 2>&1
+            adb -s emulator-5554 pull -q "/sdcard/$xml" "$xml" >/dev/null
+            python3 - "$xml" "$wanted" <<'PY'
+import sys, xml.etree.ElementTree as ET, re, subprocess
+
+path, wanted = sys.argv[1], sys.argv[2]
+root = ET.parse(path).getroot()
+for node in root.iter("node"):
+    text = node.attrib.get("text", "")
+    if text == wanted or (wanted == "🚀" and text.startswith("🚀")):
+        bounds = node.attrib.get("bounds", "")
+        m = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
+        if not m:
+            continue
+        x1,y1,x2,y2 = map(int, m.groups())
+        x=(x1+x2)//2
+        y=(y1+y2)//2
+        subprocess.run(["adb","-s","emulator-5554","shell","input","tap",str(x),str(y)], check=True)
+        print(f"TAPPED text={text!r} x={x} y={y}")
+        raise SystemExit(0)
+print(f"Could not find text {wanted!r}", file=sys.stderr)
+for node in root.iter("node"):
+    t=node.attrib.get("text","")
+    if t:
+        print(t, file=sys.stderr)
+raise SystemExit(1)
+PY
+            rm -f "$xml"
+          }
+
+          wait_for_result() {
+            for i in $(seq 1 150); do
+              adb -s emulator-5554 shell uiautomator dump /sdcard/window-result.xml >/dev/null 2>&1 || true
+              adb -s emulator-5554 pull -q /sdcard/window-result.xml ui-result.xml >/dev/null 2>&1 || true
+              if grep -q "نتيجة فحص السرعة" ui-result.xml 2>/dev/null; then
+                cat ui-result.xml
+                return 0
+              fi
+              sleep 1
+            done
+            echo "Speed test did not finish within 150s."
+            adb -s emulator-5554 logcat -d -t 1500 > speed-test-logcat.txt || true
+            return 1
+          }
+
+          : > speed-test-results.txt
+
+          # Run the unchanged Build 197 test three times.
+          for run in 1 2 3; do
+            echo "===== SPEED TEST RUN $run =====" | tee -a speed-test-results.txt
+
+            if [ "$run" -eq 1 ]; then
+              tap_text "السرعة"
+              sleep 2
+            fi
+
+            tap_text "🚀"
+            sleep 2
+
+            wait_for_result > "ui-result-$run.xml"
+            python3 - "ui-result-$run.xml" <<'PY' | tee -a speed-test-results.txt
+import sys, xml.etree.ElementTree as ET
+path = sys.argv[1]
+root = ET.parse(path).getroot()
+texts=[]
+for node in root.iter("node"):
+    t=node.attrib.get("text","").strip()
+    if t and t not in texts:
+        texts.append(t)
+for t in texts:
+    if any(k in t for k in ("نتيجة فحص السرعة","Download","Upload","المدة","ملاحظة:")):
+        print(t)
+PY
+
+            if [ "$run" -lt 3 ]; then
+              sleep 2
+            fi
+          done
+
+          echo "===== SPEED TEST COMPLETE =====" | tee -a speed-test-results.txt
+          cat speed-test-results.txt
+
+          adb -s emulator-5554 logcat -d -t 1500 > speed-test-logcat.txt
+          ! grep -Eiq "FATAL EXCEPTION|AndroidRuntime.*FATAL" speed-test-logcat.txt
+
+
+
       - name: Upload emulator logs
         if: ${{ always() }}
         uses: actions/upload-artifact@v7
