@@ -395,9 +395,14 @@ jobs:
             return 1
           }
 
+          adb -s emulator-5554 shell am force-stop com.speedvpn.app
+          adb -s emulator-5554 shell am start -n com.speedvpn.app/.MainActivity
+          sleep 4
+          adb -s emulator-5554 shell dumpsys activity activities | grep -m 1 "com.speedvpn.app"
+
           : > speed-test-results.txt
 
-          # Run the unchanged Build 197 test three times.
+          # Run the current speed-test engine three times.
           for run in 1 2 3; do
             echo "===== SPEED TEST RUN $run =====" | tee -a speed-test-results.txt
 
