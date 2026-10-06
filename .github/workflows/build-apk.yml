@@ -180,7 +180,7 @@ jobs:
           test -x "$SDKMANAGER"
 
           rm -rf "$ANDROID_SDK_ROOT/emulator"
-          rm -rf "$ANDROID_SDK_ROOT/system-images/android-35/google_apis/x86_64"
+          rm -rf "$ANDROID_SDK_ROOT/system-images/android-29/google_apis/x86_64"
 
           yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
 
@@ -195,7 +195,7 @@ jobs:
               if [[ "$package" == emulator ]]; then
                 rm -rf "$ANDROID_SDK_ROOT/emulator"
               elif [[ "$package" == "system-images;"* ]]; then
-                rm -rf "$ANDROID_SDK_ROOT/system-images/android-35/google_apis/x86_64"
+                rm -rf "$ANDROID_SDK_ROOT/system-images/android-29/google_apis/x86_64"
               fi
               sleep 5
             done
@@ -205,11 +205,11 @@ jobs:
 
           install_with_retry "platform-tools"
           install_with_retry "emulator"
-          install_with_retry "system-images;android-35;google_apis;x86_64"
+          install_with_retry "system-images;android-29;google_apis;x86_64"
 
           test -x "$ANDROID_SDK_ROOT/emulator/emulator"
-          test -f "$ANDROID_SDK_ROOT/system-images/android-35/google_apis/x86_64/package.xml"
-          test -f "$ANDROID_SDK_ROOT/system-images/android-35/google_apis/x86_64/system.img"
+          test -f "$ANDROID_SDK_ROOT/system-images/android-29/google_apis/x86_64/package.xml"
+          test -f "$ANDROID_SDK_ROOT/system-images/android-29/google_apis/x86_64/system.img"
 
       - name: Enable KVM
         run: |
@@ -230,21 +230,23 @@ jobs:
           mkdir -p "$ANDROID_AVD_HOME"
 
           echo "Checking emulator system image..."
-          test -f "$ANDROID_SDK_ROOT/system-images/android-35/google_apis/x86_64/package.xml"
-          test -f "$ANDROID_SDK_ROOT/system-images/android-35/google_apis/x86_64/system.img"
+          test -f "$ANDROID_SDK_ROOT/system-images/android-29/google_apis/x86_64/package.xml"
+          test -f "$ANDROID_SDK_ROOT/system-images/android-29/google_apis/x86_64/system.img"
 
           echo "Creating AVD..."
-          timeout 120s bash -c 'echo no | avdmanager create avd -n speedvpn-ci -k "system-images;android-35;google_apis;x86_64" --force'
+          timeout 120s bash -c 'echo no | avdmanager create avd -n speedvpn-ci -k "system-images;android-29;google_apis;x86_64" --force'
           test -f "$ANDROID_AVD_HOME/speedvpn-ci.avd/config.ini"
 
           echo "Starting emulator..."
-          nohup emulator -avd speedvpn-ci -no-window -no-audio -no-boot-anim -no-snapshot -no-snapshot-save -gpu swiftshader_indirect -accel on -cores 2 -memory 2048 > emulator-console.log 2>&1 &
+          nohup emulator -avd speedvpn-ci -no-window -no-audio -no-boot-anim -no-snapshot -no-snapshot-save -gpu swiftshader_indirect -accel on -cores 2 -memory 1536 -partition-size 2048 > emulator-console.log 2>&1 &
           EMULATOR_PID=$!
           trap 'adb -s emulator-5554 emu kill >/dev/null 2>&1 || true; kill "$EMULATOR_PID" >/dev/null 2>&1 || true' EXIT
 
           adb start-server
-          timeout 120s adb -s emulator-5554 wait-for-device
-          timeout 300s bash -c 'until adb -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null | tr -d "\r" | grep -q "^1$"; do sleep 2; done'
+          echo "Waiting for emulator device..."
+          timeout 180s adb -s emulator-5554 wait-for-device
+          echo "ADB device detected. Waiting for Android boot..."
+          timeout 180s bash -c 'until adb -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null | tr -d "\r" | grep -q "^1$"; do sleep 2; done'
 
           adb -s emulator-5554 shell settings put global window_animation_scale 0
           adb -s emulator-5554 shell settings put global transition_animation_scale 0
