@@ -165,10 +165,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v4
-        with:
-          packages: 'platform-tools'
+      - name: Configure Android SDK tools
+        run: |
+          set -euo pipefail
+          export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+          echo "PATH=$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/platform-tools:$ANDROID_SDK_ROOT/emulator:$PATH" >> "$GITHUB_ENV"
+          test -x "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
 
       - name: Install emulator SDK packages
         run: |
@@ -179,7 +182,7 @@ jobs:
           rm -rf "$ANDROID_SDK_ROOT/emulator"
           rm -rf "$ANDROID_SDK_ROOT/system-images/android-35/google_apis/x86_64"
 
-          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
 
           install_with_retry() {
             local package="$1"
@@ -191,7 +194,7 @@ jobs:
               echo "Install failed; removing partial package and retrying..."
               if [[ "$package" == emulator ]]; then
                 rm -rf "$ANDROID_SDK_ROOT/emulator"
-              elif [[ "$package" == system-images;* ]]; then
+              elif [[ "$package" == "system-images;"* ]]; then
                 rm -rf "$ANDROID_SDK_ROOT/system-images/android-35/google_apis/x86_64"
               fi
               sleep 5
@@ -200,6 +203,7 @@ jobs:
             exit 1
           }
 
+          install_with_retry "platform-tools"
           install_with_retry "emulator"
           install_with_retry "system-images;android-35;google_apis;x86_64"
 
