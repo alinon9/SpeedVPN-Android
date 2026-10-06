@@ -66,17 +66,18 @@ jobs:
       - name: Smoke test on Android Emulator
         uses: reactivecircus/android-emulator-runner@v2
         with:
-          api-level: 35
+          api-level: 29
           arch: x86_64
           target: google_apis
-          profile: pixel_6
+          profile: pixel_2
           force-avd-creation: true
-          emulator-options: -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect
+          emulator-options: -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -no-snapshot
           disable-animations: true
           cores: 2
-          ram-size: 2048M
-          heap-size: 512M
-          disk-size: 4096M
+          ram-size: 1536M
+          heap-size: 256M
+          disk-size: 2048M
+          emulator-boot-timeout: 600
           script: |
             set -euo pipefail
             adb wait-for-device
