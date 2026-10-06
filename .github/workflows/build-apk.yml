@@ -353,30 +353,30 @@ jobs:
             adb -s emulator-5554 shell uiautomator dump "/sdcard/$xml" >/dev/null 2>&1
             adb -s emulator-5554 pull -q "/sdcard/$xml" "$xml" >/dev/null
             python3 - "$xml" "$wanted" <<'PY'
-import sys, xml.etree.ElementTree as ET, re, subprocess
-
-path, wanted = sys.argv[1], sys.argv[2]
-root = ET.parse(path).getroot()
-for node in root.iter("node"):
-    text = node.attrib.get("text", "")
-    if text == wanted or (wanted == "🚀" and text.startswith("🚀")):
-        bounds = node.attrib.get("bounds", "")
-        m = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
-        if not m:
-            continue
-        x1,y1,x2,y2 = map(int, m.groups())
-        x=(x1+x2)//2
-        y=(y1+y2)//2
-        subprocess.run(["adb","-s","emulator-5554","shell","input","tap",str(x),str(y)], check=True)
-        print(f"TAPPED text={text!r} x={x} y={y}")
-        raise SystemExit(0)
-print(f"Could not find text {wanted!r}", file=sys.stderr)
-for node in root.iter("node"):
-    t=node.attrib.get("text","")
-    if t:
-        print(t, file=sys.stderr)
-raise SystemExit(1)
-PY
+                    import sys, xml.etree.ElementTree as ET, re, subprocess
+          
+          path, wanted = sys.argv[1], sys.argv[2]
+          root = ET.parse(path).getroot()
+          for node in root.iter("node"):
+              text = node.attrib.get("text", "")
+              if text == wanted or (wanted == "🚀" and text.startswith("🚀")):
+                  bounds = node.attrib.get("bounds", "")
+                  m = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
+                  if not m:
+                      continue
+                  x1,y1,x2,y2 = map(int, m.groups())
+                  x=(x1+x2)//2
+                  y=(y1+y2)//2
+                  subprocess.run(["adb","-s","emulator-5554","shell","input","tap",str(x),str(y)], check=True)
+                  print(f"TAPPED text={text!r} x={x} y={y}")
+                  raise SystemExit(0)
+          print(f"Could not find text {wanted!r}", file=sys.stderr)
+          for node in root.iter("node"):
+              t=node.attrib.get("text","")
+              if t:
+                  print(t, file=sys.stderr)
+          raise SystemExit(1)
+          PY
             rm -f "$xml"
           }
 
@@ -411,18 +411,18 @@ PY
 
             wait_for_result > "ui-result-$run.xml"
             python3 - "ui-result-$run.xml" <<'PY' | tee -a speed-test-results.txt
-import sys, xml.etree.ElementTree as ET
-path = sys.argv[1]
-root = ET.parse(path).getroot()
-texts=[]
-for node in root.iter("node"):
-    t=node.attrib.get("text","").strip()
-    if t and t not in texts:
-        texts.append(t)
-for t in texts:
-    if any(k in t for k in ("نتيجة فحص السرعة","Download","Upload","المدة","ملاحظة:")):
-        print(t)
-PY
+                    import sys, xml.etree.ElementTree as ET
+          path = sys.argv[1]
+          root = ET.parse(path).getroot()
+          texts=[]
+          for node in root.iter("node"):
+              t=node.attrib.get("text","").strip()
+              if t and t not in texts:
+                  texts.append(t)
+          for t in texts:
+              if any(k in t for k in ("نتيجة فحص السرعة","Download","Upload","المدة","ملاحظة:")):
+                  print(t)
+          PY
 
             if [ "$run" -lt 3 ]; then
               sleep 2
