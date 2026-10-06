@@ -213,9 +213,20 @@ jobs:
 
       - name: Enable KVM
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y cpu-checker
           sudo kvm-ok
+          echo "KVM device before permission fix:"
+          ls -l /dev/kvm
+          echo "Granting the GitHub runner user direct read/write access to KVM..."
+          sudo chmod 666 /dev/kvm
+          test -r /dev/kvm
+          test -w /dev/kvm
+          echo "KVM device after permission fix:"
+          ls -l /dev/kvm
+          echo "Checking emulator acceleration as the runner user:"
+          emulator -accel-check
 
       - name: Download debug APK
         uses: actions/download-artifact@v8
@@ -237,8 +248,14 @@ jobs:
           timeout 120s bash -c 'echo no | avdmanager create avd -n speedvpn-ci -k "system-images;android-29;google_apis;x86_64" --force'
           test -f "$ANDROID_AVD_HOME/speedvpn-ci.avd/config.ini"
 
+          mkdir -p "$HOME/.android"
+          chmod 700 "$HOME/.android"
+          echo "Starting ADB server before the emulator..."
+          adb kill-server >/dev/null 2>&1 || true
+          adb start-server
+
           echo "Starting emulator..."
-          nohup emulator -avd speedvpn-ci -no-window -no-audio -no-boot-anim -no-snapshot -no-snapshot-save -gpu swiftshader_indirect -accel on -cores 2 -memory 1536 -partition-size 2048 > emulator-console.log 2>&1 &
+          nohup emulator -avd speedvpn-ci -no-window -no-audio -no-boot-anim -no-snapshot -no-snapshot-save -no-metrics -gpu swiftshader_indirect -accel on -cores 2 -memory 1536 -partition-size 2048 > emulator-console.log 2>&1 &
           EMULATOR_PID=$!
 
           diagnostics() {
@@ -272,7 +289,6 @@ jobs:
           }
           trap cleanup EXIT
 
-          adb start-server
           echo "Waiting for emulator device..."
           for i in $(seq 1 180); do
             if adb -s emulator-5554 get-state >/dev/null 2>&1; then
