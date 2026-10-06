@@ -168,7 +168,44 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
         with:
-          packages: 'platform-tools emulator system-images;android-35;google_apis;x86_64'
+          packages: 'platform-tools'
+
+      - name: Install emulator SDK packages
+        run: |
+          set -euo pipefail
+          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$SDKMANAGER"
+
+          rm -rf "$ANDROID_SDK_ROOT/emulator"
+          rm -rf "$ANDROID_SDK_ROOT/system-images/android-35/google_apis/x86_64"
+
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+
+          install_with_retry() {
+            local package="$1"
+            for attempt in 1 2 3; do
+              echo "Installing $package (attempt $attempt/3)"
+              if "$SDKMANAGER" --install "$package"; then
+                return 0
+              fi
+              echo "Install failed; removing partial package and retrying..."
+              if [[ "$package" == emulator ]]; then
+                rm -rf "$ANDROID_SDK_ROOT/emulator"
+              elif [[ "$package" == system-images;* ]]; then
+                rm -rf "$ANDROID_SDK_ROOT/system-images/android-35/google_apis/x86_64"
+              fi
+              sleep 5
+            done
+            echo "Failed to install $package after 3 attempts."
+            exit 1
+          }
+
+          install_with_retry "emulator"
+          install_with_retry "system-images;android-35;google_apis;x86_64"
+
+          test -x "$ANDROID_SDK_ROOT/emulator/emulator"
+          test -f "$ANDROID_SDK_ROOT/system-images/android-35/google_apis/x86_64/package.xml"
+          test -f "$ANDROID_SDK_ROOT/system-images/android-35/google_apis/x86_64/system.img"
 
       - name: Enable KVM
         run: |
