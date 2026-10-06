@@ -57,58 +57,12 @@ jobs:
       - name: Build debug APK
         run: ./gradlew :app:assembleDebug --stacktrace --no-daemon
 
-      - name: Enable KVM
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cpu-checker
-          sudo kvm-ok
-
-      - name: Free runner disk space for emulator
-        run: |
-          echo "Disk before cleanup:"
-          df -h
-          rm -rf "$ANDROID_SDK_ROOT/ndk/30.0.16248370"
-          rm -rf "$HOME/.gradle/caches"
-          rm -rf "$HOME/.gradle/wrapper/dists"
-          rm -rf "$GITHUB_WORKSPACE/.gradle"
-          rm -rf "$GITHUB_WORKSPACE/app/build/intermediates"
-          echo "Disk after cleanup:"
-          df -h
-
-      - name: Smoke test on Android Emulator
-        run: |
-          set -euo pipefail
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "emulator" "platform-tools" "system-images;android-29;google_apis;x86_64"
-          echo "no" | avdmanager create avd -n speedvpn-ci -k "system-images;android-29;google_apis;x86_64" --device "pixel_2" --force
-          nohup emulator -avd speedvpn-ci -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect -accel on -cores 2 -memory 1536 -partition-size 2048 > emulator-console.log 2>&1 &
-          EMULATOR_PID=$!
-          trap 'adb -s emulator-5554 emu kill >/dev/null 2>&1 || true; kill "$EMULATOR_PID" >/dev/null 2>&1 || true' EXIT
-          adb start-server
-          adb wait-for-device
-          timeout 300 bash -c 'until adb -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null | tr -d "\r" | grep -q "^1$"; do sleep 2; done'
-          adb -s emulator-5554 shell settings put global window_animation_scale 0
-          adb -s emulator-5554 shell settings put global transition_animation_scale 0
-          adb -s emulator-5554 shell settings put global animator_duration_scale 0
-          adb -s emulator-5554 install -r app/build/outputs/apk/debug/app-debug.apk
-          adb -s emulator-5554 shell am force-stop com.speedvpn.app
-          adb -s emulator-5554 shell monkey -p com.speedvpn.app 1
-          sleep 5
-          adb -s emulator-5554 shell pidof com.speedvpn.app
-          adb -s emulator-5554 shell dumpsys activity activities | grep -m 1 "com.speedvpn.app"
-          adb -s emulator-5554 logcat -d -t 500 > emulator-logcat.txt
-          ! grep -Eiq "FATAL EXCEPTION|AndroidRuntime.*FATAL" emulator-logcat.txt
-          echo "Android Emulator smoke test passed."
-
-      - name: Upload emulator log
-        if: ${{ always() }}
+      - name: Upload debug APK for emulator
         uses: actions/upload-artifact@v7
         with:
-          name: android-emulator-log
-          path: |
-            emulator-logcat.txt
-            emulator-console.log
-          if-no-files-found: ignore
+          name: speedvpn-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
 
       - name: Build release APK
         env:
@@ -202,3 +156,66 @@ jobs:
             app/build/outputs/apk/debug/app-debug.apk
             app/build/outputs/apk/release/*.apk
           if-no-files-found: error
+
+  emulator-smoke-test:
+    needs: build-apk
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools emulator system-images;android-35;google_apis;x86_64'
+
+      - name: Enable KVM
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cpu-checker
+          sudo kvm-ok
+
+      - name: Download debug APK
+        uses: actions/download-artifact@v8
+        with:
+          name: speedvpn-debug-apk
+          path: app/build/outputs/apk/debug
+
+      - name: Run Android Emulator smoke test
+        run: |
+          set -euo pipefail
+          echo "no" | avdmanager create avd             -n speedvpn-ci             -k "system-images;android-35;google_apis;x86_64"             --force
+
+          nohup emulator             -avd speedvpn-ci             -no-window             -no-audio             -no-boot-anim             -no-snapshot             -gpu swiftshader_indirect             -accel on             -cores 2             -memory 2048             > emulator-console.log 2>&1 &
+          EMULATOR_PID=$!
+          trap 'adb -s emulator-5554 emu kill >/dev/null 2>&1 || true; kill "$EMULATOR_PID" >/dev/null 2>&1 || true' EXIT
+
+          adb start-server
+          adb wait-for-device
+          timeout 300 bash -c 'until adb -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null | tr -d "\r" | grep -q "^1$"; do sleep 2; done'
+
+          adb -s emulator-5554 shell settings put global window_animation_scale 0
+          adb -s emulator-5554 shell settings put global transition_animation_scale 0
+          adb -s emulator-5554 shell settings put global animator_duration_scale 0
+
+          adb -s emulator-5554 install -r app/build/outputs/apk/debug/app-debug.apk
+          adb -s emulator-5554 shell am force-stop com.speedvpn.app
+          adb -s emulator-5554 shell monkey -p com.speedvpn.app 1
+          sleep 5
+
+          adb -s emulator-5554 shell pidof com.speedvpn.app
+          adb -s emulator-5554 shell dumpsys activity activities | grep -m 1 "com.speedvpn.app"
+
+          adb -s emulator-5554 logcat -d -t 500 > emulator-logcat.txt
+          ! grep -Eiq "FATAL EXCEPTION|AndroidRuntime.*FATAL" emulator-logcat.txt
+          echo "Android Emulator smoke test passed."
+
+      - name: Upload emulator logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-emulator-log
+          path: |
+            emulator-logcat.txt
+            emulator-console.log
+          if-no-files-found: ignore
