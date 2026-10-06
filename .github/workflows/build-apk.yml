@@ -240,13 +240,76 @@ jobs:
           echo "Starting emulator..."
           nohup emulator -avd speedvpn-ci -no-window -no-audio -no-boot-anim -no-snapshot -no-snapshot-save -gpu swiftshader_indirect -accel on -cores 2 -memory 1536 -partition-size 2048 > emulator-console.log 2>&1 &
           EMULATOR_PID=$!
-          trap 'adb -s emulator-5554 emu kill >/dev/null 2>&1 || true; kill "$EMULATOR_PID" >/dev/null 2>&1 || true' EXIT
+
+          diagnostics() {
+            echo "===== EMULATOR DIAGNOSTICS ====="
+            echo "Runner:"
+            uname -a || true
+            echo "Memory:"
+            free -h || true
+            echo "Disk:"
+            df -h "$RUNNER_TEMP" "$ANDROID_SDK_ROOT" || true
+            echo "KVM:"
+            ls -l /dev/kvm || true
+            test -r /dev/kvm && echo "/dev/kvm is readable" || true
+            echo "Emulator process:"
+            ps -fp "$EMULATOR_PID" || true
+            pgrep -af emulator || true
+            echo "ADB devices:"
+            adb devices -l || true
+            echo "ADB server:"
+            adb version || true
+            echo "AVD config:"
+            cat "$ANDROID_AVD_HOME/speedvpn-ci.avd/config.ini" || true
+            echo "Emulator console log:"
+            cat emulator-console.log || true
+            echo "================================"
+          }
+
+          cleanup() {
+            adb -s emulator-5554 emu kill >/dev/null 2>&1 || true
+            kill "$EMULATOR_PID" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
 
           adb start-server
           echo "Waiting for emulator device..."
-          timeout 180s adb -s emulator-5554 wait-for-device
-          echo "ADB device detected. Waiting for Android boot..."
-          timeout 180s bash -c 'until adb -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null | tr -d "\r" | grep -q "^1$"; do sleep 2; done'
+          for i in $(seq 1 180); do
+            if adb -s emulator-5554 get-state >/dev/null 2>&1; then
+              echo "ADB device detected after ${i}s."
+              break
+            fi
+            if ! kill -0 "$EMULATOR_PID" >/dev/null 2>&1; then
+              echo "Emulator process exited before appearing in ADB."
+              diagnostics
+              exit 1
+            fi
+            sleep 1
+            if [ "$i" -eq 180 ]; then
+              echo "Emulator did not appear in ADB within 180 seconds."
+              diagnostics
+              exit 1
+            fi
+          done
+
+          echo "Waiting for Android boot completion..."
+          for i in $(seq 1 180); do
+            if adb -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null | tr -d "\r" | grep -q "^1$"; then
+              echo "Android boot completed after ${i}s."
+              break
+            fi
+            if ! kill -0 "$EMULATOR_PID" >/dev/null 2>&1; then
+              echo "Emulator process exited during Android boot."
+              diagnostics
+              exit 1
+            fi
+            sleep 1
+            if [ "$i" -eq 180 ]; then
+              echo "Android did not report boot completion within 180 seconds."
+              diagnostics
+              exit 1
+            fi
+          done
 
           adb -s emulator-5554 shell settings put global window_animation_scale 0
           adb -s emulator-5554 shell settings put global transition_animation_scale 0
