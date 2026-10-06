@@ -63,6 +63,18 @@ jobs:
           sudo apt-get install -y cpu-checker
           sudo kvm-ok
 
+      - name: Free runner disk space for emulator
+        run: |
+          echo "Disk before cleanup:"
+          df -h
+          rm -rf "$ANDROID_SDK_ROOT/ndk/30.0.16248370"
+          rm -rf "$HOME/.gradle/caches"
+          rm -rf "$HOME/.gradle/wrapper/dists"
+          rm -rf "$GITHUB_WORKSPACE/.gradle"
+          rm -rf "$GITHUB_WORKSPACE/app/build/intermediates"
+          echo "Disk after cleanup:"
+          df -h
+
       - name: Smoke test on Android Emulator
         uses: reactivecircus/android-emulator-runner@v2
         with:
