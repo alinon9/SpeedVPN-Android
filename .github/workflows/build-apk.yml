@@ -76,6 +76,7 @@ jobs:
           cores: 2
           ram-size: 2048M
           heap-size: 512M
+          disk-size: 4096M
           script: |
             set -euo pipefail
             adb wait-for-device
