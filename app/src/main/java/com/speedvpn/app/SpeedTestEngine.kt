@@ -55,6 +55,7 @@ object SpeedTestEngine {
     private const val MIN_SAMPLE_DURATION_MS = 250L
     private const val MIN_SAMPLE_BYTES = 64L * 1024L
     private const val MIN_VALID_SAMPLES = 4
+    private const val MIN_VALID_ROUNDS = 2
 
     private const val WARMUP_BYTES = 100_000L
     private const val STREAM_REQUEST_BYTES = 25_000_000L
@@ -113,29 +114,37 @@ object SpeedTestEngine {
     ): Long {
         runCatching { warmup(client, isUpload) }
 
-        val roundSamples = ArrayList<Long>()
+        val allSamples = ArrayList<Long>()
+        var validRounds = 0
         var lastFailure: Throwable? = null
 
         repeat(ROUND_COUNT) {
-            val phase = runCatching {
+            val phaseSamples = runCatching {
                 measurePhase(
                     client = client,
                     isUpload = isUpload,
                 )
             }.onFailure { lastFailure = it }.getOrNull()
 
-            if (phase != null) {
-                roundSamples += phase
+            if (phaseSamples != null) {
+                validRounds++
+                // Ignore the first measurement window of each round so a newly
+                // opened/reused TCP connection cannot dominate the result.
+                allSamples += phaseSamples.drop(1)
             }
         }
 
-        if (roundSamples.size < MIN_VALID_SAMPLES) {
+        if (validRounds < MIN_VALID_ROUNDS) {
             throw IOException(
-                lastFailure?.message ?: "Not enough valid speed samples",
+                lastFailure?.message ?: "Not enough valid speed rounds",
             )
         }
 
-        return percentile(roundSamples, 0.90)
+        if (allSamples.size < MIN_VALID_SAMPLES) {
+            throw IOException("Not enough valid throughput samples")
+        }
+
+        return percentile(allSamples, 0.90)
     }
 
     private fun warmup(
@@ -181,7 +190,7 @@ object SpeedTestEngine {
     private suspend fun measurePhase(
         client: OkHttpClient,
         isUpload: Boolean,
-    ): Long = coroutineScope {
+    ): ArrayList<Long> = coroutineScope {
         val totalBytes = AtomicLong(0L)
         val stop = AtomicBoolean(false)
         val activeCalls = Collections.synchronizedSet(mutableSetOf<Call>())
@@ -300,7 +309,7 @@ object SpeedTestEngine {
             throw IOException("Not enough valid throughput samples")
         }
 
-        percentile(ArrayList(filtered), 0.90)
+        ArrayList(filtered)
     }
 
     private fun runDownloadStream(
