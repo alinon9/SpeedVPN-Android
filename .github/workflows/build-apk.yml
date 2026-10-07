@@ -312,7 +312,7 @@ jobs:
 
           echo "Waiting for Android boot completion..."
           for i in $(seq 1 180); do
-            if adb -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null | tr -d "$r" | grep -q "^1$"; then
+            if adb -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' | grep -q "^1$"; then
               echo "Android boot completed after ${i}s."
               break
             fi
@@ -341,7 +341,7 @@ jobs:
           adb -s emulator-5554 shell monkey -p com.speedvpn.app 1
           sleep 5
 
-          test -n "$(adb -s emulator-5554 shell pidof com.speedvpn.app | tr -d "$r" || true)"
+          test -n "$(adb -s emulator-5554 shell pidof com.speedvpn.app | tr -d '\r' || true)"
           adb -s emulator-5554 shell dumpsys activity activities | grep -m 1 "com.speedvpn.app"
 
           adb -s emulator-5554 logcat -d -t 500 > emulator-logcat.txt
@@ -502,4 +502,7 @@ jobs:
           path: |
             emulator-logcat.txt
             emulator-console.log
+            speed-test-logcat.txt
+            speed-test-results.txt
+            ui-result-*.xml
           if-no-files-found: ignore
