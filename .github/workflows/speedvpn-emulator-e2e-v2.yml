@@ -169,10 +169,12 @@ jobs:
           echo '===== REAL INTERNET TEST ====='
           internet_ok=0
           for i in 1 2 3 4 5; do
-            if adb -s emulator-5554 shell toybox wget -q -O /dev/null -T 10 'https://speed.cloudflare.com/__down?bytes=1024' >/dev/null 2>&1; then internet_ok=1; break; fi
+            if adb -s emulator-5554 shell ping -c 1 -W 3 1.1.1.1 >/dev/null 2>&1; then internet_ok=1; break; fi
             sleep 2
           done
-          if [ "$internet_ok" -ne 1 ]; then echo 'FAIL: no HTTPS Internet inside Android guest'; diagnostics; exit 1; fi
+          if [ "$internet_ok" -ne 1 ]; then echo 'FAIL: no IP Internet route inside Android guest'; diagnostics; exit 1; fi
+
+          echo 'Android guest network is reachable. The app HTTPS SpeedTest will be the authoritative test.'
 
           echo '===== SPEED TEST: 3 RUNS =====' | tee speed-results.txt
           adb -s emulator-5554 shell am force-stop com.speedvpn.app
