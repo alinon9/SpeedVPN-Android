@@ -399,7 +399,7 @@ jobs:
               if not text:
                   return False
               if wanted == "🚀":
-                  return "فحص السرعة" in text or text.startswith("🚀")
+                  return text == "🚀 فحص السرعة"
               return text == wanted
 
           for node in root.iter("node"):
@@ -568,7 +568,23 @@ jobs:
 
             ui_result="ui-result-${run}.xml"
             wait_for_speed_result "${ui_result}"
-            validate_speed_result "${ui_result}" "${run}"
+
+            # The result card may begin near the bottom of the 320x640
+            # emulator viewport. Scroll upward to expose Download/Upload
+            # values before parsing the hierarchy.
+            for reveal in 0 1 2 3; do
+              if validate_speed_result "${ui_result}" "${run}" 2>/dev/null; then
+                break
+              fi
+              if [ "${reveal}" -eq 3 ]; then
+                echo "Could not expose numeric Download/Upload values after scrolling."
+                validate_speed_result "${ui_result}" "${run}"
+                exit 1
+              fi
+              adb -s emulator-5554 shell input swipe 160 500 160 220 600
+              sleep 1
+              dump_ui "${ui_result}"
+            done
 
             echo "RUN ${run}: numeric Download/Upload result validated." | tee -a speed-test-results.txt
           done
