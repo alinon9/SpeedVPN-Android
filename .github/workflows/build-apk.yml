@@ -552,10 +552,34 @@ jobs:
           PY
           }
 
-          echo "Checking emulator network before network-dependent speed validation..."
-          if ! adb -s emulator-5554 shell dumpsys connectivity 2>/dev/null | grep -Eq "VALIDATED|NET_CAPABILITY_VALIDATED"; then
-            echo "GitHub emulator has no validated Internet connection."
-            echo "Skipping network-dependent speed validation; build and emulator smoke checks remain blocking."
+          echo "Checking emulator Internet connectivity before network-dependent speed validation..."
+
+          # Do not rely on dumpsys connectivity alone: it can expose
+          # capability metadata even when the emulator has no usable route.
+          # Probe real external reachability from inside the Android guest.
+          has_emulator_internet=0
+
+          for probe in 1 2 3; do
+            echo "Internet probe ${probe}/3..."
+            if adb -s emulator-5554 shell ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1; then
+              echo "IPv4 Internet reachability probe succeeded."
+              has_emulator_internet=1
+              break
+            fi
+
+            if adb -s emulator-5554 shell ping -c 1 -W 2 speed.cloudflare.com >/dev/null 2>&1; then
+              echo "DNS + Internet reachability probe succeeded."
+              has_emulator_internet=1
+              break
+            fi
+
+            sleep 2
+          done
+
+          if [ "${has_emulator_internet}" -ne 1 ]; then
+            echo "GitHub emulator has no verified Internet connectivity."
+            echo "Skipping network-dependent speed/Verify validation."
+            echo "Build, unit tests, lint, APK validation, and emulator smoke checks remain blocking."
             exit 0
           fi
 
