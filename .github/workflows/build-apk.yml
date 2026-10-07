@@ -351,7 +351,18 @@ jobs:
             local wanted="$1"
             local xml="ui-dump.xml"
             adb -s emulator-5554 shell uiautomator dump "/sdcard/$xml" >/dev/null 2>&1
-            adb -s emulator-5554 pull -q "/sdcard/$xml" "$xml" >/dev/null
+            for attempt in 1 2 3; do
+              if adb -s emulator-5554 shell cat "/sdcard/$xml" > "$xml" 2>/dev/null && [ -s "$xml" ]; then
+                break
+              fi
+              echo "ADB UI read failed (attempt $attempt/3); restarting ADB connection..."
+              adb reconnect >/dev/null 2>&1 || true
+              sleep 1
+              if [ "$attempt" -eq 3 ]; then
+                echo "Could not read UI hierarchy from emulator."
+                return 1
+              fi
+            done
             python3 - "$xml" "$wanted" <<'PY'
                     import sys, xml.etree.ElementTree as ET, re, subprocess
           
@@ -383,7 +394,7 @@ jobs:
           wait_for_result() {
             for i in $(seq 1 150); do
               adb -s emulator-5554 shell uiautomator dump /sdcard/window-result.xml >/dev/null 2>&1 || true
-              adb -s emulator-5554 pull -q /sdcard/window-result.xml ui-result.xml >/dev/null 2>&1 || true
+              adb -s emulator-5554 shell cat /sdcard/window-result.xml > ui-result.xml 2>/dev/null || true
               if grep -q "نتيجة فحص السرعة" ui-result.xml 2>/dev/null; then
                 cat ui-result.xml
                 return 0
