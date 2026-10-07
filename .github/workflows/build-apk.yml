@@ -383,9 +383,10 @@ jobs:
             local wanted="$1"
             local xml="${RUNNER_TEMP}/ui-dump.xml"
 
-            dump_ui "${xml}"
+            for scroll in 0 1 2 3 4; do
+              dump_ui "${xml}"
 
-            python3 - "${xml}" "${wanted}" <<'PY'
+              if python3 "${xml}" "${wanted}" <<'PY'
           import re
           import subprocess
           import sys
@@ -394,9 +395,16 @@ jobs:
           path, wanted = sys.argv[1], sys.argv[2]
           root = ET.parse(path).getroot()
 
+          def wanted_match(text):
+              if not text:
+                  return False
+              if wanted == "🚀":
+                  return "فحص السرعة" in text or text.startswith("🚀")
+              return text == wanted or wanted in text
+
           for node in root.iter("node"):
               text = node.attrib.get("text", "")
-              if text == wanted or (wanted == "🚀" and text.startswith("🚀")):
+              if wanted_match(text):
                   bounds = node.attrib.get("bounds", "")
                   match = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
                   if not match:
@@ -411,13 +419,22 @@ jobs:
                   print(f"TAPPED text={text!r} x={x} y={y}")
                   raise SystemExit(0)
 
-          print(f"Could not find text {wanted!r}", file=sys.stderr)
-          for node in root.iter("node"):
-              text = node.attrib.get("text", "").strip()
-              if text:
-                  print(text, file=sys.stderr)
-          raise SystemExit(1)
+          raise SystemExit(2)
           PY
+              then
+                return 0
+              fi
+
+              if [ "${scroll}" -lt 4 ]; then
+                echo "UI element '${wanted}' is not visible yet; scrolling up (${scroll}/4)..."
+                adb -s emulator-5554 shell input swipe 540 650 540 250 500
+                sleep 1
+              fi
+            done
+
+            echo "Could not find visible UI element '${wanted}' after scrolling."
+            cat "${xml}" || true
+            return 1
           }
 
           wait_for_result() {
