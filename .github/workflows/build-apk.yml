@@ -526,7 +526,7 @@ jobs:
               notes = [text for text in texts if text.startswith("ملاحظة:")]
               raise SystemExit(f"RUN {run}: speed test reported an error/note: {notes}")
 
-          rate_re = re.compile(r"^(?:\d+(?:\.\d+)?)[ ]?(?:B/s|KB/s|MB/s|GB/s)$")
+          rate_re = re.compile(r"^(?:\d+(?:\.\d+)?)[ ]?(?:bps|Kbps|Mbps|Gbps)$")
 
           def value_after(label):
               try:
