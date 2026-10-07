@@ -386,7 +386,7 @@ jobs:
             for scroll in 0 1 2 3 4; do
               dump_ui "${xml}"
 
-              if python3 "${xml}" "${wanted}" <<'PY'
+              if python3 - "${xml}" "${wanted}" <<'PY'
           import re
           import subprocess
           import sys
