@@ -234,22 +234,23 @@ jobs:
           name: speedvpn-debug-apk
           path: app/build/outputs/apk/debug
 
-      - name: Run Android Emulator smoke test
+      - name: Run Android Emulator smoke test + Build 197 speed test
         run: |
           set -euo pipefail
-          export ANDROID_AVD_HOME="$RUNNER_TEMP/android-avd"
-          mkdir -p "$ANDROID_AVD_HOME"
+          export ANDROID_AVD_HOME="${RUNNER_TEMP}/android-avd"
+          mkdir -p "${ANDROID_AVD_HOME}"
 
           echo "Checking emulator system image..."
-          test -f "$ANDROID_SDK_ROOT/system-images/android-29/google_apis/x86_64/package.xml"
-          test -f "$ANDROID_SDK_ROOT/system-images/android-29/google_apis/x86_64/system.img"
+          test -f "${ANDROID_SDK_ROOT}/system-images/android-29/google_apis/x86_64/package.xml"
+          test -f "${ANDROID_SDK_ROOT}/system-images/android-29/google_apis/x86_64/system.img"
 
           echo "Creating AVD..."
           timeout 120s bash -c 'echo no | avdmanager create avd -n speedvpn-ci -k "system-images;android-29;google_apis;x86_64" --force'
-          test -f "$ANDROID_AVD_HOME/speedvpn-ci.avd/config.ini"
+          test -f "${ANDROID_AVD_HOME}/speedvpn-ci.avd/config.ini"
 
           mkdir -p "$HOME/.android"
           chmod 700 "$HOME/.android"
+
           echo "Starting ADB server before the emulator..."
           adb kill-server >/dev/null 2>&1 || true
           adb start-server
@@ -265,27 +266,28 @@ jobs:
             echo "Memory:"
             free -h || true
             echo "Disk:"
-            df -h "$RUNNER_TEMP" "$ANDROID_SDK_ROOT" || true
+            df -h "${RUNNER_TEMP}" "${ANDROID_SDK_ROOT}" || true
             echo "KVM:"
             ls -l /dev/kvm || true
-            test -r /dev/kvm && echo "/dev/kvm is readable" || true
             echo "Emulator process:"
-            ps -fp "$EMULATOR_PID" || true
+            ps -fp "${EMULATOR_PID}" || true
             pgrep -af emulator || true
             echo "ADB devices:"
             adb devices -l || true
-            echo "ADB server:"
-            adb version || true
             echo "AVD config:"
-            cat "$ANDROID_AVD_HOME/speedvpn-ci.avd/config.ini" || true
+            cat "${ANDROID_AVD_HOME}/speedvpn-ci.avd/config.ini" || true
             echo "Emulator console log:"
             cat emulator-console.log || true
+            echo "Connectivity:"
+            adb -s emulator-5554 shell dumpsys connectivity 2>/dev/null | head -n 120 || true
             echo "================================"
           }
 
           cleanup() {
+            echo "Stopping Android Emulator..."
             adb -s emulator-5554 emu kill >/dev/null 2>&1 || true
-            kill "$EMULATOR_PID" >/dev/null 2>&1 || true
+            kill "${EMULATOR_PID}" >/dev/null 2>&1 || true
+            wait "${EMULATOR_PID}" >/dev/null 2>&1 || true
           }
           trap cleanup EXIT
 
@@ -295,13 +297,13 @@ jobs:
               echo "ADB device detected after ${i}s."
               break
             fi
-            if ! kill -0 "$EMULATOR_PID" >/dev/null 2>&1; then
+            if ! kill -0 "${EMULATOR_PID}" >/dev/null 2>&1; then
               echo "Emulator process exited before appearing in ADB."
               diagnostics
               exit 1
             fi
             sleep 1
-            if [ "$i" -eq 180 ]; then
+            if [ "${i}" -eq 180 ]; then
               echo "Emulator did not appear in ADB within 180 seconds."
               diagnostics
               exit 1
@@ -310,17 +312,17 @@ jobs:
 
           echo "Waiting for Android boot completion..."
           for i in $(seq 1 180); do
-            if adb -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null | tr -d "\r" | grep -q "^1$"; then
+            if adb -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null | tr -d "$r" | grep -q "^1$"; then
               echo "Android boot completed after ${i}s."
               break
             fi
-            if ! kill -0 "$EMULATOR_PID" >/dev/null 2>&1; then
+            if ! kill -0 "${EMULATOR_PID}" >/dev/null 2>&1; then
               echo "Emulator process exited during Android boot."
               diagnostics
               exit 1
             fi
             sleep 1
-            if [ "$i" -eq 180 ]; then
+            if [ "${i}" -eq 180 ]; then
               echo "Android did not report boot completion within 180 seconds."
               diagnostics
               exit 1
@@ -331,103 +333,115 @@ jobs:
           adb -s emulator-5554 shell settings put global transition_animation_scale 0
           adb -s emulator-5554 shell settings put global animator_duration_scale 0
 
+          echo "Installing debug APK..."
           adb -s emulator-5554 install -r app/build/outputs/apk/debug/app-debug.apk
+
+          echo "Launching app for smoke test..."
           adb -s emulator-5554 shell am force-stop com.speedvpn.app
           adb -s emulator-5554 shell monkey -p com.speedvpn.app 1
           sleep 5
 
-          adb -s emulator-5554 shell pidof com.speedvpn.app
+          test -n "$(adb -s emulator-5554 shell pidof com.speedvpn.app | tr -d "$r" || true)"
           adb -s emulator-5554 shell dumpsys activity activities | grep -m 1 "com.speedvpn.app"
 
           adb -s emulator-5554 logcat -d -t 500 > emulator-logcat.txt
           ! grep -Eiq "FATAL EXCEPTION|AndroidRuntime.*FATAL" emulator-logcat.txt
           echo "Android Emulator smoke test passed."
 
-      - name: Run Build 197 speed test on emulator
-        run: |
-          set -euo pipefail
-
-          tap_text() {
-            local wanted="$1"
-            local xml="ui-dump.xml"
-            local dump_log="ui-dump-attempt.log"
+          dump_ui() {
+            local output="$1"
+            local remote="/sdcard/speedvpn-ui.xml"
+            local dump_log="${RUNNER_TEMP}/speedvpn-ui-dump.log"
 
             for attempt in 1 2 3 4 5; do
-              : > "$dump_log"
-              if timeout 15s adb -s emulator-5554 shell uiautomator dump "/sdcard/$xml" >"$dump_log" 2>&1 &&                  timeout 15s adb -s emulator-5554 shell cat "/sdcard/$xml" > "$xml" 2>>"$dump_log" &&                  [ -s "$xml" ]; then
-                break
+              : > "${dump_log}"
+              rm -f "${output}"
+
+              if timeout 10s adb -s emulator-5554 shell uiautomator dump "${remote}" >"${dump_log}" 2>&1 &&
+                 timeout 10s adb -s emulator-5554 exec-out cat "${remote}" >"${output}" 2>>"${dump_log}" &&
+                 [ -s "${output}" ]; then
+                adb -s emulator-5554 shell rm -f "${remote}" >/dev/null 2>&1 || true
+                return 0
               fi
 
-              echo "ADB UI dump/read failed (attempt $attempt/5):"
-              cat "$dump_log" || true
-              if [ "$attempt" -eq 5 ]; then
-                echo "Could not read UI hierarchy from emulator."
-                cat emulator-console.log || true
-                return 1
-              fi
+              echo "ADB UI dump/read failed (attempt ${attempt}/5):"
+              cat "${dump_log}" || true
 
-              adb reconnect >/dev/null 2>&1 || true
-              sleep 1
-              adb -s emulator-5554 wait-for-device >/dev/null 2>&1 || true
+              if ! adb -s emulator-5554 get-state >/dev/null 2>&1; then
+                echo "Emulator is not connected to ADB; attempting reconnect..."
+                adb reconnect >/dev/null 2>&1 || true
+                timeout 10s adb -s emulator-5554 wait-for-device >/dev/null 2>&1 || true
+              fi
               sleep 1
             done
 
-            rm -f "$dump_log"
-            python3 - "$xml" "$wanted" <<'PY'
-                    import sys, xml.etree.ElementTree as ET, re, subprocess
-          
+            echo "Could not read UI hierarchy from emulator."
+            return 1
+          }
+
+          tap_text() {
+            local wanted="$1"
+            local xml="${RUNNER_TEMP}/ui-dump.xml"
+
+            dump_ui "${xml}"
+
+            python3 - "${xml}" "${wanted}" <<'PY'
+          import re
+          import subprocess
+          import sys
+          import xml.etree.ElementTree as ET
+
           path, wanted = sys.argv[1], sys.argv[2]
           root = ET.parse(path).getroot()
+
           for node in root.iter("node"):
               text = node.attrib.get("text", "")
               if text == wanted or (wanted == "🚀" and text.startswith("🚀")):
                   bounds = node.attrib.get("bounds", "")
-                  m = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
-                  if not m:
+                  match = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
+                  if not match:
                       continue
-                  x1,y1,x2,y2 = map(int, m.groups())
-                  x=(x1+x2)//2
-                  y=(y1+y2)//2
-                  subprocess.run(["adb","-s","emulator-5554","shell","input","tap",str(x),str(y)], check=True)
+                  x1, y1, x2, y2 = map(int, match.groups())
+                  x = (x1 + x2) // 2
+                  y = (y1 + y2) // 2
+                  subprocess.run(
+                      ["adb", "-s", "emulator-5554", "shell", "input", "tap", str(x), str(y)],
+                      check=True,
+                  )
                   print(f"TAPPED text={text!r} x={x} y={y}")
                   raise SystemExit(0)
+
           print(f"Could not find text {wanted!r}", file=sys.stderr)
           for node in root.iter("node"):
-              t=node.attrib.get("text","")
-              if t:
-                  print(t, file=sys.stderr)
+              text = node.attrib.get("text", "").strip()
+              if text:
+                  print(text, file=sys.stderr)
           raise SystemExit(1)
           PY
-            rm -f "$xml"
           }
 
           wait_for_result() {
+            local out="$1"
             for i in $(seq 1 150); do
-              if timeout 15s adb -s emulator-5554 shell uiautomator dump /sdcard/window-result.xml >/dev/null 2>&1 &&                  timeout 15s adb -s emulator-5554 shell cat /sdcard/window-result.xml > ui-result.xml 2>/dev/null; then
-                if grep -q "نتيجة فحص السرعة" ui-result.xml 2>/dev/null; then
-                  cat ui-result.xml
-                  return 0
-                fi
-              else
-                adb reconnect >/dev/null 2>&1 || true
+              if dump_ui "${out}" 2>/dev/null && grep -q "نتيجة فحص السرعة" "${out}" 2>/dev/null; then
+                cat "${out}"
+                return 0
+              fi
+
+              if ! adb -s emulator-5554 get-state >/dev/null 2>&1; then
+                echo "ADB device disappeared during speed test."
+                diagnostics
+                return 1
               fi
               sleep 1
             done
-            echo "Speed test did not finish within 150s."
+
+            echo "Speed test did not finish within 150 seconds."
             adb -s emulator-5554 logcat -d -t 1500 > speed-test-logcat.txt || true
             return 1
           }
 
-          adb -s emulator-5554 shell am force-stop com.speedvpn.app
-                fi
-              fi
-              sleep 1
-            done
-            echo "Speed test did not finish within 150s."
-            adb -s emulator-5554 logcat -d -t 1500 > speed-test-logcat.txt || true
-            return 1
-          }
-
+          echo "Starting Build 197 speed test..."
           adb -s emulator-5554 shell am force-stop com.speedvpn.app
           adb -s emulator-5554 shell am start -n com.speedvpn.app/.MainActivity
           sleep 4
@@ -435,11 +449,10 @@ jobs:
 
           : > speed-test-results.txt
 
-          # Run the current speed-test engine three times.
           for run in 1 2 3; do
-            echo "===== SPEED TEST RUN $run =====" | tee -a speed-test-results.txt
+            echo "===== SPEED TEST RUN ${run} =====" | tee -a speed-test-results.txt
 
-            if [ "$run" -eq 1 ]; then
+            if [ "${run}" -eq 1 ]; then
               tap_text "السرعة"
               sleep 2
             fi
@@ -447,22 +460,25 @@ jobs:
             tap_text "🚀"
             sleep 2
 
-            wait_for_result > "ui-result-$run.xml"
-            python3 - "ui-result-$run.xml" <<'PY' | tee -a speed-test-results.txt
-                    import sys, xml.etree.ElementTree as ET
-          path = sys.argv[1]
-          root = ET.parse(path).getroot()
-          texts=[]
+            ui_result="ui-result-${run}.xml"
+            wait_for_result "${ui_result}"
+
+            python3 - "${ui_result}" <<'PY' | tee -a speed-test-results.txt
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse(sys.argv[1]).getroot()
+          seen = set()
           for node in root.iter("node"):
-              t=node.attrib.get("text","").strip()
-              if t and t not in texts:
-                  texts.append(t)
-          for t in texts:
-              if any(k in t for k in ("نتيجة فحص السرعة","Download","Upload","المدة","ملاحظة:")):
-                  print(t)
+              text = node.attrib.get("text", "").strip()
+              if not text or text in seen:
+                  continue
+              seen.add(text)
+              if any(k in text for k in ("نتيجة فحص السرعة", "Download", "Upload", "المدة", "ملاحظة:")):
+                  print(text)
           PY
 
-            if [ "$run" -lt 3 ]; then
+            if [ "${run}" -lt 3 ]; then
               sleep 2
             fi
           done
@@ -470,10 +486,13 @@ jobs:
           echo "===== SPEED TEST COMPLETE =====" | tee -a speed-test-results.txt
           cat speed-test-results.txt
 
-          adb -s emulator-5554 logcat -d -t 1500 > speed-test-logcat.txt
-          ! grep -Eiq "FATAL EXCEPTION|AndroidRuntime.*FATAL" speed-test-logcat.txt
+          adb -s emulator-5554 logcat -d -t 2000 > speed-test-logcat.txt
+          if grep -Eiq "FATAL EXCEPTION|AndroidRuntime.*FATAL" speed-test-logcat.txt; then
+            echo "Fatal exception detected during Build 197 speed test."
+            exit 1
+          fi
 
-
+          echo "Build 197 speed test passed on emulator."
 
       - name: Upload emulator logs
         if: ${{ always() }}
