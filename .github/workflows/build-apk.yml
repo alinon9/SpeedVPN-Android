@@ -830,4 +830,8 @@ jobs:
             speed-test-logcat.txt
             speed-test-results.txt
             ui-result-*.xml
+            verify-speed-logcat.txt
+            verify-speed-results.txt
+            verify-speed-result.xml
+            verify-speed-result.xml.loading.xml
           if-no-files-found: ignore
