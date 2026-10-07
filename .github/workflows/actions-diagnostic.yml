@@ -1,0 +1,11 @@
+name: Actions Diagnostic
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  diagnostic:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "GitHub Actions runner is executing jobs normally."
