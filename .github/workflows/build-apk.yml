@@ -400,7 +400,7 @@ jobs:
                   return False
               if wanted == "🚀":
                   return "فحص السرعة" in text or text.startswith("🚀")
-              return text == wanted or wanted in text
+              return text == wanted
 
           for node in root.iter("node"):
               text = node.attrib.get("text", "")
