@@ -350,19 +350,29 @@ jobs:
           tap_text() {
             local wanted="$1"
             local xml="ui-dump.xml"
-            adb -s emulator-5554 shell uiautomator dump "/sdcard/$xml" >/dev/null 2>&1
-            for attempt in 1 2 3; do
-              if adb -s emulator-5554 shell cat "/sdcard/$xml" > "$xml" 2>/dev/null && [ -s "$xml" ]; then
+            local dump_log="ui-dump-attempt.log"
+
+            for attempt in 1 2 3 4 5; do
+              : > "$dump_log"
+              if timeout 15s adb -s emulator-5554 shell uiautomator dump "/sdcard/$xml" >"$dump_log" 2>&1 &&                  timeout 15s adb -s emulator-5554 shell cat "/sdcard/$xml" > "$xml" 2>>"$dump_log" &&                  [ -s "$xml" ]; then
                 break
               fi
-              echo "ADB UI read failed (attempt $attempt/3); restarting ADB connection..."
-              adb reconnect >/dev/null 2>&1 || true
-              sleep 1
-              if [ "$attempt" -eq 3 ]; then
+
+              echo "ADB UI dump/read failed (attempt $attempt/5):"
+              cat "$dump_log" || true
+              if [ "$attempt" -eq 5 ]; then
                 echo "Could not read UI hierarchy from emulator."
+                cat emulator-console.log || true
                 return 1
               fi
+
+              adb reconnect >/dev/null 2>&1 || true
+              sleep 1
+              adb -s emulator-5554 wait-for-device >/dev/null 2>&1 || true
+              sleep 1
             done
+
+            rm -f "$dump_log"
             python3 - "$xml" "$wanted" <<'PY'
                     import sys, xml.etree.ElementTree as ET, re, subprocess
           
@@ -393,11 +403,23 @@ jobs:
 
           wait_for_result() {
             for i in $(seq 1 150); do
-              adb -s emulator-5554 shell uiautomator dump /sdcard/window-result.xml >/dev/null 2>&1 || true
-              adb -s emulator-5554 shell cat /sdcard/window-result.xml > ui-result.xml 2>/dev/null || true
-              if grep -q "نتيجة فحص السرعة" ui-result.xml 2>/dev/null; then
-                cat ui-result.xml
-                return 0
+              if timeout 15s adb -s emulator-5554 shell uiautomator dump /sdcard/window-result.xml >/dev/null 2>&1 &&                  timeout 15s adb -s emulator-5554 shell cat /sdcard/window-result.xml > ui-result.xml 2>/dev/null; then
+                if grep -q "نتيجة فحص السرعة" ui-result.xml 2>/dev/null; then
+                  cat ui-result.xml
+                  return 0
+                fi
+              else
+                adb reconnect >/dev/null 2>&1 || true
+              fi
+              sleep 1
+            done
+            echo "Speed test did not finish within 150s."
+            adb -s emulator-5554 logcat -d -t 1500 > speed-test-logcat.txt || true
+            return 1
+          }
+
+          adb -s emulator-5554 shell am force-stop com.speedvpn.app
+                fi
               fi
               sleep 1
             done
