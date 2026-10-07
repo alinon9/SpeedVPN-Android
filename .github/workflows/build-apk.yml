@@ -427,7 +427,7 @@ jobs:
 
               if [ "${scroll}" -lt 4 ]; then
                 echo "UI element '${wanted}' is not visible yet; scrolling up (${scroll}/4)..."
-                adb -s emulator-5554 shell input swipe 540 650 540 250 500
+                adb -s emulator-5554 shell input swipe 160 500 160 220 600
                 sleep 1
               fi
             done
