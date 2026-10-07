@@ -617,9 +617,19 @@ jobs:
 
           tap_text "السرعة"
           sleep 2
-          tap_text_occurrence "100 KB" 1
+
+          # Set Download from the first visible 100 KB preset.
+          tap_text "100 KB"
           sleep 1
-          tap_text_occurrence "100 KB" 2
+
+          # Move to the Upload card so its 100 KB preset is the visible
+          # matching element; do not rely on two identical labels being
+          # visible at once on the 320x640 CI emulator.
+          adb -s emulator-5554 shell input swipe 160 500 160 220 600
+          sleep 1
+          adb -s emulator-5554 shell input swipe 160 500 160 220 600
+          sleep 1
+          tap_text "100 KB"
           sleep 2
 
           verify_started=0
