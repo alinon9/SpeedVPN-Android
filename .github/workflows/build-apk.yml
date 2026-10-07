@@ -437,12 +437,42 @@ jobs:
             return 1
           }
 
-          wait_for_result() {
+          wait_for_speed_result() {
             local out="$1"
+            local loading_seen=0
+
+            echo "Waiting for speed-test loading state..."
+            for i in $(seq 1 20); do
+              dump_ui "${out}.loading.xml" 2>/dev/null || true
+
+              if grep -q "جاري فحص السرعة…" "${out}.loading.xml" 2>/dev/null; then
+                echo "Loading state detected after ${i}s."
+                loading_seen=1
+                break
+              fi
+
+              if ! adb -s emulator-5554 get-state >/dev/null 2>&1; then
+                echo "ADB device disappeared while waiting for speed-test loading state."
+                diagnostics
+                return 1
+              fi
+              sleep 1
+            done
+
+            if [ "${loading_seen}" -ne 1 ]; then
+              echo "Speed-test loading state never appeared after tapping the button."
+              adb -s emulator-5554 logcat -d -t 1500 > speed-test-logcat.txt || true
+              return 1
+            fi
+
+            echo "Waiting for the current speed-test run to finish..."
             for i in $(seq 1 150); do
-              if dump_ui "${out}" 2>/dev/null && grep -q "نتيجة فحص السرعة" "${out}" 2>/dev/null; then
-                cat "${out}"
-                return 0
+              if dump_ui "${out}" 2>/dev/null; then
+                if grep -q "نتيجة فحص السرعة" "${out}" 2>/dev/null &&
+                   ! grep -q "جاري فحص السرعة…" "${out}" 2>/dev/null; then
+                  echo "Speed-test run completed after ${i}s."
+                  return 0
+                fi
               fi
 
               if ! adb -s emulator-5554 get-state >/dev/null 2>&1; then
@@ -454,63 +484,105 @@ jobs:
             done
 
             echo "Speed test did not finish within 150 seconds."
-            adb -s emulator-5554 logcat -d -t 1500 > speed-test-logcat.txt || true
+            adb -s emulator-5554 logcat -d -t 2000 > speed-test-logcat.txt || true
             return 1
           }
 
-          echo "Starting Build 197 speed test..."
-          adb -s emulator-5554 shell am force-stop com.speedvpn.app
-          adb -s emulator-5554 shell am start -n com.speedvpn.app/.MainActivity
-          sleep 4
-          adb -s emulator-5554 shell dumpsys activity activities | grep -m 1 "com.speedvpn.app"
+          validate_speed_result() {
+            local xml="$1"
+            local run="$2"
 
+            python3 - "${xml}" "${run}" <<'PY' | tee -a speed-test-results.txt
+          import re
+          import sys
+          import xml.etree.ElementTree as ET
+
+          path, run = sys.argv[1], sys.argv[2]
+          root = ET.parse(path).getroot()
+          texts = [
+              node.attrib.get("text", "").strip()
+              for node in root.iter("node")
+              if node.attrib.get("text", "").strip()
+          ]
+
+          if "نتيجة فحص السرعة" not in texts:
+              raise SystemExit(f"RUN {run}: missing speed-test result card")
+
+          if "جاري فحص السرعة…" in texts:
+              raise SystemExit(f"RUN {run}: speed test is still loading")
+
+          if "فشل القياس" in texts:
+              raise SystemExit(f"RUN {run}: speed test returned 'فشل القياس'")
+
+          if any(text.startswith("ملاحظة:") for text in texts):
+              notes = [text for text in texts if text.startswith("ملاحظة:")]
+              raise SystemExit(f"RUN {run}: speed test reported an error/note: {notes}")
+
+          rate_re = re.compile(r"^(?:\d+(?:\.\d+)?)[ ]?(?:B/s|KB/s|MB/s|GB/s)$")
+
+          def value_after(label):
+              try:
+                  idx = texts.index(label)
+              except ValueError:
+                  raise SystemExit(f"RUN {run}: missing {label} label")
+
+              for candidate in texts[idx + 1:idx + 6]:
+                  if candidate in {"Download", "Upload", "المدة", "ملاحظة:"}:
+                      break
+                  if rate_re.fullmatch(candidate):
+                      number = float(re.match(r"\d+(?:\.\d+)?", candidate).group(0))
+                      if number <= 0:
+                          raise SystemExit(f"RUN {run}: {label} value is not positive: {candidate}")
+                      return candidate
+              raise SystemExit(f"RUN {run}: missing numeric {label} value after label")
+
+          download = value_after("Download")
+          upload = value_after("Upload")
+
+          print(f"RUN {run}: Download={download}")
+          print(f"RUN {run}: Upload={upload}")
+          PY
+          }
+
+          echo "Starting Build 197 speed test..."
           : > speed-test-results.txt
 
           for run in 1 2 3; do
             echo "===== SPEED TEST RUN ${run} =====" | tee -a speed-test-results.txt
 
-            if [ "${run}" -eq 1 ]; then
-              tap_text "السرعة"
-              sleep 2
-            fi
+            # Each run starts from a fresh Activity state so no previous
+            # result card can be mistaken for the current run.
+            adb -s emulator-5554 shell am force-stop com.speedvpn.app
+            adb -s emulator-5554 shell am start -n com.speedvpn.app/.MainActivity
+            sleep 4
 
-            tap_text "🚀"
+            test -n "$(adb -s emulator-5554 shell pidof com.speedvpn.app | tr -d '\r' || true)"
+            adb -s emulator-5554 shell dumpsys activity activities | grep -m 1 "com.speedvpn.app"
+
+            tap_text "السرعة"
             sleep 2
 
+            # The exact start label is used. The old generic matcher could
+            # also tap "جاري فحص السرعة…" while the previous run was active.
+            tap_text "🚀"
+
             ui_result="ui-result-${run}.xml"
-            wait_for_result "${ui_result}"
+            wait_for_speed_result "${ui_result}"
+            validate_speed_result "${ui_result}" "${run}"
 
-            python3 - "${ui_result}" <<'PY' | tee -a speed-test-results.txt
-          import sys
-          import xml.etree.ElementTree as ET
-
-          root = ET.parse(sys.argv[1]).getroot()
-          seen = set()
-          for node in root.iter("node"):
-              text = node.attrib.get("text", "").strip()
-              if not text or text in seen:
-                  continue
-              seen.add(text)
-              if any(k in text for k in ("نتيجة فحص السرعة", "Download", "Upload", "المدة", "ملاحظة:")):
-                  print(text)
-          PY
-
-            if [ "${run}" -lt 3 ]; then
-              sleep 2
-            fi
+            echo "RUN ${run}: numeric Download/Upload result validated." | tee -a speed-test-results.txt
           done
 
           echo "===== SPEED TEST COMPLETE =====" | tee -a speed-test-results.txt
           cat speed-test-results.txt
 
-          adb -s emulator-5554 logcat -d -t 2000 > speed-test-logcat.txt
+          adb -s emulator-5554 logcat -d -t 3000 > speed-test-logcat.txt
           if grep -Eiq "FATAL EXCEPTION|AndroidRuntime.*FATAL" speed-test-logcat.txt; then
             echo "Fatal exception detected during Build 197 speed test."
             exit 1
           fi
 
           echo "Build 197 speed test passed on emulator."
-
       - name: Upload emulator logs
         if: ${{ always() }}
         uses: actions/upload-artifact@v7
