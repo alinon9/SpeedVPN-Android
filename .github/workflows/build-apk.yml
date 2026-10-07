@@ -160,7 +160,7 @@ jobs:
   emulator-smoke-test:
     needs: build-apk
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -380,19 +380,24 @@ jobs:
           }
 
           tap_text() {
+            tap_text_occurrence "$1" 1
+          }
+
+          tap_text_occurrence() {
             local wanted="$1"
+            local occurrence="$2"
             local xml="${RUNNER_TEMP}/ui-dump.xml"
 
             for scroll in 0 1 2 3 4; do
               dump_ui "${xml}"
 
-              if python3 - "${xml}" "${wanted}" <<'PY'
+              if python3 - "${xml}" "${wanted}" "${occurrence}" <<'PY'
           import re
           import subprocess
           import sys
           import xml.etree.ElementTree as ET
 
-          path, wanted = sys.argv[1], sys.argv[2]
+          path, wanted, occurrence = sys.argv[1], sys.argv[2], int(sys.argv[3])
           root = ET.parse(path).getroot()
 
           def wanted_match(text):
@@ -402,22 +407,25 @@ jobs:
                   return text == "🚀 فحص السرعة"
               return text == wanted
 
+          matches = []
           for node in root.iter("node"):
               text = node.attrib.get("text", "")
               if wanted_match(text):
                   bounds = node.attrib.get("bounds", "")
                   match = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
-                  if not match:
-                      continue
-                  x1, y1, x2, y2 = map(int, match.groups())
-                  x = (x1 + x2) // 2
-                  y = (y1 + y2) // 2
-                  subprocess.run(
-                      ["adb", "-s", "emulator-5554", "shell", "input", "tap", str(x), str(y)],
-                      check=True,
-                  )
-                  print(f"TAPPED text={text!r} x={x} y={y}")
-                  raise SystemExit(0)
+                  if match:
+                      matches.append((text, tuple(map(int, match.groups()))))
+
+          if len(matches) >= occurrence:
+              text, (x1, y1, x2, y2) = matches[occurrence - 1]
+              x = (x1 + x2) // 2
+              y = (y1 + y2) // 2
+              subprocess.run(
+                  ["adb", "-s", "emulator-5554", "shell", "input", "tap", str(x), str(y)],
+                  check=True,
+              )
+              print(f"TAPPED occurrence={occurrence} text={text!r} x={x} y={y}")
+              raise SystemExit(0)
 
           raise SystemExit(2)
           PY
@@ -426,13 +434,13 @@ jobs:
               fi
 
               if [ "${scroll}" -lt 4 ]; then
-                echo "UI element '${wanted}' is not visible yet; scrolling up (${scroll}/4)..."
+                echo "UI element '${wanted}' occurrence ${occurrence} is not visible yet; scrolling up (${scroll}/4)..."
                 adb -s emulator-5554 shell input swipe 160 500 160 220 600
                 sleep 1
               fi
             done
 
-            echo "Could not find visible UI element '${wanted}' after scrolling."
+            echo "Could not find UI element '${wanted}' occurrence ${occurrence} after scrolling."
             cat "${xml}" || true
             return 1
           }
@@ -597,6 +605,218 @@ jobs:
             echo "Fatal exception detected during Build 197 speed test."
             exit 1
           fi
+
+          echo "Starting Verify Speed end-to-end test..."
+
+          # Use a finite, low plan so the policy has a real target to evaluate.
+          # The first 100 KB preset belongs to Download; occurrence 2 belongs
+          # to Upload after the page is scrolled far enough to expose it.
+          adb -s emulator-5554 shell am force-stop com.speedvpn.app
+          adb -s emulator-5554 shell am start -n com.speedvpn.app/.MainActivity
+          sleep 4
+
+          tap_text "السرعة"
+          sleep 2
+          tap_text_occurrence "100 KB" 1
+          sleep 1
+          tap_text_occurrence "100 KB" 2
+          sleep 2
+
+          verify_started=0
+
+          # First tap may show the app's VPN disclosure and then Android's
+          # system VPN confirmation. Complete both only when they appear.
+          if tap_text "✅ تحقق من السرعة"; then
+            sleep 1
+
+            if tap_text "أوافق والمتابعة"; then
+              echo "Accepted SpeedVPN VPN disclosure."
+              sleep 2
+              if tap_text "OK"; then
+                echo "Accepted Android VPN confirmation."
+              elif tap_text "السماح"; then
+                echo "Accepted Android VPN permission."
+              elif tap_text "Allow"; then
+                echo "Accepted Android VPN permission."
+              else
+                echo "Android VPN confirmation dialog did not expose a known approval button."
+                cat "${RUNNER_TEMP}/ui-dump.xml" || true
+                exit 1
+              fi
+              sleep 3
+              tap_text "✅ تحقق من السرعة"
+            fi
+
+            verify_started=1
+          fi
+
+          if [ "${verify_started}" -ne 1 ]; then
+            echo "Could not start Verify Speed from the Speed screen."
+            exit 1
+          fi
+
+          wait_for_verify_result() {
+            local out="$1"
+            local loading_seen=0
+
+            echo "Waiting for Verify Speed loading state..."
+            for i in $(seq 1 20); do
+              dump_ui "${out}.loading.xml" 2>/dev/null || true
+
+              if grep -q "جاري التحقق من الخطة…" "${out}.loading.xml" 2>/dev/null; then
+                echo "Verify Speed loading state detected after ${i}s."
+                loading_seen=1
+                break
+              fi
+
+              if ! adb -s emulator-5554 get-state >/dev/null 2>&1; then
+                echo "ADB device disappeared while waiting for Verify Speed."
+                diagnostics
+                return 1
+              fi
+              sleep 1
+            done
+
+            if [ "${loading_seen}" -ne 1 ]; then
+              echo "Verify Speed loading state never appeared."
+              return 1
+            fi
+
+            echo "Waiting for Verify Speed to finish..."
+            for i in $(seq 1 300); do
+              if dump_ui "${out}" 2>/dev/null; then
+                if grep -q "نتيجة التحقق" "${out}" 2>/dev/null &&
+                   ! grep -q "جاري التحقق من الخطة…" "${out}" 2>/dev/null; then
+                  echo "Verify Speed finished after ${i}s."
+                  return 0
+                fi
+              fi
+
+              if ! adb -s emulator-5554 get-state >/dev/null 2>&1; then
+                echo "ADB device disappeared during Verify Speed."
+                diagnostics
+                return 1
+              fi
+              sleep 1
+            done
+
+            echo "Verify Speed did not finish within 300 seconds."
+            adb -s emulator-5554 logcat -d -t 4000 > verify-speed-logcat.txt || true
+            return 1
+          }
+
+          validate_verify_result() {
+            local xml="$1"
+
+            python3 - "${xml}" <<'PY' | tee -a verify-speed-results.txt
+          import re
+          import sys
+          import xml.etree.ElementTree as ET
+
+          path = sys.argv[1]
+          root = ET.parse(path).getroot()
+          texts = [
+              node.attrib.get("text", "").strip()
+              for node in root.iter("node")
+              if node.attrib.get("text", "").strip()
+          ]
+
+          if "نتيجة التحقق" not in texts:
+              raise SystemExit("VERIFY: missing result card")
+
+          if "جاري التحقق من الخطة…" in texts:
+              raise SystemExit("VERIFY: verification is still running")
+
+          if "فشل القياس" in texts:
+              raise SystemExit("VERIFY: one or more measurements failed")
+
+          notes = [text for text in texts if text.startswith("ملاحظة:")]
+          if notes:
+              raise SystemExit(f"VERIFY: verification reported an error/note: {notes}")
+
+          rate_re = re.compile(r"^(?:\d+(?:\.\d+)?)[ ]?(?:bps|Kbps|Mbps|Gbps)$")
+          status_labels = {
+              "✅ السرعة متطابقة",
+              "❌ السرعة غير متطابقة",
+              "⚠️ لا يمكن الحكم",
+              "✅ لا يظهر سقف واضح",
+          }
+
+          for metric, next_metric in (("Download", "Upload"), ("Upload", None)):
+              try:
+                  start = texts.index(metric)
+              except ValueError:
+                  raise SystemExit(f"VERIFY: missing {metric} metric section")
+
+              end = texts.index(next_metric, start + 1) if next_metric and next_metric in texts[start + 1:] else len(texts)
+              section = texts[start:end]
+
+              if not any(status in section for status in status_labels):
+                  raise SystemExit(f"VERIFY: {metric} has no final verdict")
+
+              def value_after(label):
+                  try:
+                      idx = section.index(label)
+                  except ValueError:
+                      raise SystemExit(f"VERIFY: {metric} missing label {label}")
+
+                  for candidate in section[idx + 1:idx + 8]:
+                      if candidate in {
+                          "🌐 سرعة الإنترنت الأصلية",
+                          "🔒 السرعة المحجوزة / المحددة",
+                          "🚀 السرعة الفعلية داخل VPN",
+                          "الدقة مقارنة بالخيار",
+                      }:
+                          continue
+                      if candidate in status_labels:
+                          break
+                      if rate_re.fullmatch(candidate):
+                          return candidate
+                  raise SystemExit(f"VERIFY: {metric} missing numeric value after {label}")
+
+              baseline = value_after("🌐 سرعة الإنترنت الأصلية")
+              plan = value_after("🔒 السرعة المحجوزة / المحددة")
+              vpn = value_after("🚀 السرعة الفعلية داخل VPN")
+
+              if plan == "بدون حد":
+                  raise SystemExit(f"VERIFY: {metric} plan is unexpectedly unlimited")
+
+              print(f"VERIFY {metric}: baseline={baseline}, plan={plan}, vpn={vpn}")
+              print(f"VERIFY {metric}: verdict={next(status for status in status_labels if status in section)}")
+          PY
+          }
+
+          : > verify-speed-results.txt
+          verify_result_xml="verify-speed-result.xml"
+
+          wait_for_verify_result "${verify_result_xml}"
+
+          # Bring the metric rows into the small emulator viewport before
+          # parsing, in case only the result heading is currently visible.
+          for reveal in 0 1 2 3 4; do
+            if validate_verify_result "${verify_result_xml}" 2>/dev/null; then
+              break
+            fi
+            if [ "${reveal}" -eq 4 ]; then
+              echo "Could not expose complete Verify Speed metrics."
+              validate_verify_result "${verify_result_xml}"
+              exit 1
+            fi
+            adb -s emulator-5554 shell input swipe 160 500 160 220 600
+            sleep 1
+            dump_ui "${verify_result_xml}"
+          done
+
+          echo "===== VERIFY SPEED COMPLETE =====" | tee -a verify-speed-results.txt
+          cat verify-speed-results.txt
+
+          adb -s emulator-5554 logcat -d -t 5000 > verify-speed-logcat.txt
+          if grep -Eiq "FATAL EXCEPTION|AndroidRuntime.*FATAL" verify-speed-logcat.txt; then
+            echo "Fatal exception detected during Verify Speed."
+            exit 1
+          fi
+
+          echo "Verify Speed end-to-end test passed on emulator."
 
           echo "Build 197 speed test passed on emulator."
       - name: Upload emulator logs
