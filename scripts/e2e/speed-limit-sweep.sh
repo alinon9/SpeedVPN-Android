@@ -55,14 +55,8 @@ coord_for_text() {
   local mode="$3"
   python3 - "$xml" "$wanted" "$mode" <<'PY'
 import re, sys, xml.etree.ElementTree as ET
-path, mode, group_title = sys.argv[1:]
+path, wanted, mode = sys.argv[1:]
 root = ET.parse(path).getroot()
-group_labels = {
-    "منخفض": {"10 KB","25 KB","50 KB","75 KB","100 KB","130 KB","250 KB","500 KB","750 KB","950 KB"},
-    "متوسط": {"1 MB","2 MB","3 MB","4 MB","5 MB"},
-    "مرتفع": {"9 MB","10 MB","11 MB"},
-}
-labels = group_labels.get(group_title, set())
 matches = []
 for node in root.iter("node"):
     if node.attrib.get("text") not in labels:
@@ -125,11 +119,13 @@ preset_swipe_y() {
   local group_title="$3"
   python3 - "$xml" "$mode" "$group_title" <<'PY'
 import re, sys, xml.etree.ElementTree as ET
-mode = sys.argv[2]
-labels = {
- "10 KB","25 KB","50 KB","75 KB","100 KB","130 KB","250 KB","500 KB","750 KB","950 KB",
- "1 MB","2 MB","3 MB","4 MB","5 MB","9 MB","10 MB","11 MB","بدون حد"
+mode, group_title = sys.argv[2], sys.argv[3]
+groups = {
+    "منخفض": {"10 KB","25 KB","50 KB","75 KB","100 KB","130 KB","250 KB","500 KB","750 KB","950 KB"},
+    "متوسط": {"1 MB","2 MB","3 MB","4 MB","5 MB"},
+    "مرتفع": {"9 MB","10 MB","11 MB"},
 }
+labels = groups.get(group_title, set())
 root=ET.parse(sys.argv[1]).getroot()
 ys=[]
 for node in root.iter("node"):
