@@ -627,7 +627,12 @@ jobs:
           # This avoids relying on a horizontally-scrolled Compose preset button.
           # 100 KB/s == 800 Kbps for both directions.
           adb -s emulator-5554 shell am force-stop com.speedvpn.app
-          adb -s emulator-5554 shell run-as com.speedvpn.app sh -c "mkdir -p shared_prefs; printf PG1hcD48bG9uZyBuYW1lPSJkbCIgdmFsdWU9IjgwMCIgLz48bG9uZyBuYW1lPSJ1bCIgdmFsdWU9IjgwMCIgLz48L21hcD4= | base64 -d > shared_prefs/local_limits.xml"
+          cat > "${RUNNER_TEMP}/local_limits.xml" <<'EOF'
+          <?xml version='1.0' encoding='utf-8' standalone='yes' ?><map><long name="dl" value="800" /><long name="ul" value="800" /></map>
+          EOF
+          adb -s emulator-5554 push "${RUNNER_TEMP}/local_limits.xml" /data/local/tmp/speedvpn-local-limits.xml
+          adb -s emulator-5554 shell "run-as com.speedvpn.app sh -c 'cat /data/local/tmp/speedvpn-local-limits.xml > shared_prefs/local_limits.xml'"
+          adb -s emulator-5554 shell run-as com.speedvpn.app cat shared_prefs/local_limits.xml
           adb -s emulator-5554 shell run-as com.speedvpn.app cat shared_prefs/local_limits.xml
 
           adb -s emulator-5554 shell am start -n com.speedvpn.app/.MainActivity
