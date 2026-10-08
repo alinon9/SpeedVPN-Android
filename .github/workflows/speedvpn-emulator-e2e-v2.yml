@@ -225,6 +225,10 @@ jobs:
           sleep 4
           tap_text 'السرعة'
           for run in 1 2 3; do
+            if [ "$run" -gt 1 ]; then
+              echo 'Cooling down before repeat speed test...'
+              sleep 3
+            fi
             echo "RUN $run: start" | tee -a speed-results.txt
             tap_text '🚀 فحص السرعة'
             wait_for_result 'نتيجة فحص السرعة' 'جاري فحص السرعة…' "$RUNNER_TEMP/speed.xml"
