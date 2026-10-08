@@ -158,6 +158,43 @@ jobs:
             return 1
           }
 
+          reveal_speed_metrics() {
+            local out="$1"
+            for reveal in 0 1 2 3 4 5 6 7; do
+              dump_ui "$out" || true
+              if grep -q 'Download' "$out" 2>/dev/null &&
+                 grep -q 'Upload' "$out" 2>/dev/null; then
+                echo "Speed result metrics are visible after scroll ${reveal}."
+                return 0
+              fi
+              if [ "${reveal}" -lt 7 ]; then
+                adb -s emulator-5554 shell input swipe 160 500 160 220 600
+                sleep 1
+              fi
+            done
+            echo "Could not expose Download/Upload metrics in the speed result."
+            return 1
+          }
+
+          reveal_verify_metrics() {
+            local out="$1"
+            for reveal in 0 1 2 3 4 5 6 7 8; do
+              dump_ui "$out" || true
+              if grep -q '🌐 سرعة الإنترنت الأصلية' "$out" 2>/dev/null &&
+                 grep -q '🔒 السرعة المحجوزة / المحددة' "$out" 2>/dev/null &&
+                 grep -q '🚀 السرعة الفعلية داخل VPN' "$out" 2>/dev/null; then
+                echo "Verify Speed metric rows are visible after scroll ${reveal}."
+                return 0
+              fi
+              if [ "${reveal}" -lt 8 ]; then
+                adb -s emulator-5554 shell input swipe 160 500 160 220 600
+                sleep 1
+              fi
+            done
+            echo "Could not expose complete Verify Speed metrics."
+            return 1
+          }
+
           echo '===== SMOKE TEST ====='
           adb -s emulator-5554 shell am force-stop com.speedvpn.app
           adb -s emulator-5554 shell am start -n com.speedvpn.app/.MainActivity
@@ -178,6 +215,7 @@ jobs:
             echo "RUN $run: start" | tee -a speed-results.txt
             tap_text '🚀 فحص السرعة'
             wait_for_result 'نتيجة فحص السرعة' 'جاري فحص السرعة…' "$RUNNER_TEMP/speed.xml"
+            reveal_speed_metrics "$RUNNER_TEMP/speed.xml"
             ! grep -q 'فشل القياس' "$RUNNER_TEMP/speed.xml"
             python3 - "$RUNNER_TEMP/speed.xml" "$run" <<'PY' | tee -a speed-results.txt
           import re, sys, xml.etree.ElementTree as ET
@@ -219,6 +257,7 @@ jobs:
           dump_ui "$RUNNER_TEMP/verify-start.xml" || true
           if grep -q '✅ تحقق من السرعة' "$RUNNER_TEMP/verify-start.xml" 2>/dev/null; then tap_text '✅ تحقق من السرعة'; fi
           wait_for_result 'نتيجة التحقق' 'جاري التحقق من الخطة…' "$RUNNER_TEMP/verify.xml"
+          reveal_verify_metrics "$RUNNER_TEMP/verify.xml"
           ! grep -q 'فشل القياس' "$RUNNER_TEMP/verify.xml"
           grep -q '🌐 سرعة الإنترنت الأصلية' "$RUNNER_TEMP/verify.xml"
           grep -q '🔒 السرعة المحجوزة / المحددة' "$RUNNER_TEMP/verify.xml"
