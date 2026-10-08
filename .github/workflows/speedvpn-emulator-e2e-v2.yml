@@ -260,30 +260,36 @@ jobs:
           tap_text "السرعة"
           sleep 2
 
+          # Select Download = 100 KB/s from the real preset button.
           tap_text "100 KB"
-          sleep 1
+          sleep 2
+          download_limits_xml="${RUNNER_TEMP}/after-download-selection.xml"
+          adb -s emulator-5554 shell run-as com.speedvpn.app cat shared_prefs/local_limits.xml > "${download_limits_xml}" || true
+          cat "${download_limits_xml}" || true
+          grep -q 'name="dl" value="800"' "${download_limits_xml}" || {
+            echo "VERIFY PLAN: UI click did not persist Download=800 Kbps (100 KB/s)."
+            exit 1
+          }
 
-          # Move to the second limiter card and select the same 100 KB/s preset
-          # for upload. A fresh vertical swipe prevents tapping the first card twice.
-          adb -s emulator-5554 shell input swipe 160 520 160 250 700
-          sleep 1
+          # Scroll far enough that the second limiter card is the active visible
+          # control. Then select Upload = 100 KB/s from its real preset button.
+          adb -s emulator-5554 shell input swipe 160 560 160 180 900
+          sleep 2
           tap_text "100 KB"
-          sleep 1
+          sleep 2
+          upload_limits_xml="${RUNNER_TEMP}/after-upload-selection.xml"
+          adb -s emulator-5554 shell run-as com.speedvpn.app cat shared_prefs/local_limits.xml > "${upload_limits_xml}" || true
+          cat "${upload_limits_xml}" || true
+          grep -q 'name="dl" value="800"' "${upload_limits_xml}" || {
+            echo "VERIFY PLAN: Upload selection unexpectedly changed Download plan."
+            exit 1
+          }
+          grep -q 'name="ul" value="800"' "${upload_limits_xml}" || {
+            echo "VERIFY PLAN: UI click did not persist Upload=800 Kbps (100 KB/s)."
+            exit 1
+          }
 
-          # Capture the UI after the real selection so the artifact proves the
-          # selected plan was applied through the same controls a user sees.
-          dump_ui "${RUNNER_TEMP}/verify-plan-selected.xml" || true
-          python3 - "${RUNNER_TEMP}/verify-plan-selected.xml" <<'PY' | tee -a verify-results.txt
-          import sys
-          import xml.etree.ElementTree as ET
-
-          root = ET.parse(sys.argv[1]).getroot()
-          texts = [n.attrib.get("text","").strip() for n in root.iter("node") if n.attrib.get("text","").strip()]
-          count = texts.count("100.0 KB/s")
-          print(f"UI selected-plan visible values: {count}")
-          if "100.0 KB/s" not in texts:
-              raise SystemExit("VERIFY PLAN: selected 100 KB/s value was not reflected in the UI")
-          PY
+          echo "VERIFY PLAN: real UI selection persisted Download=800 Kbps and Upload=800 Kbps."
 
           verify_started=0
           if tap_text "✅ تحقق من السرعة"; then
@@ -418,15 +424,23 @@ jobs:
               plan = value_after(section, metric, "🔒 السرعة المحجوزة / المحددة")
               vpn = value_after(section, metric, "🚀 السرعة الفعلية داخل VPN")
 
-              reasons = []
-              for idx, candidate in enumerate(section):
-                  if candidate.startswith("ملاحظة:"):
-                      reasons.append(candidate)
+              known = {
+                  metric,
+                  "🌐 سرعة الإنترنت الأصلية",
+                  "🔒 السرعة المحجوزة / المحددة",
+                  "🚀 السرعة الفعلية داخل VPN",
+                  "الدقة مقارنة بالخيار",
+              }
+              reason_candidates = []
+              status_index = section.index(status)
+              for candidate in section[status_index + 1:]:
+                  if candidate in known or rate_re.fullmatch(candidate) or candidate in statuses:
+                      continue
+                  reason_candidates.append(candidate)
               print(f"VERIFY {metric}: baseline={baseline}, plan={plan}, vpn={vpn}")
               print(f"VERIFY {metric}: verdict={status}")
-              if reasons:
-                  for reason in reasons:
-                      print(f"VERIFY {metric}: reason={reason}")
+              for reason in reason_candidates:
+                  print(f"VERIFY {metric}: reason={reason}")
 
               if plan not in {"100.0 KB/s", "100 KB/s"}:
                   raise SystemExit(f"VERIFY {metric}: selected plan is not 100 KB/s: {plan}")
