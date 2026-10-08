@@ -38,8 +38,8 @@ jobs:
         run: |
           set -euo pipefail
           test -x ./gradlew
-          echo "ANDROID_NDK_HOME=\${ANDROID_SDK_ROOT}/ndk/30.0.16248370" >> "\$GITHUB_ENV"
-          echo "ANDROID_NDK_ROOT=\${ANDROID_SDK_ROOT}/ndk/30.0.16248370" >> "\$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/30.0.16248370" >> "\$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=${ANDROID_SDK_ROOT}/ndk/30.0.16248370" >> "\$GITHUB_ENV"
           bash ./setup.sh
           test "\$(git -C app/src/main/jni/hev-socks5-tunnel rev-parse HEAD)" = 'd9dca26c7ad0e494492244f0309e80ee583e739e'
 
@@ -68,7 +68,7 @@ jobs:
       - name: Run exhaustive speed-limit sweep
         run: |
           set -euo pipefail
-          export ANDROID_AVD_HOME="\${RUNNER_TEMP}/android-avd"
+          export ANDROID_AVD_HOME="${RUNNER_TEMP}/android-avd"
           mkdir -p "\$ANDROID_AVD_HOME"
           echo no | avdmanager create avd -n speedvpn-sweep -k 'system-images;android-29;google_apis;x86_64' --force
           adb kill-server >/dev/null 2>&1 || true
