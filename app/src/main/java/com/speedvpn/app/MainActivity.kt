@@ -46,6 +46,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -1247,6 +1249,7 @@ class MainActivity : ComponentActivity() {
         label: String,
         values: List<Pair<String, Long>>,
         accent: Color,
+        accessibilityPrefix: String,
         onApply: (Long?) -> Unit,
     ) {
         Column(Modifier.fillMaxWidth()) {
@@ -1262,7 +1265,11 @@ class MainActivity : ComponentActivity() {
                         shape = RoundedCornerShape(9.dp),
                         border = androidx.compose.foundation.BorderStroke(1.dp, accent.copy(alpha = 0.45f)),
                         contentPadding = PaddingValues(horizontal = 9.dp, vertical = 0.dp),
-                        modifier = Modifier.height(32.dp),
+                        modifier = Modifier
+                            .height(32.dp)
+                            .semantics {
+                                contentDescription = "$accessibilityPrefix: $labelText"
+                            },
                     ) {
                         Text(labelText, fontSize = 10.sp, color = TextPrimary)
                     }
@@ -1307,9 +1314,9 @@ class MainActivity : ComponentActivity() {
                 Text(fmt(kbps), color = Blue, fontWeight = FontWeight.ExtraBold, fontSize = 15.sp)
             }
             Spacer(Modifier.height(10.dp))
-            PresetGroup("منخفض", slowPresets, Amber, onApply)
-            PresetGroup("متوسط", mediumPresets, Blue, onApply)
-            PresetGroup("مرتفع", fastPresets, Purple, onApply)
+            PresetGroup("منخفض", slowPresets, Amber, title, onApply)
+            PresetGroup("متوسط", mediumPresets, Blue, title, onApply)
+            PresetGroup("مرتفع", fastPresets, Purple, title, onApply)
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                 OutlinedButton(
                     onClick = { onApply(null) },
