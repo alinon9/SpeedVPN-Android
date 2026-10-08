@@ -72,7 +72,11 @@ object SpeedVerificationEngine {
             }
 
             onProgress("قياس Download عبر VPN…")
-            vpn = SpeedTestEngine.measure(context) { phase ->
+            vpn = SpeedTestEngine.measure(
+                context = context,
+                expectedDownloadKbps = planDownloadKbps,
+                expectedUploadKbps = planUploadKbps,
+            ) { phase ->
                 onProgress(if (phase == SpeedTestPhase.DOWNLOAD) "قياس Download عبر VPN…" else "قياس Upload عبر VPN…")
             }
 
