@@ -1264,9 +1264,6 @@ class MainActivity : ComponentActivity() {
                 values.forEach { (labelText, speedKbps) ->
                     OutlinedButton(
                         onClick = { onApply(speedKbps) },
-                        modifier = Modifier.semantics {
-                            contentDescription = "$title: $labelText"
-                        },
                         shape = RoundedCornerShape(9.dp),
                         border = androidx.compose.foundation.BorderStroke(1.dp, accent.copy(alpha = 0.45f)),
                         contentPadding = PaddingValues(horizontal = 9.dp, vertical = 0.dp),
