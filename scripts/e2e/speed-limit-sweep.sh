@@ -592,11 +592,16 @@ while IFS='|' read -r index preset expected; do
   result_xml="$RUN_DIR/$slug-verify.xml"
   finished=0
   for second in $(seq 1 300); do
-    if dump_ui "$result_xml" 2>/dev/null &&
-       grep -q "نتيجة التحقق" "$result_xml" 2>/dev/null &&
-       ! grep -q "جاري التحقق من الخطة…" "$result_xml" 2>/dev/null; then
+    dump_ui "$RUN_DIR/$slug-loading.xml" || true
+
+    # The completed Verify card is below the initial viewport on the CI
+    # emulator. Do not use visibility of "نتيجة التحقق" as the completion
+    # signal; that caused false 300-second timeouts even after the coroutine
+    # had already returned and the button had changed back to its idle label.
+    if ! grep -q "جاري التحقق من الخطة…" "$RUN_DIR/$slug-loading.xml" 2>/dev/null &&
+       grep -q "✅ تحقق من السرعة" "$RUN_DIR/$slug-loading.xml" 2>/dev/null; then
       finished=1
-      echo "Verify completed for $preset after $second seconds." | tee -a "$RUN_DIR/sweep-console.log"
+      echo "Verify coroutine completed for $preset after $second seconds." | tee -a "$RUN_DIR/sweep-console.log"
       break
     fi
     sleep 1
@@ -612,14 +617,29 @@ while IFS='|' read -r index preset expected; do
     continue
   fi
 
-  for reveal in 0 1 2 3 4 5 6; do
-    if grep -q "🚀 السرعة الفعلية داخل VPN" "$result_xml" 2>/dev/null; then
+  # Now that the coroutine has returned, scroll the Compose ScrollView until
+  # the completed verification metrics are actually exposed to UIAutomator.
+  metrics_visible=0
+  for reveal in 0 1 2 3 4 5 6 7 8 9; do
+    dump_ui "$result_xml" || true
+    if grep -q "نتيجة التحقق" "$result_xml" 2>/dev/null &&
+       grep -q "🚀 السرعة الفعلية داخل VPN" "$result_xml" 2>/dev/null; then
+      metrics_visible=1
+      echo "Verify result metrics visible for $preset after scroll $reveal." | tee -a "$RUN_DIR/sweep-console.log"
       break
     fi
-    adb -s "$DEVICE" shell input swipe 160 500 160 220 650
-    sleep 1
-    dump_ui "$result_xml" || true
+    if [ "$reveal" -lt 9 ]; then
+      adb -s "$DEVICE" shell input swipe 160 500 160 220 650
+      sleep 1
+    fi
   done
+
+  if [ "$metrics_visible" -ne 1 ]; then
+    echo "FAIL $preset: completed Verify result was not exposed in UI."
+    FAIL_COUNT=$((FAIL_COUNT+1))
+    echo "$index,$preset,$expected,Verify,,,,,Completed result not visible after scroll,FAIL" >> "$RUN_DIR/speed-limit-sweep-results.csv"
+    continue
+  fi
 
   set +e
   parse_verify "$result_xml" "$preset" "$expected" "$index" "$RUN_DIR/$slug-parsed.csv" | tee -a "$RUN_DIR/sweep-console.log"
