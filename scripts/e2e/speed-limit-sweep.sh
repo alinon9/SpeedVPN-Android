@@ -360,14 +360,19 @@ def section(metric,next_metric):
     e=texts.index(next_metric,s+1) if next_metric and next_metric in texts[s+1:] else len(texts)
     return texts[s:e]
 
-def value_after(sec,label):
+def value_near(sec,label):
     i=sec.index(label)
-    for v in sec[i+1:i+10]:
-        if rate(v) is not None:
-            return v
-        if v in status_map:
-            break
-    raise RuntimeError(f"{label}: numeric value missing")
+    for distance in range(1,25):
+        for candidate in (i-distance, i+distance):
+            if candidate < 0 or candidate >= len(sec):
+                continue
+            value = sec[candidate]
+            if value in {"Download","Upload"} and value != label:
+                continue
+            if rate(value) is not None:
+                return value
+    nearby=" | ".join(sec[max(0,i-8):min(len(sec),i+17)])
+    raise RuntimeError(f"{label}: numeric value missing; nearby={nearby}")
 
 rows=[]
 hard=False
@@ -378,8 +383,8 @@ for metric,next_metric in (("Download","Upload"),("Upload",None)):
     if not status:
         raise RuntimeError(f"{metric}: verdict missing")
 
-    baseline=value_after(sec,"🌐 سرعة الإنترنت الأصلية")
-    vpn=value_after(sec,"🚀 السرعة الفعلية داخل VPN")
+    baseline=value_near(sec,"🌐 سرعة الإنترنت الأصلية")
+    vpn=value_near(sec,"🚀 السرعة الفعلية داخل VPN")
 
     pi=sec.index("🔒 السرعة المحجوزة / المحددة")
     plan=None
