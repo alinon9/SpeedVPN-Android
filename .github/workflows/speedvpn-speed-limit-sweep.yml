@@ -38,10 +38,10 @@ jobs:
         run: |
           set -euo pipefail
           test -x ./gradlew
-          echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/30.0.16248370" >> "\$GITHUB_ENV"
-          echo "ANDROID_NDK_ROOT=${ANDROID_SDK_ROOT}/ndk/30.0.16248370" >> "\$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/30.0.16248370" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=${ANDROID_SDK_ROOT}/ndk/30.0.16248370" >> "$GITHUB_ENV"
           bash ./setup.sh
-          test "\$(git -C app/src/main/jni/hev-socks5-tunnel rev-parse HEAD)" = 'd9dca26c7ad0e494492244f0309e80ee583e739e'
+          test "$(git -C app/src/main/jni/hev-socks5-tunnel rev-parse HEAD)" = 'd9dca26c7ad0e494492244f0309e80ee583e739e'
 
       - name: Build debug APK
         run: ./gradlew :app:assembleDebug --stacktrace --no-daemon
@@ -49,12 +49,12 @@ jobs:
       - name: Install Android Emulator
         run: |
           set -euo pipefail
-          SDKMANAGER="\$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
-          echo "PATH=\$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:\$ANDROID_SDK_ROOT/platform-tools:\$ANDROID_SDK_ROOT/emulator:\$PATH" >> "\$GITHUB_ENV"
-          export PATH="\$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:\$ANDROID_SDK_ROOT/platform-tools:\$ANDROID_SDK_ROOT/emulator:\$PATH"
-          yes | "\$SDKMANAGER" --licenses >/dev/null 2>&1 || true
-          "\$SDKMANAGER" --install emulator 'system-images;android-29;google_apis;x86_64'
-          test -x "\$ANDROID_SDK_ROOT/emulator/emulator"
+          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          echo "PATH=$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/platform-tools:$ANDROID_SDK_ROOT/emulator:$PATH" >> "$GITHUB_ENV"
+          export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/platform-tools:$ANDROID_SDK_ROOT/emulator:$PATH"
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" --install emulator 'system-images;android-29;google_apis;x86_64'
+          test -x "$ANDROID_SDK_ROOT/emulator/emulator"
 
       - name: Enable KVM
         run: |
@@ -69,17 +69,17 @@ jobs:
         run: |
           set -euo pipefail
           export ANDROID_AVD_HOME="${RUNNER_TEMP}/android-avd"
-          mkdir -p "\$ANDROID_AVD_HOME"
+          mkdir -p "$ANDROID_AVD_HOME"
           echo no | avdmanager create avd -n speedvpn-sweep -k 'system-images;android-29;google_apis;x86_64' --force
           adb kill-server >/dev/null 2>&1 || true
           adb start-server
           nohup emulator -avd speedvpn-sweep -no-window -no-audio -no-boot-anim -no-snapshot -no-snapshot-save -no-metrics -gpu swiftshader_indirect -accel on -cores 2 -memory 1536 -partition-size 2048 -netdelay none -netspeed full -dns-server 8.8.8.8,1.1.1.1 > emulator-console.log 2>&1 &
-          EMULATOR_PID=\$!
+          EMULATOR_PID=$!
 
           cleanup() {
             adb -s emulator-5554 emu kill >/dev/null 2>&1 || true
-            kill "\$EMULATOR_PID" >/dev/null 2>&1 || true
-            wait "\$EMULATOR_PID" >/dev/null 2>&1 || true
+            kill "$EMULATOR_PID" >/dev/null 2>&1 || true
+            wait "$EMULATOR_PID" >/dev/null 2>&1 || true
           }
           diagnostics() {
             echo '===== SWEEP EMULATOR DIAGNOSTICS ====='
@@ -91,16 +91,16 @@ jobs:
           }
           trap cleanup EXIT
 
-          for i in \$(seq 1 180); do
+          for i in $(seq 1 180); do
             adb -s emulator-5554 get-state >/dev/null 2>&1 && break
-            kill -0 "\$EMULATOR_PID" >/dev/null 2>&1 || { diagnostics; exit 1; }
+            kill -0 "$EMULATOR_PID" >/dev/null 2>&1 || { diagnostics; exit 1; }
             sleep 1
           done
           adb -s emulator-5554 wait-for-device
 
-          for i in \$(seq 1 180); do
-            adb -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' | grep -q '^1\$' && break
-            kill -0 "\$EMULATOR_PID" >/dev/null 2>&1 || { diagnostics; exit 1; }
+          for i in $(seq 1 180); do
+            adb -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' | grep -q '^1$' && break
+            kill -0 "$EMULATOR_PID" >/dev/null 2>&1 || { diagnostics; exit 1; }
             sleep 1
           done
 
