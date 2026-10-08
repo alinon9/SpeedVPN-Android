@@ -474,7 +474,7 @@ jobs:
             fi
 
             echo "Waiting for the current speed-test run to finish..."
-            for i in $(seq 1 150); do
+            for i in $(seq 1 180); do
               if dump_ui "${out}" 2>/dev/null; then
                 if grep -q "نتيجة فحص السرعة" "${out}" 2>/dev/null &&
                    ! grep -q "جاري فحص السرعة…" "${out}" 2>/dev/null; then
@@ -487,6 +487,13 @@ jobs:
                 echo "ADB device disappeared during speed test."
                 diagnostics
                 return 1
+              fi
+
+              # Keep the result card reachable on the small CI viewport.
+              # Some Compose layouts append the completed card below the
+              # current scroll position after the async measurement finishes.
+              if [ "$((i % 5))" -eq 0 ]; then
+                adb -s emulator-5554 shell input swipe 160 500 160 220 600 || true
               fi
               sleep 1
             done
