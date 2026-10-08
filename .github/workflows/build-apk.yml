@@ -567,6 +567,10 @@ jobs:
           : > speed-test-results.txt
 
           for run in 1 2 3; do
+            if [ "${run}" -gt 1 ]; then
+              echo "Cooling down before repeat speed test..."
+              sleep 3
+            fi
             echo "===== SPEED TEST RUN ${run} =====" | tee -a speed-test-results.txt
 
             # Each run starts from a fresh Activity state so no previous
