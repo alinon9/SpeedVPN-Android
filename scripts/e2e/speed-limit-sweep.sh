@@ -252,9 +252,11 @@ tap_preset_row() {
     fi
 
     local y=""
-    y="$(preset_desc_row_y "$xml" "$card_title" 2>/dev/null || true)"
+    # content-desc is not exposed by the Android UI dump for these Compose
+    # buttons, so derive the visible preset-row Y directly from the labels in
+    # the same speed group and scroll that horizontal row.
+    y="$(preset_swipe_y "$xml" "$mode" "$(preset_group_title "$wanted")" 2>/dev/null || true)"
     if [ -n "$y" ]; then
-      # Horizontal scrolling is restricted to the exact card/row.
       adb -s "$DEVICE" shell input swipe 300 "$y" 60 "$y" 750
     else
       adb -s "$DEVICE" shell input swipe 160 570 160 190 850
