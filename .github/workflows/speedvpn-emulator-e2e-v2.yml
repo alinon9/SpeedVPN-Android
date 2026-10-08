@@ -260,7 +260,12 @@ jobs:
           tap_text "السرعة"
           sleep 2
 
-          # Select Download = 100 KB/s from the real preset button.
+          # The preset row is horizontally scrollable and the 100 KB button
+          # is not visible at the initial scroll position. Reveal it first.
+          for y in 260 340 420 500; do
+            adb -s emulator-5554 shell input swipe 300 "$y" 60 "$y" 500 || true
+          done
+          sleep 1
           tap_text "100 KB"
           sleep 2
           download_limits_xml="${RUNNER_TEMP}/after-download-selection.xml"
@@ -272,9 +277,14 @@ jobs:
           }
 
           # Scroll far enough that the second limiter card is the active visible
-          # control. Then select Upload = 100 KB/s from its real preset button.
+          # control. Reveal its horizontally scrolled preset row before selecting
+          # Upload = 100 KB/s.
           adb -s emulator-5554 shell input swipe 160 560 160 180 900
           sleep 2
+          for y in 260 340 420 500; do
+            adb -s emulator-5554 shell input swipe 300 "$y" 60 "$y" 500 || true
+          done
+          sleep 1
           tap_text "100 KB"
           sleep 2
           upload_limits_xml="${RUNNER_TEMP}/after-upload-selection.xml"
