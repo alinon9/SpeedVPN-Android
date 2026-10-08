@@ -252,16 +252,16 @@ jobs:
           done
 
           echo '===== VERIFY SPEED =====' | tee verify-results.txt
+          # Configure the finite CI plan through the app's real persistent store.
+          # This avoids relying on a horizontally-scrolled Compose preset button.
+          # 100 KB/s == 800 Kbps for both directions.
           adb -s emulator-5554 shell am force-stop com.speedvpn.app
+          adb -s emulator-5554 shell 'run-as com.speedvpn.app sh -c "mkdir -p shared_prefs; printf %s \\"<map><long name=\\\"dl\\\" value=\\\"800\\\" /><long name=\\\"ul\\\" value=\\\"800\\\" /></map>\\" > shared_prefs/local_limits.xml"'
+          adb -s emulator-5554 shell run-as com.speedvpn.app cat shared_prefs/local_limits.xml
           adb -s emulator-5554 shell am start -n com.speedvpn.app/.MainActivity
           sleep 4
           tap_text 'السرعة'
-          tap_text '100 KB'
-          adb -s emulator-5554 shell input swipe 160 500 160 220 600
-          sleep 1
-          adb -s emulator-5554 shell input swipe 160 500 160 220 600
-          sleep 1
-          tap_text '100 KB'
+          sleep 2
           tap_text '✅ تحقق من السرعة' || true
           sleep 2
           dump_ui "$RUNNER_TEMP/dialog.xml" || true
