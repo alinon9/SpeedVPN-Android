@@ -252,9 +252,10 @@ jobs:
           done
 
           echo '===== VERIFY SPEED =====' | tee verify-results.txt
-          # Configure the finite CI plan through the app's real persistent store.
-          # This avoids relying on a horizontally-scrolled Compose preset button.
-          # 100 KB/s == 800 Kbps for both directions.
+          # Use the same hardened Verify flow as the successful Build #270
+          # emulator smoke test. Configure the real persistent limiter state,
+          # explicitly complete both VPN consent dialogs, and require the
+          # loading state before accepting the final result.
           adb -s emulator-5554 shell am force-stop com.speedvpn.app
           cat > "${RUNNER_TEMP}/local_limits.xml" <<'EOF'
           <?xml version='1.0' encoding='utf-8' standalone='yes' ?><map><long name="dl" value="800" /><long name="ul" value="800" /></map>
@@ -262,31 +263,184 @@ jobs:
           adb -s emulator-5554 push "${RUNNER_TEMP}/local_limits.xml" /data/local/tmp/speedvpn-local-limits.xml
           adb -s emulator-5554 shell "run-as com.speedvpn.app sh -c 'cat /data/local/tmp/speedvpn-local-limits.xml > shared_prefs/local_limits.xml'"
           adb -s emulator-5554 shell run-as com.speedvpn.app cat shared_prefs/local_limits.xml
-          adb -s emulator-5554 shell run-as com.speedvpn.app cat shared_prefs/local_limits.xml
+
           adb -s emulator-5554 shell am start -n com.speedvpn.app/.MainActivity
           sleep 4
-          tap_text 'السرعة'
+          tap_text "السرعة"
           sleep 2
-          tap_text '✅ تحقق من السرعة' || true
-          sleep 2
-          dump_ui "$RUNNER_TEMP/dialog.xml" || true
-          if grep -q 'أوافق والمتابعة' "$RUNNER_TEMP/dialog.xml" 2>/dev/null; then tap_text 'أوافق والمتابعة'; sleep 2; fi
-          dump_ui "$RUNNER_TEMP/dialog2.xml" || true
-          if grep -q 'السماح' "$RUNNER_TEMP/dialog2.xml" 2>/dev/null; then tap_text 'السماح'; fi
-          if grep -q 'Allow' "$RUNNER_TEMP/dialog2.xml" 2>/dev/null; then tap_text 'Allow'; fi
-          if grep -q 'OK' "$RUNNER_TEMP/dialog2.xml" 2>/dev/null; then tap_text 'OK'; fi
-          sleep 2
-          dump_ui "$RUNNER_TEMP/verify-start.xml" || true
-          if grep -q '✅ تحقق من السرعة' "$RUNNER_TEMP/verify-start.xml" 2>/dev/null; then tap_text '✅ تحقق من السرعة'; fi
-          wait_for_result 'نتيجة التحقق' 'جاري التحقق من الخطة…' "$RUNNER_TEMP/verify.xml"
-          reveal_verify_metrics "$RUNNER_TEMP/verify.xml"
-          ! grep -q 'فشل القياس' "$RUNNER_TEMP/verify.xml"
-          grep -q '🌐 سرعة الإنترنت الأصلية' "$RUNNER_TEMP/verify.xml"
-          grep -q '🔒 السرعة المحجوزة / المحددة' "$RUNNER_TEMP/verify.xml"
-          grep -q '🚀 السرعة الفعلية داخل VPN' "$RUNNER_TEMP/verify.xml"
-          grep -Eq '✅ السرعة متطابقة|❌ السرعة غير متطابقة|⚠️ لا يمكن الحكم|✅ لا يظهر سقف واضح' "$RUNNER_TEMP/verify.xml"
-          cat "$RUNNER_TEMP/verify.xml" | tee -a verify-results.txt
 
+          verify_started=0
+          if tap_text "✅ تحقق من السرعة"; then
+            sleep 1
+            if tap_text "أوافق والمتابعة"; then
+              echo "Accepted SpeedVPN VPN disclosure."
+              sleep 2
+              if tap_text "OK"; then
+                echo "Accepted Android VPN confirmation."
+              elif tap_text "السماح"; then
+                echo "Accepted Android VPN permission."
+              elif tap_text "Allow"; then
+                echo "Accepted Android VPN permission."
+              else
+                echo "Android VPN confirmation dialog did not expose a known approval button."
+                dump_ui "${RUNNER_TEMP}/verify-permission-dialog.xml" || true
+                exit 1
+              fi
+              sleep 3
+              tap_text "✅ تحقق من السرعة"
+            fi
+            verify_started=1
+          fi
+
+          if [ "${verify_started}" -ne 1 ]; then
+            echo "Could not start Verify Speed from the Speed screen."
+            dump_ui "${RUNNER_TEMP}/verify-start-failed.xml" || true
+            exit 1
+          fi
+
+          wait_for_verify_result() {
+            local out="$1"
+            local loading_seen=0
+
+            echo "Waiting for Verify Speed loading state..."
+            for i in $(seq 1 20); do
+              dump_ui "${out}.loading.xml" || true
+              if grep -q "جاري التحقق من الخطة…" "${out}.loading.xml" 2>/dev/null; then
+                echo "Verify Speed loading state detected after ${i}s."
+                loading_seen=1
+                break
+              fi
+              if ! adb -s emulator-5554 get-state >/dev/null 2>&1; then
+                echo "ADB device disappeared while waiting for Verify Speed."
+                diagnostics
+                return 1
+              fi
+              sleep 1
+            done
+
+            if [ "${loading_seen}" -ne 1 ]; then
+              echo "Verify Speed loading state never appeared."
+              dump_ui "${out}.no-loading.xml" || true
+              adb -s emulator-5554 logcat -d -t 4000 > verify-speed-logcat.txt || true
+              return 1
+            fi
+
+            echo "Waiting for Verify Speed to finish..."
+            for i in $(seq 1 300); do
+              if dump_ui "${out}" 2>/dev/null; then
+                if grep -q "نتيجة التحقق" "${out}" 2>/dev/null &&
+                   ! grep -q "جاري التحقق من الخطة…" "${out}" 2>/dev/null; then
+                  echo "Verify Speed finished after ${i}s."
+                  return 0
+                fi
+              fi
+              if ! adb -s emulator-5554 get-state >/dev/null 2>&1; then
+                echo "ADB device disappeared during Verify Speed."
+                diagnostics
+                return 1
+              fi
+              sleep 1
+            done
+
+            echo "Verify Speed did not finish within 300 seconds."
+            adb -s emulator-5554 logcat -d -t 5000 > verify-speed-logcat.txt || true
+            return 1
+          }
+
+          validate_verify_result() {
+            local xml="$1"
+            python3 - "${xml}" <<'PY' | tee -a verify-results.txt
+          import re
+          import sys
+          import xml.etree.ElementTree as ET
+
+          path = sys.argv[1]
+          root = ET.parse(path).getroot()
+          texts = [
+              node.attrib.get("text", "").strip()
+              for node in root.iter("node")
+              if node.attrib.get("text", "").strip()
+          ]
+
+          if "نتيجة التحقق" not in texts:
+              raise SystemExit("VERIFY: missing result card")
+          if "جاري التحقق من الخطة…" in texts:
+              raise SystemExit("VERIFY: verification is still running")
+          if "فشل القياس" in texts:
+              raise SystemExit("VERIFY: one or more measurements failed")
+
+          rate_re = re.compile(r"^(?:\d+(?:\.\d+)?)[ ]?(?:bps|Kbps|Mbps|Gbps)$")
+          status_labels = {
+              "✅ السرعة متطابقة",
+              "❌ السرعة غير متطابقة",
+              "⚠️ لا يمكن الحكم",
+              "✅ لا يظهر سقف واضح",
+          }
+
+          for metric, next_metric in (("Download", "Upload"), ("Upload", None)):
+              try:
+                  start = texts.index(metric)
+              except ValueError:
+                  raise SystemExit(f"VERIFY: missing {metric} metric section")
+              end = texts.index(next_metric, start + 1) if next_metric and next_metric in texts[start + 1:] else len(texts)
+              section = texts[start:end]
+
+              if not any(status in section for status in status_labels):
+                  raise SystemExit(f"VERIFY: {metric} has no final verdict")
+
+              def value_after(label):
+                  try:
+                      idx = section.index(label)
+                  except ValueError:
+                      raise SystemExit(f"VERIFY: {metric} missing label {label}")
+                  for candidate in section[idx + 1:idx + 8]:
+                      if candidate in {
+                          "🌐 سرعة الإنترنت الأصلية",
+                          "🔒 السرعة المحجوزة / المحددة",
+                          "🚀 السرعة الفعلية داخل VPN",
+                          "الدقة مقارنة بالخيار",
+                      }:
+                          continue
+                      if candidate in status_labels:
+                          break
+                      if rate_re.fullmatch(candidate):
+                          return candidate
+                  raise SystemExit(f"VERIFY: {metric} missing numeric value after {label}")
+
+              baseline = value_after("🌐 سرعة الإنترنت الأصلية")
+              plan = value_after("🔒 السرعة المحجوزة / المحددة")
+              vpn = value_after("🚀 السرعة الفعلية داخل VPN")
+
+              if plan == "بدون حد":
+                  raise SystemExit(f"VERIFY: {metric} plan is unexpectedly unlimited")
+
+              print(f"VERIFY {metric}: baseline={baseline}, plan={plan}, vpn={vpn}")
+              print(f"VERIFY {metric}: verdict={next(status for status in status_labels if status in section)}")
+          PY
+          }
+
+          verify_result_xml="verify-speed-result.xml"
+          : > verify-results.txt
+          wait_for_verify_result "${verify_result_xml}"
+
+          # Try validation first, then reveal the result card through the small
+          # emulator viewport. The final XML remains in the workspace for CI.
+          for reveal in 0 1 2 3 4; do
+            if validate_verify_result "${verify_result_xml}" 2>/dev/null; then
+              break
+            fi
+            if [ "${reveal}" -eq 4 ]; then
+              echo "Could not expose complete Verify Speed metrics."
+              validate_verify_result "${verify_result_xml}"
+              exit 1
+            fi
+            adb -s emulator-5554 shell input swipe 160 500 160 220 600
+            sleep 1
+            dump_ui "${verify_result_xml}" || true
+          done
+
+          echo "===== VERIFY SPEED COMPLETE =====" | tee -a verify-results.txt
+          cat verify-results.txt
           adb -s emulator-5554 logcat -d -t 5000 > e2e-logcat.txt
           ! grep -Eiq 'FATAL EXCEPTION|AndroidRuntime.*FATAL' e2e-logcat.txt
           echo '===== ALL SPEEDVPN EMULATOR E2E TESTS PASSED ====='
