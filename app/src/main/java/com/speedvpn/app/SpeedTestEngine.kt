@@ -69,6 +69,8 @@ object SpeedTestEngine {
 
     suspend fun measure(
         context: Context,
+        expectedDownloadKbps: Long? = null,
+        expectedUploadKbps: Long? = null,
         onProgress: (SpeedTestPhase) -> Unit = {},
     ): SpeedTestResult =
         withContext(Dispatchers.IO) {
@@ -78,7 +80,7 @@ object SpeedTestEngine {
 
             val download = runCatching {
                 onProgress(SpeedTestPhase.DOWNLOAD)
-                measurePhase(testClient, isUpload = false)
+                measurePhase(testClient, isUpload = false, expectedKbps = expectedDownloadKbps)
             }.onFailure { error ->
                 firstError = errorMessage(error)
                 Log.w(TAG, "Download failed: ${errorMessage(error)}", error)
@@ -86,7 +88,7 @@ object SpeedTestEngine {
 
             val upload = runCatching {
                 onProgress(SpeedTestPhase.UPLOAD)
-                measurePhase(testClient, isUpload = true)
+                measurePhase(testClient, isUpload = true, expectedKbps = expectedUploadKbps)
             }.onFailure { error ->
                 firstError = firstError ?: errorMessage(error)
                 Log.w(TAG, "Upload failed: ${errorMessage(error)}", error)
@@ -106,14 +108,17 @@ object SpeedTestEngine {
     private suspend fun measurePhase(
         client: OkHttpClient,
         isUpload: Boolean,
+        expectedKbps: Long?,
     ): Long {
-        runCatching { warmup(client, isUpload) }
+        val requestSizes = requestSizesFor(expectedKbps)
+        val warmupBytes = warmupBytesFor(expectedKbps)
+        runCatching { warmup(client, isUpload, warmupBytes) }
             .onFailure { Log.i(TAG, "Warm-up failed for ${if (isUpload) "upload" else "download"}; continuing", it) }
 
         val samples = ArrayList<Long>()
         var lastFailure: Throwable? = null
 
-        for (sizeBytes in REQUEST_SIZES) {
+        for (sizeBytes in requestSizes) {
             var measured: Long? = null
 
             for (attempt in 1..MAX_RETRIES) {
@@ -158,22 +163,42 @@ object SpeedTestEngine {
         return percentile(samples, 0.90)
     }
 
+    private fun requestSizesFor(expectedKbps: Long?): LongArray =
+        when {
+            expectedKbps == null || expectedKbps <= 0L -> REQUEST_SIZES
+            expectedKbps <= 100L -> longArrayOf(16_000L, 32_000L, 64_000L, 128_000L)
+            expectedKbps <= 1_000L -> longArrayOf(32_000L, 64_000L, 128_000L, 256_000L, 512_000L)
+            expectedKbps <= 5_000L -> longArrayOf(64_000L, 128_000L, 256_000L, 512_000L, 1_000_000L)
+            expectedKbps <= 20_000L -> longArrayOf(128_000L, 256_000L, 512_000L, 1_000_000L, 2_000_000L)
+            expectedKbps <= 100_000L -> longArrayOf(256_000L, 512_000L, 1_000_000L, 2_000_000L, 5_000_000L)
+            else -> REQUEST_SIZES
+        }
+
+    private fun warmupBytesFor(expectedKbps: Long?): Long =
+        when {
+            expectedKbps == null || expectedKbps <= 0L -> WARMUP_BYTES
+            expectedKbps <= 100L -> 8_000L
+            expectedKbps <= 1_000L -> 16_000L
+            expectedKbps <= 5_000L -> 32_000L
+            else -> WARMUP_BYTES
+        }
+
     private fun requestDurationFor(sizeBytes: Long, bitsPerSecond: Long): Long {
         if (bitsPerSecond <= 0L) return 0L
         return (sizeBytes.toDouble() * 8_000.0 / bitsPerSecond.toDouble()).toLong()
     }
 
-    private fun warmup(client: OkHttpClient, isUpload: Boolean) {
+    private fun warmup(client: OkHttpClient, isUpload: Boolean, warmupBytes: Long) {
         if (isUpload) {
-            val body = FixedUploadBody(WARMUP_BYTES)
-            val request = buildUploadRequest(WARMUP_BYTES, body)
+            val body = FixedUploadBody(warmupBytes)
+            val request = buildUploadRequest(warmupBytes, body)
             client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
                     throw IOException("Upload warm-up HTTP ${response.code}")
                 }
             }
         } else {
-            val request = buildDownloadRequest(WARMUP_BYTES)
+            val request = buildDownloadRequest(warmupBytes)
             client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
                     throw IOException("Download warm-up HTTP ${response.code}")
@@ -182,11 +207,11 @@ object SpeedTestEngine {
                 body.byteStream().use { input ->
                     val buffer = ByteArray(CHUNK_BYTES)
                     var readTotal = 0L
-                    while (readTotal < WARMUP_BYTES) {
+                    while (readTotal < warmupBytes) {
                         val count = input.read(
                             buffer,
                             0,
-                            min(buffer.size.toLong(), WARMUP_BYTES - readTotal).toInt(),
+                            min(buffer.size.toLong(), warmupBytes - readTotal).toInt(),
                         )
                         if (count <= 0) break
                         readTotal += count
