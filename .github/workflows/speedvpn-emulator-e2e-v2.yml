@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: speedvpn-emulator-e2e-main
+  cancel-in-progress: true
+
 jobs:
   emulator-e2e:
     runs-on: ubuntu-latest
