@@ -313,6 +313,7 @@ sys.exit(2 if hard else 0)
 PY
 }
 
+TOTAL=19
 FAIL_COUNT=0
 ENV_LIMITED_COUNT=0
 PASS_COUNT=0
