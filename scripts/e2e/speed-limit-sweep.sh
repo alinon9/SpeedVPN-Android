@@ -141,24 +141,72 @@ print(min(ys) if mode=="top" else max(ys))
 PY
 }
 
+direction_title() {
+  case "$1" in
+    top) echo "سرعة التحميل" ;;
+    bottom) echo "سرعة الرفع" ;;
+    *) return 1 ;;
+  esac
+}
+
+coord_for_content_desc() {
+  local xml="$1"
+  local wanted="$2"
+  python3 - "$xml" "$wanted" <<'PY'
+import re, sys, xml.etree.ElementTree as ET
+path, wanted = sys.argv[1:]
+root = ET.parse(path).getroot()
+for node in root.iter("node"):
+    if node.attrib.get("content-desc") != wanted:
+        continue
+    m = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", node.attrib.get("bounds",""))
+    if m:
+        x1,y1,x2,y2 = map(int,m.groups())
+        print((x1+x2)//2, (y1+y2)//2)
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+preset_desc_row_y() {
+  local xml="$1"
+  local prefix="$2"
+  python3 - "$xml" "$prefix" <<'PY'
+import re, sys, xml.etree.ElementTree as ET
+path, prefix = sys.argv[1:]
+root = ET.parse(path).getroot()
+ys = []
+for node in root.iter("node"):
+    desc = node.attrib.get("content-desc","")
+    if not desc.startswith(prefix + ": "):
+        continue
+    m = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", node.attrib.get("bounds",""))
+    if m:
+        x1,y1,x2,y2 = map(int,m.groups())
+        ys.append((y1+y2)//2)
+if not ys:
+    raise SystemExit(1)
+print(max(ys))
+PY
+}
+
 tap_preset_row() {
   local wanted="$1"
   local mode="$2"
   local xml="$RUN_DIR/current-ui.xml"
-  local group_title=""
-  group_title="$(preset_group_title "$wanted" 2>/dev/null || true)"
+  local card_title=""
+  card_title="$(direction_title "$mode")" || return 1
+  local unique_desc="$card_title: $wanted"
 
-  # Bring the requested speed group into the viewport before horizontal scrolling.
-  if [ -n "$group_title" ]; then
-    tap_text "$group_title" "$mode" || true
-    sleep 1
-  fi
+  # First reveal the correct Download/Upload card using its actual UI title.
+  tap_text "$card_title" "$mode" || true
+  sleep 1
 
-  for attempt in $(seq 1 12); do
+  for attempt in $(seq 1 16); do
     dump_ui "$xml" || true
 
     local c=""
-    c="$(coord_for_text "$xml" "$wanted" "$mode" 2>/dev/null || true)"
+    c="$(coord_for_content_desc "$xml" "$unique_desc" 2>/dev/null || true)"
     if [ -n "$c" ]; then
       read -r x y <<< "$c"
       adb -s "$DEVICE" shell input tap "$x" "$y"
@@ -167,18 +215,17 @@ tap_preset_row() {
     fi
 
     local y=""
-    y="$(preset_swipe_y "$xml" "$mode" "$group_title" 2>/dev/null || true)"
+    y="$(preset_desc_row_y "$xml" "$card_title" 2>/dev/null || true)"
     if [ -n "$y" ]; then
+      # Horizontal scrolling is restricted to the exact card/row.
       adb -s "$DEVICE" shell input swipe 300 "$y" 60 "$y" 750
-    elif [ "$mode" = "bottom" ]; then
-      adb -s "$DEVICE" shell input swipe 160 570 160 200 800
     else
-      adb -s "$DEVICE" shell input swipe 160 210 160 580 800
+      adb -s "$DEVICE" shell input swipe 160 570 160 190 850
     fi
     sleep 1
   done
 
-  echo "UI_ERROR: cannot select '$wanted' in $mode row."
+  echo "UI_ERROR: cannot select '$wanted' using '$unique_desc'."
   return 1
 }
 
