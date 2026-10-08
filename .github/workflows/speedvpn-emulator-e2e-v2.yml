@@ -251,23 +251,39 @@ jobs:
           PY
           done
 
-          echo '===== VERIFY SPEED =====' | tee verify-results.txt
-          # Use the same hardened Verify flow as the successful Build #270
-          # emulator smoke test. Configure the real persistent limiter state,
-          # explicitly complete both VPN consent dialogs, and require the
-          # loading state before accepting the final result.
+          echo '===== VERIFY SPEED: REAL UI PLAN SELECTION =====' | tee verify-results.txt
+          # This test intentionally uses the real UI controls instead of injecting
+          # SharedPreferences, so it validates the user-facing selection flow.
           adb -s emulator-5554 shell am force-stop com.speedvpn.app
-          cat > "${RUNNER_TEMP}/local_limits.xml" <<'EOF'
-          <?xml version='1.0' encoding='utf-8' standalone='yes' ?><map><long name="dl" value="800" /><long name="ul" value="800" /></map>
-          EOF
-          adb -s emulator-5554 push "${RUNNER_TEMP}/local_limits.xml" /data/local/tmp/speedvpn-local-limits.xml
-          adb -s emulator-5554 shell "run-as com.speedvpn.app sh -c 'cat /data/local/tmp/speedvpn-local-limits.xml > shared_prefs/local_limits.xml'"
-          adb -s emulator-5554 shell run-as com.speedvpn.app cat shared_prefs/local_limits.xml
-
           adb -s emulator-5554 shell am start -n com.speedvpn.app/.MainActivity
           sleep 4
           tap_text "السرعة"
           sleep 2
+
+          tap_text "100 KB"
+          sleep 1
+
+          # Move to the second limiter card and select the same 100 KB/s preset
+          # for upload. A fresh vertical swipe prevents tapping the first card twice.
+          adb -s emulator-5554 shell input swipe 160 520 160 250 700
+          sleep 1
+          tap_text "100 KB"
+          sleep 1
+
+          # Capture the UI after the real selection so the artifact proves the
+          # selected plan was applied through the same controls a user sees.
+          dump_ui "${RUNNER_TEMP}/verify-plan-selected.xml" || true
+          python3 - "${RUNNER_TEMP}/verify-plan-selected.xml" <<'PY' | tee -a verify-results.txt
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse(sys.argv[1]).getroot()
+          texts = [n.attrib.get("text","").strip() for n in root.iter("node") if n.attrib.get("text","").strip()]
+          count = texts.count("100.0 KB/s")
+          print(f"UI selected-plan visible values: {count}")
+          if "100.0 KB/s" not in texts:
+              raise SystemExit("VERIFY PLAN: selected 100 KB/s value was not reflected in the UI")
+          PY
 
           verify_started=0
           if tap_text "✅ تحقق من السرعة"; then
@@ -356,66 +372,71 @@ jobs:
 
           path = sys.argv[1]
           root = ET.parse(path).getroot()
-          texts = [
-              node.attrib.get("text", "").strip()
-              for node in root.iter("node")
-              if node.attrib.get("text", "").strip()
-          ]
+          texts = [n.attrib.get("text","").strip() for n in root.iter("node") if n.attrib.get("text","").strip()]
 
           if "نتيجة التحقق" not in texts:
               raise SystemExit("VERIFY: missing result card")
           if "جاري التحقق من الخطة…" in texts:
               raise SystemExit("VERIFY: verification is still running")
-          if "فشل القياس" in texts:
-              raise SystemExit("VERIFY: one or more measurements failed")
 
           rate_re = re.compile(r"^(?:\d+(?:\.\d+)?)[ ]?(?:bps|Kbps|Mbps|Gbps)$")
-          status_labels = {
+          statuses = {
               "✅ السرعة متطابقة",
               "❌ السرعة غير متطابقة",
               "⚠️ لا يمكن الحكم",
               "✅ لا يظهر سقف واضح",
           }
 
-          for metric, next_metric in (("Download", "Upload"), ("Upload", None)):
+          def metric_section(metric, next_metric):
               try:
                   start = texts.index(metric)
               except ValueError:
                   raise SystemExit(f"VERIFY: missing {metric} metric section")
               end = texts.index(next_metric, start + 1) if next_metric and next_metric in texts[start + 1:] else len(texts)
-              section = texts[start:end]
+              return texts[start:end]
 
-              if not any(status in section for status in status_labels):
+          def value_after(section, metric, label):
+              try:
+                  idx = section.index(label)
+              except ValueError:
+                  raise SystemExit(f"VERIFY: {metric} missing label {label}")
+              for candidate in section[idx + 1:idx + 10]:
+                  if candidate in statuses:
+                      break
+                  if rate_re.fullmatch(candidate):
+                      return candidate
+              raise SystemExit(f"VERIFY: {metric} missing numeric value after {label}")
+
+          results = []
+          for metric, next_metric in (("Download","Upload"),("Upload",None)):
+              section = metric_section(metric, next_metric)
+              status = next((s for s in statuses if s in section), None)
+              if not status:
                   raise SystemExit(f"VERIFY: {metric} has no final verdict")
 
-              def value_after(label):
-                  try:
-                      idx = section.index(label)
-                  except ValueError:
-                      raise SystemExit(f"VERIFY: {metric} missing label {label}")
-                  for candidate in section[idx + 1:idx + 8]:
-                      if candidate in {
-                          "🌐 سرعة الإنترنت الأصلية",
-                          "🔒 السرعة المحجوزة / المحددة",
-                          "🚀 السرعة الفعلية داخل VPN",
-                          "الدقة مقارنة بالخيار",
-                      }:
-                          continue
-                      if candidate in status_labels:
-                          break
-                      if rate_re.fullmatch(candidate):
-                          return candidate
-                  raise SystemExit(f"VERIFY: {metric} missing numeric value after {label}")
+              baseline = value_after(section, metric, "🌐 سرعة الإنترنت الأصلية")
+              plan = value_after(section, metric, "🔒 السرعة المحجوزة / المحددة")
+              vpn = value_after(section, metric, "🚀 السرعة الفعلية داخل VPN")
 
-              baseline = value_after("🌐 سرعة الإنترنت الأصلية")
-              plan = value_after("🔒 السرعة المحجوزة / المحددة")
-              vpn = value_after("🚀 السرعة الفعلية داخل VPN")
-
-              if plan == "بدون حد":
-                  raise SystemExit(f"VERIFY: {metric} plan is unexpectedly unlimited")
-
+              reasons = []
+              for idx, candidate in enumerate(section):
+                  if candidate.startswith("ملاحظة:"):
+                      reasons.append(candidate)
               print(f"VERIFY {metric}: baseline={baseline}, plan={plan}, vpn={vpn}")
-              print(f"VERIFY {metric}: verdict={next(status for status in status_labels if status in section)}")
+              print(f"VERIFY {metric}: verdict={status}")
+              if reasons:
+                  for reason in reasons:
+                      print(f"VERIFY {metric}: reason={reason}")
+
+              if plan not in {"100.0 KB/s", "100 KB/s"}:
+                  raise SystemExit(f"VERIFY {metric}: selected plan is not 100 KB/s: {plan}")
+
+              results.append(status)
+
+          # Treat mismatch/not-verifiable as a diagnostic outcome: print the
+          # reason and fail the CI assertion so the problem is investigated.
+          if any(status in {"❌ السرعة غير متطابقة","⚠️ لا يمكن الحكم"} for status in results):
+              raise SystemExit("VERIFY: selected 100 KB/s plan was not successfully verified; inspect verify-results.txt and logcat.")
           PY
           }
 
@@ -423,13 +444,12 @@ jobs:
           : > verify-results.txt
           wait_for_verify_result "${verify_result_xml}"
 
-          # Try validation first, then reveal the result card through the small
-          # emulator viewport. The final XML remains in the workspace for CI.
-          for reveal in 0 1 2 3 4; do
+          # Reveal additional result rows if the card is below the viewport.
+          for reveal in 0 1 2 3 4 5; do
             if validate_verify_result "${verify_result_xml}" 2>/dev/null; then
               break
             fi
-            if [ "${reveal}" -eq 4 ]; then
+            if [ "${reveal}" -eq 5 ]; then
               echo "Could not expose complete Verify Speed metrics."
               validate_verify_result "${verify_result_xml}"
               exit 1
