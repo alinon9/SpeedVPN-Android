@@ -215,11 +215,13 @@ for n in root.iter("node"):
 if not titles or not buttons:
     raise SystemExit(1)
 ty=min(titles,key=lambda b:abs(b[4]-500))[4]
-near=[b for b in buttons if abs(b[4]-ty)<=55]
+near=[b for b in buttons if abs(b[4]-ty)<=90]
 if not near:
     raise SystemExit(1)
-# Prefer the button nearest the title row; x is irrelevant because the
-# horizontal row may be scrolled.
+# The rendered card layout places the preset row below the title; allow
+# enough vertical tolerance for density/font/layout differences. The
+# direction title still prevents matching the duplicate speed label in the
+# other card.
 b=min(near,key=lambda b:abs(b[4]-ty))
 print(b[5],b[4])
 PY
