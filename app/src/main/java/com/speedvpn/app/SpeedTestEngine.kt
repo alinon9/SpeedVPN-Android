@@ -49,12 +49,12 @@ object SpeedTestEngine {
      * sampled throughput, invalid-sample filtering, and P90 aggregation.
      */
     private const val ROUND_COUNT = 3
-    private const val WORKER_COUNT = 4
+    private const val WORKER_COUNT = 1
     private const val PHASE_DURATION_MS = 4_000L
     private const val SAMPLE_INTERVAL_MS = 250L
     private const val MIN_SAMPLE_DURATION_MS = 150L
-    private const val MIN_SAMPLE_BYTES = 32L * 1024L
-    private const val MIN_VALID_SAMPLES = 3
+    private const val MIN_SAMPLE_BYTES = 16L * 1024L
+    private const val MIN_VALID_SAMPLES = 2
     private const val MIN_VALID_ROUNDS = 2
 
     private const val WARMUP_BYTES = 100_000L
