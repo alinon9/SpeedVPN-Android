@@ -190,6 +190,41 @@ print(max(ys))
 PY
 }
 
+coord_for_text_near_title() {
+  local xml="$1"
+  local title="$2"
+  local wanted="$3"
+  python3 - "$xml" "$title" "$wanted" <<'PY'
+import re, sys, xml.etree.ElementTree as ET
+path,title,wanted=sys.argv[1:]
+root=ET.parse(path).getroot()
+def bounds(node):
+    m=re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]",node.attrib.get("bounds",""))
+    if not m: return None
+    x1,y1,x2,y2=map(int,m.groups())
+    return (x1,y1,x2,y2,(y1+y2)//2,(x1+x2)//2)
+titles=[]
+buttons=[]
+for n in root.iter("node"):
+    b=bounds(n)
+    if not b: continue
+    if n.attrib.get("text")==title:
+        titles.append(b)
+    if n.attrib.get("text")==wanted:
+        buttons.append(b)
+if not titles or not buttons:
+    raise SystemExit(1)
+ty=min(titles,key=lambda b:abs(b[4]-500))[4]
+near=[b for b in buttons if abs(b[4]-ty)<=55]
+if not near:
+    raise SystemExit(1)
+# Prefer the button nearest the title row; x is irrelevant because the
+# horizontal row may be scrolled.
+b=min(near,key=lambda b:abs(b[4]-ty))
+print(b[5],b[4])
+PY
+}
+
 tap_preset_row() {
   local wanted="$1"
   local mode="$2"
@@ -206,7 +241,7 @@ tap_preset_row() {
     dump_ui "$xml" || true
 
     local c=""
-    c="$(coord_for_content_desc "$xml" "$unique_desc" 2>/dev/null || true)"
+    c="$(coord_for_text_near_title "$xml" "$card_title" "$wanted" 2>/dev/null || true)"
     if [ -n "$c" ]; then
       read -r x y <<< "$c"
       adb -s "$DEVICE" shell input tap "$x" "$y"
