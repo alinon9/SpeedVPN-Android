@@ -355,10 +355,17 @@ def rate(v):
     m=rate_re.fullmatch(v)
     return None if not m else float(m.group(1))*mult[m.group(2)]
 
-def section(metric,next_metric):
-    s=texts.index(metric)
-    e=texts.index(next_metric,s+1) if next_metric and next_metric in texts[s+1:] else len(texts)
-    return texts[s:e]
+def metric_sections():
+    # The Android viewport can clip the "Download" heading while leaving all
+    # metric rows visible. Split by the repeated original-network label instead
+    # of requiring section headings to be present in the UIAutomator snapshot.
+    anchors=[i for i,value in enumerate(texts) if value=="🌐 سرعة الإنترنت الأصلية"]
+    if len(anchors) < 2:
+        raise RuntimeError(f"Expected two verification metric groups; found {len(anchors)}")
+    return [
+        ("Download", texts[anchors[0]:anchors[1]]),
+        ("Upload", texts[anchors[1]:]),
+    ]
 
 def value_near(sec,label):
     i=sec.index(label)
@@ -377,8 +384,7 @@ def value_near(sec,label):
 rows=[]
 hard=False
 
-for metric,next_metric in (("Download","Upload"),("Upload",None)):
-    sec=section(metric,next_metric)
+for metric,sec in metric_sections():
     status=next((s for s in status_map if s in sec),None)
     if not status:
         raise RuntimeError(f"{metric}: verdict missing")
@@ -622,10 +628,16 @@ while IFS='|' read -r index preset expected; do
   metrics_visible=0
   for reveal in 0 1 2 3 4 5 6 7 8 9; do
     dump_ui "$result_xml" || true
-    if grep -q "نتيجة التحقق" "$result_xml" 2>/dev/null &&
-       grep -q "🚀 السرعة الفعلية داخل VPN" "$result_xml" 2>/dev/null; then
+    baseline_rows="$(grep -cF "🌐 سرعة الإنترنت الأصلية" "$result_xml" 2>/dev/null || true)"
+    plan_rows="$(grep -cF "🔒 السرعة المحجوزة / المحددة" "$result_xml" 2>/dev/null || true)"
+    vpn_rows="$(grep -cF "🚀 السرعة الفعلية داخل VPN" "$result_xml" 2>/dev/null || true)"
+    # The result card title/Download heading may be just above the viewport,
+    # while both Download and Upload metric groups are already fully visible.
+    if [ "${baseline_rows:-0}" -ge 2 ] &&
+       [ "${plan_rows:-0}" -ge 2 ] &&
+       [ "${vpn_rows:-0}" -ge 2 ]; then
       metrics_visible=1
-      echo "Verify result metrics visible for $preset after scroll $reveal." | tee -a "$RUN_DIR/sweep-console.log"
+      echo "Both Verify metric groups visible for $preset after scroll $reveal." | tee -a "$RUN_DIR/sweep-console.log"
       break
     fi
     if [ "$reveal" -lt 9 ]; then
