@@ -256,7 +256,7 @@ jobs:
           adb start-server
 
           echo "Starting emulator..."
-          nohup emulator -avd speedvpn-ci -no-window -no-audio -no-boot-anim -no-snapshot -no-snapshot-save -no-metrics -gpu swiftshader_indirect -accel on -cores 2 -memory 1536 -partition-size 2048 > emulator-console.log 2>&1 &
+          nohup emulator -avd speedvpn-ci -no-window -no-audio -no-boot-anim -no-snapshot -no-snapshot-save -no-metrics -gpu swiftshader_indirect -accel on -cores 2 -memory 1536 -partition-size 2048 -netdelay none -netspeed full -dns-server 8.8.8.8,1.1.1.1 > emulator-console.log 2>&1 &
           EMULATOR_PID=$!
 
           diagnostics() {
