@@ -100,6 +100,19 @@ tap_text() {
   return 1
 }
 
+preset_group_title() {
+  case "$1" in
+    "10 KB"|"25 KB"|"50 KB"|"75 KB"|"100 KB"|"130 KB"|"250 KB"|"500 KB"|"750 KB"|"950 KB")
+      echo "منخفض" ;;
+    "1 MB"|"2 MB"|"3 MB"|"4 MB"|"5 MB")
+      echo "متوسط" ;;
+    "9 MB"|"10 MB"|"11 MB")
+      echo "مرتفع" ;;
+    *)
+      return 1 ;;
+  esac
+}
+
 preset_swipe_y() {
   local xml="$1"
   local mode="$2"
@@ -129,6 +142,14 @@ tap_preset_row() {
   local wanted="$1"
   local mode="$2"
   local xml="$RUN_DIR/current-ui.xml"
+  local group_title=""
+  group_title="$(preset_group_title "$wanted" 2>/dev/null || true)"
+
+  # Bring the requested speed group into the viewport before horizontal scrolling.
+  if [ -n "$group_title" ]; then
+    tap_text "$group_title" "$mode" || true
+    sleep 1
+  fi
 
   for attempt in $(seq 1 12); do
     dump_ui "$xml" || true
