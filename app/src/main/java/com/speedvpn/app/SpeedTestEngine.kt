@@ -166,7 +166,10 @@ object SpeedTestEngine {
     private fun requestSizesFor(expectedKbps: Long?): LongArray =
         when {
             expectedKbps == null || expectedKbps <= 0L -> REQUEST_SIZES
-            expectedKbps <= 100L -> longArrayOf(16_000L, 32_000L, 64_000L, 128_000L)
+            // Tiny requests can fit in one or two 16 KiB relay reads, measuring the
+            // initial burst rather than sustained throughput. Use larger samples
+            // while staying under the 30s HTTP call timeout at 80 Kbps (10 KB/s).
+            expectedKbps <= 100L -> longArrayOf(128_000L, 192_000L, 256_000L)
             expectedKbps <= 1_000L -> longArrayOf(32_000L, 64_000L, 128_000L, 256_000L, 512_000L)
             expectedKbps <= 5_000L -> longArrayOf(64_000L, 128_000L, 256_000L, 512_000L, 1_000_000L)
             expectedKbps <= 20_000L -> longArrayOf(128_000L, 256_000L, 512_000L, 1_000_000L, 2_000_000L)
@@ -316,17 +319,12 @@ object SpeedTestEngine {
         val dns = object : Dns {
             override fun lookup(hostname: String): List<java.net.InetAddress> {
                 if (physicalNetwork == null) {
-                    return runCatching {
+                    return lookupWithRetry(hostname, "DNS") {
                         java.net.InetAddress.getAllByName(hostname).toList()
-                    }.getOrElse { error ->
-                        throw IOException("DNS resolution failed for $hostname: ${errorMessage(error)}", error)
                     }
                 }
-
-                return runCatching {
+                return lookupWithRetry(hostname, "Physical DNS") {
                     physicalNetwork.getAllByName(hostname).toList()
-                }.getOrElse { error ->
-                    throw IOException("Physical DNS resolution failed for $hostname: ${errorMessage(error)}", error)
                 }
             }
         }
@@ -334,6 +332,37 @@ object SpeedTestEngine {
         return client.newBuilder()
             .dns(dns)
             .build()
+    }
+
+    /**
+     * Retry transient Android physical-network DNS failures. Do not silently
+     * switch to VPN-routed DNS, which can return synthetic MapDNS addresses.
+     */
+    private fun lookupWithRetry(
+        hostname: String,
+        resolverName: String,
+        lookup: () -> List<java.net.InetAddress>,
+    ): List<java.net.InetAddress> {
+        var lastError: Exception? = null
+        for (attempt in 1..3) {
+            try {
+                val addresses = lookup()
+                if (addresses.isNotEmpty()) return addresses
+                lastError = IOException("$resolverName returned no addresses for $hostname")
+            } catch (error: Exception) {
+                lastError = error
+            }
+            if (attempt < 3) {
+                try {
+                    Thread.sleep(200L * attempt)
+                } catch (interrupted: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    throw IOException("$resolverName lookup interrupted for $hostname", interrupted)
+                }
+            }
+        }
+        val prefix = if (resolverName == "Physical DNS") "Physical DNS resolution failed" else "DNS resolution failed"
+        throw IOException("$prefix for $hostname after 3 attempts: ${errorMessage(lastError ?: IOException("unknown DNS error"))}", lastError)
     }
 
     private fun findPhysicalNetwork(connectivity: ConnectivityManager): Network? =
