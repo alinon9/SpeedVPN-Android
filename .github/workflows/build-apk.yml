@@ -623,31 +623,21 @@ jobs:
 
           echo "Starting Verify Speed end-to-end test..."
 
-          # Use a finite, low plan so the policy has a real target to evaluate.
-          # The first 100 KB preset belongs to Download; occurrence 2 belongs
-          # to Upload after the page is scrolled far enough to expose it.
+          # Configure the finite CI plan through the app's real persistent store.
+          # This avoids relying on a horizontally-scrolled Compose preset button.
+          # 100 KB/s == 800 Kbps for both directions.
           adb -s emulator-5554 shell am force-stop com.speedvpn.app
+          adb -s emulator-5554 shell 'run-as com.speedvpn.app sh -c "mkdir -p shared_prefs; printf %s \\"<?xml version=\\\"1.0\\\" encoding=\\\"utf-8\\\" standalone=\\\"yes\\\" ?><map><long name=\\\"dl\\\" value=\\\"800\\\" /><long name=\\\"ul\\\" value=\\\"800\\\" /></map>\\" > shared_prefs/local_limits.xml"'
+          adb -s emulator-5554 shell run-as com.speedvpn.app cat shared_prefs/local_limits.xml
+
           adb -s emulator-5554 shell am start -n com.speedvpn.app/.MainActivity
           sleep 4
 
           tap_text "السرعة"
           sleep 2
 
-          # Set Download from the first visible 100 KB preset.
-          tap_text "100 KB"
-          sleep 1
-
-          # Move to the Upload card so its 100 KB preset is the visible
-          # matching element; do not rely on two identical labels being
-          # visible at once on the 320x640 CI emulator.
-          adb -s emulator-5554 shell input swipe 160 500 160 220 600
-          sleep 1
-          adb -s emulator-5554 shell input swipe 160 500 160 220 600
-          sleep 1
-          tap_text "100 KB"
-          sleep 2
-
           verify_started=0
+
 
           # First tap may show the app's VPN disclosure and then Android's
           # system VPN confirmation. Complete both only when they appear.
