@@ -59,7 +59,7 @@ path, wanted, mode = sys.argv[1:]
 root = ET.parse(path).getroot()
 matches = []
 for node in root.iter("node"):
-    if node.attrib.get("text") not in labels:
+    if node.attrib.get("text") != wanted:
         continue
     m = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", node.attrib.get("bounds",""))
     if not m:
