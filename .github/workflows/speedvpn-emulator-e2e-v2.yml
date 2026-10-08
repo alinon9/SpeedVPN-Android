@@ -152,9 +152,22 @@ jobs:
             local out="$3"
             for i in $(seq 1 300); do
               dump_ui "$out" || true
-              if grep -q "$title" "$out" 2>/dev/null && ! grep -q "$loading" "$out" 2>/dev/null; then return 0; fi
+              if grep -q "$title" "$out" 2>/dev/null && ! grep -q "$loading" "$out" 2>/dev/null; then
+                return 0
+              fi
+
+              # Async Compose content can move the completed card below the
+              # small CI viewport. Periodically scroll while waiting so the
+              # title/result can become observable instead of timing out.
+              if [ "$((i % 5))" -eq 0 ]; then
+                adb -s emulator-5554 shell input swipe 160 500 160 220 600 || true
+              fi
               sleep 1
             done
+
+            echo "Timed out waiting for $title."
+            dump_ui "$out" || true
+            adb -s emulator-5554 logcat -d -t 2500 > result-timeout-logcat.txt || true
             return 1
           }
 
