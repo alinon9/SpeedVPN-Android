@@ -51,10 +51,10 @@ object SpeedTestEngine {
     private const val ROUND_COUNT = 3
     private const val WORKER_COUNT = 4
     private const val PHASE_DURATION_MS = 4_000L
-    private const val SAMPLE_INTERVAL_MS = 500L
-    private const val MIN_SAMPLE_DURATION_MS = 250L
-    private const val MIN_SAMPLE_BYTES = 64L * 1024L
-    private const val MIN_VALID_SAMPLES = 4
+    private const val SAMPLE_INTERVAL_MS = 250L
+    private const val MIN_SAMPLE_DURATION_MS = 150L
+    private const val MIN_SAMPLE_BYTES = 32L * 1024L
+    private const val MIN_VALID_SAMPLES = 3
     private const val MIN_VALID_ROUNDS = 2
 
     private const val WARMUP_BYTES = 100_000L
@@ -128,9 +128,10 @@ object SpeedTestEngine {
 
             if (phaseSamples != null) {
                 validRounds++
-                // Ignore the first measurement window of each round so a newly
-                // opened/reused TCP connection cannot dominate the result.
-                allSamples += phaseSamples.drop(1)
+                // The warm-up request already primes the connection. Keep the
+                // first measured window so fast uploads cannot be left with too few
+                // samples after a short-lived request completes.
+                allSamples += phaseSamples
             }
         }
 
