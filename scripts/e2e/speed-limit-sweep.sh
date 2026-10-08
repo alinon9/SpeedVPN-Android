@@ -539,7 +539,30 @@ while IFS='|' read -r index preset expected; do
       cleanup_vpn || true
       continue
     fi
-    sleep 3
+
+    # VpnService.prepare() launches an external Android permission activity.
+    # Returning from it only updates MainActivity.permissionGranted; it does
+    # not automatically execute the Verify button's action a second time.
+    # Give the ActivityResult callback time to update Compose, then explicitly
+    # press Verify again so the actual verification coroutine starts.
+    verify_restarted=0
+    for retry in 1 2 3 4 5; do
+      sleep 1
+      if tap_text "✅ تحقق من السرعة"; then
+        echo "Re-started Verify Speed after VPN permission (attempt $retry)."
+        verify_restarted=1
+        break
+      fi
+    done
+    if [ "$verify_restarted" -ne 1 ]; then
+      echo "FAIL $preset: Verify button was not available after VPN permission."
+      FAIL_COUNT=$((FAIL_COUNT+1))
+      echo "$index,$preset,$expected,Verify,,,,,Verify restart after VPN permission failed,FAIL" >> "$RUN_DIR/speed-limit-sweep-results.csv"
+      adb -s "$DEVICE" logcat -d -t 3500 > "$RUN_DIR/$slug-logcat.txt" || true
+      cleanup_vpn || true
+      continue
+    fi
+    sleep 1
   fi
 
   loading=0
