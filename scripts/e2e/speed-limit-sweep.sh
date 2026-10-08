@@ -141,6 +141,39 @@ print(min(ys) if mode=="top" else max(ys))
 PY
 }
 
+preset_swipe_y_near_card() {
+  local xml="$1"
+  local title="$2"
+  local group_title="$3"
+  python3 - "$xml" "$title" "$group_title" <<'PY'
+import re, sys, xml.etree.ElementTree as ET
+path,title,group=sys.argv[1:]
+groups = {
+    "منخفض": {"10 KB","25 KB","50 KB","75 KB","100 KB","130 KB","250 KB","500 KB","750 KB","950 KB"},
+    "متوسط": {"1 MB","2 MB","3 MB","4 MB","5 MB"},
+    "مرتفع": {"9 MB","10 MB","11 MB"},
+}
+labels=groups.get(group,set())
+root=ET.parse(path).getroot()
+def center(node):
+    m=re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]",node.attrib.get("bounds",""))
+    if not m: return None
+    x1,y1,x2,y2=map(int,m.groups())
+    return (x1,y1,x2,y2,(y1+y2)//2,(x1+x2)//2)
+titles=[center(n) for n in root.iter("node") if n.attrib.get("text")==title]
+buttons=[center(n) for n in root.iter("node") if n.attrib.get("text") in labels]
+titles=[b for b in titles if b]
+buttons=[b for b in buttons if b]
+if not titles or not buttons:
+    raise SystemExit(1)
+ty=min(titles,key=lambda b:abs(b[4]-500))[4]
+near=[b for b in buttons if abs(b[4]-ty)<=100]
+if not near:
+    raise SystemExit(1)
+print(min(b[4] for b in near))
+PY
+}
+
 direction_title() {
   case "$1" in
     top) echo "سرعة التحميل" ;;
@@ -252,14 +285,18 @@ tap_preset_row() {
     fi
 
     local y=""
-    # content-desc is not exposed by the Android UI dump for these Compose
-    # buttons, so derive the visible preset-row Y directly from the labels in
-    # the same speed group and scroll that horizontal row.
-    y="$(preset_swipe_y "$xml" "$mode" "$(preset_group_title "$wanted")" 2>/dev/null || true)"
+    local group_title=""
+    group_title="$(preset_group_title "$wanted" 2>/dev/null || true)"
+    # If at least one preset from this speed group is currently visible near
+    # the correct card, the row is in view and needs horizontal scrolling.
+    y="$(preset_swipe_y_near_card "$xml" "$card_title" "$group_title" 2>/dev/null || true)"
     if [ -n "$y" ]; then
       adb -s "$DEVICE" shell input swipe 300 "$y" 60 "$y" 750
     else
-      adb -s "$DEVICE" shell input swipe 160 570 160 190 850
+      # The Upload card can be visible while its preset row is still below
+      # the ScrollView viewport. Start the gesture inside the ScrollView
+      # (not on the bottom navigation) to reveal the row.
+      adb -s "$DEVICE" shell input swipe 160 500 160 300 700
     fi
     sleep 1
   done
