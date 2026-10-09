@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import contextlib
-import io
 import json
 import re
 import threading
@@ -55,12 +53,11 @@ class LocalSpeedTestServerTests(unittest.TestCase):
 
     def test_download_logs_actual_transfer_timing(self) -> None:
         expected = 64_321
-        output = io.StringIO()
-        with contextlib.redirect_stdout(output):
-            with urlopen(f"{self.base_url}/__down?bytes={expected}&cacheBust=timing", timeout=2) as response:
-                self.assertEqual(expected, len(response.read()))
+        with urlopen(f"{self.base_url}/__down?bytes={expected}&cacheBust=timing", timeout=2) as response:
+            self.assertEqual(expected, len(response.read()))
+        self.assertTrue(self.server.wait_for_transfer_event())
         self.assertRegex(
-            output.getvalue(),
+            "\n".join(self.server.transfer_events),
             re.compile(
                 rf"TRANSFER method=GET path=/__down requested_bytes={expected} "
                 rf"sent_bytes={expected} elapsed_ms=\d+\.\d{{3}} outcome=complete"
@@ -75,13 +72,12 @@ class LocalSpeedTestServerTests(unittest.TestCase):
             method="POST",
             headers={"Content-Type": "application/octet-stream"},
         )
-        output = io.StringIO()
-        with contextlib.redirect_stdout(output):
-            with urlopen(request, timeout=2) as response:
-                self.assertEqual(200, response.status)
-                self.assertEqual(b"", response.read())
+        with urlopen(request, timeout=2) as response:
+            self.assertEqual(200, response.status)
+            self.assertEqual(b"", response.read())
+        self.assertTrue(self.server.wait_for_transfer_event())
         self.assertRegex(
-            output.getvalue(),
+            "\n".join(self.server.transfer_events),
             re.compile(
                 rf"TRANSFER method=POST path=/__up requested_bytes={len(payload)} "
                 rf"received_bytes={len(payload)} elapsed_ms=\d+\.\d{{3}} outcome=complete"

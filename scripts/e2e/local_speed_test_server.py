@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
@@ -20,6 +21,12 @@ class SpeedTestRequestHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "SpeedVPN-CI-SpeedTest/1.0"
     sys_version = ""
+
+    def _record_transfer_event(self, event: str) -> None:
+        print(event, flush=True)
+        recorder = getattr(self.server, "record_transfer_event", None)
+        if callable(recorder):
+            recorder(event)
 
     def _send_body(self, status: int, body: bytes, content_type: str = "text/plain") -> None:
         self.send_response(status)
@@ -83,10 +90,9 @@ class SpeedTestRequestHandler(BaseHTTPRequestHandler):
         finally:
             elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000
             outcome = "complete" if completed else "aborted"
-            print(
+            self._record_transfer_event(
                 f"TRANSFER method=GET path=/__down requested_bytes={size} "
-                f"sent_bytes={sent} elapsed_ms={elapsed_ms:.3f} outcome={outcome}",
-                flush=True,
+                f"sent_bytes={sent} elapsed_ms={elapsed_ms:.3f} outcome={outcome}"
             )
     def do_POST(self) -> None:
         if urlsplit(self.path).path != "/__up":
@@ -130,10 +136,9 @@ class SpeedTestRequestHandler(BaseHTTPRequestHandler):
         finally:
             elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000
             outcome = "complete" if completed else "aborted"
-            print(
+            self._record_transfer_event(
                 f"TRANSFER method=POST path=/__up requested_bytes={size} "
-                f"received_bytes={received} elapsed_ms={elapsed_ms:.3f} outcome={outcome}",
-                flush=True,
+                f"received_bytes={received} elapsed_ms={elapsed_ms:.3f} outcome={outcome}"
             )
     def log_message(self, format_string: str, *args: object) -> None:
         # Request counts are high during the sweep; keep the artifact log concise.
@@ -145,6 +150,20 @@ class SpeedTestRequestHandler(BaseHTTPRequestHandler):
 class ReusableThreadingHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
+
+    def __init__(self, server_address: tuple[str, int], handler_class: type[BaseHTTPRequestHandler]) -> None:
+        super().__init__(server_address, handler_class)
+        self.transfer_events: list[str] = []
+        self._transfer_events_lock = threading.Lock()
+        self._transfer_event_added = threading.Event()
+
+    def record_transfer_event(self, event: str) -> None:
+        with self._transfer_events_lock:
+            self.transfer_events.append(event)
+        self._transfer_event_added.set()
+
+    def wait_for_transfer_event(self, timeout: float = 1.0) -> bool:
+        return self._transfer_event_added.wait(timeout)
 
 
 def make_server(host: str, port: int) -> ReusableThreadingHTTPServer:
