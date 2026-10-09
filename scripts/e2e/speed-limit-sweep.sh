@@ -194,6 +194,36 @@ path, wanted, width_raw, height_raw = sys.argv[1:]
 width = int(width_raw) if width_raw.isdigit() else 0
 height = int(height_raw) if height_raw.isdigit() else 0
 root = ET.parse(path).getroot()
+parents = {child: parent for parent in root.iter() for child in list(parent)}
+
+def visible_center(node):
+    match = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", node.attrib.get("bounds", ""))
+    if not match:
+        return None
+    left, top, right, bottom = map(int, match.groups())
+    if right <= left or bottom <= top:
+        return None
+    ancestor = parents.get(node)
+    while ancestor is not None:
+        class_name = ancestor.attrib.get("class", "")
+        if "ScrollView" in class_name or ancestor.attrib.get("scrollable", "false").lower() == "true":
+            pm = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", ancestor.attrib.get("bounds", ""))
+            if pm:
+                pl, pt, pr, pb = map(int, pm.groups())
+                if pr <= pl or pb <= pt:
+                    return None
+                left, top, right, bottom = max(left, pl), max(top, pt), min(right, pr), min(bottom, pb)
+                if right <= left or bottom <= top:
+                    return None
+        ancestor = parents.get(ancestor)
+    if width:
+        left, right = max(left, 0), min(right, width)
+    if height:
+        top, bottom = max(top, 0), min(bottom, height)
+    if right <= left or bottom <= top:
+        return None
+    return (left + right) // 2, (top + bottom) // 2
+
 for node in root.iter("node"):
     resource_id = node.attrib.get("resource-id", "")
     if resource_id != wanted and not resource_id.endswith("/" + wanted) and not resource_id.endswith(":id/" + wanted):
@@ -202,16 +232,10 @@ for node in root.iter("node"):
         continue
     if node.attrib.get("visible-to-user", "true").lower() == "false":
         continue
-    match = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", node.attrib.get("bounds",""))
-    if not match:
+    point = visible_center(node)
+    if point is None:
         continue
-    x1,y1,x2,y2 = map(int, match.groups())
-    x,y = (x1+x2)//2,(y1+y2)//2
-    # A partially clipped Compose node may still be listed as visible, while its
-    # center lies outside the Android display; do not issue a tap there.
-    if x < 0 or y < 0 or (width and x >= width) or (height and y >= height):
-        continue
-    print(x, y)
+    print(point[0], point[1])
     raise SystemExit(0)
 raise SystemExit(1)
 PY
@@ -226,6 +250,36 @@ path, wanted, width_raw, height_raw = sys.argv[1:]
 width = int(width_raw) if width_raw.isdigit() else 0
 height = int(height_raw) if height_raw.isdigit() else 0
 root = ET.parse(path).getroot()
+parents = {child: parent for parent in root.iter() for child in list(parent)}
+
+def visible_center(node):
+    match = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", node.attrib.get("bounds", ""))
+    if not match:
+        return None
+    left, top, right, bottom = map(int, match.groups())
+    if right <= left or bottom <= top:
+        return None
+    ancestor = parents.get(node)
+    while ancestor is not None:
+        class_name = ancestor.attrib.get("class", "")
+        if "ScrollView" in class_name or ancestor.attrib.get("scrollable", "false").lower() == "true":
+            pm = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", ancestor.attrib.get("bounds", ""))
+            if pm:
+                pl, pt, pr, pb = map(int, pm.groups())
+                if pr <= pl or pb <= pt:
+                    return None
+                left, top, right, bottom = max(left, pl), max(top, pt), min(right, pr), min(bottom, pb)
+                if right <= left or bottom <= top:
+                    return None
+        ancestor = parents.get(ancestor)
+    if width:
+        left, right = max(left, 0), min(right, width)
+    if height:
+        top, bottom = max(top, 0), min(bottom, height)
+    if right <= left or bottom <= top:
+        return None
+    return (left + right) // 2, (top + bottom) // 2
+
 for node in root.iter("node"):
     if node.attrib.get("content-desc") != wanted:
         continue
@@ -233,20 +287,16 @@ for node in root.iter("node"):
         continue
     if node.attrib.get("visible-to-user", "true").lower() == "false":
         continue
-    match = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", node.attrib.get("bounds",""))
-    if not match:
+    point = visible_center(node)
+    if point is None:
         continue
-    x1,y1,x2,y2 = map(int, match.groups())
-    x,y = (x1+x2)//2,(y1+y2)//2
-    if x < 0 or y < 0 or (width and x >= width) or (height and y >= height):
-        continue
-    print(x, y)
+    print(point[0], point[1])
     raise SystemExit(0)
 raise SystemExit(1)
 PY
 }
 
-preset_desc_row_y() {
+preset_scroll_bounds() {
   local xml="$1"
   local prefix="$2"
   local group_title="$3"
@@ -262,7 +312,8 @@ labels = groups.get(group_title, set())
 if not labels:
     raise SystemExit(1)
 root = ET.parse(path).getroot()
-ys = []
+parents = {child: parent for parent in root.iter() for child in list(parent)}
+rows = set()
 for node in root.iter("node"):
     desc = node.attrib.get("content-desc", "")
     if not desc.startswith(prefix + ": "):
@@ -271,16 +322,32 @@ for node in root.iter("node"):
         continue
     if node.attrib.get("visible-to-user", "true").lower() == "false":
         continue
-    match = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", node.attrib.get("bounds", ""))
-    if match:
-        x1, y1, x2, y2 = map(int, match.groups())
-        if x2 > x1 and y2 > y1:
-            ys.append((y1 + y2) // 2)
-if not ys:
+    child_match = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", node.attrib.get("bounds", ""))
+    if not child_match:
+        continue
+    cl, ct, cr, cb = map(int, child_match.groups())
+    if cr <= cl or cb <= ct:
+        continue
+    ancestor = parents.get(node)
+    while ancestor is not None:
+        class_name = ancestor.attrib.get("class", "")
+        if "HorizontalScrollView" in class_name:
+            match = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", ancestor.attrib.get("bounds", ""))
+            if match:
+                left, top, right, bottom = map(int, match.groups())
+                if right > left and bottom > top:
+                    left, top, right, bottom = max(left, cl), max(top, ct), min(right, cr), min(bottom, cb)
+                    if right > left and bottom > top:
+                        rows.add(tuple(map(int, match.groups())))
+            break
+        ancestor = parents.get(ancestor)
+if not rows:
     raise SystemExit(1)
-print(sorted(ys)[len(ys) // 2])
+left, top, right, bottom = sorted(rows, key=lambda b: (b[1], b[0]))[0]
+print(left, top, right, bottom)
 PY
 }
+
 coord_for_text_near_title() {
   local xml="$1"
   local title="$2"
@@ -352,15 +419,26 @@ tap_preset_row() {
       # Unlimited is a standalone button below the horizontal preset rows.
       adb -s "$DEVICE" shell input swipe 160 500 160 300 700
     else
-      local y=""
+      local bounds=""
       local group_title=""
       group_title="$(preset_group_title "$wanted" 2>/dev/null || true)"
-      y="$(preset_desc_row_y "$xml" "$card_title" "$group_title" 2>/dev/null || true)"
-      if [ -n "$y" ]; then
-        # Scroll only the selected Download/Upload preset row horizontally.
-        adb -s "$DEVICE" shell input swipe 300 "$y" 60 "$y" 700
+      bounds="$(preset_scroll_bounds "$xml" "$card_title" "$group_title" 2>/dev/null || true)"
+      if [ -n "$bounds" ]; then
+        local x1 y1 x2 y2
+        read -r x1 y1 x2 y2 <<< "$bounds"
+        # Derive the drag from the actual HorizontalScrollView bounds. The old
+        # x=300 start point was outside the observed [34,286] container.
+        local inset=8
+        local from_x=$((x2 - inset))
+        local to_x=$((x1 + inset))
+        local y=$(((y1 + y2) / 2))
+        if [ "$from_x" -gt "$to_x" ]; then
+          adb -s "$DEVICE" shell input swipe "$from_x" "$y" "$to_x" "$y" 700
+        else
+          adb -s "$DEVICE" shell input swipe 160 500 160 300 700
+        fi
       else
-        # Reveal the card inside the main vertical ScrollView.
+        # If the preset row is not visible yet, reveal it in the main ScrollView.
         adb -s "$DEVICE" shell input swipe 160 500 160 300 700
       fi
     fi
@@ -380,16 +458,7 @@ preference_matches() {
   local target_key="$2"
   local expected="$3"
   local check_download="$4"
-  printf '%s\n' "$xml" | python3 -c '
-import sys, xml.etree.ElementTree as ET
-key, expected_raw, check_download = sys.argv[1:]
-try:
-    root = ET.parse(sys.stdin).getroot()
-except ET.ParseError:
-    raise SystemExit(1)
-values = {
-    node.attrib.get("name"): int(node.attrib.get("value", "-999999"))
-    for node in root.iter("long") if node.attrib.get("name")
+  printf '%s\n' "$xml" | python3 scripts/e2e/preference_matches.py "$target_key" "$expected" "$check_download"
 }
 expected = int(expected_raw)
 keys = [key]

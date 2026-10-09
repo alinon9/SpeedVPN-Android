@@ -42,6 +42,13 @@ jobs:
           bash ./setup.sh
           test "$(git -C app/src/main/jni/hev-socks5-tunnel rev-parse HEAD)" = 'd9dca26c7ad0e494492244f0309e80ee583e739e'
 
+      - name: Validate E2E harness helpers
+        run: |
+          set -euo pipefail
+          bash -n scripts/e2e/speed-limit-sweep.sh
+          python3 -m py_compile scripts/e2e/preference_matches.py scripts/e2e/verify_metrics.py
+          python3 -m unittest discover -s scripts/e2e/tests -v
+
       - name: Build debug APK
         run: ./gradlew :app:assembleDebug --stacktrace --no-daemon
 
