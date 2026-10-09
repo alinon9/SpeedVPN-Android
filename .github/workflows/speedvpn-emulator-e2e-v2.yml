@@ -10,7 +10,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: speedvpn-emulator-e2e-main
+  # Keep unrelated PR/main runs from cancelling one another; newer commits on the same ref still supersede stale runs.
+  group: speedvpn-emulator-e2e-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
