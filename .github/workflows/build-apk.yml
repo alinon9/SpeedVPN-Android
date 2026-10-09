@@ -237,8 +237,6 @@ jobs:
       - name: Run Android Emulator smoke test + Build 197 speed test
         run: |
           set -euo pipefail
-          # Preserve diagnostic logcat even when a strict assertion exits early.
-          trap 'adb -s emulator-5554 logcat -d -t 5000 > verify-speed-logcat.txt 2>/dev/null || true' EXIT
           export ANDROID_AVD_HOME="${RUNNER_TEMP}/android-avd"
           mkdir -p "${ANDROID_AVD_HOME}"
 
@@ -286,6 +284,8 @@ jobs:
           }
 
           cleanup() {
+            echo "Capturing Android logcat before emulator shutdown..."
+            adb -s emulator-5554 logcat -d -t 5000 > verify-speed-logcat.txt 2>/dev/null || true
             echo "Stopping Android Emulator..."
             adb -s emulator-5554 emu kill >/dev/null 2>&1 || true
             kill "${EMULATOR_PID}" >/dev/null 2>&1 || true

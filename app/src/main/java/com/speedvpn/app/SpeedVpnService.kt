@@ -482,9 +482,7 @@ class SpeedVpnService : VpnService() {
             appendLine("  cache-size: 10000")
             appendLine("misc:")
             appendLine("  task-stack-size: 86016")
-            // Match the patched lwIP TCP_SND_BUF (32 * TCP_MSS = 262112 bytes).
-            // The native config parser caps this ring buffer at TCP_SND_BUF.
-            appendLine("  tcp-buffer-size: 262144")
+            appendLine("  tcp-buffer-size: 65536")
             appendLine("  udp-recv-buffer-size: 262144")
             appendLine("  udp-copy-buffer-nums: 12")
             appendLine("  max-session-count: 80")
