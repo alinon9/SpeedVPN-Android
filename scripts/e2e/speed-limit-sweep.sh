@@ -687,7 +687,12 @@ PY
     while IFS=',' read -r r_index r_preset r_expected r_direction r_baseline r_plan r_vpn r_verdict r_reason r_classification; do
       # Python's csv module emits CRLF; strip CR from the final field before
       # comparing classifications so successful rows actually increment counts.
-      r_classification="${r_classification%        PASS|PASS_UNLIMITED) PASS_COUNT=$((PASS_COUNT+1));;
+      # Python csv output uses CRLF; remove CR before classification comparisons.
+      r_classification="$(printf '%s' "$r_classification" | tr -d '\r')"
+      METRIC_RESULT_COUNT=$((METRIC_RESULT_COUNT+1))
+      echo "RESULT: $r_preset / $r_direction / plan=$r_plan / vpn=$r_vpn / verdict=$r_verdict / class=$r_classification / reason=$r_reason"
+      case "$r_classification" in
+        PASS|PASS_UNLIMITED) PASS_COUNT=$((PASS_COUNT+1));;
         ENV_LIMITED) ENV_LIMITED_COUNT=$((ENV_LIMITED_COUNT+1));;
         FAIL) FAIL_COUNT=$((FAIL_COUNT+1));;
       esac
