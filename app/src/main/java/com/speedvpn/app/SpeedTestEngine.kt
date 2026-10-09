@@ -51,6 +51,10 @@ object SpeedTestEngine {
     private const val TARGET_STABLE_DURATION_MS = 250L
     private const val MIN_VALID_SAMPLES = 2
     private const val MIN_CAPPED_RANGE_SAMPLES = 3
+    private const val BASELINE_STABLE_DURATION_MS = 250L
+    internal const val FINITE_SAMPLE_TARGET_DURATION_MS = 1_500L
+    private const val MIN_FINITE_SAMPLE_BYTES = 256_000L
+    private const val MAX_FINITE_SAMPLE_BYTES = 20_000_000L
     private const val MAX_RETRIES = 2
 
     private const val CONNECT_TIMEOUT_SECONDS = 8L
@@ -120,10 +124,17 @@ object SpeedTestEngine {
         // lets the first 16 KiB chunk through immediately after an idle gap.
         // For the finite 200–1,000 Kbps plans, collect three larger samples so
         // the initial burst cannot dominate the result.
-        val requiredSamples = if (expectedKbps != null && expectedKbps in 101L..1_000L) {
+        val requiredSamples = if (expectedKbps != null && expectedKbps > 0L) {
             MIN_CAPPED_RANGE_SAMPLES
         } else {
             MIN_VALID_SAMPLES
+        }
+        // Baseline tests retain the short adaptive ladder; capped plans use
+        // repeatable ~1.5-second payloads to reduce TCP-startup and short-request bias.
+        val targetDurationMs = if (expectedKbps != null && expectedKbps > 1_000L) {
+            FINITE_SAMPLE_TARGET_DURATION_MS
+        } else {
+            BASELINE_STABLE_DURATION_MS
         }
         val samples = ArrayList<Long>()
         var lastFailure: Throwable? = null
@@ -156,7 +167,7 @@ object SpeedTestEngine {
                 // Once a real request lasts long enough to amortize connection
                 // overhead, do not keep issuing large transfers needlessly.
                 if (samples.size >= requiredSamples &&
-                    requestDurationFor(sizeBytes, measured) >= TARGET_STABLE_DURATION_MS
+                    requestDurationFor(sizeBytes, measured) >= targetDurationMs
                 ) {
                     break
                 }
@@ -176,18 +187,23 @@ object SpeedTestEngine {
         return percentile(samples, if (expectedKbps != null && expectedKbps > 0L) 0.50 else 0.90)
     }
 
-    private fun requestSizesFor(expectedKbps: Long?): LongArray =
+    internal fun requestSizesFor(expectedKbps: Long?): LongArray =
         when {
             expectedKbps == null || expectedKbps <= 0L -> REQUEST_SIZES
-            // Tiny requests can fit in one or two 16 KiB relay reads, measuring the
-            // initial burst rather than sustained throughput. Use larger samples
-            // while staying under the 30s HTTP call timeout at 80 Kbps (10 KB/s).
+            // At the slowest presets, keep progressively larger bounded requests
+            // so the run stays practical while still covering many relay reads.
             expectedKbps <= 100L -> longArrayOf(128_000L, 192_000L, 256_000L)
             expectedKbps <= 1_000L -> longArrayOf(128_000L, 256_000L, 512_000L, 1_000_000L)
-            expectedKbps <= 5_000L -> longArrayOf(64_000L, 128_000L, 256_000L, 512_000L, 1_000_000L)
-            expectedKbps <= 20_000L -> longArrayOf(128_000L, 256_000L, 512_000L, 1_000_000L, 2_000_000L)
-            expectedKbps <= 100_000L -> longArrayOf(256_000L, 512_000L, 1_000_000L, 2_000_000L, 5_000_000L)
-            else -> REQUEST_SIZES
+            else -> {
+                // Each capped sample aims for 1.5 seconds at the selected rate.
+                // Repeating a stable payload gives the median three independent
+                // long transfers rather than mixing short slow-start and long samples.
+                // Stay below the public endpoint's practical 25 MB request ceiling.
+                val sampleBytes = (
+                    expectedKbps.toDouble() * FINITE_SAMPLE_TARGET_DURATION_MS / 8.0
+                ).toLong().coerceIn(MIN_FINITE_SAMPLE_BYTES, MAX_FINITE_SAMPLE_BYTES)
+                longArrayOf(sampleBytes, sampleBytes, sampleBytes)
+            }
         }
 
     private fun warmupBytesFor(expectedKbps: Long?): Long =
@@ -195,11 +211,13 @@ object SpeedTestEngine {
             expectedKbps == null || expectedKbps <= 0L -> WARMUP_BYTES
             expectedKbps <= 100L -> 8_000L
             expectedKbps <= 1_000L -> 16_000L
-            expectedKbps <= 5_000L -> 32_000L
-            else -> WARMUP_BYTES
+            else -> min(
+                1_000_000L,
+                requestSizesFor(expectedKbps).firstOrNull()?.div(4L) ?: WARMUP_BYTES,
+            ).coerceAtLeast(WARMUP_BYTES)
         }
 
-    private fun requestDurationFor(sizeBytes: Long, bitsPerSecond: Long): Long {
+    internal fun requestDurationFor(sizeBytes: Long, bitsPerSecond: Long): Long {
         if (bitsPerSecond <= 0L) return 0L
         return (sizeBytes.toDouble() * 8_000.0 / bitsPerSecond.toDouble()).toLong()
     }
