@@ -510,9 +510,14 @@ class Socks5Server(
     ) {
         var eof = false
         try {
-            val buf = ByteArray(16 * 1024)
+            // Match relay read granularity to the current pacing bucket. A 16 KiB
+            // read requires hundreds of scheduler wakeups per second at high rates;
+            // larger reads reduce that overhead while staying inside the bucket's
+            // bounded burst window. The bucket can change while the pipe is active.
+            val buf = ByteArray(64 * 1024)
             while (running && SpeedLimiter.isGenerationActive(generation)) {
-                val n = src.read(buf)
+                val readSize = bucket.recommendedReadBytes().coerceAtMost(buf.size)
+                val n = src.read(buf, 0, readSize)
                 if (n < 0) {
                     eof = true
                     break

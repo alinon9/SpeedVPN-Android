@@ -6,6 +6,28 @@ import org.junit.Test
 
 class SpeedLimiterConversionTest {
     @Test
+    fun relayReadSizeFollowsBoundedPacingWindow() {
+        val bucket = TokenBucket()
+
+        // Low rates keep the established minimum chunk and must not send 64 KiB
+        // every time the bucket refills.
+        bucket.setRate(10_000L)
+        assertEquals(16 * 1024, bucket.recommendedReadBytes())
+
+        // Larger finite plans use proportionally larger chunks to reduce wakeups.
+        bucket.setRate(2_000_000L)
+        assertEquals(20_000, bucket.recommendedReadBytes())
+        bucket.setRate(4_000_000L)
+        assertEquals(40_000, bucket.recommendedReadBytes())
+
+        // High rates and Unlimited remain bounded by the existing 64 KiB cap.
+        bucket.setRate(11_000_000L)
+        assertEquals(64 * 1024, bucket.recommendedReadBytes())
+        bucket.setRate(0L)
+        assertEquals(64 * 1024, bucket.recommendedReadBytes())
+    }
+
+    @Test
     fun convertsKilobitsToBytesPerSecond() {
         val bucket = TokenBucket()
 

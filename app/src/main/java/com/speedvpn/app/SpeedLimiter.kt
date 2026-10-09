@@ -109,6 +109,21 @@ class TokenBucket {
         }
     }
 
+    /**
+     * Chooses a relay read size close to the token bucket's bounded burst window.
+     *
+     * Small plans retain the 16 KiB minimum so a single read cannot create a
+     * large burst. Faster plans use larger reads to reduce per-chunk scheduler
+     * and lock overhead, up to the same 64 KiB maximum used by the bucket.
+     */
+    internal fun recommendedReadBytes(): Int = lock.withLock {
+        if (bytesPerSec <= 0L) {
+            MAX_BURST_BYTES
+        } else {
+            ceil(capacityBytes).toInt().coerceIn(MIN_BURST_BYTES, MAX_BURST_BYTES)
+        }
+    }
+
     private fun burstCapacity(rate: Long): Double {
         if (rate <= 0L) return 0.0
         val rateWindowBytes = rate.toDouble() * BURST_WINDOW_NS.toDouble() / NANOS_PER_SECOND
