@@ -17,7 +17,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: speedvpn-speed-limit-sweep-main
+  # Keep unrelated PR/main runs from cancelling one another; newer commits on the same ref still supersede stale runs.
+  group: speedvpn-speed-limit-sweep-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
