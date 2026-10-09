@@ -97,6 +97,21 @@ def check_metric(direction: str, values: dict[str, str], expected_kbps: int) -> 
             reasons.append(f"{direction}: Unlimited selected but UI reports plan '{plan}'")
         if verdict != STATUS_UNLIMITED:
             reasons.append(f"{direction}: expected verdict '{STATUS_UNLIMITED}', got '{verdict}'")
+        # Independently validate the behavior instead of trusting the UI verdict.
+        # The product policy treats an Unlimited path as healthy when at least
+        # 80% of its measured physical baseline is retained; faster VPN samples
+        # are allowed because consecutive network samples can fluctuate upward.
+        if (
+            baseline_bps is not None
+            and baseline_bps > 0
+            and vpn_bps is not None
+            and vpn_bps >= 0
+            and vpn_bps < baseline_bps * 0.8
+        ):
+            reasons.append(
+                f"{direction}: Unlimited VPN rate {vpn_bps / 1_000_000:.2f} Mbps "
+                f"retains less than 80% of baseline {baseline_bps / 1_000_000:.2f} Mbps"
+            )
         classification = "PASS_UNLIMITED" if not reasons else "FAIL"
         return baseline, plan, vpn, verdict, classification + ("|" + "; ".join(reasons) if reasons else "")
 
