@@ -47,7 +47,7 @@ jobs:
         run: |
           set -euo pipefail
           bash -n scripts/e2e/speed-limit-sweep.sh
-          python3 -m py_compile scripts/e2e/preference_matches.py scripts/e2e/verify_metrics.py scripts/e2e/local_speed_test_server.py scripts/e2e/tests/test_local_speed_test_server.py
+          python3 -m py_compile scripts/e2e/preference_matches.py scripts/e2e/verify_metrics.py scripts/e2e/local_speed_test_server.py scripts/e2e/metric_result_status.py scripts/e2e/tests/test_local_speed_test_server.py scripts/e2e/tests/test_metric_result_status.py
           python3 -m unittest discover -s scripts/e2e/tests -v
 
       - name: Build debug APK

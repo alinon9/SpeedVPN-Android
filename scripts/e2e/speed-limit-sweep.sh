@@ -646,73 +646,7 @@ while IFS='|' read -r index preset expected <&3; do
     # Completion is accepted only when a rendered metric row has the current
     # preset's plan, a baseline, an in-VPN measurement and a final verdict.
     # The spinner does not have to be captured by UIAutomator.
-    if python3 - "$result_xml" "$expected" <<'PY' >/dev/null 2>&1
-import re, sys, xml.etree.ElementTree as ET
-
-path, expected_raw = sys.argv[1:]
-expected = int(expected_raw)
-try:
-    texts = [(n.attrib.get("text", "") or "").strip()
-             for n in ET.parse(path).getroot().iter("node")]
-except (OSError, ET.ParseError):
-    raise SystemExit(1)
-
-status_labels = {
-    "✅ السرعة متطابقة", "❌ السرعة غير متطابقة",
-    "⚠️ لا يمكن الحكم", "✅ لا يظهر سقف واضح",
-}
-labels = {
-    "baseline": "🌐 سرعة الإنترنت الأصلية",
-    "plan": "🔒 السرعة المحجوزة / المحددة",
-    "vpn": "🚀 السرعة الفعلية داخل VPN",
-}
-rate_re = re.compile(r"^([0-9]+(?:\.[0-9]+)?) ?(bps|Kbps|Mbps|Gbps)$")
-mult = {"bps": 1.0, "Kbps": 1000.0, "Mbps": 1_000_000.0, "Gbps": 1_000_000_000.0}
-
-def rate(value):
-    match = rate_re.fullmatch(value)
-    return None if not match else float(match.group(1)) * mult[match.group(2)]
-
-def value_after(section, label):
-    try:
-        index = section.index(label)
-    except ValueError:
-        return None
-    boundaries = set(status_labels) | set(labels.values()) | {
-        "Download", "Upload", "الدقة مقارنة بالخيار"
-    }
-    for value in section[index + 1:index + 7]:
-        if value == "بدون حد" or rate(value) is not None:
-            return value
-        if value in boundaries:
-            break
-    return None
-
-anchors = [i for i, value in enumerate(texts)
-           if value == labels["baseline"]]
-for position, start in enumerate(anchors):
-    end = anchors[position + 1] if position + 1 < len(anchors) else len(texts)
-    section = texts[start:end]
-    if not any(value in status_labels for value in section):
-        continue
-    baseline_raw = value_after(section, labels["baseline"])
-    plan_raw = value_after(section, labels["plan"])
-    vpn_raw = value_after(section, labels["vpn"])
-    if baseline_raw is None or plan_raw is None or vpn_raw is None:
-        continue
-    if rate(baseline_raw) is None or rate(vpn_raw) is None:
-        continue
-    if expected == 0:
-        plan_matches = plan_raw == "بدون حد"
-    else:
-        plan_bps = rate(plan_raw)
-        expected_bps = expected * 1000.0
-        # Allow only visible-label rounding when identifying the selected plan.
-        plan_matches = plan_bps is not None and abs(plan_bps - expected_bps) <= max(1.0, expected_bps * 0.01)
-    if plan_matches:
-        raise SystemExit(0)
-raise SystemExit(1)
-PY
+    if python3 scripts/e2e/metric_result_status.py "$result_xml" "$expected" >/dev/null 2>&1
     then
       finished=1
       echo "Verify result exposed for $preset after ${second}s (loading_frame_seen=$loading_seen)." | tee -a "$RUN_DIR/sweep-console.log"
