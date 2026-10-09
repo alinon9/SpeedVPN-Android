@@ -29,6 +29,28 @@ class SpeedVerificationPolicyTest {
     }
 
     @Test
+    fun baselineJustBelowHeadroomFloorIsNotVerifiable() {
+        val result = SpeedVerificationPolicy.evaluate(
+            planKbps = 1_000L,
+            baselineBps = 1_199_999L,
+            vpnBps = 1_000_000L,
+        )
+
+        assertEquals(SpeedVerificationStatus.NOT_VERIFIABLE, result.status)
+    }
+
+    @Test
+    fun baselineAtHeadroomFloorIsVerifiable() {
+        val result = SpeedVerificationPolicy.evaluate(
+            planKbps = 1_000L,
+            baselineBps = 1_200_000L,
+            vpnBps = 1_000_000L,
+        )
+
+        assertEquals(SpeedVerificationStatus.MATCH, result.status)
+    }
+
+    @Test
     fun moreThanTwentyPercentErrorIsMismatch() {
         val result = SpeedVerificationPolicy.evaluate(
             planKbps = 5_000L,
