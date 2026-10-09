@@ -773,19 +773,27 @@ PY
 
   if [ -s "$RUN_DIR/$slug-parsed.csv" ]; then
     cat "$RUN_DIR/$slug-parsed.csv" >> "$RUN_DIR/speed-limit-sweep-results.csv"
-    while IFS=',' read -r r_index r_preset r_expected r_direction r_baseline r_plan r_vpn r_verdict r_reason r_classification; do
-      # Python's csv module emits CRLF; strip CR from the final field before
-      # comparing classifications so successful rows actually increment counts.
-      # Python csv output uses CRLF; remove CR before classification comparisons.
+    while IFS= read -r r_classification; do
       r_classification="$(printf '%s' "$r_classification" | tr -d '\r')"
+      [ -n "$r_classification" ] || continue
       METRIC_RESULT_COUNT=$((METRIC_RESULT_COUNT+1))
-      echo "RESULT: $r_preset / $r_direction / plan=$r_plan / vpn=$r_vpn / verdict=$r_verdict / class=$r_classification / reason=$r_reason"
       case "$r_classification" in
         PASS|PASS_UNLIMITED) PASS_COUNT=$((PASS_COUNT+1));;
         ENV_LIMITED) ENV_LIMITED_COUNT=$((ENV_LIMITED_COUNT+1));;
         FAIL) FAIL_COUNT=$((FAIL_COUNT+1));;
+        *) echo "FAIL $preset: invalid classification '$r_classification'."; FAIL_COUNT=$((FAIL_COUNT+1));;
       esac
-    done < "$RUN_DIR/$slug-parsed.csv"
+    done < <(python3 - "$RUN_DIR/$slug-parsed.csv" <<'PY'
+import csv, sys
+with open(sys.argv[1], newline="", encoding="utf-8") as handle:
+    for row in csv.reader(handle):
+        if not row:
+            continue
+        if len(row) != 10:
+            raise SystemExit(f"Malformed parser CSV row: expected 10 columns, got {len(row)}")
+        print(row[9].strip())
+PY
+    )
   else
     echo "FAIL $preset: parser produced no rows."
     FAIL_COUNT=$((FAIL_COUNT+1))
