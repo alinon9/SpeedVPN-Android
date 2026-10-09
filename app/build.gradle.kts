@@ -1,3 +1,9 @@
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
+}
+
 val configuredSpeedTestBaseUrl = providers.gradleProperty("speedTestBaseUrl")
     .orNull
     ?.trim()
@@ -7,12 +13,6 @@ val configuredSpeedTestBaseUrl = providers.gradleProperty("speedTestBaseUrl")
 if (configuredSpeedTestBaseUrl.isNotEmpty() &&
     configuredSpeedTestBaseUrl != "http://10.0.2.2:18765") {
     throw GradleException("speedTestBaseUrl is restricted to the CI local fixture endpoint")
-}
-
-plugins {
-    id("com.android.application")
-    id("org.jetbrains.kotlin.android")
-    id("org.jetbrains.kotlin.plugin.compose")
 }
 
 android {
