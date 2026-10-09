@@ -453,14 +453,19 @@ TOTAL=19
 FAIL_COUNT=0
 ENV_LIMITED_COUNT=0
 PASS_COUNT=0
+TESTED_PRESET_COUNT=0
+METRIC_RESULT_COUNT=0
 
 echo "===== SPEED LIMIT SWEEP START ====="
 echo "19 finite presets + Unlimited."
 echo "Real UI selection for Download and Upload, then Verify Speed, record, stop VPN, next preset."
 echo
 
-while IFS='|' read -r index preset expected; do
+# Keep the case list on FD 3 rather than stdin: adb shell can consume
+# stdin and otherwise discard all remaining speed presets after the first one.
+while IFS='|' read -r index preset expected <&3; do
   [ -n "$index" ] || continue
+  TESTED_PRESET_COUNT=$((TESTED_PRESET_COUNT+1))
   slug="$(printf '%02d' "$index")-$(echo "$preset" | tr ' ' '_' | tr -cd '[:alnum:]_-')"
   echo "===== SWEEP $index/$TOTAL: $preset =====" | tee -a "$RUN_DIR/sweep-console.log"
 
@@ -680,6 +685,90 @@ PY
   if [ -s "$RUN_DIR/$slug-parsed.csv" ]; then
     cat "$RUN_DIR/$slug-parsed.csv" >> "$RUN_DIR/speed-limit-sweep-results.csv"
     while IFS=',' read -r r_index r_preset r_expected r_direction r_baseline r_plan r_vpn r_verdict r_reason r_classification; do
+      # Python's csv module emits CRLF; strip CR from the final field before
+      # comparing classifications so successful rows actually increment counts.
+      r_classification="${r_classification%        PASS|PASS_UNLIMITED) PASS_COUNT=$((PASS_COUNT+1));;
+        ENV_LIMITED) ENV_LIMITED_COUNT=$((ENV_LIMITED_COUNT+1));;
+        FAIL) FAIL_COUNT=$((FAIL_COUNT+1));;
+      esac
+    done < "$RUN_DIR/$slug-parsed.csv"
+  else
+    echo "FAIL $preset: parser produced no rows."
+    FAIL_COUNT=$((FAIL_COUNT+1))
+  fi
+
+  if ! cleanup_vpn; then
+    echo "FAIL $preset: VPN TUN remained after cleanup."
+    FAIL_COUNT=$((FAIL_COUNT+1))
+    echo "$index,$preset,$expected,VPN,,,,,VPN remained active after cleanup,FAIL" >> "$RUN_DIR/speed-limit-sweep-results.csv"
+  else
+    echo "VPN OFF confirmed before next preset." | tee -a "$RUN_DIR/sweep-console.log"
+  fi
+
+  echo
+done 3<<< "$SPEED_CASES"
+
+# Enforce full coverage so a prematurely terminated loop can never pass CI.
+if [ "$TESTED_PRESET_COUNT" -ne "$TOTAL" ]; then
+  echo "COVERAGE FAIL: tested $TESTED_PRESET_COUNT/$TOTAL presets."
+  FAIL_COUNT=$((FAIL_COUNT+1))
+fi
+EXPECTED_METRIC_RESULTS=$((TOTAL * 2))
+if [ "$METRIC_RESULT_COUNT" -ne "$EXPECTED_METRIC_RESULTS" ]; then
+  echo "COVERAGE FAIL: recorded $METRIC_RESULT_COUNT/$EXPECTED_METRIC_RESULTS Download/Upload results."
+  FAIL_COUNT=$((FAIL_COUNT+1))
+fi
+
+cat > "$RUN_DIR/speed-limit-sweep-summary.md" <<MD
+# SpeedVPN Speed-Limit Sweep
+
+- Presets attempted: $TESTED_PRESET_COUNT/$TOTAL
+- Download/Upload metric results recorded: $METRIC_RESULT_COUNT/$EXPECTED_METRIC_RESULTS
+- PASS: $PASS_COUNT
+- ENV_LIMITED (physical/emulator baseline below selected plan): $ENV_LIMITED_COUNT
+- HARD FAIL: $FAIL_COUNT
+
+Every labeled preset is covered: 10/25/50/75/100/130/250/500/750/950 KB/s, 1/2/3/4/5 MB/s, 9/10/11 MB/s, and Unlimited.
+
+HARD FAIL means UI selection/persistence failed, Verify Speed produced MISMATCH, verification failed/timed out, or VPN did not shut down between cases.
+
+ENV_LIMITED is expected when the emulator's physical baseline is below the selected plan; it is recorded separately and does not fail the sweep.
+
+The slider itself is continuous from 1 KB/s to 100 MB/s, so no finite test can enumerate every slider value.
+MD
+
+cp "$RUN_DIR/speed-limit-sweep-results.csv" speed-limit-sweep-results.csv
+cp "$RUN_DIR/speed-limit-sweep-summary.md" speed-limit-sweep-summary.md
+
+{
+  echo "## SpeedVPN Speed-Limit Sweep"
+  echo
+  echo "- PASS: $PASS_COUNT"
+  echo "- ENV_LIMITED: $ENV_LIMITED_COUNT"
+  echo "- HARD FAIL: $FAIL_COUNT"
+  echo
+  echo "| # | Preset | Direction | Plan | VPN | Verdict | Classification |"
+  echo "|---:|---|---|---|---|---|---|"
+  awk -F',' 'NR>1 && NF>=10 {printf "| %s | %s | %s | %s | %s | %s | %s |\\n",$1,$2,$4,$6,$7,$8,$10}' speed-limit-sweep-results.csv
+} >> "$GITHUB_STEP_SUMMARY"
+
+if grep -Eiq "FATAL EXCEPTION|AndroidRuntime.*FATAL" "$RUN_DIR/"*-logcat.txt 2>/dev/null; then
+  echo "FATAL EXCEPTION detected in sweep logcats."
+  FAIL_COUNT=$((FAIL_COUNT+1))
+fi
+
+echo "===== SPEED LIMIT SWEEP COMPLETE ====="
+echo "PRESETS_TESTED=$TESTED_PRESET_COUNT/$TOTAL"
+echo "METRIC_RESULTS=$METRIC_RESULT_COUNT/$EXPECTED_METRIC_RESULTS"
+echo "PASS=$PASS_COUNT"
+echo "ENV_LIMITED=$ENV_LIMITED_COUNT"
+echo "HARD_FAIL=$FAIL_COUNT"
+
+if [ "$FAIL_COUNT" -gt 0 ]; then
+  exit 1
+fi
+\\r'}"
+      METRIC_RESULT_COUNT=$((METRIC_RESULT_COUNT+1))
       echo "RESULT: $r_preset / $r_direction / plan=$r_plan / vpn=$r_vpn / verdict=$r_verdict / class=$r_classification / reason=$r_reason"
       case "$r_classification" in
         PASS|PASS_UNLIMITED) PASS_COUNT=$((PASS_COUNT+1));;
