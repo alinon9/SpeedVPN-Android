@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import contextlib
+import io
 import json
+import re
 import threading
 import unittest
 from urllib.error import HTTPError
@@ -49,6 +52,41 @@ class LocalSpeedTestServerTests(unittest.TestCase):
         with urlopen(request, timeout=2) as response:
             self.assertEqual(200, response.status)
             self.assertEqual(b"", response.read())
+
+    def test_download_logs_actual_transfer_timing(self) -> None:
+        expected = 64_321
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            with urlopen(f"{self.base_url}/__down?bytes={expected}&cacheBust=timing", timeout=2) as response:
+                self.assertEqual(expected, len(response.read()))
+        self.assertRegex(
+            output.getvalue(),
+            re.compile(
+                rf"TRANSFER method=GET path=/__down requested_bytes={expected} "
+                rf"sent_bytes={expected} elapsed_ms=\d+\.\d{{3}} outcome=complete"
+            ),
+        )
+
+    def test_upload_logs_actual_transfer_timing(self) -> None:
+        payload = b"x" * 65_432
+        request = Request(
+            f"{self.base_url}/__up?bytes={len(payload)}&cacheBust=timing",
+            data=payload,
+            method="POST",
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            with urlopen(request, timeout=2) as response:
+                self.assertEqual(200, response.status)
+                self.assertEqual(b"", response.read())
+        self.assertRegex(
+            output.getvalue(),
+            re.compile(
+                rf"TRANSFER method=POST path=/__up requested_bytes={len(payload)} "
+                rf"received_bytes={len(payload)} elapsed_ms=\d+\.\d{{3}} outcome=complete"
+            ),
+        )
 
     def test_unknown_route_is_not_misreported_as_success(self) -> None:
         with self.assertRaises(HTTPError) as raised:

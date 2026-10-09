@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
@@ -58,23 +59,35 @@ class SpeedTestRequestHandler(BaseHTTPRequestHandler):
             self._send_body(413, b"requested payload exceeds fixture limit")
             return
 
-        self.send_response(200)
-        self.send_header("Content-Type", "application/octet-stream")
-        self.send_header("Content-Length", str(size))
-        self.send_header("Cache-Control", "no-cache, no-store")
-        self.end_headers()
-        block = b"\x00" * CHUNK_BYTES
-        remaining = size
+        started_ns = time.monotonic_ns()
+        sent = 0
+        completed = False
         try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Cache-Control", "no-cache, no-store")
+            self.end_headers()
+            block = b"\x00" * CHUNK_BYTES
+            remaining = size
             while remaining:
                 count = min(remaining, len(block))
                 self.wfile.write(block[:count])
                 remaining -= count
+                sent += count
             self.wfile.flush()
+            completed = True
         except (BrokenPipeError, ConnectionResetError):
             # A cancelled sample can close the connection before the payload ends.
             self.close_connection = True
-
+        finally:
+            elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000
+            outcome = "complete" if completed else "aborted"
+            print(
+                f"TRANSFER method=GET path=/__down requested_bytes={size} "
+                f"sent_bytes={sent} elapsed_ms={elapsed_ms:.3f} outcome={outcome}",
+                flush=True,
+            )
     def do_POST(self) -> None:
         if urlsplit(self.path).path != "/__up":
             self._send_body(404, b"not found")
@@ -95,20 +108,33 @@ class SpeedTestRequestHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             return
 
-        remaining = content_length
-        while remaining:
-            chunk = self.rfile.read(min(CHUNK_BYTES, remaining))
-            if not chunk:
-                self._send_body(400, b"upload body ended before Content-Length")
-                self.close_connection = True
-                return
-            remaining -= len(chunk)
+        started_ns = time.monotonic_ns()
+        received = 0
+        completed = False
+        try:
+            remaining = content_length
+            while remaining:
+                chunk = self.rfile.read(min(CHUNK_BYTES, remaining))
+                if not chunk:
+                    self._send_body(400, b"upload body ended before Content-Length")
+                    self.close_connection = True
+                    return
+                remaining -= len(chunk)
+                received += len(chunk)
 
-        self.send_response(200)
-        self.send_header("Content-Length", "0")
-        self.send_header("Cache-Control", "no-cache, no-store")
-        self.end_headers()
-
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-cache, no-store")
+            self.end_headers()
+            completed = True
+        finally:
+            elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000
+            outcome = "complete" if completed else "aborted"
+            print(
+                f"TRANSFER method=POST path=/__up requested_bytes={size} "
+                f"received_bytes={received} elapsed_ms={elapsed_ms:.3f} outcome={outcome}",
+                flush=True,
+            )
     def log_message(self, format_string: str, *args: object) -> None:
         # Request counts are high during the sweep; keep the artifact log concise.
         if urlsplit(self.path).path == "/healthz":

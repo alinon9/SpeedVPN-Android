@@ -145,14 +145,19 @@ object SpeedTestEngine {
 
         for (sizeBytes in requestSizes) {
             var measured: Long? = null
+            var requestElapsedMs: Long? = null
 
             for (attempt in 1..MAX_RETRIES) {
                 try {
+                    val requestStartedNs = System.nanoTime()
                     measured = if (isUpload) {
                         measureUploadRequest(client, sizeBytes)
                     } else {
                         measureDownloadRequest(client, sizeBytes)
                     }
+                    requestElapsedMs = TimeUnit.NANOSECONDS.toMillis(
+                        (System.nanoTime() - requestStartedNs).coerceAtLeast(1L),
+                    )
                     break
                 } catch (error: Throwable) {
                     lastFailure = error
@@ -166,7 +171,7 @@ object SpeedTestEngine {
 
             if (measured != null && measured > 0L) {
                 samples += measured
-                Log.d(TAG, "Sample ${if (isUpload) "upload" else "download"} ${sizeBytes}B = $measured bps; estimatedDurationMs=${requestDurationFor(sizeBytes, measured)}")
+                Log.d(TAG, "Sample ${if (isUpload) "upload" else "download"} bytes=$sizeBytes rateBps=$measured actualRequestMs=${requestElapsedMs ?: -1L}")
 
                 // Once a real request lasts long enough to amortize connection
                 // overhead, do not keep issuing large transfers needlessly.

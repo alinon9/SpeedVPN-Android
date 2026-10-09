@@ -513,6 +513,9 @@ class Socks5Server(
         var firstForwardedNs = 0L
         var lastForwardedNs = 0L
         var forwardedBytes = 0L
+        var readCalls = 0L
+        var writeCalls = 0L
+        var maxReadBytes = 0
         var sourceReadNs = 0L
         var limiterCallNs = 0L
         var destinationWriteNs = 0L
@@ -531,6 +534,8 @@ class Socks5Server(
                     eof = true
                     break
                 }
+                readCalls++
+                maxReadBytes = maxOf(maxReadBytes, n)
                 val limiterStartedNs = System.nanoTime()
                 val mayProceed = SpeedLimiter.acquire(bucket, n, generation)
                 limiterCallNs += System.nanoTime() - limiterStartedNs
@@ -538,6 +543,7 @@ class Socks5Server(
                 if (!running || !SpeedLimiter.isGenerationActive(generation)) break
                 val writeStartedNs = System.nanoTime()
                 dst.write(buf, 0, n)
+                writeCalls++
                 val writeFinishedNs = System.nanoTime()
                 destinationWriteNs += writeFinishedNs - writeStartedNs
                 if (firstForwardedNs == 0L) firstForwardedNs = writeStartedNs
@@ -564,9 +570,9 @@ class Socks5Server(
                 ).toLong()
                 log(
                     "Relay pipe stats direction=$direction bytes=$forwardedBytes " +
-                        "transferMs=${TimeUnit.NANOSECONDS.toMillis(transferDurationNs).coerceAtLeast(1L)} " +
-                        "wallMs=${TimeUnit.NANOSECONDS.toMillis(wallDurationNs)} " +
-                        "throughputBps=$throughputBps " +
+                        "firstToLastForwardedSpanMs=${TimeUnit.NANOSECONDS.toMillis(transferDurationNs).coerceAtLeast(1L)} " +
+                        "pipeWallMs=${TimeUnit.NANOSECONDS.toMillis(wallDurationNs)} " +
+                        "firstToLastSpanBps=$throughputBps readCalls=$readCalls writeCalls=$writeCalls maxReadBytes=$maxReadBytes " +
                         "sourceReadMs=${TimeUnit.NANOSECONDS.toMillis(sourceReadNs)} " +
                         "limiterCallMs=${TimeUnit.NANOSECONDS.toMillis(limiterCallNs)} " +
                         "destinationWriteMs=${TimeUnit.NANOSECONDS.toMillis(destinationWriteNs)}"
