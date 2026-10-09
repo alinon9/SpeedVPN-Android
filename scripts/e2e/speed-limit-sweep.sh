@@ -182,6 +182,28 @@ direction_title() {
   esac
 }
 
+coord_for_resource_id() {
+  local xml="$1"
+  local wanted="$2"
+  python3 - "$xml" "$wanted" <<'PY'
+import re, sys, xml.etree.ElementTree as ET
+path, wanted = sys.argv[1:]
+root = ET.parse(path).getroot()
+for node in root.iter("node"):
+    resource_id = node.attrib.get("resource-id", "")
+    if resource_id != wanted and not resource_id.endswith("/" + wanted) and not resource_id.endswith(":id/" + wanted):
+        continue
+    if node.attrib.get("enabled", "true").lower() == "false":
+        continue
+    m = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", node.attrib.get("bounds",""))
+    if m:
+        x1,y1,x2,y2 = map(int, m.groups())
+        print((x1+x2)//2, (y1+y2)//2)
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
 coord_for_content_desc() {
   local xml="$1"
   local wanted="$2"
@@ -192,9 +214,11 @@ root = ET.parse(path).getroot()
 for node in root.iter("node"):
     if node.attrib.get("content-desc") != wanted:
         continue
+    if node.attrib.get("enabled", "true").lower() == "false":
+        continue
     m = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", node.attrib.get("bounds",""))
     if m:
-        x1,y1,x2,y2 = map(int,m.groups())
+        x1,y1,x2,y2 = map(int, m.groups())
         print((x1+x2)//2, (y1+y2)//2)
         raise SystemExit(0)
 raise SystemExit(1)
@@ -263,20 +287,26 @@ PY
 tap_preset_row() {
   local wanted="$1"
   local mode="$2"
+  local expected="${3:?expected Kbps is required}"
   local xml="$RUN_DIR/current-ui.xml"
   local card_title=""
+  local direction_tag=""
   card_title="$(direction_title "$mode")" || return 1
-  local unique_desc="$card_title: $wanted"
+  if [ "$mode" = "top" ]; then direction_tag="download"; else direction_tag="upload"; fi
 
-  # First reveal the correct Download/Upload card using its actual UI title.
+  local unique_desc="$card_title: $wanted"
+  local unique_tag="speed_preset_${direction_tag}_${expected}"
+  if [ "$expected" -eq 0 ]; then unique_tag="speed_preset_${direction_tag}_unlimited"; fi
+
+  # Stable Compose testTag/resource-id first; accessibility contentDescription second.
   tap_text "$card_title" "$mode" || true
   sleep 1
 
-  for attempt in $(seq 1 16); do
+  for attempt in $(seq 1 24); do
     dump_ui "$xml" || true
-
     local c=""
-    c="$(coord_for_text_near_title "$xml" "$card_title" "$wanted" 2>/dev/null || true)"
+    c="$(coord_for_resource_id "$xml" "$unique_tag" 2>/dev/null || true)"
+    if [ -z "$c" ]; then c="$(coord_for_content_desc "$xml" "$unique_desc" 2>/dev/null || true)"; fi
     if [ -n "$c" ]; then
       read -r x y <<< "$c"
       adb -s "$DEVICE" shell input tap "$x" "$y"
@@ -284,24 +314,24 @@ tap_preset_row() {
       return 0
     fi
 
-    local y=""
-    local group_title=""
-    group_title="$(preset_group_title "$wanted" 2>/dev/null || true)"
-    # If at least one preset from this speed group is currently visible near
-    # the correct card, the row is in view and needs horizontal scrolling.
-    y="$(preset_swipe_y_near_card "$xml" "$card_title" "$group_title" 2>/dev/null || true)"
-    if [ -n "$y" ]; then
-      adb -s "$DEVICE" shell input swipe 300 "$y" 60 "$y" 750
-    else
-      # The Upload card can be visible while its preset row is still below
-      # the ScrollView viewport. Start the gesture inside the ScrollView
-      # (not on the bottom navigation) to reveal the row.
+    if [ "$wanted" = "بدون حد" ]; then
+      # Unlimited is a standalone button below the horizontal preset rows.
       adb -s "$DEVICE" shell input swipe 160 500 160 300 700
+    else
+      local y=""
+      y="$(preset_desc_row_y "$xml" "$card_title" 2>/dev/null || true)"
+      if [ -n "$y" ]; then
+        # Scroll only the selected Download/Upload preset row horizontally.
+        adb -s "$DEVICE" shell input swipe 300 "$y" 60 "$y" 700
+      else
+        # Reveal the card inside the main vertical ScrollView.
+        adb -s "$DEVICE" shell input swipe 160 500 160 300 700
+      fi
     fi
     sleep 1
   done
 
-  echo "UI_ERROR: cannot select '$wanted' using '$unique_desc'."
+  echo "UI_ERROR: cannot select '$wanted' using '$unique_tag' / '$unique_desc'."
   return 1
 }
 
@@ -482,7 +512,7 @@ while IFS='|' read -r index preset expected <&3; do
   fi
   sleep 2
 
-  if ! tap_preset_row "$preset" top; then
+  if ! tap_preset_row "$preset" top "$expected"; then
     FAIL_COUNT=$((FAIL_COUNT+1))
     echo "$index,$preset,$expected,Download,,,,,Preset selection failed,FAIL" >> "$RUN_DIR/speed-limit-sweep-results.csv"
     cleanup_vpn || true
@@ -507,7 +537,7 @@ while IFS='|' read -r index preset expected <&3; do
   adb -s "$DEVICE" shell input swipe 160 570 160 190 850
   sleep 2
 
-  if ! tap_preset_row "$preset" bottom; then
+  if ! tap_preset_row "$preset" bottom "$expected"; then
     FAIL_COUNT=$((FAIL_COUNT+1))
     echo "$index,$preset,$expected,Upload,,,,,Preset selection failed,FAIL" >> "$RUN_DIR/speed-limit-sweep-results.csv"
     cleanup_vpn || true
