@@ -361,9 +361,14 @@ jobs:
 
               if timeout 10s adb -s emulator-5554 shell uiautomator dump "${remote}" >"${dump_log}" 2>&1 &&
                  timeout 10s adb -s emulator-5554 exec-out cat "${remote}" >"${output}" 2>>"${dump_log}" &&
-                 [ -s "${output}" ]; then
+                 [ -s "${output}" ] &&
+                 python3 -c 'import sys, xml.etree.ElementTree as ET; ET.parse(sys.argv[1])' "${output}" >/dev/null 2>&1; then
                 adb -s emulator-5554 shell rm -f "${remote}" >/dev/null 2>&1 || true
                 return 0
+              fi
+
+              if [ -s "${output}" ] && ! python3 -c 'import sys, xml.etree.ElementTree as ET; ET.parse(sys.argv[1])' "${output}" >/dev/null 2>&1; then
+                echo "UI hierarchy XML is malformed (attempt ${attempt}/5); retrying."
               fi
 
               echo "ADB UI dump/read failed (attempt ${attempt}/5):"
@@ -402,21 +407,25 @@ jobs:
           path, wanted, occurrence = sys.argv[1], sys.argv[2], int(sys.argv[3])
           root = ET.parse(path).getroot()
 
-          def wanted_match(text):
-              if not text:
-                  return False
+          def normalize(value):
+              return " ".join((value or "").split())
+
+          def wanted_match(text, content_desc):
+              candidates = {normalize(text), normalize(content_desc)}
+              candidates.discard("")
               if wanted == "🚀":
-                  return text == "🚀 فحص السرعة"
-              return text == wanted
+                  return bool(candidates & {"🚀 فحص السرعة", "فحص السرعة"})
+              return normalize(wanted) in candidates
 
           matches = []
           for node in root.iter("node"):
-              text = node.attrib.get("text", "")
-              if wanted_match(text):
+              text = normalize(node.attrib.get("text", ""))
+              content_desc = normalize(node.attrib.get("content-desc", ""))
+              if wanted_match(text, content_desc):
                   bounds = node.attrib.get("bounds", "")
                   match = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
                   if match:
-                      matches.append((text, tuple(map(int, match.groups()))))
+                      matches.append((text or content_desc or wanted, tuple(map(int, match.groups()))))
 
           if len(matches) >= occurrence:
               text, (x1, y1, x2, y2) = matches[occurrence - 1]
