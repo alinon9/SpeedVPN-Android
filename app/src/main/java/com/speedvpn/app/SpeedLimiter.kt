@@ -4,7 +4,9 @@ import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
+import kotlin.math.ceil
 import kotlin.math.max
+import kotlin.math.min
 
 internal data class SessionCounter(
     val generation: Long,
@@ -14,19 +16,31 @@ internal data class SessionCounter(
 /**
  * Global device-wide pacing limiter.
  *
- * A single scheduler is shared by all flows in each direction. Waiting is done
- * with a Condition, which releases the lock while sleeping and wakes promptly
- * when the user changes the limit. This preserves a global limit without the
- * long head-of-line lock held by Thread.sleep inside synchronized().
+ * Uses a monotonic-clock token bucket shared by all flows in each direction.
+ * Tokens accrue while the relay is reading/writing sockets, so ordinary I/O
+ * overhead is accounted for instead of being added on top of a full per-chunk
+ * sleep. A bounded burst absorbs scheduler jitter; no waiter reserves future
+ * tokens before those tokens are available.
  */
 class TokenBucket {
+    companion object {
+        private const val NANOS_PER_SECOND = 1_000_000_000.0
+        private const val BURST_WINDOW_NS = 10_000_000L
+        // Preserve the relay's normal 16 KiB TCP read size as the minimum burst.
+        // At higher rates, permit at most 64 KiB of accumulated credit.
+        private const val MIN_BURST_BYTES = 16 * 1024
+        private const val MAX_BURST_BYTES = 64 * 1024
+    }
+
     @Volatile
     var bytesPerSec: Long = 0
         private set
 
     private val lock = ReentrantLock(true)
     private val changed = lock.newCondition()
-    private var nextAvailableNs = System.nanoTime()
+    private var capacityBytes = 0.0
+    private var availableBytes = 0.0
+    private var lastRefillNs = System.nanoTime()
 
     // Counts bytes actually forwarded successfully, not bytes merely requested.
     val total = AtomicLong(0)
@@ -38,18 +52,20 @@ class TokenBucket {
         lock.withLock {
             val newRate = max(0L, bytesPerSec)
             this.bytesPerSec = newRate
-            // Apply a new limit immediately. One in-flight chunk may finish under
-            // the old schedule, then all subsequent chunks use the new rate.
-            nextAvailableNs = System.nanoTime()
+            capacityBytes = burstCapacity(newRate)
+            // Apply a changed rate immediately. One in-flight chunk can complete
+            // under the old schedule; subsequent acquires use the new token budget.
+            availableBytes = capacityBytes
+            lastRefillNs = System.nanoTime()
             changed.signalAll()
         }
     }
 
     /**
-     * Wait until this chunk's turn, then reserve only the slot that is actually
-     * being granted. A waiter never pre-reserves future time before it can send,
-     * so interruption/cancellation cannot leave phantom pacing debt behind.
-     * rate==0 means unlimited.
+     * Wait until enough credit exists for this chunk, then debit it.
+     * A rate of zero means unlimited. Chunks larger than the bucket capacity
+     * are allowed once the bucket is full and create debt that must refill before
+     * the next chunk, so a large UDP datagram cannot wait forever.
      */
     fun acquire(n: Int, canProceed: () -> Boolean = { true }): Boolean {
         if (n <= 0) return canProceed()
@@ -62,31 +78,52 @@ class TokenBucket {
                 if (rate <= 0L) return true
 
                 val now = System.nanoTime()
-                val startAt = nextAvailableNs.coerceAtLeast(now)
-                val waitNs = startAt - now
-                if (waitNs > 0L) {
-                    try {
-                        changed.awaitNanos(waitNs)
-                    } catch (_: InterruptedException) {
-                        // No reservation was made for this waiter, so returning
-                        // cannot leave a future deadline behind for other flows.
-                        Thread.currentThread().interrupt()
-                        return false
-                    }
-                    // Re-check rate and deadline after wakeup (including a
-                    // setRate() signal or a spurious wakeup).
-                    continue
+                refill(now, rate)
+                if (!canProceed()) return false
+
+                // For an oversized packet, a full bucket is the eligibility
+                // threshold. Debiting the full packet then accounts for its
+                // transmission time as token debt before another packet is sent.
+                val requiredBytes = min(n.toDouble(), capacityBytes)
+                if (availableBytes >= requiredBytes) {
+                    availableBytes -= n.toDouble()
+                    return true
                 }
 
-                if (!canProceed()) return false
-                val durationNs = ((n.toDouble() * 1_000_000_000.0) / rate.toDouble())
-                    .toLong().coerceAtLeast(1L)
-                nextAvailableNs = safeAdd(now, durationNs)
-                return true
+                val missingBytes = requiredBytes - availableBytes
+                val waitNs = ceil(missingBytes * NANOS_PER_SECOND / rate.toDouble())
+                    .toLong()
+                    .coerceAtLeast(1L)
+                try {
+                    changed.awaitNanos(waitNs)
+                } catch (_: InterruptedException) {
+                    // No reservation was made for this waiter, so returning cannot
+                    // leave phantom pacing debt behind for other flows.
+                    Thread.currentThread().interrupt()
+                    return false
+                }
+                // Re-check rate, generation and token balance after every wakeup.
             }
         } finally {
             lock.unlock()
         }
+    }
+
+    private fun burstCapacity(rate: Long): Double {
+        if (rate <= 0L) return 0.0
+        val rateWindowBytes = rate.toDouble() * BURST_WINDOW_NS.toDouble() / NANOS_PER_SECOND
+        return rateWindowBytes.coerceIn(MIN_BURST_BYTES.toDouble(), MAX_BURST_BYTES.toDouble())
+    }
+
+    /** Refill tokens using elapsed monotonic time, including time spent doing I/O. */
+    private fun refill(nowNs: Long, rate: Long) {
+        val elapsedNs = (nowNs - lastRefillNs).coerceAtLeast(0L)
+        lastRefillNs = nowNs
+        if (elapsedNs == 0L) return
+        availableBytes = min(
+            capacityBytes,
+            availableBytes + elapsedNs.toDouble() * rate.toDouble() / NANOS_PER_SECOND,
+        )
     }
 
     fun beginSession(generation: Long) {
@@ -132,19 +169,17 @@ class TokenBucket {
     }
 
     /**
-     * Clears any pacing deadline left by flows that are being torn down. This is
-     * safe at relay/session shutdown because the relay has already stopped its
-     * workers, and prevents a cancelled session from delaying a later session.
+     * Clears stale pacing state at session teardown/startup and wakes waiters.
+     * This is safe only at the lifecycle points guarded by SpeedLimiter below.
      */
     fun resetScheduler() {
         lock.withLock {
-            nextAvailableNs = System.nanoTime()
+            capacityBytes = burstCapacity(bytesPerSec)
+            availableBytes = capacityBytes
+            lastRefillNs = System.nanoTime()
             changed.signalAll()
         }
     }
-
-    private fun safeAdd(a: Long, b: Long): Long =
-        if (Long.MAX_VALUE - a < b) Long.MAX_VALUE else a + b
 }
 
 object SpeedLimiter {
