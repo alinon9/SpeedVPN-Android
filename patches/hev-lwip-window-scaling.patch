@@ -25,11 +25,12 @@ diff --git a/src/ports/include/lwipopts.h b/src/ports/include/lwipopts.h
 -#define TCP_WND                         (8 * TCP_MSS)
 +#define TCP_WND                         (32 * TCP_MSS)
  
-@@ -400,6 +404,6 @@
+@@ -400,6 +404,7 @@
  /**
   * TCP_SND_BUF: TCP sender buffer space (bytes).
   * To achieve good performance, this should be at least 2 * TCP_MSS.
   */
 -#define TCP_SND_BUF                     (8 * TCP_MSS)
 +#define TCP_SND_BUF                     (32 * TCP_MSS)
++#define TCP_SNDLOWAT                   ((2 * TCP_MSS) + 1)
  

@@ -41,6 +41,7 @@ LWIP_OPTS="$LWIP_DIR/src/ports/include/lwipopts.h"
 grep -Fq '#define PBUF_POOL_SIZE                  64' "$LWIP_OPTS"
 grep -Fq '#define TCP_WND                         (32 * TCP_MSS)' "$LWIP_OPTS"
 grep -Fq '#define TCP_SND_BUF                     (32 * TCP_MSS)' "$LWIP_OPTS"
+grep -Fq '#define TCP_SNDLOWAT                   ((2 * TCP_MSS) + 1)' "$LWIP_OPTS"
 grep -Fq '#define LWIP_WND_SCALE                  1' "$LWIP_OPTS"
 grep -Fq '#define TCP_RCV_SCALE                   2' "$LWIP_OPTS"
 git -C "$LWIP_DIR" diff --check
