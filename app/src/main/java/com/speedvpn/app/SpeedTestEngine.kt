@@ -312,20 +312,74 @@ object SpeedTestEngine {
             .post(body)
             .build()
 
+    private data class CachedDnsEntry(
+        val expiresAtNanos: Long,
+        val addresses: List<java.net.InetAddress>,
+    )
+
+    // Reuse a successful Cloudflare DNS answer across the consecutive requests
+    // in a speed test and across the baseline/VPN halves of Verify Speed. Besides
+    // avoiding needless resolver load, this prevents a transient DNS outage
+    // halfway through a three-run CI check from invalidating an otherwise good
+    // measurement. Entries expire quickly to tolerate address rotation.
+    private val dnsCache = java.util.concurrent.ConcurrentHashMap<String, CachedDnsEntry>()
+    private val dnsCacheTtlNanos = TimeUnit.SECONDS.toNanos(60)
+
     private fun buildTestClient(context: Context): OkHttpClient {
         val connectivity = context.getSystemService(ConnectivityManager::class.java)
+        val activeNetwork = connectivity.activeNetwork
+        val activeCapabilities = activeNetwork?.let(connectivity::getNetworkCapabilities)
+        val activeDefaultIsVpn = activeCapabilities?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
+        val canUseSystemDnsFallback = activeCapabilities != null &&
+            !activeDefaultIsVpn &&
+            activeCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
         val physicalNetwork = findPhysicalNetwork(connectivity)
 
         val dns = object : Dns {
             override fun lookup(hostname: String): List<java.net.InetAddress> {
-                if (physicalNetwork == null) {
-                    return lookupWithRetry(hostname, "DNS") {
+                val now = System.nanoTime()
+                dnsCache[hostname]?.let { cached ->
+                    if (now < cached.expiresAtNanos) return cached.addresses
+                    dnsCache.remove(hostname, cached)
+                }
+
+                val addresses = if (physicalNetwork == null) {
+                    if (!canUseSystemDnsFallback) {
+                        throw IOException(
+                            "No usable physical network for DNS lookup of $hostname; refusing VPN-routed DNS",
+                        )
+                    }
+                    lookupWithRetry(hostname, "DNS") {
                         java.net.InetAddress.getAllByName(hostname).toList()
                     }
+                } else {
+                    try {
+                        lookupWithRetry(hostname, "Physical DNS") {
+                            physicalNetwork.getAllByName(hostname).toList()
+                        }
+                    } catch (physicalError: IOException) {
+                        // The system resolver fallback is safe only while Android's
+                        // default route is explicitly non-VPN. If VPN is active,
+                        // never silently send a DNS request through the VPN path or
+                        // accept its synthetic MapDNS response.
+                        if (!canUseSystemDnsFallback) throw physicalError
+                        Log.w(
+                            TAG,
+                            "Physical DNS failed on a non-VPN default network; retrying via Android system DNS",
+                            physicalError,
+                        )
+                        lookupWithRetry(hostname, "Default DNS fallback") {
+                            java.net.InetAddress.getAllByName(hostname).toList()
+                        }
+                    }
                 }
-                return lookupWithRetry(hostname, "Physical DNS") {
-                    physicalNetwork.getAllByName(hostname).toList()
-                }
+
+                val immutableAddresses = addresses.toList()
+                dnsCache[hostname] = CachedDnsEntry(
+                    expiresAtNanos = System.nanoTime() + dnsCacheTtlNanos,
+                    addresses = immutableAddresses,
+                )
+                return immutableAddresses
             }
         }
 
@@ -365,8 +419,22 @@ object SpeedTestEngine {
         throw IOException("$prefix for $hostname after 3 attempts: ${errorMessage(lastError ?: IOException("unknown DNS error"))}", lastError)
     }
 
-    private fun findPhysicalNetwork(connectivity: ConnectivityManager): Network? =
-        connectivity.allNetworks.firstOrNull { network ->
+    private fun findPhysicalNetwork(connectivity: ConnectivityManager): Network? {
+        // During a normal speed test the active network is already physical.
+        // Prefer it rather than an arbitrary connected network, which may have
+        // stale DNS settings even though another network is the default route.
+        val active = connectivity.activeNetwork
+        if (active != null) {
+            val caps = connectivity.getNetworkCapabilities(active)
+            if (caps != null &&
+                !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
+                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            ) {
+                return active
+            }
+        }
+
+        return connectivity.allNetworks.firstOrNull { network ->
             val caps = connectivity.getNetworkCapabilities(network)
                 ?: return@firstOrNull false
             !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
@@ -378,6 +446,7 @@ object SpeedTestEngine {
             !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
                 caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
         }
+    }
 
     private fun percentile(values: ArrayList<Long>, percentile: Double): Long {
         if (values.isEmpty()) throw IOException("No speed samples")

@@ -630,14 +630,32 @@ while IFS='|' read -r index preset expected; do
   metrics_visible=0
   for reveal in 0 1 2 3 4 5 6 7 8 9; do
     dump_ui "$result_xml" || true
-    baseline_rows="$(grep -cF "🌐 سرعة الإنترنت الأصلية" "$result_xml" 2>/dev/null || true)"
-    plan_rows="$(grep -cF "🔒 السرعة المحجوزة / المحددة" "$result_xml" 2>/dev/null || true)"
-    vpn_rows="$(grep -cF "🚀 السرعة الفعلية داخل VPN" "$result_xml" 2>/dev/null || true)"
-    # The result card title/Download heading may be just above the viewport,
-    # while both Download and Upload metric groups are already fully visible.
-    if [ "${baseline_rows:-0}" -ge 2 ] &&
-       [ "${plan_rows:-0}" -ge 2 ] &&
-       [ "${vpn_rows:-0}" -ge 2 ]; then
+    # UIAutomator XML escapes emoji text as numeric character references
+    # (for example &#127760;), so grep against literal emoji never matches.
+    # Parse the XML instead; ElementTree decodes entities back to the actual
+    # Compose text and avoids false failures when the completed metrics exist.
+    if python3 - "$result_xml" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+path = sys.argv[1]
+texts = [
+    (node.attrib.get("text", "") or "").strip()
+    for node in ET.parse(path).getroot().iter("node")
+]
+labels = (
+    "🌐 سرعة الإنترنت الأصلية",
+    "🔒 السرعة المحجوزة / المحددة",
+    "🚀 السرعة الفعلية داخل VPN",
+)
+counts = [sum(value == label for value in texts) for label in labels]
+print(
+    "Verify metric row counts after XML decode: "
+    f"baseline={counts[0]}, plan={counts[1]}, vpn={counts[2]}"
+)
+raise SystemExit(0 if all(count >= 2 for count in counts) else 1)
+PY
+    then
       metrics_visible=1
       echo "Both Verify metric groups visible for $preset after scroll $reveal." | tee -a "$RUN_DIR/sweep-console.log"
       break
