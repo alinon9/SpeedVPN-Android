@@ -68,7 +68,10 @@ wanted = normalize(wanted)
 for node in root.iter("node"):
     text = normalize(node.attrib.get("text", ""))
     content_desc = normalize(node.attrib.get("content-desc", ""))
-    if wanted not in {text, content_desc}:
+    if wanted == "🚀 فحص السرعة":
+        if not ({wanted, "فحص السرعة"} & {text, content_desc}):
+            continue
+    elif wanted not in {text, content_desc}:
         continue
     m = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", node.attrib.get("bounds",""))
     if not m:
