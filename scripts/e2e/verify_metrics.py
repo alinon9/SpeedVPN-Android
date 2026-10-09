@@ -100,7 +100,8 @@ def check_metric(direction: str, values: dict[str, str], expected_kbps: int) -> 
 
     target_bps = expected_kbps * 1_000.0
     plan_bps = rate_bps(plan)
-    if plan_bps is None or abs(plan_bps - target_bps) > max(1.0, target_bps * 0.01):
+    plan_valid = plan_bps is not None and abs(plan_bps - target_bps) <= max(1.0, target_bps * 0.01)
+    if not plan_valid:
         reasons.append(f"{direction}: plan '{plan}' differs from target {expected_kbps} Kbps")
     if verdict == STATUS_MISMATCH:
         reasons.append(f"{direction}: app verdict is MISMATCH")
@@ -113,16 +114,31 @@ def check_metric(direction: str, values: dict[str, str], expected_kbps: int) -> 
             f"{direction}: measured {vpn_bps / 1000:.2f} Kbps outside "
             f"±20% interval [{target_bps * 0.8 / 1000:.2f}, {target_bps * 1.2 / 1000:.2f}] Kbps"
         )
-    if baseline_bps is not None and baseline_bps < target_bps * 1.2:
+
+    baseline_limited = baseline_bps is not None and 0 < baseline_bps < target_bps * 1.2
+    if baseline_limited:
         reasons.append(
             f"{direction}: environment baseline {baseline_bps / 1000:.2f} Kbps "
             f"is below the 1.2x verification floor for {expected_kbps} Kbps"
         )
 
+    # When the physical baseline misses the documented 1.2x headroom floor,
+    # an under/over-target VPN result cannot independently prove an app defect.
+    # Keep the strict gate red (ENV_LIMITED is never PASS), but classify it
+    # separately from a verified rate-limiter failure. Structural failures such
+    # as a wrong saved plan, missing rate, or unknown verdict remain FAIL.
+    valid_verdicts = {STATUS_PASS, STATUS_MISMATCH, STATUS_UNJUDGEABLE}
+    if (
+        baseline_limited
+        and plan_valid
+        and vpn_bps is not None
+        and vpn_bps > 0
+        and verdict in valid_verdicts
+    ):
+        return baseline, plan, vpn, verdict, "ENV_LIMITED|" + "; ".join(reasons)
+
     if not reasons:
         return baseline, plan, vpn, verdict, "PASS"
-    if len(reasons) == 1 and "environment baseline" in reasons[0]:
-        return baseline, plan, vpn, verdict, "ENV_LIMITED|" + "; ".join(reasons)
     return baseline, plan, vpn, verdict, "FAIL|" + "; ".join(reasons)
 
 
