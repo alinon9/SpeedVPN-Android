@@ -42,6 +42,7 @@ This run uses seven named engineering roles sequentially in one coordinated tool
 | L-04 | Sweep run has limited physical baseline at some upload levels | Observed; environment-limited, not app PASS | Test-Runner-Agent | Run on headroom-sufficient baseline; keep ENV_LIMITED red for strict all-pass gate |
 | L-05 | Unlimited Download differs across runner environments | E2E passed; lower-baseline sweep failed | Test-Runner-Agent + Traffic-Shaping-Agent | Validate policy and repeated paired baseline/VPN measurements; don't hard-code PASS |
 | L-06 | Preserve 800 Kbps behavior | Historical baseline PASS; current regression not yet re-run | Traffic-Shaping-Agent + Independent-Verification-Agent | JVM conversion/pacing tests plus fresh in-app Download and Upload measurements |
+| L-07 | CSV provenance omitted run ID/time | Confirmed static gap before change | Test-Runner-Agent | Each result row records run_id and UTC result time; validator rejects invalid timestamps, mixed runs and IDs inconsistent with current GitHub run |
 
 ## 4. Proposed scoped change
 

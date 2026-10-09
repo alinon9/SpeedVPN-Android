@@ -7,11 +7,13 @@ SCREEN_SIZE="$(adb -s "$DEVICE" shell wm size 2>/dev/null | awk -F': ' '/Overrid
 SCREEN_WIDTH="${SCREEN_SIZE%x*}"
 SCREEN_HEIGHT="${SCREEN_SIZE#*x}"
 RUN_DIR="speed-limit-sweep"
+CSV_RUN_ID="${GITHUB_RUN_ID:-local}"
+recorded_at_utc() { date -u +"%Y-%m-%dT%H:%M:%S.%3NZ"; }
 mkdir -p "$RUN_DIR"
 : > "$RUN_DIR/speed-limit-sweep-results.csv"
 : > "$RUN_DIR/sweep-console.log"
 
-echo 'index,preset,expected_kbps,direction,baseline_raw,plan_raw,vpn_raw,verdict,reason,classification' > "$RUN_DIR/speed-limit-sweep-results.csv"
+echo 'index,preset,expected_kbps,direction,baseline_raw,plan_raw,vpn_raw,verdict,reason,classification,run_id,recorded_at_utc' > "$RUN_DIR/speed-limit-sweep-results.csv"
 
 SPEED_CASES=$(cat <<'CASES'
 1|10 KB|80
@@ -545,7 +547,7 @@ while IFS='|' read -r index preset expected <&3; do
   if ! tap_text "السرعة"; then
     echo "FAIL $preset: Speed tab not found."
     FAIL_COUNT=$((FAIL_COUNT+1))
-    echo "$index,$preset,$expected,UI,,,,,Speed tab not found,FAIL" >> "$RUN_DIR/speed-limit-sweep-results.csv"
+    echo "$index,$preset,$expected,UI,,,,,Speed tab not found,FAIL,${CSV_RUN_ID},$(recorded_at_utc)" >> "$RUN_DIR/speed-limit-sweep-results.csv"
     continue
   fi
   sleep 2
@@ -554,7 +556,7 @@ while IFS='|' read -r index preset expected <&3; do
     dl_limits="$(read_limits)"
     echo "Download prefs after failed selection: $dl_limits" | tee -a "$RUN_DIR/sweep-console.log"
     FAIL_COUNT=$((FAIL_COUNT+1))
-    echo "$index,$preset,$expected,Download,,,,,Preset selection/persistence failed,FAIL" >> "$RUN_DIR/speed-limit-sweep-results.csv"
+    echo "$index,$preset,$expected,Download,,,,,Preset selection/persistence failed,FAIL,${CSV_RUN_ID},$(recorded_at_utc)" >> "$RUN_DIR/speed-limit-sweep-results.csv"
     cleanup_vpn || true
     continue
   fi
@@ -569,7 +571,7 @@ while IFS='|' read -r index preset expected <&3; do
     ul_limits="$(read_limits)"
     echo "Upload prefs after failed selection: $ul_limits" | tee -a "$RUN_DIR/sweep-console.log"
     FAIL_COUNT=$((FAIL_COUNT+1))
-    echo "$index,$preset,$expected,Upload,,,,,Preset selection/persistence failed,FAIL" >> "$RUN_DIR/speed-limit-sweep-results.csv"
+    echo "$index,$preset,$expected,Upload,,,,,Preset selection/persistence failed,FAIL,${CSV_RUN_ID},$(recorded_at_utc)" >> "$RUN_DIR/speed-limit-sweep-results.csv"
     cleanup_vpn || true
     continue
   fi
@@ -582,7 +584,7 @@ while IFS='|' read -r index preset expected <&3; do
   if ! tap_text "✅ تحقق من السرعة"; then
     echo "FAIL $preset: Verify button not found."
     FAIL_COUNT=$((FAIL_COUNT+1))
-    echo "$index,$preset,$expected,Verify,,,,,Verify button not found,FAIL" >> "$RUN_DIR/speed-limit-sweep-results.csv"
+    echo "$index,$preset,$expected,Verify,,,,,Verify button not found,FAIL,${CSV_RUN_ID},$(recorded_at_utc)" >> "$RUN_DIR/speed-limit-sweep-results.csv"
     cleanup_vpn || true
     continue
   fi
@@ -599,7 +601,7 @@ while IFS='|' read -r index preset expected <&3; do
     else
       echo "FAIL $preset: Android VPN approval not completed."
       FAIL_COUNT=$((FAIL_COUNT+1))
-      echo "$index,$preset,$expected,VPN,,,,,VPN approval failed,FAIL" >> "$RUN_DIR/speed-limit-sweep-results.csv"
+      echo "$index,$preset,$expected,VPN,,,,,VPN approval failed,FAIL,${CSV_RUN_ID},$(recorded_at_utc)" >> "$RUN_DIR/speed-limit-sweep-results.csv"
       cleanup_vpn || true
       continue
     fi
@@ -621,7 +623,7 @@ while IFS='|' read -r index preset expected <&3; do
     if [ "$verify_restarted" -ne 1 ]; then
       echo "FAIL $preset: Verify button was not available after VPN permission."
       FAIL_COUNT=$((FAIL_COUNT+1))
-      echo "$index,$preset,$expected,Verify,,,,,Verify restart after VPN permission failed,FAIL" >> "$RUN_DIR/speed-limit-sweep-results.csv"
+      echo "$index,$preset,$expected,Verify,,,,,Verify restart after VPN permission failed,FAIL,${CSV_RUN_ID},$(recorded_at_utc)" >> "$RUN_DIR/speed-limit-sweep-results.csv"
       adb -s "$DEVICE" logcat -d -t 3500 > "$RUN_DIR/$slug-logcat.txt" || true
       cleanup_vpn || true
       continue
@@ -730,7 +732,7 @@ PY
   if [ "$finished" -ne 1 ]; then
     echo "FAIL $preset: no completed metric row appeared within 300 seconds (loading_frame_seen=$loading_seen)."
     FAIL_COUNT=$((FAIL_COUNT+1))
-    echo "$index,$preset,$expected,Verify,,,,,Completed metric row missing or timeout,FAIL" >> "$RUN_DIR/speed-limit-sweep-results.csv"
+    echo "$index,$preset,$expected,Verify,,,,,Completed metric row missing or timeout,FAIL,${CSV_RUN_ID},$(recorded_at_utc)" >> "$RUN_DIR/speed-limit-sweep-results.csv"
     cleanup_vpn || true
     continue
   fi
@@ -785,7 +787,7 @@ required = [
 print("VERIFY_FIELDS_MISSING=" + ",".join(key for key in required if not data.get(key)))
 PY
     FAIL_COUNT=$((FAIL_COUNT+1))
-    echo "$index,$preset,$expected,Verify,,,,,Tagged metrics not fully captured,FAIL" >> "$RUN_DIR/speed-limit-sweep-results.csv"
+    echo "$index,$preset,$expected,Verify,,,,,Tagged metrics not fully captured,FAIL,${CSV_RUN_ID},$(recorded_at_utc)" >> "$RUN_DIR/speed-limit-sweep-results.csv"
     cleanup_vpn || true
     continue
   fi
@@ -811,8 +813,8 @@ with open(sys.argv[1], newline="", encoding="utf-8") as handle:
     for row in csv.reader(handle):
         if not row:
             continue
-        if len(row) != 10:
-            raise SystemExit(f"Malformed parser CSV row: expected 10 columns, got {len(row)}")
+        if len(row) != 12:
+            raise SystemExit(f"Malformed parser CSV row: expected 12 columns, got {len(row)}")
         print(row[9].strip())
 PY
     )
@@ -824,7 +826,7 @@ PY
   if ! cleanup_vpn; then
     echo "FAIL $preset: VPN TUN remained after cleanup."
     FAIL_COUNT=$((FAIL_COUNT+1))
-    echo "$index,$preset,$expected,VPN,,,,,VPN remained active after cleanup,FAIL" >> "$RUN_DIR/speed-limit-sweep-results.csv"
+    echo "$index,$preset,$expected,VPN,,,,,VPN remained active after cleanup,FAIL,${CSV_RUN_ID},$(recorded_at_utc)" >> "$RUN_DIR/speed-limit-sweep-results.csv"
   else
     echo "VPN OFF confirmed before next preset." | tee -a "$RUN_DIR/sweep-console.log"
   fi
@@ -852,9 +854,12 @@ if ! python3 scripts/e2e/verify_metrics.py validate-sweep "$RUN_DIR/speed-limit-
   FAIL_COUNT=$((FAIL_COUNT+1))
 fi
 
+SUMMARY_RECORDED_AT_UTC="$(recorded_at_utc)"
 cat > "$RUN_DIR/speed-limit-sweep-summary.md" <<MD
 # SpeedVPN Speed-Limit Sweep
 
+- GitHub run ID: $CSV_RUN_ID
+- Summary generated at (UTC): $SUMMARY_RECORDED_AT_UTC
 - Presets attempted: $TESTED_PRESET_COUNT/$TOTAL
 - Download/Upload metric results recorded: $METRIC_RESULT_COUNT/$EXPECTED_METRIC_RESULTS
 - Metric PASS: $PASS_COUNT
@@ -886,7 +891,15 @@ cp "$RUN_DIR/speed-limit-sweep-summary.md" speed-limit-sweep-summary.md
   echo
   echo "| # | Preset | Direction | Plan | VPN | Verdict | Classification |"
   echo "|---:|---|---|---|---|---|---|"
-  awk -F',' 'NR>1 && NF>=10 {printf "| %s | %s | %s | %s | %s | %s | %s |\\n",$1,$2,$4,$6,$7,$8,$10}' speed-limit-sweep-results.csv
+  python3 - "speed-limit-sweep-results.csv" <<'PY'
+import csv, sys
+with open(sys.argv[1], newline="", encoding="utf-8-sig") as handle:
+    for row in csv.DictReader(handle):
+        if not row:
+            continue
+        fields = (row["index"], row["preset"], row["direction"], row["plan_raw"], row["vpn_raw"], row["verdict"], row["classification"])
+        print("| " + " | ".join(fields) + " |")
+PY
 } >> "$GITHUB_STEP_SUMMARY"
 
 if grep -Eiq "FATAL EXCEPTION|AndroidRuntime.*FATAL" "$RUN_DIR/"*-logcat.txt 2>/dev/null; then

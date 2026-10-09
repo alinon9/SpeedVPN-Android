@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import re
 import sys
+from datetime import datetime, timezone
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -37,7 +39,7 @@ EXPECTED_PRESETS = {
 }
 CSV_FIELDS = [
     "index", "preset", "expected_kbps", "direction", "baseline_raw",
-    "plan_raw", "vpn_raw", "verdict", "reason", "classification",
+    "plan_raw", "vpn_raw", "verdict", "reason", "classification", "run_id", "recorded_at_utc",
 ]
 
 
@@ -146,12 +148,14 @@ def parse_json(json_path: str, preset: str, expected_kbps: int, index: int, outp
     values = json.loads(Path(json_path).read_text(encoding="utf-8"))
     rows = []
     failed = False
+    run_id = (os.environ.get("GITHUB_RUN_ID") or "local").strip()
+    recorded_at_utc = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
     for direction in ("download", "upload"):
         baseline, plan, vpn, verdict, result = check_metric(direction, values, expected_kbps)
         classification, sep, reason = result.partition("|")
         failed = failed or classification not in {"PASS", "PASS_UNLIMITED"}
         label = "Download" if direction == "download" else "Upload"
-        rows.append([index, preset, expected_kbps, label, baseline, plan, vpn, verdict, reason if sep else "", classification])
+        rows.append([index, preset, expected_kbps, label, baseline, plan, vpn, verdict, reason if sep else "", classification, run_id, recorded_at_utc])
     with open(output_path, "w", newline="", encoding="utf-8") as handle:
         csv.writer(handle).writerows(rows)
     for row in rows:
@@ -194,9 +198,28 @@ def validate_sweep(csv_path: str) -> int:
         return 1
 
     errors = []
+    expected_run_id = (os.environ.get("GITHUB_RUN_ID") or "").strip()
+    observed_run_ids: set[str] = set()
     expected_keys = {(i, direction) for i in EXPECTED_PRESETS for direction in ("Download", "Upload")}
     found = {}
     for line, row in enumerate(rows, start=2):
+        row_run_id = (row.get("run_id") or "").strip()
+        recorded_at = (row.get("recorded_at_utc") or "").strip()
+        if not row_run_id:
+            errors.append(f"CSV line {line}: missing run_id")
+        else:
+            observed_run_ids.add(row_run_id)
+            if expected_run_id and row_run_id != expected_run_id:
+                errors.append(f"CSV line {line}: run_id {row_run_id!r} does not match current GitHub run {expected_run_id!r}")
+        if not recorded_at.endswith("Z"):
+            errors.append(f"CSV line {line}: recorded_at_utc must be an ISO-8601 UTC timestamp ending in Z")
+        else:
+            try:
+                parsed_at = datetime.fromisoformat(recorded_at[:-1] + "+00:00")
+                if parsed_at.tzinfo is None or parsed_at.utcoffset() is None:
+                    errors.append(f"CSV line {line}: recorded_at_utc is missing UTC timezone")
+            except ValueError:
+                errors.append(f"CSV line {line}: invalid recorded_at_utc {recorded_at!r}")
         try:
             index = int(row["index"])
             expected = int(row["expected_kbps"])
@@ -234,6 +257,8 @@ def validate_sweep(csv_path: str) -> int:
         if recorded != calculated:
             errors.append(f"{key}: recorded class {recorded} disagrees with strict class {calculated}")
 
+    if len(observed_run_ids) > 1:
+        errors.append(f"provenance: rows contain mixed run IDs: {sorted(observed_run_ids)}")
     missing = expected_keys - set(found)
     if missing:
         errors.append(f"coverage: missing {len(missing)} of 38 metrics: {sorted(missing)[:8]}")
