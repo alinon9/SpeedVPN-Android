@@ -460,15 +460,6 @@ preference_matches() {
   local check_download="$4"
   printf '%s\n' "$xml" | python3 scripts/e2e/preference_matches.py "$target_key" "$expected" "$check_download"
 }
-expected = int(expected_raw)
-keys = [key]
-if check_download == "both" and "dl" not in keys:
-    keys.append("dl")
-if any(values.get(item, -999999) != expected for item in keys):
-    raise SystemExit(1)
-'
-}
-
 select_preset_and_wait() {
   local wanted="$1"
   local mode="$2"
