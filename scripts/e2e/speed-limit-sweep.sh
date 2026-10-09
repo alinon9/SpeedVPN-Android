@@ -518,6 +518,7 @@ parse_verify() {
 
 TOTAL=19
 FAIL_COUNT=0
+METRIC_FAIL_COUNT=0
 ENV_LIMITED_COUNT=0
 PASS_COUNT=0
 TESTED_PRESET_COUNT=0
@@ -801,8 +802,8 @@ PY
       case "$r_classification" in
         PASS|PASS_UNLIMITED) PASS_COUNT=$((PASS_COUNT+1));;
         ENV_LIMITED) ENV_LIMITED_COUNT=$((ENV_LIMITED_COUNT+1));;
-        FAIL) FAIL_COUNT=$((FAIL_COUNT+1));;
-        *) echo "FAIL $preset: invalid classification '$r_classification'."; FAIL_COUNT=$((FAIL_COUNT+1));;
+        FAIL) FAIL_COUNT=$((FAIL_COUNT+1)); METRIC_FAIL_COUNT=$((METRIC_FAIL_COUNT+1));;
+        *) echo "FAIL $preset: invalid classification '$r_classification'."; FAIL_COUNT=$((FAIL_COUNT+1)); METRIC_FAIL_COUNT=$((METRIC_FAIL_COUNT+1));;
       esac
     done < <(python3 - "$RUN_DIR/$slug-parsed.csv" <<'PY'
 import csv, sys
@@ -856,9 +857,11 @@ cat > "$RUN_DIR/speed-limit-sweep-summary.md" <<MD
 
 - Presets attempted: $TESTED_PRESET_COUNT/$TOTAL
 - Download/Upload metric results recorded: $METRIC_RESULT_COUNT/$EXPECTED_METRIC_RESULTS
-- PASS: $PASS_COUNT
-- ENV_LIMITED (physical/emulator baseline below selected plan): $ENV_LIMITED_COUNT
-- HARD FAIL: $FAIL_COUNT
+- Metric PASS: $PASS_COUNT
+- Metric FAIL (validly collected but outside criteria, or invalid verification result): $METRIC_FAIL_COUNT
+- Metric ENV_LIMITED (insufficient physical-baseline headroom): $ENV_LIMITED_COUNT
+- Additional hard-fail events outside metric rows, including coverage/strict-gate events: $((FAIL_COUNT-METRIC_FAIL_COUNT))
+- HARD FAIL event count (not a unique metric count): $FAIL_COUNT
 
 Every labeled preset is covered: 10/25/50/75/100/130/250/500/750/950 KB/s, 1/2/3/4/5 MB/s, 9/10/11 MB/s, and Unlimited.
 
@@ -875,9 +878,11 @@ cp "$RUN_DIR/speed-limit-sweep-summary.md" speed-limit-sweep-summary.md
 {
   echo "## SpeedVPN Speed-Limit Sweep"
   echo
-  echo "- PASS: $PASS_COUNT"
-  echo "- ENV_LIMITED: $ENV_LIMITED_COUNT"
-  echo "- HARD FAIL: $FAIL_COUNT"
+  echo "- Metric PASS: $PASS_COUNT"
+  echo "- Metric FAIL: $METRIC_FAIL_COUNT"
+  echo "- Metric ENV_LIMITED: $ENV_LIMITED_COUNT"
+  echo "- Additional hard-fail events beyond metric rows: $((FAIL_COUNT-METRIC_FAIL_COUNT))"
+  echo "- HARD FAIL event count (not unique metric count): $FAIL_COUNT"
   echo
   echo "| # | Preset | Direction | Plan | VPN | Verdict | Classification |"
   echo "|---:|---|---|---|---|---|---|"
@@ -893,7 +898,9 @@ echo "===== SPEED LIMIT SWEEP COMPLETE ====="
 echo "PRESETS_TESTED=$TESTED_PRESET_COUNT/$TOTAL"
 echo "METRIC_RESULTS=$METRIC_RESULT_COUNT/$EXPECTED_METRIC_RESULTS"
 echo "PASS=$PASS_COUNT"
+echo "METRIC_FAIL=$METRIC_FAIL_COUNT"
 echo "ENV_LIMITED=$ENV_LIMITED_COUNT"
+echo "ADDITIONAL_HARD_FAIL_EVENTS=$((FAIL_COUNT-METRIC_FAIL_COUNT))"
 echo "HARD_FAIL=$FAIL_COUNT"
 
 if [ "$FAIL_COUNT" -gt 0 ]; then
