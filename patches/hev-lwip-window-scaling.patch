@@ -1,0 +1,17 @@
+diff --git a/src/ports/include/lwipopts.h b/src/ports/include/lwipopts.h
+--- a/src/ports/include/lwipopts.h
++++ b/src/ports/include/lwipopts.h
+@@ -203 +203 @@
+-#define PBUF_POOL_SIZE                  32
++#define PBUF_POOL_SIZE                  64
+@@ -398 +398 @@
+-#define TCP_WND                         (8 * TCP_MSS)
++#define TCP_WND                         (32 * TCP_MSS)
+@@ -404 +404 @@
+-#define TCP_SND_BUF                     (8 * TCP_MSS)
++#define TCP_SND_BUF                     (32 * TCP_MSS)
+@@ -1538,2 +1538,2 @@
+-#define LWIP_WND_SCALE                  0
+-#define TCP_RCV_SCALE                   0
++#define LWIP_WND_SCALE                  1
++#define TCP_RCV_SCALE                   2
