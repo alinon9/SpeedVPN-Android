@@ -154,9 +154,12 @@ jobs:
             local remote=/sdcard/speedvpn-ui.xml
             for attempt in 1 2 3 4 5; do
               rm -f "$out"
-              if adb -s emulator-5554 shell uiautomator dump "$remote" >/dev/null 2>&1 && adb -s emulator-5554 exec-out cat "$remote" > "$out" 2>/dev/null && [ -s "$out" ]; then
+              if adb -s emulator-5554 shell uiautomator dump "$remote" >/dev/null 2>&1 && adb -s emulator-5554 exec-out cat "$remote" > "$out" 2>/dev/null && [ -s "$out" ] && python3 -c 'import sys, xml.etree.ElementTree as ET; ET.parse(sys.argv[1])' "$out" >/dev/null 2>&1; then
                 adb -s emulator-5554 shell rm -f "$remote" >/dev/null 2>&1 || true
                 return 0
+              fi
+              if [ -s "$out" ] && ! python3 -c 'import sys, xml.etree.ElementTree as ET; ET.parse(sys.argv[1])' "$out" >/dev/null 2>&1; then
+                echo "UI hierarchy XML is malformed (attempt ${attempt}/5); retrying."
               fi
               sleep 1
             done
@@ -172,9 +175,18 @@ jobs:
           import re, subprocess, sys, xml.etree.ElementTree as ET
           path, wanted = sys.argv[1], sys.argv[2]
           root = ET.parse(path).getroot()
+          def normalize(value):
+              return ' '.join((value or '').split())
           for node in root.iter('node'):
-              if node.attrib.get('text','') == wanted:
-                  m = re.fullmatch(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', node.attrib.get('bounds',''))
+              text = normalize(node.attrib.get('text',''))
+              content_desc = normalize(node.attrib.get('content-desc',''))
+              matches = {text, content_desc}
+              if wanted == '🚀 فحص السرعة':
+                  if not (matches & {wanted, 'فحص السرعة'}):
+                      continue
+              elif normalize(wanted) not in matches:
+                  continue
+              m = re.fullmatch(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', node.attrib.get('bounds',''))
                   if m:
                       x1,y1,x2,y2 = map(int,m.groups())
                       subprocess.run(['adb','-s','emulator-5554','shell','input','tap',str((x1+x2)//2),str((y1+y2)//2)],check=True)
