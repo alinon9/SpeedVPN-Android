@@ -132,7 +132,7 @@ jobs:
           bash scripts/e2e/speed-limit-sweep.sh
 
       - name: Strict 38/38 speed-limiter gate
-        if: always()
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
           test -s speed-limit-sweep-results.csv || { echo "Missing speed-limit-sweep-results.csv"; exit 1; }
