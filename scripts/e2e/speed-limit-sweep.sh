@@ -3,6 +3,9 @@ set -euo pipefail
 
 DEVICE="emulator-5554"
 PACKAGE="com.speedvpn.app"
+SCREEN_SIZE="$(adb -s "$DEVICE" shell wm size 2>/dev/null | awk -F': ' '/Override size:/{size=$2} /Physical size:/{if(size=="")size=$2} END{print size}')"
+SCREEN_WIDTH="${SCREEN_SIZE%x*}"
+SCREEN_HEIGHT="${SCREEN_SIZE#*x}"
 RUN_DIR="speed-limit-sweep"
 mkdir -p "$RUN_DIR"
 : > "$RUN_DIR/speed-limit-sweep-results.csv"
@@ -185,9 +188,11 @@ direction_title() {
 coord_for_resource_id() {
   local xml="$1"
   local wanted="$2"
-  python3 - "$xml" "$wanted" <<'PY'
+  python3 - "$xml" "$wanted" "$SCREEN_WIDTH" "$SCREEN_HEIGHT" <<'PY'
 import re, sys, xml.etree.ElementTree as ET
-path, wanted = sys.argv[1:]
+path, wanted, width_raw, height_raw = sys.argv[1:]
+width = int(width_raw) if width_raw.isdigit() else 0
+height = int(height_raw) if height_raw.isdigit() else 0
 root = ET.parse(path).getroot()
 for node in root.iter("node"):
     resource_id = node.attrib.get("resource-id", "")
@@ -202,8 +207,9 @@ for node in root.iter("node"):
         continue
     x1,y1,x2,y2 = map(int, match.groups())
     x,y = (x1+x2)//2,(y1+y2)//2
-    # Do not tap a clipped off-screen center even if the Compose node remains in the XML tree.
-    if x < 0 or y < 0:
+    # A partially clipped Compose node may still be listed as visible, while its
+    # center lies outside the Android display; do not issue a tap there.
+    if x < 0 or y < 0 or (width and x >= width) or (height and y >= height):
         continue
     print(x, y)
     raise SystemExit(0)
@@ -214,9 +220,11 @@ PY
 coord_for_content_desc() {
   local xml="$1"
   local wanted="$2"
-  python3 - "$xml" "$wanted" <<'PY'
+  python3 - "$xml" "$wanted" "$SCREEN_WIDTH" "$SCREEN_HEIGHT" <<'PY'
 import re, sys, xml.etree.ElementTree as ET
-path, wanted = sys.argv[1:]
+path, wanted, width_raw, height_raw = sys.argv[1:]
+width = int(width_raw) if width_raw.isdigit() else 0
+height = int(height_raw) if height_raw.isdigit() else 0
 root = ET.parse(path).getroot()
 for node in root.iter("node"):
     if node.attrib.get("content-desc") != wanted:
@@ -230,7 +238,7 @@ for node in root.iter("node"):
         continue
     x1,y1,x2,y2 = map(int, match.groups())
     x,y = (x1+x2)//2,(y1+y2)//2
-    if x < 0 or y < 0:
+    if x < 0 or y < 0 or (width and x >= width) or (height and y >= height):
         continue
     print(x, y)
     raise SystemExit(0)
