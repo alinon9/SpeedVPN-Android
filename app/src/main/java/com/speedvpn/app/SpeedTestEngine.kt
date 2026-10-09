@@ -50,6 +50,7 @@ object SpeedTestEngine {
     private const val MIN_SAMPLE_DURATION_MS = 10L
     private const val TARGET_STABLE_DURATION_MS = 250L
     private const val MIN_VALID_SAMPLES = 2
+    private const val MIN_CAPPED_RANGE_SAMPLES = 3
     private const val MAX_RETRIES = 2
 
     private const val CONNECT_TIMEOUT_SECONDS = 8L
@@ -115,6 +116,15 @@ object SpeedTestEngine {
         runCatching { warmup(client, isUpload, warmupBytes) }
             .onFailure { Log.i(TAG, "Warm-up failed for ${if (isUpload) "upload" else "download"}; continuing", it) }
 
+        // A small HTTP body can overstate a rate-limited flow because the relay
+        // lets the first 16 KiB chunk through immediately after an idle gap.
+        // For the finite 200–1,000 Kbps plans, collect three larger samples so
+        // the initial burst cannot dominate the result.
+        val requiredSamples = if (expectedKbps != null && expectedKbps in 101L..1_000L) {
+            MIN_CAPPED_RANGE_SAMPLES
+        } else {
+            MIN_VALID_SAMPLES
+        }
         val samples = ArrayList<Long>()
         var lastFailure: Throwable? = null
 
@@ -145,7 +155,7 @@ object SpeedTestEngine {
 
                 // Once a real request lasts long enough to amortize connection
                 // overhead, do not keep issuing large transfers needlessly.
-                if (samples.size >= MIN_VALID_SAMPLES &&
+                if (samples.size >= requiredSamples &&
                     requestDurationFor(sizeBytes, measured) >= TARGET_STABLE_DURATION_MS
                 ) {
                     break
@@ -153,14 +163,17 @@ object SpeedTestEngine {
             }
         }
 
-        if (samples.size < MIN_VALID_SAMPLES) {
+        if (samples.size < requiredSamples) {
             throw IOException(
                 lastFailure?.let(::errorMessage)
                     ?: "Not enough valid throughput samples",
             )
         }
 
-        return percentile(samples, 0.90)
+        // The public speed-test screen reports a high percentile, while a cap
+        // verification must be resistant to one optimistic sample. Use the
+        // median for finite plans; an uncapped baseline continues to use p90.
+        return percentile(samples, if (expectedKbps != null && expectedKbps > 0L) 0.50 else 0.90)
     }
 
     private fun requestSizesFor(expectedKbps: Long?): LongArray =
@@ -170,7 +183,7 @@ object SpeedTestEngine {
             // initial burst rather than sustained throughput. Use larger samples
             // while staying under the 30s HTTP call timeout at 80 Kbps (10 KB/s).
             expectedKbps <= 100L -> longArrayOf(128_000L, 192_000L, 256_000L)
-            expectedKbps <= 1_000L -> longArrayOf(32_000L, 64_000L, 128_000L, 256_000L, 512_000L)
+            expectedKbps <= 1_000L -> longArrayOf(128_000L, 256_000L, 512_000L, 1_000_000L)
             expectedKbps <= 5_000L -> longArrayOf(64_000L, 128_000L, 256_000L, 512_000L, 1_000_000L)
             expectedKbps <= 20_000L -> longArrayOf(128_000L, 256_000L, 512_000L, 1_000_000L, 2_000_000L)
             expectedKbps <= 100_000L -> longArrayOf(256_000L, 512_000L, 1_000_000L, 2_000_000L, 5_000_000L)
