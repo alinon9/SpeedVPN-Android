@@ -32,6 +32,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.compose.ui.draw.clip
@@ -308,6 +309,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    @OptIn(ExperimentalComposeUiApi::class)
     @Composable
     private fun SpeedScreen(s: Snapshot) {
         var testBusy by remember { mutableStateOf(false) }
