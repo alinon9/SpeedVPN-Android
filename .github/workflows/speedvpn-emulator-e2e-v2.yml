@@ -187,10 +187,10 @@ jobs:
               elif normalize(wanted) not in matches:
                   continue
               m = re.fullmatch(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', node.attrib.get('bounds',''))
-                  if m:
-                      x1,y1,x2,y2 = map(int,m.groups())
-                      subprocess.run(['adb','-s','emulator-5554','shell','input','tap',str((x1+x2)//2),str((y1+y2)//2)],check=True)
-                      raise SystemExit(0)
+              if m:
+                  x1,y1,x2,y2 = map(int,m.groups())
+                  subprocess.run(['adb','-s','emulator-5554','shell','input','tap',str((x1+x2)//2),str((y1+y2)//2)],check=True)
+                  raise SystemExit(0)
           raise SystemExit(1)
           PY
               then return 0; fi
