@@ -473,7 +473,7 @@ with open(out_path,"w",newline="",encoding="utf-8") as f:
     csv.writer(f).writerows(rows)
 
 for row in rows:
-    print("RESULT|"+"|".join(row))
+    print("RESULT|"+"|".join(map(str, row)))
 print("OVERALL|"+("FAIL" if hard else "PASS"))
 sys.exit(2 if hard else 0)
 PY
@@ -613,39 +613,98 @@ while IFS='|' read -r index preset expected <&3; do
     sleep 1
   fi
 
-  loading=0
-  for second in $(seq 1 30); do
-    dump_ui "$RUN_DIR/$slug-loading.xml" || true
-    if grep -q "جاري التحقق من الخطة…" "$RUN_DIR/$slug-loading.xml" 2>/dev/null; then
-      loading=1
-      break
-    fi
-    sleep 1
-  done
-
-  if [ "$loading" -ne 1 ]; then
-    echo "FAIL $preset: Verify loading state missing."
-    FAIL_COUNT=$((FAIL_COUNT+1))
-    adb -s "$DEVICE" logcat -d -t 2500 > "$RUN_DIR/$slug-logcat.txt" || true
-    echo "$index,$preset,$expected,Verify,,,,,Loading state missing,FAIL" >> "$RUN_DIR/speed-limit-sweep-results.csv"
-    cleanup_vpn || true
-    continue
-  fi
-
+  # The completed result is a better completion signal than the transient loading
+  # text: fast runs can finish between UIAutomator snapshots. Activity state is
+  # recreated between presets, so this metric card belongs to the current run.
   result_xml="$RUN_DIR/$slug-verify.xml"
   finished=0
+  loading_seen=0
   for second in $(seq 1 300); do
-    dump_ui "$RUN_DIR/$slug-loading.xml" || true
+    dump_ui "$result_xml" || true
+    if grep -q "جاري التحقق من الخطة…" "$result_xml" 2>/dev/null; then
+      loading_seen=1
+    fi
 
-    # The completed Verify card is below the initial viewport on the CI
-    # emulator. Do not use visibility of "نتيجة التحقق" as the completion
-    # signal; that caused false 300-second timeouts even after the coroutine
-    # had already returned and the button had changed back to its idle label.
-    if ! grep -q "جاري التحقق من الخطة…" "$RUN_DIR/$slug-loading.xml" 2>/dev/null &&
-       grep -q "✅ تحقق من السرعة" "$RUN_DIR/$slug-loading.xml" 2>/dev/null; then
+    # Completion is accepted only when a rendered metric row has the current
+    # preset's plan, a baseline, an in-VPN measurement and a final verdict.
+    # The spinner does not have to be captured by UIAutomator.
+    if python3 - "$result_xml" "$expected" <<'PY' >/dev/null 2>&1
+import re, sys, xml.etree.ElementTree as ET
+
+path, expected_raw = sys.argv[1:]
+expected = int(expected_raw)
+try:
+    texts = [(n.attrib.get("text", "") or "").strip()
+             for n in ET.parse(path).getroot().iter("node")]
+except (OSError, ET.ParseError):
+    raise SystemExit(1)
+
+status_labels = {
+    "✅ السرعة متطابقة", "❌ السرعة غير متطابقة",
+    "⚠️ لا يمكن الحكم", "✅ لا يظهر سقف واضح",
+}
+labels = {
+    "baseline": "🌐 سرعة الإنترنت الأصلية",
+    "plan": "🔒 السرعة المحجوزة / المحددة",
+    "vpn": "🚀 السرعة الفعلية داخل VPN",
+}
+rate_re = re.compile(r"^([0-9]+(?:\.[0-9]+)?) ?(bps|Kbps|Mbps|Gbps)$")
+mult = {"bps": 1.0, "Kbps": 1000.0, "Mbps": 1_000_000.0, "Gbps": 1_000_000_000.0}
+
+def rate(value):
+    match = rate_re.fullmatch(value)
+    return None if not match else float(match.group(1)) * mult[match.group(2)]
+
+def value_after(section, label):
+    try:
+        index = section.index(label)
+    except ValueError:
+        return None
+    boundaries = set(status_labels) | set(labels.values()) | {
+        "Download", "Upload", "الدقة مقارنة بالخيار"
+    }
+    for value in section[index + 1:index + 7]:
+        if value == "بدون حد" or rate(value) is not None:
+            return value
+        if value in boundaries:
+            break
+    return None
+
+anchors = [i for i, value in enumerate(texts)
+           if value == labels["baseline"]]
+for position, start in enumerate(anchors):
+    end = anchors[position + 1] if position + 1 < len(anchors) else len(texts)
+    section = texts[start:end]
+    if not any(value in status_labels for value in section):
+        continue
+    baseline_raw = value_after(section, labels["baseline"])
+    plan_raw = value_after(section, labels["plan"])
+    vpn_raw = value_after(section, labels["vpn"])
+    if baseline_raw is None or plan_raw is None or vpn_raw is None:
+        continue
+    if rate(baseline_raw) is None or rate(vpn_raw) is None:
+        continue
+    if expected == 0:
+        plan_matches = plan_raw == "بدون حد"
+    else:
+        plan_bps = rate(plan_raw)
+        expected_bps = expected * 1000.0
+        # Allow only visible-label rounding when identifying the selected plan.
+        plan_matches = plan_bps is not None and abs(plan_bps - expected_bps) <= max(1.0, expected_bps * 0.01)
+    if plan_matches:
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+    then
       finished=1
-      echo "Verify coroutine completed for $preset after $second seconds." | tee -a "$RUN_DIR/sweep-console.log"
+      echo "Verify result exposed for $preset after ${second}s (loading_frame_seen=$loading_seen)." | tee -a "$RUN_DIR/sweep-console.log"
       break
+    fi
+
+    # Keep scrolling toward the current result card. This handles the case
+    # where the result is complete but below the UIAutomator viewport.
+    if [ "$((second % 3))" -eq 0 ]; then
+      adb -s "$DEVICE" shell input swipe 160 500 160 220 650 || true
     fi
     sleep 1
   done
@@ -653,9 +712,9 @@ while IFS='|' read -r index preset expected <&3; do
   adb -s "$DEVICE" logcat -d -t 3500 > "$RUN_DIR/$slug-logcat.txt" || true
 
   if [ "$finished" -ne 1 ]; then
-    echo "FAIL $preset: Verify timeout."
+    echo "FAIL $preset: no completed metric row appeared within 300 seconds (loading_frame_seen=$loading_seen)."
     FAIL_COUNT=$((FAIL_COUNT+1))
-    echo "$index,$preset,$expected,Verify,,,,,Verification timeout,FAIL" >> "$RUN_DIR/speed-limit-sweep-results.csv"
+    echo "$index,$preset,$expected,Verify,,,,,Completed metric row missing or timeout,FAIL" >> "$RUN_DIR/speed-limit-sweep-results.csv"
     cleanup_vpn || true
     continue
   fi
