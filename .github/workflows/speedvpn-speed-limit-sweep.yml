@@ -6,6 +6,11 @@ on:
     paths:
       - 'scripts/e2e/speed-limit-sweep.sh'
       - '.github/workflows/speedvpn-speed-limit-sweep.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'scripts/e2e/speed-limit-sweep.sh'
+      - '.github/workflows/speedvpn-speed-limit-sweep.yml'
   workflow_dispatch:
 
 permissions:
