@@ -32,6 +32,8 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
@@ -317,7 +319,11 @@ class MainActivity : ComponentActivity() {
         var verificationHistory by remember { mutableStateOf(SpeedVerificationStore.loadRecent(this@MainActivity, 8)) }
 
         Column(
-            Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(18.dp),
+            Modifier.fillMaxSize()
+                .semantics { testTagsAsResourceId = true }
+                .testTag("speed_screen")
+                .verticalScroll(rememberScrollState())
+                .padding(18.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
             ScreenTitle("التحكم بالسرعة", "اختر مستوى جاهزًا أو اضبطه بالمؤشر — الوحدات KB/s وMB/s")
@@ -371,7 +377,7 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                     },
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth().testTag("verify_speed_button"),
                     shape = RoundedCornerShape(14.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = Blue2),
                 ) {
@@ -1254,6 +1260,7 @@ class MainActivity : ComponentActivity() {
         accessibilityPrefix: String,
         onApply: (Long?) -> Unit,
     ) {
+        val directionTag = if (accessibilityPrefix == "سرعة التحميل") "download" else "upload"
         Column(Modifier.fillMaxWidth()) {
             Text(label, color = accent, fontSize = 10.sp, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(4.dp))
@@ -1269,6 +1276,7 @@ class MainActivity : ComponentActivity() {
                         contentPadding = PaddingValues(horizontal = 9.dp, vertical = 0.dp),
                         modifier = Modifier
                             .height(32.dp)
+                            .testTag("speed_preset_${directionTag}_${speedKbps}")
                             .semantics {
                                 contentDescription = "$accessibilityPrefix: $labelText"
                             },
@@ -1309,6 +1317,7 @@ class MainActivity : ComponentActivity() {
             exp(minLog + (maxLog - minLog) * pos.coerceIn(0f, 1f)).roundToLong().coerceIn(1L, 100_000L)
         }
         val kbps: Long? = selectedKBps?.let { it * 8L }
+        val directionTag = if (title == "سرعة التحميل") "download" else "upload"
 
         GlassCard {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -1325,7 +1334,10 @@ class MainActivity : ComponentActivity() {
                     shape = RoundedCornerShape(11.dp),
                     border = androidx.compose.foundation.BorderStroke(1.dp, Green.copy(alpha = 0.45f)),
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
-                    modifier = Modifier.height(34.dp),
+                    modifier = Modifier
+                        .height(34.dp)
+                        .testTag("speed_preset_${directionTag}_unlimited")
+                        .semantics { contentDescription = "$title: $unlimitedPreset" },
                 ) { Text(unlimitedPreset, fontSize = 11.sp, color = TextPrimary) }
             }
             Spacer(Modifier.height(4.dp))
