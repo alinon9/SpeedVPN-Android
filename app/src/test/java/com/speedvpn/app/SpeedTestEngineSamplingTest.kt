@@ -45,7 +45,7 @@ class SpeedTestEngineSamplingTest {
     fun baselineAndUnlimitedKeepAdaptiveLadder() {
         val baseline = SpeedTestEngine.requestSizesFor(null)
         assertEquals(7, baseline.size)
-        assertTrue(baseline.zipWithNext().all { (left, right) -> left < right })
+        assertTrue(baseline.asList().zipWithNext().all { (left, right) -> left < right })
         assertArrayEquals(baseline, SpeedTestEngine.requestSizesFor(0L))
     }
 }
