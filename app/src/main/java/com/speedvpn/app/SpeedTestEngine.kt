@@ -124,7 +124,7 @@ object SpeedTestEngine {
         // lets the first 16 KiB chunk through immediately after an idle gap.
         // For the finite 200–1,000 Kbps plans, collect three larger samples so
         // the initial burst cannot dominate the result.
-        val requiredSamples = if (expectedKbps != null && expectedKbps > 0L) {
+        val requiredSamples = if (expectedKbps != null && expectedKbps > 100L) {
             MIN_CAPPED_RANGE_SAMPLES
         } else {
             MIN_VALID_SAMPLES
