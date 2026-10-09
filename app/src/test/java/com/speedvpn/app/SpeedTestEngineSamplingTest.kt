@@ -1,7 +1,10 @@
 package com.speedvpn.app
 
 import org.junit.Assert.assertArrayEquals
+import okhttp3.Dns
+import okhttp3.OkHttpClient
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -73,4 +76,19 @@ class SpeedTestEngineSamplingTest {
         assertTrue(baseline.asList().zipWithNext().all { (left, right) -> left < right })
         assertArrayEquals(baseline, SpeedTestEngine.requestSizesFor(0L))
     }
+    @Test
+    fun eachMeasurementClientUsesAnIsolatedConnectionPool() {
+        val sharedClient = OkHttpClient.Builder().build()
+        val baselineClient = SpeedTestEngine.createIsolatedMeasurementClient(sharedClient, Dns.SYSTEM)
+        val vpnClient = SpeedTestEngine.createIsolatedMeasurementClient(sharedClient, Dns.SYSTEM)
+
+        assertNotSame(sharedClient.connectionPool, baselineClient.connectionPool)
+        assertNotSame(sharedClient.connectionPool, vpnClient.connectionPool)
+        assertNotSame(baselineClient.connectionPool, vpnClient.connectionPool)
+
+        baselineClient.connectionPool.evictAll()
+        vpnClient.connectionPool.evictAll()
+        sharedClient.connectionPool.evictAll()
+    }
+
 }

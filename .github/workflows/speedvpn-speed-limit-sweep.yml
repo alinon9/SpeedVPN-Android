@@ -123,7 +123,7 @@ jobs:
           echo no | avdmanager create avd -n speedvpn-sweep -k 'system-images;android-29;google_apis;x86_64' --force
           adb kill-server >/dev/null 2>&1 || true
           adb start-server
-          nohup emulator -avd speedvpn-sweep -no-window -no-audio -no-boot-anim -no-snapshot -no-snapshot-save -no-metrics -gpu swiftshader_indirect -accel on -cores 2 -memory 1536 -partition-size 2048 -netdelay none -netspeed full -dns-server 8.8.8.8,1.1.1.1 > emulator-console.log 2>&1 &
+          nohup emulator -avd speedvpn-sweep -no-window -no-audio -no-boot-anim -no-snapshot -no-snapshot-save -no-metrics -gpu swiftshader_indirect -accel on -cores 4 -memory 4096 -partition-size 2048 -netdelay none -netspeed full -dns-server 8.8.8.8,1.1.1.1 > emulator-console.log 2>&1 &
           EMULATOR_PID=$!
 
           cleanup() {
@@ -158,6 +158,15 @@ jobs:
           adb -s emulator-5554 shell settings put global transition_animation_scale 0
           adb -s emulator-5554 shell settings put global animator_duration_scale 0
           adb -s emulator-5554 install -r app/build/outputs/apk/debug/app-debug.apk
+
+          echo '===== ISOLATE EMULATOR BACKGROUND NETWORK NOISE ====='
+          adb -s emulator-5554 shell settings put global private_dns_mode off
+          adb -s emulator-5554 shell settings delete global private_dns_specifier || true
+          adb -s emulator-5554 shell settings put global master_sync_enabled 0
+          adb -s emulator-5554 shell settings put global wifi_scan_always_enabled 0
+          adb -s emulator-5554 shell settings put global ble_scan_always_enabled 0
+          echo "private_dns_mode=$(adb -s emulator-5554 shell settings get global private_dns_mode | tr -d '\r')"
+          echo "master_sync_enabled=$(adb -s emulator-5554 shell settings get global master_sync_enabled | tr -d '\r')"
 
           echo '===== SWEEP NETWORK PRECHECK ====='
           adb -s emulator-5554 shell ip route || true

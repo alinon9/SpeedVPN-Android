@@ -9,6 +9,7 @@ import kotlinx.coroutines.Dispatchers
 import okhttp3.MediaType.Companion.toMediaType
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import okhttp3.ConnectionPool
 import okhttp3.Dns
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -63,6 +64,7 @@ object SpeedTestEngine {
     private const val READ_TIMEOUT_SECONDS = 25L
     private const val WRITE_TIMEOUT_SECONDS = 25L
     private const val CALL_TIMEOUT_SECONDS = 30L
+    private const val MEASUREMENT_POOL_KEEP_ALIVE_SECONDS = 30L
 
     private val client: OkHttpClient by lazy {
         OkHttpClient.Builder()
@@ -164,7 +166,7 @@ object SpeedTestEngine {
 
             if (measured != null && measured > 0L) {
                 samples += measured
-                Log.d(TAG, "Sample ${if (isUpload) "upload" else "download"} ${sizeBytes}B = $measured bps")
+                Log.d(TAG, "Sample ${if (isUpload) "upload" else "download"} ${sizeBytes}B = $measured bps; estimatedDurationMs=${requestDurationFor(sizeBytes, measured)}")
 
                 // Once a real request lasts long enough to amortize connection
                 // overhead, do not keep issuing large transfers needlessly.
@@ -193,6 +195,12 @@ object SpeedTestEngine {
         require(path == "__down" || path == "__up") { "Unsupported speed-test endpoint: $path" }
         return "${resolveTestBaseUrl(configuredBaseUrl)}/$path"
     }
+
+    internal fun createIsolatedMeasurementClient(baseClient: OkHttpClient, dns: Dns): OkHttpClient =
+        baseClient.newBuilder()
+            .connectionPool(ConnectionPool(5, MEASUREMENT_POOL_KEEP_ALIVE_SECONDS, TimeUnit.SECONDS))
+            .dns(dns)
+            .build()
 
     private fun resolveTestBaseUrl(configuredBaseUrl: String?): String =
         configuredBaseUrl
@@ -428,9 +436,7 @@ object SpeedTestEngine {
             }
         }
 
-        return client.newBuilder()
-            .dns(dns)
-            .build()
+        return createIsolatedMeasurementClient(client, dns)
     }
 
     /**
