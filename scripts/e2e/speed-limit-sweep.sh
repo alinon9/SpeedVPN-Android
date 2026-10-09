@@ -45,9 +45,13 @@ dump_ui() {
     rm -f "$out"
     if adb -s "$DEVICE" shell uiautomator dump "$remote" >/dev/null 2>&1 &&
        adb -s "$DEVICE" exec-out cat "$remote" > "$out" 2>/dev/null &&
-       [ -s "$out" ]; then
+       [ -s "$out" ] &&
+       python3 -c 'import sys, xml.etree.ElementTree as ET; ET.parse(sys.argv[1])' "$out" >/dev/null 2>&1; then
       adb -s "$DEVICE" shell rm -f "$remote" >/dev/null 2>&1 || true
       return 0
+    fi
+    if [ -s "$out" ] && ! python3 -c 'import sys, xml.etree.ElementTree as ET; ET.parse(sys.argv[1])' "$out" >/dev/null 2>&1; then
+      echo "UI hierarchy XML is malformed (attempt ${attempt}/5); retrying."
     fi
     sleep 1
   done
@@ -63,8 +67,16 @@ import re, sys, xml.etree.ElementTree as ET
 path, wanted, mode = sys.argv[1:]
 root = ET.parse(path).getroot()
 matches = []
+def normalize(value):
+    return " ".join((value or "").split())
+wanted = normalize(wanted)
 for node in root.iter("node"):
-    if node.attrib.get("text") != wanted:
+    text = normalize(node.attrib.get("text", ""))
+    content_desc = normalize(node.attrib.get("content-desc", ""))
+    if wanted == "🚀 فحص السرعة":
+        if not ({wanted, "فحص السرعة"} & {text, content_desc}):
+            continue
+    elif wanted not in {text, content_desc}:
         continue
     m = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", node.attrib.get("bounds",""))
     if not m:
