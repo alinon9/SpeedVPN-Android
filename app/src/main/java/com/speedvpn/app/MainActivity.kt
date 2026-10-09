@@ -340,6 +340,7 @@ class MainActivity : ComponentActivity() {
                     onClick = {
                         lifecycleScope.launch {
                             testBusy = true
+                            lastTest = null
                             testProgress = "جاري بدء الفحص…"
                             lastTest = SpeedTestEngine.measure(this@MainActivity) { phase ->
                                 val label = if (phase == SpeedTestPhase.DOWNLOAD) "جاري قياس Download…" else "جاري قياس Upload…"
@@ -363,6 +364,9 @@ class MainActivity : ComponentActivity() {
                         } else {
                             lifecycleScope.launch {
                                 verifyBusy = true
+                                // Do not expose a previous run's tagged metrics while the new
+                                // baseline/VPN measurements are still in progress.
+                                lastVerification = null
                                 verifyProgress = "جاري تحضير التحقق…"
                                 lastVerification = SpeedVerificationEngine.verify(
                                     context = this@MainActivity,
