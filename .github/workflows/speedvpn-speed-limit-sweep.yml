@@ -5,11 +5,25 @@ on:
     branches: [main, master]
     paths:
       - 'scripts/e2e/speed-limit-sweep.sh'
+      - 'scripts/e2e/local_speed_test_server.py'
+      - 'scripts/e2e/verify_metrics.py'
+      - 'scripts/e2e/tests/**'
+      - 'app/build.gradle.kts'
+      - 'app/src/main/java/com/speedvpn/app/SpeedTestEngine.kt'
+      - 'app/src/test/java/com/speedvpn/app/SpeedTestEngineSamplingTest.kt'
+      - 'app/src/debug/res/xml/network_security_config.xml'
       - '.github/workflows/speedvpn-speed-limit-sweep.yml'
   pull_request:
     branches: [main]
     paths:
       - 'scripts/e2e/speed-limit-sweep.sh'
+      - 'scripts/e2e/local_speed_test_server.py'
+      - 'scripts/e2e/verify_metrics.py'
+      - 'scripts/e2e/tests/**'
+      - 'app/build.gradle.kts'
+      - 'app/src/main/java/com/speedvpn/app/SpeedTestEngine.kt'
+      - 'app/src/test/java/com/speedvpn/app/SpeedTestEngineSamplingTest.kt'
+      - 'app/src/debug/res/xml/network_security_config.xml'
       - '.github/workflows/speedvpn-speed-limit-sweep.yml'
   workflow_dispatch:
 
@@ -53,14 +67,14 @@ jobs:
         run: |
           set -euo pipefail
           bash -n scripts/e2e/speed-limit-sweep.sh
-          python3 -m py_compile scripts/e2e/preference_matches.py scripts/e2e/verify_metrics.py
+          python3 -m py_compile scripts/e2e/preference_matches.py scripts/e2e/verify_metrics.py scripts/e2e/local_speed_test_server.py scripts/e2e/tests/test_local_speed_test_server.py
           python3 -m unittest discover -s scripts/e2e/tests -v
 
       - name: Build debug APK
-        run: ./gradlew :app:assembleDebug --stacktrace --no-daemon
+        run: ./gradlew :app:assembleDebug -PspeedTestBaseUrl=http://10.0.2.2:18765 --stacktrace --no-daemon
 
       - name: Run Android JVM unit tests
-        run: ./gradlew :app:testDebugUnitTest --stacktrace --no-daemon
+        run: ./gradlew :app:testDebugUnitTest -PspeedTestBaseUrl=http://10.0.2.2:18765 --stacktrace --no-daemon
 
       - name: Install Android Emulator
         run: |
@@ -80,6 +94,26 @@ jobs:
           sudo kvm-ok
           sudo chmod 666 /dev/kvm
           emulator -accel-check
+
+      - name: Start deterministic local speed-test fixture
+        run: |
+          nohup python3 -u scripts/e2e/local_speed_test_server.py --host 0.0.0.0 --port 18765 < /dev/null > speed-test-server.log 2>&1 &
+          echo "$!" > speed-test-server.pid
+          python3 - <<'PY'
+          import time
+          from urllib.request import urlopen
+
+          for attempt in range(40):
+              try:
+                  with urlopen("http://127.0.0.1:18765/healthz", timeout=1) as response:
+                      if response.status == 200:
+                          print("Deterministic local speed-test fixture is healthy.")
+                          break
+              except Exception:
+                  time.sleep(0.25)
+          else:
+              raise SystemExit("Local speed-test fixture did not become ready")
+          PY
 
       - name: Run exhaustive speed-limit sweep
         run: |
@@ -145,7 +179,15 @@ jobs:
           name: speedvpn-exhaustive-speed-limit-sweep
           path: |
             emulator-console.log
+            speed-test-server.log
             speed-limit-sweep-results.csv
             speed-limit-sweep-summary.md
             speed-limit-sweep/**
           if-no-files-found: ignore
+
+      - name: Stop deterministic local speed-test fixture
+        if: always()
+        run: |
+          if [ -f speed-test-server.pid ]; then
+            kill "$(cat speed-test-server.pid)" >/dev/null 2>&1 || true
+          fi

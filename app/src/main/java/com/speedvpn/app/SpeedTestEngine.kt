@@ -29,9 +29,11 @@ data class SpeedTestResult(
 
 object SpeedTestEngine {
     private const val TAG = "SpeedTestEngine"
-    private const val DOWNLOAD_URL = "https://speed.cloudflare.com/__down"
-    private const val UPLOAD_URL = "https://speed.cloudflare.com/__up"
-    private const val REFERER = "https://speed.cloudflare.com/"
+    private const val DEFAULT_TEST_BASE_URL = "https://speed.cloudflare.com"
+    private val testBaseUrl = resolveTestBaseUrl(BuildConfig.SPEED_TEST_BASE_URL)
+    private val DOWNLOAD_URL = endpointUrl("__down", BuildConfig.SPEED_TEST_BASE_URL)
+    private val UPLOAD_URL = endpointUrl("__up", BuildConfig.SPEED_TEST_BASE_URL)
+    private val REFERER = "$testBaseUrl/"
 
     // Sequential, adaptive requests. Cloudflare public speedtest also uses
     // progressively larger request sizes instead of a fixed concurrent window.
@@ -186,6 +188,18 @@ object SpeedTestEngine {
         // median for finite plans; an uncapped baseline continues to use p90.
         return percentile(samples, if (expectedKbps != null && expectedKbps > 0L) 0.50 else 0.90)
     }
+
+    internal fun endpointUrl(path: String, configuredBaseUrl: String?): String {
+        require(path == "__down" || path == "__up") { "Unsupported speed-test endpoint: $path" }
+        return "${resolveTestBaseUrl(configuredBaseUrl)}/$path"
+    }
+
+    private fun resolveTestBaseUrl(configuredBaseUrl: String?): String =
+        configuredBaseUrl
+            ?.trim()
+            ?.trimEnd('/')
+            ?.takeIf { it.isNotEmpty() }
+            ?: DEFAULT_TEST_BASE_URL
 
     internal fun requestSizesFor(expectedKbps: Long?): LongArray =
         when {

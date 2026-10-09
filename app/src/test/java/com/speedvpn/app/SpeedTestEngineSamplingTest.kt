@@ -7,6 +7,31 @@ import org.junit.Test
 
 class SpeedTestEngineSamplingTest {
     @Test
+    fun configuredDebugFixtureIsUsedForBothEndpoints() {
+        val baseUrl = "http://10.0.2.2:18765/"
+        assertEquals(
+            "http://10.0.2.2:18765/__down",
+            SpeedTestEngine.endpointUrl("__down", baseUrl),
+        )
+        assertEquals(
+            "http://10.0.2.2:18765/__up",
+            SpeedTestEngine.endpointUrl("__up", baseUrl),
+        )
+    }
+
+    @Test
+    fun emptyFixtureConfigurationKeepsPublicCloudflareEndpoint() {
+        assertEquals(
+            "https://speed.cloudflare.com/__down",
+            SpeedTestEngine.endpointUrl("__down", ""),
+        )
+        assertEquals(
+            "https://speed.cloudflare.com/__up",
+            SpeedTestEngine.endpointUrl("__up", null),
+        )
+    }
+
+    @Test
     fun mediumAndHighFinitePlansUseThreeEqualSustainedSamples() {
         assertArrayEquals(
             longArrayOf(3_000_000L, 3_000_000L, 3_000_000L),
