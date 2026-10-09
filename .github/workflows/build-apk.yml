@@ -725,107 +725,45 @@ jobs:
             return 1
           }
 
-          validate_verify_result() {
-            local xml="$1"
-
-            python3 - "${xml}" <<'PY' | tee -a verify-speed-results.txt
-          import re
-          import sys
-          import xml.etree.ElementTree as ET
-
-          path = sys.argv[1]
-          root = ET.parse(path).getroot()
-          texts = [
-              node.attrib.get("text", "").strip()
-              for node in root.iter("node")
-              if node.attrib.get("text", "").strip()
-          ]
-
-          if "نتيجة التحقق" not in texts:
-              raise SystemExit("VERIFY: missing result card")
-
-          if "جاري التحقق من الخطة…" in texts:
-              raise SystemExit("VERIFY: verification is still running")
-
-          if "فشل القياس" in texts:
-              raise SystemExit("VERIFY: one or more measurements failed")
-
-          notes = [text for text in texts if text.startswith("ملاحظة:")]
-          if notes:
-              raise SystemExit(f"VERIFY: verification reported an error/note: {notes}")
-
-          rate_re = re.compile(r"^(?:\d+(?:\.\d+)?)[ ]?(?:bps|Kbps|Mbps|Gbps)$")
-          status_labels = {
-              "✅ السرعة متطابقة",
-              "❌ السرعة غير متطابقة",
-              "⚠️ لا يمكن الحكم",
-              "✅ لا يظهر سقف واضح",
-          }
-
-          for metric, next_metric in (("Download", "Upload"), ("Upload", None)):
-              try:
-                  start = texts.index(metric)
-              except ValueError:
-                  raise SystemExit(f"VERIFY: missing {metric} metric section")
-
-              end = texts.index(next_metric, start + 1) if next_metric and next_metric in texts[start + 1:] else len(texts)
-              section = texts[start:end]
-
-              if not any(status in section for status in status_labels):
-                  raise SystemExit(f"VERIFY: {metric} has no final verdict")
-
-              def value_after(label):
-                  try:
-                      idx = section.index(label)
-                  except ValueError:
-                      raise SystemExit(f"VERIFY: {metric} missing label {label}")
-
-                  for candidate in section[idx + 1:idx + 8]:
-                      if candidate in {
-                          "🌐 سرعة الإنترنت الأصلية",
-                          "🔒 السرعة المحجوزة / المحددة",
-                          "🚀 السرعة الفعلية داخل VPN",
-                          "الدقة مقارنة بالخيار",
-                      }:
-                          continue
-                      if candidate in status_labels:
-                          break
-                      if rate_re.fullmatch(candidate):
-                          return candidate
-                  raise SystemExit(f"VERIFY: {metric} missing numeric value after {label}")
-
-              baseline = value_after("🌐 سرعة الإنترنت الأصلية")
-              plan = value_after("🔒 السرعة المحجوزة / المحددة")
-              vpn = value_after("🚀 السرعة الفعلية داخل VPN")
-
-              if plan == "بدون حد":
-                  raise SystemExit(f"VERIFY: {metric} plan is unexpectedly unlimited")
-
-              print(f"VERIFY {metric}: baseline={baseline}, plan={plan}, vpn={vpn}")
-              print(f"VERIFY {metric}: verdict={next(status for status in status_labels if status in section)}")
-          PY
-          }
 
           : > verify-speed-results.txt
           verify_result_xml="verify-speed-result.xml"
 
           wait_for_verify_result "${verify_result_xml}"
 
-          # Bring the metric rows into the small emulator viewport before
-          # parsing, in case only the result heading is currently visible.
-          for reveal in 0 1 2 3 4; do
-            if validate_verify_result "${verify_result_xml}" 2>/dev/null; then
+          # Merge stable Compose-tagged fields across viewport snapshots.
+          verify_metrics_json="verify-speed-metrics.json"
+          printf '{}' > "$verify_metrics_json"
+          metrics_valid=0
+          for reset in $(seq 1 10); do
+            dump_ui "${verify_result_xml}" || true
+            if python3 scripts/e2e/verify_metrics.py collect "${verify_result_xml}" "$verify_metrics_json" >> verify-speed-results.txt 2>&1; then
+              metrics_valid=1
               break
             fi
-            if [ "${reveal}" -eq 4 ]; then
-              echo "Could not expose complete Verify Speed metrics."
-              validate_verify_result "${verify_result_xml}"
-              exit 1
-            fi
-            adb -s emulator-5554 shell input swipe 160 500 160 220 600
-            sleep 1
-            dump_ui "${verify_result_xml}"
+            adb -s emulator-5554 shell input swipe 160 220 160 560 550 || true
+            sleep 0.3
           done
+          if [ "$metrics_valid" -ne 1 ]; then
+            for reveal in $(seq 1 30); do
+              dump_ui "${verify_result_xml}" || true
+              if python3 scripts/e2e/verify_metrics.py collect "${verify_result_xml}" "$verify_metrics_json" >> verify-speed-results.txt 2>&1; then
+                metrics_valid=1
+                break
+              fi
+              adb -s emulator-5554 shell input swipe 160 550 160 220 550 || true
+              sleep 0.3
+            done
+          fi
+          if [ "$metrics_valid" -ne 1 ]; then
+            echo "Could not collect all tagged Verify Speed fields."
+            cat verify-speed-results.txt
+            exit 1
+          fi
+
+          # The CI scenario sets both directions to 800 Kbps. Reject any
+          # MISMATCH, unjudgeable baseline, wrong plan, or VPN rate outside ±20%.
+          python3 scripts/e2e/verify_metrics.py validate-json "$verify_metrics_json" 800 800 | tee -a verify-speed-results.txt
 
           echo "===== VERIFY SPEED COMPLETE =====" | tee -a verify-speed-results.txt
           cat verify-speed-results.txt
@@ -852,6 +790,7 @@ jobs:
             ui-result-*.xml
             verify-speed-logcat.txt
             verify-speed-results.txt
+            verify-speed-metrics.json
             verify-speed-result.xml
             verify-speed-result.xml.loading.xml
           if-no-files-found: ignore

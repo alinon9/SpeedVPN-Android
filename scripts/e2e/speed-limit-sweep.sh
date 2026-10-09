@@ -195,11 +195,18 @@ for node in root.iter("node"):
         continue
     if node.attrib.get("enabled", "true").lower() == "false":
         continue
-    m = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", node.attrib.get("bounds",""))
-    if m:
-        x1,y1,x2,y2 = map(int, m.groups())
-        print((x1+x2)//2, (y1+y2)//2)
-        raise SystemExit(0)
+    if node.attrib.get("visible-to-user", "true").lower() == "false":
+        continue
+    match = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", node.attrib.get("bounds",""))
+    if not match:
+        continue
+    x1,y1,x2,y2 = map(int, match.groups())
+    x,y = (x1+x2)//2,(y1+y2)//2
+    # Do not tap a clipped off-screen center even if the Compose node remains in the XML tree.
+    if x < 0 or y < 0:
+        continue
+    print(x, y)
+    raise SystemExit(0)
 raise SystemExit(1)
 PY
 }
@@ -216,11 +223,17 @@ for node in root.iter("node"):
         continue
     if node.attrib.get("enabled", "true").lower() == "false":
         continue
-    m = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", node.attrib.get("bounds",""))
-    if m:
-        x1,y1,x2,y2 = map(int, m.groups())
-        print((x1+x2)//2, (y1+y2)//2)
-        raise SystemExit(0)
+    if node.attrib.get("visible-to-user", "true").lower() == "false":
+        continue
+    match = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", node.attrib.get("bounds",""))
+    if not match:
+        continue
+    x1,y1,x2,y2 = map(int, match.groups())
+    x,y = (x1+x2)//2,(y1+y2)//2
+    if x < 0 or y < 0:
+        continue
+    print(x, y)
+    raise SystemExit(0)
 raise SystemExit(1)
 PY
 }
@@ -228,25 +241,38 @@ PY
 preset_desc_row_y() {
   local xml="$1"
   local prefix="$2"
-  python3 - "$xml" "$prefix" <<'PY'
+  local group_title="$3"
+  python3 - "$xml" "$prefix" "$group_title" <<'PY'
 import re, sys, xml.etree.ElementTree as ET
-path, prefix = sys.argv[1:]
+path, prefix, group_title = sys.argv[1:]
+groups = {
+    "منخفض": {"10 KB","25 KB","50 KB","75 KB","100 KB","130 KB","250 KB","500 KB","750 KB","950 KB"},
+    "متوسط": {"1 MB","2 MB","3 MB","4 MB","5 MB"},
+    "مرتفع": {"9 MB","10 MB","11 MB"},
+}
+labels = groups.get(group_title, set())
+if not labels:
+    raise SystemExit(1)
 root = ET.parse(path).getroot()
 ys = []
 for node in root.iter("node"):
-    desc = node.attrib.get("content-desc","")
+    desc = node.attrib.get("content-desc", "")
     if not desc.startswith(prefix + ": "):
         continue
-    m = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", node.attrib.get("bounds",""))
-    if m:
-        x1,y1,x2,y2 = map(int,m.groups())
-        ys.append((y1+y2)//2)
+    if desc[len(prefix) + 2:] not in labels:
+        continue
+    if node.attrib.get("visible-to-user", "true").lower() == "false":
+        continue
+    match = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", node.attrib.get("bounds", ""))
+    if match:
+        x1, y1, x2, y2 = map(int, match.groups())
+        if x2 > x1 and y2 > y1:
+            ys.append((y1 + y2) // 2)
 if not ys:
     raise SystemExit(1)
-print(max(ys))
+print(sorted(ys)[len(ys) // 2])
 PY
 }
-
 coord_for_text_near_title() {
   local xml="$1"
   local title="$2"
@@ -319,7 +345,9 @@ tap_preset_row() {
       adb -s "$DEVICE" shell input swipe 160 500 160 300 700
     else
       local y=""
-      y="$(preset_desc_row_y "$xml" "$card_title" 2>/dev/null || true)"
+      local group_title=""
+      group_title="$(preset_group_title "$wanted" 2>/dev/null || true)"
+      y="$(preset_desc_row_y "$xml" "$card_title" "$group_title" 2>/dev/null || true)"
       if [ -n "$y" ]; then
         # Scroll only the selected Download/Upload preset row horizontally.
         adb -s "$DEVICE" shell input swipe 300 "$y" 60 "$y" 700
@@ -338,6 +366,60 @@ tap_preset_row() {
 read_limits() {
   adb -s "$DEVICE" shell run-as "$PACKAGE" cat shared_prefs/local_limits.xml 2>/dev/null || true
 }
+
+preference_matches() {
+  local xml="$1"
+  local target_key="$2"
+  local expected="$3"
+  local check_download="$4"
+  printf '%s\n' "$xml" | python3 -c '
+import sys, xml.etree.ElementTree as ET
+key, expected_raw, check_download = sys.argv[1:]
+try:
+    root = ET.parse(sys.stdin).getroot()
+except ET.ParseError:
+    raise SystemExit(1)
+values = {
+    node.attrib.get("name"): int(node.attrib.get("value", "-999999"))
+    for node in root.iter("long") if node.attrib.get("name")
+}
+expected = int(expected_raw)
+keys = [key]
+if check_download == "both" and "dl" not in keys:
+    keys.append("dl")
+if any(values.get(item, -999999) != expected for item in keys):
+    raise SystemExit(1)
+'
+}
+
+select_preset_and_wait() {
+  local wanted="$1"
+  local mode="$2"
+  local expected="$3"
+  local target_key="$4"
+  local check_download="$5"
+  local limits=""
+
+  for attempt in 1 2 3; do
+    if tap_preset_row "$wanted" "$mode" "$expected"; then
+      for poll in $(seq 1 12); do
+        limits="$(read_limits)"
+        if preference_matches "$limits" "$target_key" "$expected" "$check_download"; then
+          echo "PREFERENCE_OK: $wanted ($mode) persisted $target_key=$expected on attempt $attempt."
+          return 0
+        fi
+        sleep 0.25
+      done
+      echo "PREFERENCE_RETRY: $wanted ($mode) did not persist expected value; attempt=$attempt."
+    else
+      echo "SELECTION_RETRY: $wanted ($mode) could not be targeted; attempt=$attempt."
+    fi
+    sleep 0.5
+  done
+  echo "PREFERENCE_FAIL: $wanted ($mode) never persisted expected $target_key=$expected."
+  return 1
+}
+
 
 vpn_tun_present() {
   adb -s "$DEVICE" shell ip -o addr show 2>/dev/null | grep -q "198\.18\.0\.1"
@@ -358,125 +440,12 @@ cleanup_vpn() {
 }
 
 parse_verify() {
-  local xml="$1"
+  local metrics_json="$1"
   local preset="$2"
   local expected="$3"
   local index="$4"
   local out="$5"
-
-  python3 - "$xml" "$preset" "$expected" "$index" "$out" <<'PY'
-import csv, re, sys, xml.etree.ElementTree as ET
-
-path,preset,expected_raw,index,out_path=sys.argv[1:]
-expected=int(expected_raw)
-texts=[n.attrib.get("text","").strip() for n in ET.parse(path).getroot().iter("node") if n.attrib.get("text","").strip()]
-
-status_map={
- "✅ السرعة متطابقة":"PASS",
- "❌ السرعة غير متطابقة":"FAIL",
- "⚠️ لا يمكن الحكم":"ENV_LIMITED",
- "✅ لا يظهر سقف واضح":"PASS_UNLIMITED",
-}
-rate_re=re.compile(r"^([0-9]+(?:\.[0-9]+)?) ?(bps|Kbps|Mbps|Gbps)$")
-pct_re=re.compile(r"^[0-9]+(?:\.[0-9]+)?%$")
-mult={"bps":1,"Kbps":1000,"Mbps":1000000,"Gbps":1000000000}
-
-def rate(v):
-    m=rate_re.fullmatch(v)
-    return None if not m else float(m.group(1))*mult[m.group(2)]
-
-def metric_sections():
-    # The Android viewport can clip the "Download" heading while leaving all
-    # metric rows visible. Split by the repeated original-network label instead
-    # of requiring section headings to be present in the UIAutomator snapshot.
-    anchors=[i for i,value in enumerate(texts) if value=="🌐 سرعة الإنترنت الأصلية"]
-    if len(anchors) < 2:
-        raise RuntimeError(f"Expected two verification metric groups; found {len(anchors)}")
-    return [
-        ("Download", texts[anchors[0]:anchors[1]]),
-        ("Upload", texts[anchors[1]:]),
-    ]
-
-def value_after(sec,label):
-    i=sec.index(label)
-    for value in sec[i+1:i+4]:
-        if rate(value) is not None:
-            return value
-        if value in status_map or value in {
-            "Download","Upload","🌐 سرعة الإنترنت الأصلية",
-            "🔒 السرعة المحجوزة / المحددة","🚀 السرعة الفعلية داخل VPN",
-            "الدقة مقارنة بالخيار"
-        }:
-            break
-        if value == "فشل القياس":
-            raise RuntimeError(f"{label}: UI reports measurement failure")
-    nearby=" | ".join(sec[max(0,i-2):min(len(sec),i+7)])
-    raise RuntimeError(f"{label}: numeric value missing in its row; nearby={nearby}")
-
-rows=[]
-hard=False
-
-for metric,sec in metric_sections():
-    status=next((s for s in status_map if s in sec),None)
-    if not status:
-        raise RuntimeError(f"{metric}: verdict missing")
-
-    baseline=value_after(sec,"🌐 سرعة الإنترنت الأصلية")
-    vpn=value_after(sec,"🚀 السرعة الفعلية داخل VPN")
-
-    pi=sec.index("🔒 السرعة المحجوزة / المحددة")
-    plan=None
-    plan_kbps=None
-    for v in sec[pi+1:pi+6]:
-        if v=="بدون حد":
-            plan=v
-            break
-        if rate(v) is not None:
-            plan=v
-            plan_kbps=rate(v)/1000.0
-            break
-    if plan is None:
-        raise RuntimeError(f"{metric}: plan missing")
-
-    reason=""
-    si=sec.index(status)
-    for v in sec[si+1:si+8]:
-        if v in status_map or v in {
-            metric,"🌐 سرعة الإنترنت الأصلية","🔒 السرعة المحجوزة / المحددة",
-            "🚀 السرعة الفعلية داخل VPN","الدقة مقارنة بالخيار"
-        }:
-            continue
-        if rate(v) is not None or pct_re.fullmatch(v):
-            continue
-        reason=v
-        break
-
-    classification=status_map[status]
-
-    if expected==0:
-        if plan!="بدون حد" or classification!="PASS_UNLIMITED":
-            classification="FAIL"
-            reason=reason or "Unlimited preset did not verify as unlimited."
-    else:
-        if plan_kbps is None or abs(plan_kbps-expected)>max(0.5,expected*0.002):
-            classification="FAIL"
-            reason=reason or f"Expected {expected} Kbps but UI reported {plan}."
-        elif classification not in {"PASS","ENV_LIMITED"}:
-            classification="FAIL"
-
-    if classification=="FAIL":
-        hard=True
-
-    rows.append([index,preset,expected,metric,baseline,plan,vpn,status,reason,classification])
-
-with open(out_path,"w",newline="",encoding="utf-8") as f:
-    csv.writer(f).writerows(rows)
-
-for row in rows:
-    print("RESULT|"+"|".join(map(str, row)))
-print("OVERALL|"+("FAIL" if hard else "PASS"))
-sys.exit(2 if hard else 0)
-PY
+  python3 scripts/e2e/verify_metrics.py parse-json "$metrics_json" "$preset" "$expected" "$index" "$out"
 }
 
 TOTAL=19
@@ -512,54 +481,32 @@ while IFS='|' read -r index preset expected <&3; do
   fi
   sleep 2
 
-  if ! tap_preset_row "$preset" top "$expected"; then
+  if ! select_preset_and_wait "$preset" top "$expected" dl none; then
+    dl_limits="$(read_limits)"
+    echo "Download prefs after failed selection: $dl_limits" | tee -a "$RUN_DIR/sweep-console.log"
     FAIL_COUNT=$((FAIL_COUNT+1))
-    echo "$index,$preset,$expected,Download,,,,,Preset selection failed,FAIL" >> "$RUN_DIR/speed-limit-sweep-results.csv"
+    echo "$index,$preset,$expected,Download,,,,,Preset selection/persistence failed,FAIL" >> "$RUN_DIR/speed-limit-sweep-results.csv"
     cleanup_vpn || true
     continue
   fi
 
   dl_limits="$(read_limits)"
   echo "Download prefs: $dl_limits" | tee -a "$RUN_DIR/sweep-console.log"
-  if [ "$expected" -eq 0 ]; then
-    ok_dl="$(grep -c 'name="dl" value="0"' <<<"$dl_limits" || true)"
-  else
-    ok_dl="$(grep -c 'name="dl" value="'"$expected"'"' <<<"$dl_limits" || true)"
-  fi
-  if [ "$ok_dl" -ne 1 ]; then
-    echo "FAIL $preset: Download preference mismatch."
-    FAIL_COUNT=$((FAIL_COUNT+1))
-    echo "$index,$preset,$expected,Download,,,,,Download persistence failed,FAIL" >> "$RUN_DIR/speed-limit-sweep-results.csv"
-    cleanup_vpn || true
-    continue
-  fi
 
   adb -s "$DEVICE" shell input swipe 160 570 160 190 850
   sleep 2
 
-  if ! tap_preset_row "$preset" bottom "$expected"; then
+  if ! select_preset_and_wait "$preset" bottom "$expected" ul both; then
+    ul_limits="$(read_limits)"
+    echo "Upload prefs after failed selection: $ul_limits" | tee -a "$RUN_DIR/sweep-console.log"
     FAIL_COUNT=$((FAIL_COUNT+1))
-    echo "$index,$preset,$expected,Upload,,,,,Preset selection failed,FAIL" >> "$RUN_DIR/speed-limit-sweep-results.csv"
+    echo "$index,$preset,$expected,Upload,,,,,Preset selection/persistence failed,FAIL" >> "$RUN_DIR/speed-limit-sweep-results.csv"
     cleanup_vpn || true
     continue
   fi
 
   ul_limits="$(read_limits)"
   echo "Upload prefs: $ul_limits" | tee -a "$RUN_DIR/sweep-console.log"
-  if [ "$expected" -eq 0 ]; then
-    ok_ul="$(grep -c 'name="ul" value="0"' <<<"$ul_limits" || true)"
-    ok_both="$(grep -c 'name="dl" value="0"' <<<"$ul_limits" || true)"
-  else
-    ok_ul="$(grep -c 'name="ul" value="'"$expected"'"' <<<"$ul_limits" || true)"
-    ok_both="$(grep -c 'name="dl" value="'"$expected"'"' <<<"$ul_limits" || true)"
-  fi
-  if [ "$ok_ul" -ne 1 ] || [ "$ok_both" -ne 1 ]; then
-    echo "FAIL $preset: persisted Upload/Download values mismatch."
-    FAIL_COUNT=$((FAIL_COUNT+1))
-    echo "$index,$preset,$expected,Upload,,,,,Upload persistence failed,FAIL" >> "$RUN_DIR/speed-limit-sweep-results.csv"
-    cleanup_vpn || true
-    continue
-  fi
 
   echo "UI selection verified for $preset." | tee -a "$RUN_DIR/sweep-console.log"
 
@@ -719,56 +666,62 @@ PY
     continue
   fi
 
-  # Now that the coroutine has returned, scroll the Compose ScrollView until
-  # the completed verification metrics are actually exposed to UIAutomator.
+  # UIAutomator only exposes visible Compose semantics on some API levels.
+  # Merge uniquely tagged values across snapshots; do not require both long metric
+  # sections to be visible in the same viewport at the same time.
+  result_xml="$RUN_DIR/$slug-verify.xml"
+  metrics_file="$RUN_DIR/$slug-metrics.json"
+  printf '{}' > "$metrics_file"
   metrics_visible=0
-  for reveal in 0 1 2 3 4 5 6 7 8 9; do
-    dump_ui "$result_xml" || true
-    # UIAutomator XML escapes emoji text as numeric character references
-    # (for example &#127760;), so grep against literal emoji never matches.
-    # Parse the XML instead; ElementTree decodes entities back to the actual
-    # Compose text and avoids false failures when the completed metrics exist.
-    if python3 - "$result_xml" <<'PY'
-import sys
-import xml.etree.ElementTree as ET
 
-path = sys.argv[1]
-texts = [
-    (node.attrib.get("text", "") or "").strip()
-    for node in ET.parse(path).getroot().iter("node")
-]
-labels = (
-    "🌐 سرعة الإنترنت الأصلية",
-    "🔒 السرعة المحجوزة / المحددة",
-    "🚀 السرعة الفعلية داخل VPN",
-)
-counts = [sum(value == label for value in texts) for label in labels]
-print(
-    "Verify metric row counts after XML decode: "
-    f"baseline={counts[0]}, plan={counts[1]}, vpn={counts[2]}"
-)
-raise SystemExit(0 if all(count >= 2 for count in counts) else 1)
-PY
-    then
+  # First move toward the top while retaining any fields already visible.
+  for reset in $(seq 1 10); do
+    dump_ui "$result_xml" || true
+    if python3 scripts/e2e/verify_metrics.py collect "$result_xml" "$metrics_file" 2>>"$RUN_DIR/sweep-console.log"; then
       metrics_visible=1
-      echo "Both Verify metric groups visible for $preset after scroll $reveal." | tee -a "$RUN_DIR/sweep-console.log"
       break
     fi
-    if [ "$reveal" -lt 9 ]; then
-      adb -s "$DEVICE" shell input swipe 160 500 160 220 650
-      sleep 1
-    fi
+    adb -s "$DEVICE" shell input swipe 160 220 160 560 550 || true
+    sleep 0.3
   done
 
+  # Then advance through the result, accumulating values from every snapshot.
   if [ "$metrics_visible" -ne 1 ]; then
-    echo "FAIL $preset: completed Verify result was not exposed in UI."
-    FAIL_COUNT=$((FAIL_COUNT+1))
-    echo "$index,$preset,$expected,Verify,,,,,Completed result not visible after scroll,FAIL" >> "$RUN_DIR/speed-limit-sweep-results.csv"
-    continue
+    for reveal in $(seq 1 30); do
+      dump_ui "$result_xml" || true
+      if python3 scripts/e2e/verify_metrics.py collect "$result_xml" "$metrics_file" 2>>"$RUN_DIR/sweep-console.log"; then
+        metrics_visible=1
+        echo "Tagged Verify metrics collected for $preset after $reveal scroll(s)." | tee -a "$RUN_DIR/sweep-console.log"
+        break
+      fi
+      adb -s "$DEVICE" shell input swipe 160 550 160 220 550 || true
+      sleep 0.3
+    done
   fi
 
+  if [ "$metrics_visible" -ne 1 ]; then
+    echo "FAIL $preset: tagged Verify Speed fields are incomplete."
+    python3 - "$metrics_file" <<'PY' | tee -a "$RUN_DIR/sweep-console.log"
+import json, sys
+from pathlib import Path
+try:
+    data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+except Exception:
+    data = {}
+required = [
+    f"verify_{direction}_{field}_value"
+    for direction in ("download", "upload")
+    for field in ("baseline", "plan", "vpn", "accuracy")
+] + [f"verify_{direction}_verdict" for direction in ("download", "upload")]
+print("VERIFY_FIELDS_MISSING=" + ",".join(key for key in required if not data.get(key)))
+PY
+    FAIL_COUNT=$((FAIL_COUNT+1))
+    echo "$index,$preset,$expected,Verify,,,,,Tagged metrics not fully captured,FAIL" >> "$RUN_DIR/speed-limit-sweep-results.csv"
+    cleanup_vpn || true
+    continue
+  fi
   set +e
-  parse_verify "$result_xml" "$preset" "$expected" "$index" "$RUN_DIR/$slug-parsed.csv" | tee -a "$RUN_DIR/sweep-console.log"
+  parse_verify "$metrics_file" "$preset" "$expected" "$index" "$RUN_DIR/$slug-parsed.csv" | tee -a "$RUN_DIR/sweep-console.log"
   set -e
 
   if [ -s "$RUN_DIR/$slug-parsed.csv" ]; then
@@ -821,6 +774,15 @@ if [ "$METRIC_RESULT_COUNT" -ne "$EXPECTED_METRIC_RESULTS" ]; then
   FAIL_COUNT=$((FAIL_COUNT+1))
 fi
 
+if [ "$PASS_COUNT" -ne "$EXPECTED_METRIC_RESULTS" ]; then
+  echo "STRICT COVERAGE FAIL: PASS=$PASS_COUNT/$EXPECTED_METRIC_RESULTS; ENV_LIMITED and mismatches cannot count as verified."
+  FAIL_COUNT=$((FAIL_COUNT+1))
+fi
+if ! python3 scripts/e2e/verify_metrics.py validate-sweep "$RUN_DIR/speed-limit-sweep-results.csv"; then
+  echo "STRICT GATE FAIL: independent CSV validation did not reach PASS=38/38."
+  FAIL_COUNT=$((FAIL_COUNT+1))
+fi
+
 cat > "$RUN_DIR/speed-limit-sweep-summary.md" <<MD
 # SpeedVPN Speed-Limit Sweep
 
@@ -834,7 +796,7 @@ Every labeled preset is covered: 10/25/50/75/100/130/250/500/750/950 KB/s, 1/2/3
 
 HARD FAIL means UI selection/persistence failed, Verify Speed produced MISMATCH, verification failed/timed out, or VPN did not shut down between cases.
 
-ENV_LIMITED is expected when the emulator's physical baseline is below the selected plan; it is recorded separately and does not fail the sweep.
+ENV_LIMITED means the test environment cannot demonstrate the selected cap; it is not a pass and fails the strict 38/38 gate.
 
 The slider itself is continuous from 1 KB/s to 100 MB/s, so no finite test can enumerate every slider value.
 MD

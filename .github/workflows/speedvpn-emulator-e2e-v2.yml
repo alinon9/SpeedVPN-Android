@@ -280,6 +280,13 @@ jobs:
           bash scripts/e2e/speed-limit-sweep.sh
           echo '===== ALL SPEEDVPN EMULATOR E2E TESTS PASSED ====='
 
+      - name: Strict 38/38 speed-limiter gate
+        if: always()
+        run: |
+          set -euo pipefail
+          test -s speed-limit-sweep-results.csv || { echo "Missing speed-limit-sweep-results.csv"; exit 1; }
+          python3 scripts/e2e/verify_metrics.py validate-sweep speed-limit-sweep-results.csv
+
       - name: Upload emulator logs
         if: ${{ always() }}
         uses: actions/upload-artifact@v7
