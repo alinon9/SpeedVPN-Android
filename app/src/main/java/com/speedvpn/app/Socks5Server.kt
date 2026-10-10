@@ -552,10 +552,24 @@ class Socks5Server(
                 forwardedBytes += n.toLong()
             }
             runCatching { dst.flush() }
-        } catch (_: SocketException) {
-            // peer closed
-        } catch (_: Exception) {
-            // connection teardown
+        } catch (error: SocketException) {
+            when {
+                !running || !SpeedLimiter.isGenerationActive(generation) -> Unit
+                classifySocketError(error) == SockErrKind.EXPECTED_CLOSE -> Unit
+                classifySocketError(error) == SockErrKind.NETWORK_EVENT ->
+                    logE("SOCKS relay pipe network event direction=${if (bucket === SpeedLimiter.download) "download" else "upload"}", error)
+                else ->
+                    logE("Unexpected SOCKS relay pipe socket failure direction=${if (bucket === SpeedLimiter.download) "download" else "upload"}", error)
+            }
+        } catch (error: Exception) {
+            when {
+                !running || !SpeedLimiter.isGenerationActive(generation) -> Unit
+                classifySocketError(error) == SockErrKind.EXPECTED_CLOSE -> Unit
+                classifySocketError(error) == SockErrKind.NETWORK_EVENT ->
+                    logE("SOCKS relay pipe network event direction=${if (bucket === SpeedLimiter.download) "download" else "upload"}", error)
+                else ->
+                    logE("Unexpected SOCKS relay pipe failure direction=${if (bucket === SpeedLimiter.download) "download" else "upload"}", error)
+            }
         } finally {
             val wallDurationNs = (System.nanoTime() - pipeStartedNs).coerceAtLeast(1L)
             val transferDurationNs = if (firstForwardedNs > 0L) {
