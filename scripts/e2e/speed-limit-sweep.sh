@@ -578,14 +578,16 @@ preflight_fail() {
     echo "# SpeedVPN baseline preflight"
     echo
     echo "- GitHub run ID: $CSV_RUN_ID"
-    echo "- Result: FAILED"
+    echo "- Result: INFRASTRUCTURE_BLOCKED"
     echo "- Target: 88 Mbps"
     echo "- Required baseline in each direction: 105.6 Mbps (1.2x)"
     echo "- Failure: $reason"
     echo "- No speed presets were counted as tested; the 38-metric sweep was not started."
   } > "$RUN_DIR/speed-limit-sweep-summary.md"
+  # Preserve a root-level CSV for the strict workflow gate even on early exits.
+  # The header-only CSV remains a hard failure; it is not treated as a successful sweep.
+  cp "$RUN_DIR/speed-limit-sweep-results.csv" speed-limit-sweep-results.csv
   cp "$RUN_DIR/speed-limit-sweep-summary.md" speed-limit-sweep-summary.md
-  # Caller must be able to finish copying the failing measurements before it exits.
   return 0
 }
 
