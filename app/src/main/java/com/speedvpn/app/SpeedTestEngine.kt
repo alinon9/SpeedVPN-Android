@@ -50,7 +50,7 @@ object SpeedTestEngine {
     )
 
     private const val WARMUP_BYTES = 100_000L
-    private const val CHUNK_BYTES = 64 * 1024
+    private const val CHUNK_BYTES = 256 * 1024
     private const val MIN_SAMPLE_DURATION_MS = 10L
     private const val TARGET_STABLE_DURATION_MS = 250L
     private const val MIN_VALID_SAMPLES = 2
