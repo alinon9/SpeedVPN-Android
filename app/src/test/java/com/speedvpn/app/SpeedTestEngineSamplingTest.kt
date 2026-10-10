@@ -199,6 +199,14 @@ class SpeedTestEngineSamplingTest {
     }
 
     @Test
+    fun requiredRelayBytesCoverTheMinimumSuccessfulSampleSetForEachPlanType() {
+        assertEquals(320_000L, SpeedTestEngine.minimumRequiredSampleBytes(80L, verificationProfile = true))
+        assertEquals(896_000L, SpeedTestEngine.minimumRequiredSampleBytes(800L, verificationProfile = true))
+        assertEquals(49_500_000L, SpeedTestEngine.minimumRequiredSampleBytes(88_000L, verificationProfile = true))
+        assertEquals(60_000_000L, SpeedTestEngine.minimumRequiredSampleBytes(0L, verificationProfile = true))
+    }
+
+    @Test
     fun sampleLadderStopsWhenRequiredCoverageBecomesImpossible() {
         assertTrue(SpeedTestEngine.enoughRemainingSamples(0, 3, 3))
         assertTrue(SpeedTestEngine.enoughRemainingSamples(1, 2, 3))

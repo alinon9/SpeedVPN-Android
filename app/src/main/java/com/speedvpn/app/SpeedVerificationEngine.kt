@@ -109,6 +109,10 @@ object SpeedVerificationEngine {
                                 "ownUidRouted=${SpeedLimiter.routeVerificationTrafficThroughVpn}",
                         )
 
+                        // Capture relay-forwarded bytes around the actual VPN measurement.
+                        // UI status alone cannot prove that the probe traversed the limiter.
+                        val relayDownloadBefore = SpeedLimiter.download.total.get()
+                        val relayUploadBefore = SpeedLimiter.upload.total.get()
                         onProgress("قياس Download عبر VPN…")
                         vpn = SpeedTestEngine.measure(
                             context = context,
@@ -119,6 +123,22 @@ object SpeedVerificationEngine {
                             onProgress(if (phase == SpeedTestPhase.DOWNLOAD) "قياس Download عبر VPN…" else "قياس Upload عبر VPN…")
                         }
 
+                        val relayDownloadBytes =
+                            (SpeedLimiter.download.total.get() - relayDownloadBefore).coerceAtLeast(0L)
+                        val relayUploadBytes =
+                            (SpeedLimiter.upload.total.get() - relayUploadBefore).coerceAtLeast(0L)
+                        val minimumDownloadBytes =
+                            SpeedTestEngine.minimumRequiredSampleBytes(planDownloadKbps, verificationProfile = true)
+                        val minimumUploadBytes =
+                            SpeedTestEngine.minimumRequiredSampleBytes(planUploadKbps, verificationProfile = true)
+                        Log.i(
+                            TAG,
+                            "Tunnel byte evidence download=" + relayDownloadBytes + "/" + minimumDownloadBytes +
+                                " upload=" + relayUploadBytes + "/" + minimumUploadBytes +
+                                " downloadEvidence=" + (relayDownloadBytes >= minimumDownloadBytes) +
+                                " uploadEvidence=" + (relayUploadBytes >= minimumUploadBytes),
+                        )
+
                         if (vpn.downloadBps == null && vpn.uploadBps == null) {
                             result = unavailable(started, "فشل القياس أثناء مرور الترافيك عبر VPN.", planDownloadKbps, planUploadKbps)
                         } else {
@@ -127,16 +147,40 @@ object SpeedVerificationEngine {
                                 vpn.error?.let { "VPN: $it" },
                             ).joinToString(" • ").takeIf { it.isNotBlank() }
 
-                            val download = SpeedVerificationPolicy.evaluate(
+                            val downloadEvaluation = SpeedVerificationPolicy.evaluate(
                                 planKbps = planDownloadKbps,
                                 baselineBps = baseline.downloadBps,
                                 vpnBps = vpn.downloadBps,
                             )
-                            val upload = SpeedVerificationPolicy.evaluate(
+                            val uploadEvaluation = SpeedVerificationPolicy.evaluate(
                                 planKbps = planUploadKbps,
                                 baselineBps = baseline.uploadBps,
                                 vpnBps = vpn.uploadBps,
                             )
+                            val download = if (
+                                vpn.downloadBps != null && relayDownloadBytes < minimumDownloadBytes
+                            ) {
+                                downloadEvaluation.copy(
+                                    status = SpeedVerificationStatus.NOT_VERIFIABLE,
+                                    accuracyPercent = null,
+                                    reason = "لم يثبت مرور بيانات قياس Download عبر مرحّل VPN: " +
+                                        relayDownloadBytes + "/" + minimumDownloadBytes + " بايت.",
+                                )
+                            } else {
+                                downloadEvaluation
+                            }
+                            val upload = if (
+                                vpn.uploadBps != null && relayUploadBytes < minimumUploadBytes
+                            ) {
+                                uploadEvaluation.copy(
+                                    status = SpeedVerificationStatus.NOT_VERIFIABLE,
+                                    accuracyPercent = null,
+                                    reason = "لم يثبت مرور بيانات قياس Upload عبر مرحّل VPN: " +
+                                        relayUploadBytes + "/" + minimumUploadBytes + " بايت.",
+                                )
+                            } else {
+                                uploadEvaluation
+                            }
 
                             result = SpeedVerificationResult(
                                 startedAtMillis = started,

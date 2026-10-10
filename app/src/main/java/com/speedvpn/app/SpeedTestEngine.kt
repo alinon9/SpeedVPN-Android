@@ -186,11 +186,7 @@ object SpeedTestEngine {
         // For the finite 200–1,000 Kbps plans, collect three larger samples so
         // the initial burst cannot dominate the result.
         val unlimitedVerification = verificationProfile && (expectedKbps == null || expectedKbps <= 0L)
-        val requiredSamples = if (unlimitedVerification || (expectedKbps != null && expectedKbps > 100L)) {
-            MIN_CAPPED_RANGE_SAMPLES
-        } else {
-            MIN_VALID_SAMPLES
-        }
+        val requiredSamples = requiredSamplesFor(expectedKbps, verificationProfile)
         // Public speed tests stop when the adaptive samples are stable enough.
         // Verification uses the same plan-shaped requests for the uncapped
         // baseline and VPN measurements, with a fixed sample count on both sides.
@@ -405,6 +401,27 @@ object SpeedTestEngine {
             .readTimeout(timeoutMs, TimeUnit.MILLISECONDS)
             .writeTimeout(timeoutMs, TimeUnit.MILLISECONDS)
             .build()
+    }
+
+    internal fun requiredSamplesFor(expectedKbps: Long?, verificationProfile: Boolean): Int {
+        val unlimitedVerification = verificationProfile && (expectedKbps == null || expectedKbps <= 0L)
+        return if (unlimitedVerification || (expectedKbps != null && expectedKbps > 100L)) {
+            MIN_CAPPED_RANGE_SAMPLES
+        } else {
+            MIN_VALID_SAMPLES
+        }
+    }
+
+    /**
+     * Minimum payload bytes that must be forwarded by the SOCKS relay for a
+     * successful result under this sampling contract. This is a lower bound:
+     * if any early request fails, later samples are at least as large.
+     */
+    internal fun minimumRequiredSampleBytes(expectedKbps: Long?, verificationProfile: Boolean): Long {
+        val sizes = requestSizesFor(expectedKbps, verificationProfile)
+        val requiredSamples = requiredSamplesFor(expectedKbps, verificationProfile)
+        if (sizes.size < requiredSamples) return Long.MAX_VALUE
+        return sizes.take(requiredSamples).sum()
     }
 
     internal fun enoughRemainingSamples(
