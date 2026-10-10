@@ -256,7 +256,7 @@ jobs:
           adb start-server
 
           echo "Starting emulator..."
-          nohup emulator -avd speedvpn-ci -no-window -no-audio -no-boot-anim -no-snapshot -no-snapshot-save -no-metrics -gpu swiftshader_indirect -accel on -cores 2 -memory 1536 -partition-size 2048 -netdelay none -netspeed full -dns-server 8.8.8.8,1.1.1.1 > emulator-console.log 2>&1 &
+          nohup emulator -avd speedvpn-ci -no-window -no-audio -no-boot-anim -no-snapshot -no-snapshot-save -no-metrics -gpu swiftshader_indirect -accel on -cores 4 -memory 4096 -partition-size 2048 -netdelay none -netspeed full -dns-server 8.8.8.8,1.1.1.1 > emulator-console.log 2>&1 &
           EMULATOR_PID=$!
 
           diagnostics() {
@@ -265,6 +265,13 @@ jobs:
             uname -a || true
             echo "Memory:"
             free -h || true
+            echo "Cgroup memory limits:"
+            for file in /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory.current /sys/fs/cgroup/memory.events; do
+              if [ -r "$file" ]; then echo "--- $file"; cat "$file"; fi
+            done
+            echo "Android guest memory:"
+            adb -s emulator-5554 shell cat /proc/meminfo 2>/dev/null | head -n 25 || true
+            adb -s emulator-5554 shell dumpsys meminfo 2>/dev/null | head -n 100 || true
             echo "Disk:"
             df -h "${RUNNER_TEMP}" "${ANDROID_SDK_ROOT}" || true
             echo "KVM:"
@@ -335,8 +342,50 @@ jobs:
           adb -s emulator-5554 shell settings put global transition_animation_scale 0
           adb -s emulator-5554 shell settings put global animator_duration_scale 0
 
-          echo "Installing debug APK..."
-          adb -s emulator-5554 install -r app/build/outputs/apk/debug/app-debug.apk
+          echo "Checking Package Manager health before install..."
+          pm_ready=0
+          for attempt in $(seq 1 30); do
+            pm_output="$(adb -s emulator-5554 shell cmd package list packages 2>&1)" && {
+              echo "$pm_output" | grep -q 'package:' && { echo "Package Manager ready after attempt $attempt."; pm_ready=1; break; }
+            }
+            echo "Package Manager unhealthy (attempt $attempt/30): $pm_output"
+            adb -s emulator-5554 logcat -d -v threadtime -t 1500 > "package-manager-attempt-$attempt-logcat.txt" 2>&1 || true
+            sleep 2
+          done
+          if [ "$pm_ready" -ne 1 ]; then
+            echo "Package Manager health check failed; installation cannot proceed."
+            diagnostics
+            exit 1
+          fi
+
+          echo "Installing debug APK with bounded diagnostic retries..."
+          install_ok=0
+          for attempt in 1 2 3; do
+            echo "APK install attempt $attempt/3 at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            adb -s emulator-5554 logcat -c || true
+            set +e
+            adb -s emulator-5554 install -r app/build/outputs/apk/debug/app-debug.apk 2>&1 | tee "apk-install-attempt-$attempt.log"
+            install_status=${PIPESTATUS[0]}
+            set -e
+            adb -s emulator-5554 logcat -d -v threadtime -t 5000 > "apk-install-attempt-$attempt-logcat.txt" 2>&1 || true
+            if [ "$install_status" -eq 0 ]; then
+              install_ok=1
+              echo "APK install succeeded on attempt $attempt."
+              break
+            fi
+            adb -s emulator-5554 shell cmd package list packages > "apk-install-attempt-$attempt-packages.txt" 2>&1 || true
+            adb -s emulator-5554 shell dumpsys meminfo > "apk-install-attempt-$attempt-meminfo.txt" 2>&1 || true
+            adb -s emulator-5554 shell dumpsys activity processes > "apk-install-attempt-$attempt-processes.txt" 2>&1 || true
+            if grep -Eiq 'OutOfMemoryError|FATAL EXCEPTION IN SYSTEM PROCESS|system_server.*died|Failure calling service package: Broken pipe' "apk-install-attempt-$attempt-logcat.txt"; then
+              echo "Package Manager/system_server instability observed on attempt $attempt."
+            fi
+            [ "$attempt" -eq 3 ] || sleep 5
+          done
+          if [ "$install_ok" -ne 1 ]; then
+            echo "APK installation failed after three attempts; this remains a hard failure."
+            diagnostics
+            exit 1
+          fi
 
           echo "Launching app for smoke test..."
           adb -s emulator-5554 shell am force-stop com.speedvpn.app
@@ -796,6 +845,12 @@ jobs:
           path: |
             emulator-logcat.txt
             emulator-console.log
+            package-manager-attempt-*-logcat.txt
+            apk-install-attempt-*.log
+            apk-install-attempt-*-logcat.txt
+            apk-install-attempt-*-packages.txt
+            apk-install-attempt-*-meminfo.txt
+            apk-install-attempt-*-processes.txt
             speed-test-logcat.txt
             speed-test-results.txt
             ui-result-*.xml
