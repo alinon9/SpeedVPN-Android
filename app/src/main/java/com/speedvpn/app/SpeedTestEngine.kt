@@ -63,7 +63,7 @@ object SpeedTestEngine {
     private const val MAX_RETRIES = 2
     // A single bad endpoint must not consume the entire 300-second E2E wait.
     // A blocking request may finish its own bounded OkHttp timeout before the next budget check.
-    internal const val PHASE_TIMEOUT_MS = 75_000L
+    internal const val PHASE_TIMEOUT_MS = 115_000L
     internal const val MIN_VERIFICATION_CALL_TIMEOUT_MS = 12_000L
     internal const val MAX_VERIFICATION_CALL_TIMEOUT_MS = 70_000L
 
@@ -162,7 +162,18 @@ object SpeedTestEngine {
         )
         try {
             Log.d(TAG, "Warm-up start direction=$directionName bytes=$warmupBytes")
-            warmup(client, isUpload, warmupBytes)
+            val warmupRemainingMs = (
+                PHASE_TIMEOUT_MS -
+                    TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - phaseStartedNs)
+                ).coerceAtLeast(1L)
+            val warmupClient = clientForMeasurementRequest(
+                client,
+                sizeBytes = warmupBytes,
+                expectedKbps = expectedKbps,
+                verificationProfile = verificationProfile,
+                remainingPhaseMs = warmupRemainingMs,
+            )
+            warmup(warmupClient, isUpload, warmupBytes)
             Log.d(TAG, "Warm-up complete direction=$directionName bytes=$warmupBytes")
         } catch (cancelled: CancellationException) {
             throw cancelled

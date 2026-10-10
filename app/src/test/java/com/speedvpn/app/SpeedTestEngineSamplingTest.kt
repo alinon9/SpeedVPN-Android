@@ -184,6 +184,21 @@ class SpeedTestEngineSamplingTest {
     }
 
     @Test
+    fun slowestFinitePlanFitsItsThreeSampleTimeoutsAndWarmupInsidePhaseBudget() {
+        val targetKbps = 80L
+        val sampleTimeouts = SpeedTestEngine.requestSizesFor(targetKbps, verificationProfile = true)
+            .map { SpeedTestEngine.measurementCallTimeoutMs(it, targetKbps, verificationProfile = true) }
+        val warmupTimeout = SpeedTestEngine.measurementCallTimeoutMs(
+            8_000L,
+            targetKbps,
+            verificationProfile = true,
+        )
+        assertEquals(listOf(21_200L, 30_800L, 40_400L), sampleTimeouts)
+        assertEquals(12_000L, warmupTimeout)
+        assertTrue(sampleTimeouts.sum() + warmupTimeout <= SpeedTestEngine.PHASE_TIMEOUT_MS)
+    }
+
+    @Test
     fun sampleLadderStopsWhenRequiredCoverageBecomesImpossible() {
         assertTrue(SpeedTestEngine.enoughRemainingSamples(0, 3, 3))
         assertTrue(SpeedTestEngine.enoughRemainingSamples(1, 2, 3))
