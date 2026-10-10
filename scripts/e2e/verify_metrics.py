@@ -27,6 +27,7 @@ VALUE_TAGS = {
 REQUIRED_FIELDS = sorted(VALUE_TAGS)
 
 RATE_RE = re.compile(r"^([0-9]+(?:\.[0-9]+)?)\s?(bps|Kbps|Mbps|Gbps)$")
+ACCURACY_RE = re.compile(r"^([0-9]+(?:\.[0-9]+)?)%$")
 MULTIPLIERS = {"bps": 1.0, "Kbps": 1_000.0, "Mbps": 1_000_000.0, "Gbps": 1_000_000_000.0}
 EXPECTED_PRESETS = {
     1: ("10 KB", 80), 2: ("25 KB", 200), 3: ("50 KB", 400),
@@ -39,7 +40,7 @@ EXPECTED_PRESETS = {
 }
 CSV_FIELDS = [
     "index", "preset", "expected_kbps", "direction", "baseline_raw",
-    "plan_raw", "vpn_raw", "verdict", "reason", "classification", "run_id", "recorded_at_utc",
+    "plan_raw", "vpn_raw", "accuracy_raw", "verdict", "reason", "classification", "run_id", "recorded_at_utc",
 ]
 
 
@@ -52,6 +53,32 @@ def rate_bps(value: str | None) -> float | None:
 
 def normalise_resource_id(value: str) -> str:
     return value.rsplit("/", 1)[-1].rsplit(":", 1)[-1]
+
+
+def expected_accuracy_percent(baseline_bps: float | None, vpn_bps: float | None, expected_kbps: int) -> float | None:
+    if baseline_bps is None or baseline_bps <= 0 or vpn_bps is None or vpn_bps < 0:
+        return None
+    if expected_kbps == 0:
+        return min(100.0, vpn_bps / baseline_bps * 100.0)
+    target_bps = expected_kbps * 1_000.0
+    if baseline_bps < target_bps * 1.2:
+        return None
+    return max(0.0, min(100.0, 100.0 - abs(vpn_bps - target_bps) / target_bps * 100.0))
+
+
+def check_accuracy(raw: str, baseline_bps: float | None, vpn_bps: float | None, expected_kbps: int) -> str | None:
+    expected = expected_accuracy_percent(baseline_bps, vpn_bps, expected_kbps)
+    value = (raw or "").strip()
+    if expected is None:
+        return None if value == "—" else f"accuracy should be unavailable (—), got {value!r}"
+    match = ACCURACY_RE.fullmatch(value)
+    if not match:
+        return f"invalid/missing accuracy '{value}'"
+    actual = float(match.group(1))
+    # The app displays one decimal place; allow only that display rounding.
+    if abs(actual - expected) > 0.11:
+        return f"accuracy {actual:.1f}% disagrees with independently calculated {expected:.3f}%"
+    return None
 
 
 def collect(xml_path: str, json_path: str) -> int:
@@ -83,6 +110,7 @@ def check_metric(direction: str, values: dict[str, str], expected_kbps: int) -> 
     plan = (values.get(f"verify_{direction}_plan_value") or "").strip()
     vpn = (values.get(f"verify_{direction}_vpn_value") or "").strip()
     verdict = (values.get(f"verify_{direction}_verdict") or "").strip()
+    accuracy = (values.get(f"verify_{direction}_accuracy_value") or "").strip()
     reasons: list[str] = []
     baseline_bps = rate_bps(baseline)
     vpn_bps = rate_bps(vpn)
@@ -91,6 +119,9 @@ def check_metric(direction: str, values: dict[str, str], expected_kbps: int) -> 
         reasons.append(f"{direction}: invalid/missing Original network rate '{baseline}'")
     if vpn_bps is None or vpn_bps <= 0:
         reasons.append(f"{direction}: invalid/missing VPN measured rate '{vpn}'")
+    accuracy_error = check_accuracy(accuracy, baseline_bps, vpn_bps, expected_kbps)
+    if accuracy_error:
+        reasons.append(f"{direction}: {accuracy_error}")
 
     if expected_kbps == 0:
         if plan != "بدون حد":
@@ -170,7 +201,8 @@ def parse_json(json_path: str, preset: str, expected_kbps: int, index: int, outp
         classification, sep, reason = result.partition("|")
         failed = failed or classification not in {"PASS", "PASS_UNLIMITED"}
         label = "Download" if direction == "download" else "Upload"
-        rows.append([index, preset, expected_kbps, label, baseline, plan, vpn, verdict, reason if sep else "", classification, run_id, recorded_at_utc])
+        accuracy = (values.get(f"verify_{direction}_accuracy_value") or "").strip()
+        rows.append([index, preset, expected_kbps, label, baseline, plan, vpn, accuracy, verdict, reason if sep else "", classification, run_id, recorded_at_utc])
     with open(output_path, "w", newline="", encoding="utf-8") as handle:
         csv.writer(handle).writerows(rows)
     for row in rows:
@@ -260,6 +292,7 @@ def validate_sweep(csv_path: str) -> int:
             f"verify_{direction}_baseline_value": row["baseline_raw"],
             f"verify_{direction}_plan_value": row["plan_raw"],
             f"verify_{direction}_vpn_value": row["vpn_raw"],
+            f"verify_{direction}_accuracy_value": row["accuracy_raw"],
             f"verify_{direction}_verdict": row["verdict"],
         }
         _, _, _, _, result = check_metric(direction, values, expected)

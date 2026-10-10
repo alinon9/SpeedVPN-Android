@@ -107,6 +107,7 @@ jobs:
           EMULATOR_PID=$!
 
           cleanup() {
+            adb -s emulator-5554 logcat -d -v threadtime > e2e-logcat.txt 2>&1 || true
             adb -s emulator-5554 emu kill >/dev/null 2>&1 || true
             kill "$EMULATOR_PID" >/dev/null 2>&1 || true
             wait "$EMULATOR_PID" >/dev/null 2>&1 || true

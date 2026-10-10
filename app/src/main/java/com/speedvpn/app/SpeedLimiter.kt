@@ -207,6 +207,13 @@ object SpeedLimiter {
 
     private val verificationLock = Any()
     private var verificationLimits: Pair<Long?, Long?>? = null
+    private var externalVpnCommandsInProgress = 0
+    @Volatile
+    private var verificationOwnPackageRoutingEnabled = false
+
+    /** True only while the verification tunnel should include SpeedVPN's own UID. */
+    val routeVerificationTrafficThroughVpn: Boolean
+        get() = verificationOwnPackageRoutingEnabled
 
     private val activeSessionGeneration = AtomicLong(0L)
     // Serializes generation ownership changes and the paired scheduler reset, but is
@@ -285,10 +292,11 @@ object SpeedLimiter {
     /** Begins a verification and freezes the limiter at the requested rates. */
     fun beginVerification(downloadKbps: Long?, uploadKbps: Long?): Boolean =
         synchronized(verificationLock) {
-            if (verificationLimits != null) {
+            if (verificationLimits != null || externalVpnCommandsInProgress > 0) {
                 false
             } else {
                 verificationLimits = downloadKbps to uploadKbps
+                verificationOwnPackageRoutingEnabled = false
                 verificationInProgress.value = true
                 applyDownloadKbps(downloadKbps)
                 applyUploadKbps(uploadKbps)
@@ -306,25 +314,73 @@ object SpeedLimiter {
         }
     }
 
+    /**
+     * Includes the app's own UID in an allow-listed VPN only while the verifier
+     * is measuring through the tunnel. The verifier clears this before restoring
+     * the user's prior VPN configuration.
+     */
+    fun setVerificationTrafficRoutingEnabled(enabled: Boolean) {
+        synchronized(verificationLock) {
+            check(verificationLimits != null || !enabled) { "No speed verification is active" }
+            verificationOwnPackageRoutingEnabled = enabled
+        }
+    }
+
     /** Applies the selected plan and releases the verification lock. */
     fun endVerification(downloadKbps: Long?, uploadKbps: Long?) {
         synchronized(verificationLock) {
             applyDownloadKbps(downloadKbps)
             applyUploadKbps(uploadKbps)
+            verificationOwnPackageRoutingEnabled = false
             verificationLimits = null
             verificationInProgress.value = false
         }
     }
 
-    fun setDownloadKbps(kbps: Long?) {
+    /** Prevents remote VPN state changes from racing a baseline or tunnel measurement. */
+    fun beginExternalVpnCommand(): Boolean = synchronized(verificationLock) {
+        if (verificationLimits != null) return@synchronized false
+        externalVpnCommandsInProgress++
+        true
+    }
+
+    fun endExternalVpnCommand() {
         synchronized(verificationLock) {
-            if (verificationLimits == null) applyDownloadKbps(kbps)
+            check(externalVpnCommandsInProgress > 0) { "No external VPN command is active" }
+            externalVpnCommandsInProgress--
         }
     }
 
-    fun setUploadKbps(kbps: Long?) {
+    fun setDownloadKbps(kbps: Long?, onApplied: (() -> Unit)? = null): Boolean {
         synchronized(verificationLock) {
-            if (verificationLimits == null) applyUploadKbps(kbps)
+            if (verificationLimits != null) return false
+            applyDownloadKbps(kbps)
+            onApplied?.invoke()
+            return true
+        }
+    }
+
+    fun setUploadKbps(kbps: Long?, onApplied: (() -> Unit)? = null): Boolean {
+        synchronized(verificationLock) {
+            if (verificationLimits != null) return false
+            applyUploadKbps(kbps)
+            onApplied?.invoke()
+            return true
+        }
+    }
+
+    /** Atomically updates both selected limits and persists them against verification start. */
+    fun setLimitsKbps(
+        downloadKbps: Long?,
+        uploadKbps: Long?,
+        onApplied: (() -> Unit)? = null,
+    ): Boolean {
+        synchronized(verificationLock) {
+            if (verificationLimits != null) return false
+            applyDownloadKbps(downloadKbps)
+            applyUploadKbps(uploadKbps)
+            onApplied?.invoke()
+            return true
         }
     }
 

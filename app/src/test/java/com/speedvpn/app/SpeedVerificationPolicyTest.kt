@@ -73,4 +73,28 @@ class SpeedVerificationPolicyTest {
         assertEquals(SpeedVerificationStatus.UNLIMITED_OK, result.status)
         assertEquals(92.0, result.accuracyPercent!!, 0.1)
     }
+
+    @Test
+    fun failedVpnRestorationInvalidatesBothMetricVerdicts() {
+        val matched = SpeedMetricVerification(
+            planKbps = 1_000L,
+            baselineBps = 2_000_000L,
+            vpnBps = 1_000_000L,
+            status = SpeedVerificationStatus.MATCH,
+            accuracyPercent = 100.0,
+        )
+        val result = SpeedVerificationResult(
+            startedAtMillis = 1L,
+            durationMs = 100L,
+            download = matched,
+            upload = matched,
+            overallStatus = SpeedVerificationStatus.MATCH,
+        )
+
+        val invalidated = SpeedVerificationEngine.withRestorationFailure(result, "stop timeout")
+
+        assertEquals(SpeedVerificationStatus.NOT_VERIFIABLE, invalidated.overallStatus)
+        assertEquals(SpeedVerificationStatus.NOT_VERIFIABLE, invalidated.download.status)
+        assertEquals(SpeedVerificationStatus.NOT_VERIFIABLE, invalidated.upload.status)
+    }
 }

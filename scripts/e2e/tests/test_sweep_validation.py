@@ -29,16 +29,18 @@ def valid_rows() -> list[dict[str, str]]:
                 baseline, plan, vpn, verdict, classification = (
                     "100.00 Mbps", "بدون حد", "90.00 Mbps", STATUS_UNLIMITED, "PASS_UNLIMITED"
                 )
+                accuracy = "90.0%"
             else:
                 target_bps = expected_kbps * 1_000.0
                 baseline, plan, vpn, verdict, classification = (
                     rate_label(target_bps * 1.5), rate_label(target_bps),
                     rate_label(target_bps), STATUS_PASS, "PASS"
                 )
+                accuracy = "100.0%"
             rows.append({
                 "index": str(index), "preset": preset, "expected_kbps": str(expected_kbps),
                 "direction": direction, "baseline_raw": baseline, "plan_raw": plan,
-                "vpn_raw": vpn, "verdict": verdict, "reason": "",
+                "vpn_raw": vpn, "accuracy_raw": accuracy, "verdict": verdict, "reason": "",
                 "classification": classification, "run_id": "test-run-123",
                 "recorded_at_utc": "2026-10-09T12:00:00.000Z",
             })
@@ -102,6 +104,28 @@ class SweepValidationTests(unittest.TestCase):
     def test_invalid_timestamp_fails(self) -> None:
         rows = valid_rows()
         rows[0]["recorded_at_utc"] = "yesterday"
+        self.write_rows(rows)
+        self.assertEqual(1, self.validate_without_ci_run())
+
+    def test_accuracy_mismatch_fails_independent_recalculation(self) -> None:
+        rows = valid_rows()
+        rows[0]["accuracy_raw"] = "64.0%"
+        self.write_rows(rows)
+        self.assertEqual(1, self.validate_without_ci_run())
+
+    def test_missing_accuracy_fails(self) -> None:
+        rows = valid_rows()
+        rows[0]["accuracy_raw"] = ""
+        self.write_rows(rows)
+        self.assertEqual(1, self.validate_without_ci_run())
+
+    def test_unavailable_accuracy_is_required_for_environment_limited_metric(self) -> None:
+        rows = valid_rows()
+        row = next(r for r in rows if r["index"] == "16" and r["direction"] == "Download")
+        target = EXPECTED_PRESETS[16][1] * 1_000.0
+        row["baseline_raw"] = rate_label(target * 1.1)
+        row["accuracy_raw"] = "80.0%"
+        row["classification"] = "ENV_LIMITED"
         self.write_rows(rows)
         self.assertEqual(1, self.validate_without_ci_run())
 

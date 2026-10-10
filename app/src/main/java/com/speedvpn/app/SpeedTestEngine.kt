@@ -6,6 +6,7 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import okhttp3.MediaType.Companion.toMediaType
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -89,7 +90,7 @@ object SpeedTestEngine {
             var firstError: String? = null
             val testClient = buildTestClient(context)
 
-            val download = runCatching {
+            val download = try {
                 onProgress(SpeedTestPhase.DOWNLOAD)
                 measurePhase(
                     testClient,
@@ -97,12 +98,15 @@ object SpeedTestEngine {
                     expectedKbps = expectedDownloadKbps,
                     verificationProfile = verificationProfile,
                 )
-            }.onFailure { error ->
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
                 firstError = errorMessage(error)
                 Log.w(TAG, "Download failed: ${errorMessage(error)}", error)
-            }.getOrNull()
+                null
+            }
 
-            val upload = runCatching {
+            val upload = try {
                 onProgress(SpeedTestPhase.UPLOAD)
                 measurePhase(
                     testClient,
@@ -110,10 +114,13 @@ object SpeedTestEngine {
                     expectedKbps = expectedUploadKbps,
                     verificationProfile = verificationProfile,
                 )
-            }.onFailure { error ->
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
                 firstError = firstError ?: errorMessage(error)
                 Log.w(TAG, "Upload failed: ${errorMessage(error)}", error)
-            }.getOrNull()
+                null
+            }
 
             SpeedTestResult(
                 downloadBps = download,
@@ -134,8 +141,13 @@ object SpeedTestEngine {
     ): Long {
         val requestSizes = requestSizesFor(expectedKbps, verificationProfile)
         val warmupBytes = warmupBytesFor(expectedKbps, verificationProfile)
-        runCatching { warmup(client, isUpload, warmupBytes) }
-            .onFailure { Log.i(TAG, "Warm-up failed for ${if (isUpload) "upload" else "download"}; continuing", it) }
+        try {
+            warmup(client, isUpload, warmupBytes)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            Log.i(TAG, "Warm-up failed for ${if (isUpload) "upload" else "download"}; continuing", error)
+        }
 
         // A small HTTP body can overstate a rate-limited flow because the relay
         // lets the first 16 KiB chunk through immediately after an idle gap.
@@ -174,6 +186,8 @@ object SpeedTestEngine {
                         (System.nanoTime() - requestStartedNs).coerceAtLeast(1L),
                     )
                     break
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
                 } catch (error: Throwable) {
                     lastFailure = error
                     Log.w(

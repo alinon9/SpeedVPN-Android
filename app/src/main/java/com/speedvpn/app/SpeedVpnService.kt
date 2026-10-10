@@ -113,6 +113,12 @@ class SpeedVpnService : VpnService() {
         /** Process-wide generation currently owning the VPN service, or 0 if none. */
         fun currentGeneration(): Long = activeServiceGeneration.get()
 
+        /** True only when the process-wide native tunnel is confirmed stopped. */
+        fun isNativeTunnelStopped(): Boolean = synchronized(processNativeLifecycleLock) {
+            nativeOwnerGeneration.get() == 0L &&
+                runCatching { !TProxyService.TProxyIsRunning() }.getOrDefault(false)
+        }
+
         /** Request token attached to the generation that last began CONNECT. */
         fun currentStartRequestId(): String? = lastStartedRequestId.get()
     }
@@ -321,15 +327,21 @@ class SpeedVpnService : VpnService() {
                     if (needsAllowList) {
                         val launchable =
                             AppTrafficManager.installedLaunchableApps(this@SpeedVpnService)
+                        val includeOwnPackage = SpeedLimiter.routeVerificationTrafficThroughVpn
+                        if (includeOwnPackage && packageName in effectiveBlocked) {
+                            throw IllegalStateException(
+                                "SpeedVPN is blocked by the active app policy and cannot verify traffic through the VPN."
+                            )
+                        }
+                        val allowedPackages = VpnApplicationPolicy.allowedPackages(
+                            launchablePackages = launchable.map { it.packageName },
+                            blockedPackages = effectiveBlocked,
+                            ownPackage = packageName,
+                            includeOwnPackageForVerification = includeOwnPackage,
+                        )
                         var allowed = 0
 
-                        launchable.forEach { app ->
-                            val pkg = app.packageName
-
-                            if (pkg == packageName || pkg in effectiveBlocked) {
-                                return@forEach
-                            }
-
+                        allowedPackages.forEach { pkg ->
                             runCatching {
                                 addAllowedApplication(pkg)
                             }.onSuccess {
@@ -358,11 +370,10 @@ class SpeedVpnService : VpnService() {
                         )
                     }
 
-                    // SpeedVPN itself must never be routed back through its own TUN.
-                    // Keep SpeedVPN traffic routable through the TUN so the built-in
-                    // speed test measures the real VPN path and is subject to SpeedLimiter.
-                    // VPN control/native sockets are protected before connecting, so this
-                    // does not create a routing loop.
+                    // VPN control/native sockets are protected before connecting.
+                    // The verifier includes the app UID in an active allow-list so
+                    // its probe measures the tunnel path; regular firewall policy
+                    // continues to exclude SpeedVPN itself.
                 }
 
             builder.establish()

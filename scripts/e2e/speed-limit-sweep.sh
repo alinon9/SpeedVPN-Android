@@ -13,7 +13,7 @@ mkdir -p "$RUN_DIR"
 : > "$RUN_DIR/speed-limit-sweep-results.csv"
 : > "$RUN_DIR/sweep-console.log"
 
-echo 'index,preset,expected_kbps,direction,baseline_raw,plan_raw,vpn_raw,verdict,reason,classification,run_id,recorded_at_utc' > "$RUN_DIR/speed-limit-sweep-results.csv"
+echo 'index,preset,expected_kbps,direction,baseline_raw,plan_raw,vpn_raw,accuracy_raw,verdict,reason,classification,run_id,recorded_at_utc' > "$RUN_DIR/speed-limit-sweep-results.csv"
 
 SPEED_CASES=$(cat <<'CASES'
 1|10 KB|80
@@ -559,7 +559,7 @@ while IFS='|' read -r index preset expected <&3; do
   if ! tap_text "السرعة"; then
     echo "FAIL $preset: Speed tab not found."
     FAIL_COUNT=$((FAIL_COUNT+1))
-    echo "$index,$preset,$expected,UI,,,,,Speed tab not found,FAIL,${CSV_RUN_ID},$(recorded_at_utc)" >> "$RUN_DIR/speed-limit-sweep-results.csv"
+    echo "$index,$preset,$expected,UI,,,,,,Speed tab not found,FAIL,${CSV_RUN_ID},$(recorded_at_utc)" >> "$RUN_DIR/speed-limit-sweep-results.csv"
     continue
   fi
   sleep 2
@@ -568,7 +568,7 @@ while IFS='|' read -r index preset expected <&3; do
     dl_limits="$(read_limits)"
     echo "Download prefs after failed selection: $dl_limits" | tee -a "$RUN_DIR/sweep-console.log"
     FAIL_COUNT=$((FAIL_COUNT+1))
-    echo "$index,$preset,$expected,Download,,,,,Preset selection/persistence failed,FAIL,${CSV_RUN_ID},$(recorded_at_utc)" >> "$RUN_DIR/speed-limit-sweep-results.csv"
+    echo "$index,$preset,$expected,Download,,,,,,Preset selection/persistence failed,FAIL,${CSV_RUN_ID},$(recorded_at_utc)" >> "$RUN_DIR/speed-limit-sweep-results.csv"
     cleanup_vpn || true
     continue
   fi
@@ -583,7 +583,7 @@ while IFS='|' read -r index preset expected <&3; do
     ul_limits="$(read_limits)"
     echo "Upload prefs after failed selection: $ul_limits" | tee -a "$RUN_DIR/sweep-console.log"
     FAIL_COUNT=$((FAIL_COUNT+1))
-    echo "$index,$preset,$expected,Upload,,,,,Preset selection/persistence failed,FAIL,${CSV_RUN_ID},$(recorded_at_utc)" >> "$RUN_DIR/speed-limit-sweep-results.csv"
+    echo "$index,$preset,$expected,Upload,,,,,,Preset selection/persistence failed,FAIL,${CSV_RUN_ID},$(recorded_at_utc)" >> "$RUN_DIR/speed-limit-sweep-results.csv"
     cleanup_vpn || true
     continue
   fi
@@ -596,7 +596,7 @@ while IFS='|' read -r index preset expected <&3; do
   if ! tap_text "✅ تحقق من السرعة"; then
     echo "FAIL $preset: Verify button not found."
     FAIL_COUNT=$((FAIL_COUNT+1))
-    echo "$index,$preset,$expected,Verify,,,,,Verify button not found,FAIL,${CSV_RUN_ID},$(recorded_at_utc)" >> "$RUN_DIR/speed-limit-sweep-results.csv"
+    echo "$index,$preset,$expected,Verify,,,,,,Verify button not found,FAIL,${CSV_RUN_ID},$(recorded_at_utc)" >> "$RUN_DIR/speed-limit-sweep-results.csv"
     cleanup_vpn || true
     continue
   fi
@@ -613,7 +613,7 @@ while IFS='|' read -r index preset expected <&3; do
     else
       echo "FAIL $preset: Android VPN approval not completed."
       FAIL_COUNT=$((FAIL_COUNT+1))
-      echo "$index,$preset,$expected,VPN,,,,,VPN approval failed,FAIL,${CSV_RUN_ID},$(recorded_at_utc)" >> "$RUN_DIR/speed-limit-sweep-results.csv"
+      echo "$index,$preset,$expected,VPN,,,,,,VPN approval failed,FAIL,${CSV_RUN_ID},$(recorded_at_utc)" >> "$RUN_DIR/speed-limit-sweep-results.csv"
       cleanup_vpn || true
       continue
     fi
@@ -635,7 +635,7 @@ while IFS='|' read -r index preset expected <&3; do
     if [ "$verify_restarted" -ne 1 ]; then
       echo "FAIL $preset: Verify button was not available after VPN permission."
       FAIL_COUNT=$((FAIL_COUNT+1))
-      echo "$index,$preset,$expected,Verify,,,,,Verify restart after VPN permission failed,FAIL,${CSV_RUN_ID},$(recorded_at_utc)" >> "$RUN_DIR/speed-limit-sweep-results.csv"
+      echo "$index,$preset,$expected,Verify,,,,,,Verify restart after VPN permission failed,FAIL,${CSV_RUN_ID},$(recorded_at_utc)" >> "$RUN_DIR/speed-limit-sweep-results.csv"
       adb -s "$DEVICE" logcat -d -t 3500 > "$RUN_DIR/$slug-logcat.txt" || true
       cleanup_vpn || true
       continue
@@ -678,7 +678,7 @@ while IFS='|' read -r index preset expected <&3; do
   if [ "$finished" -ne 1 ]; then
     echo "FAIL $preset: no completed metric row appeared within 300 seconds (loading_frame_seen=$loading_seen)."
     FAIL_COUNT=$((FAIL_COUNT+1))
-    echo "$index,$preset,$expected,Verify,,,,,Completed metric row missing or timeout,FAIL,${CSV_RUN_ID},$(recorded_at_utc)" >> "$RUN_DIR/speed-limit-sweep-results.csv"
+    echo "$index,$preset,$expected,Verify,,,,,,Completed metric row missing or timeout,FAIL,${CSV_RUN_ID},$(recorded_at_utc)" >> "$RUN_DIR/speed-limit-sweep-results.csv"
     cleanup_vpn || true
     continue
   fi
@@ -733,7 +733,7 @@ required = [
 print("VERIFY_FIELDS_MISSING=" + ",".join(key for key in required if not data.get(key)))
 PY
     FAIL_COUNT=$((FAIL_COUNT+1))
-    echo "$index,$preset,$expected,Verify,,,,,Tagged metrics not fully captured,FAIL,${CSV_RUN_ID},$(recorded_at_utc)" >> "$RUN_DIR/speed-limit-sweep-results.csv"
+    echo "$index,$preset,$expected,Verify,,,,,,Tagged metrics not fully captured,FAIL,${CSV_RUN_ID},$(recorded_at_utc)" >> "$RUN_DIR/speed-limit-sweep-results.csv"
     cleanup_vpn || true
     continue
   fi
@@ -759,9 +759,9 @@ with open(sys.argv[1], newline="", encoding="utf-8") as handle:
     for row in csv.reader(handle):
         if not row:
             continue
-        if len(row) != 12:
-            raise SystemExit(f"Malformed parser CSV row: expected 12 columns, got {len(row)}")
-        print(row[9].strip())
+        if len(row) != 13:
+            raise SystemExit(f"Malformed parser CSV row: expected 13 columns, got {len(row)}")
+        print(row[10].strip())
 PY
     )
   else
@@ -772,7 +772,7 @@ PY
   if ! cleanup_vpn; then
     echo "FAIL $preset: VPN TUN remained after cleanup."
     FAIL_COUNT=$((FAIL_COUNT+1))
-    echo "$index,$preset,$expected,VPN,,,,,VPN remained active after cleanup,FAIL,${CSV_RUN_ID},$(recorded_at_utc)" >> "$RUN_DIR/speed-limit-sweep-results.csv"
+    echo "$index,$preset,$expected,VPN,,,,,,VPN remained active after cleanup,FAIL,${CSV_RUN_ID},$(recorded_at_utc)" >> "$RUN_DIR/speed-limit-sweep-results.csv"
   else
     echo "VPN OFF confirmed before next preset." | tee -a "$RUN_DIR/sweep-console.log"
   fi

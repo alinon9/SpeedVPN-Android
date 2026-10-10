@@ -104,9 +104,12 @@ class AgentService : Service() {
             val unit = s.optString("unit", "Mbps")
             val dl = SpeedLimiter.toKbps(s.optDoubleOrNull("download_limit"), unit)
             val ul = SpeedLimiter.toKbps(s.optDoubleOrNull("upload_limit"), unit)
-            SpeedLimiter.setDownloadKbps(dl)
-            SpeedLimiter.setUploadKbps(ul)
-            SpeedLimitStore.save(this, dl, ul)
+            val applied = SpeedLimiter.setLimitsKbps(dl, ul) {
+                SpeedLimitStore.save(this, dl, ul)
+            }
+            if (!applied) {
+                log("Skipping remote speed-limit refresh while verification owns the limiter")
+            }
         }
         scope.launch { loop(5000) { heartbeat() } }
         scope.launch { loop(30_000) { stats() } }
@@ -386,25 +389,44 @@ class AgentService : Service() {
         VpnRuntime.update { it.copy(lastCommand = cmd) }
         when (cmd) {
             "GET_STATUS" -> ack(id, "SUCCESS")
-            "CONNECT" -> connect(id)
-            "DISCONNECT" -> disconnect(id)
+            "CONNECT", "DISCONNECT" -> withVpnCommandLease(id) {
+                if (cmd == "CONNECT") connect(id) else disconnect(id)
+            }
             "SET_DOWNLOAD_LIMIT", "SET_UPLOAD_LIMIT" -> {
                 ack(id, "PROCESSING")
                 val dl = cmd == "SET_DOWNLOAD_LIMIT"
                 val unit = payload.optString("unit", "Mbps")
                 val kbps = SpeedLimiter.toKbps(payload.optDoubleOrNull(if (dl) "download_limit" else "upload_limit"), unit)
-                if (dl) {
-                    SpeedLimiter.setDownloadKbps(kbps)
-                    persistLocalLimit(download = true, kbps = kbps)
+                val applied = if (dl) {
+                    SpeedLimiter.setDownloadKbps(kbps) {
+                        persistLocalLimit(download = true, kbps = kbps)
+                    }
                 } else {
-                    SpeedLimiter.setUploadKbps(kbps)
-                    persistLocalLimit(download = false, kbps = kbps)
+                    SpeedLimiter.setUploadKbps(kbps) {
+                        persistLocalLimit(download = false, kbps = kbps)
+                    }
+                }
+                if (!applied) {
+                    ack(id, "FAILED", "Speed limit cannot be changed while Verify Speed is running")
+                    return
                 }
                 ack(id, "SUCCESS") {
                     put("applied", JSONObject().put(if (dl) "download_limit" else "upload_limit", kbps ?: JSONObject.NULL).put("unit", "Kbps"))
                 }
             }
             else -> ack(id, "FAILED", "Unknown command $cmd")
+        }
+    }
+
+    private suspend fun withVpnCommandLease(id: String, action: suspend () -> Unit) {
+        if (!SpeedLimiter.beginExternalVpnCommand()) {
+            ack(id, "FAILED", "VPN state cannot be changed while Verify Speed is running")
+            return
+        }
+        try {
+            action()
+        } finally {
+            SpeedLimiter.endExternalVpnCommand()
         }
     }
 

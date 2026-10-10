@@ -110,6 +110,12 @@ class SpeedTestRequestHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             return
         if content_length != size:
+            # Consume small, already-bounded request bodies before returning the
+            # 400. Otherwise some clients (notably Windows' HTTP stack) reset the
+            # connection while the response is being read because the server
+            # closed with unread request bytes still in the socket.
+            if 0 <= content_length <= MAX_PAYLOAD_BYTES:
+                self.rfile.read(content_length)
             self._send_body(400, b"query bytes must match Content-Length")
             self.close_connection = True
             return
