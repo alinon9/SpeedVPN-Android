@@ -581,7 +581,8 @@ preflight_fail() {
     echo "- No speed presets were counted as tested; the 38-metric sweep was not started."
   } > "$RUN_DIR/speed-limit-sweep-summary.md"
   cp "$RUN_DIR/speed-limit-sweep-summary.md" speed-limit-sweep-summary.md
-  return 1
+  # Caller must be able to finish copying the failing measurements before it exits.
+  return 0
 }
 
 if ! cleanup_vpn; then
