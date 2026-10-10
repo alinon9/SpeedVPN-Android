@@ -557,15 +557,19 @@ ENV_LIMITED_COUNT=0
 PASS_COUNT=0
 TESTED_PRESET_COUNT=0
 METRIC_RESULT_COUNT=0
+BASELINE_PREFLIGHT_STATUS="NOT_RUN"
+BASELINE_PREFLIGHT_REASON="Preflight did not complete"
+BASELINE_PREFLIGHT_DOWNLOAD="unknown"
+BASELINE_PREFLIGHT_UPLOAD="unknown"
 
 echo "===== SPEED LIMIT SWEEP START ====="
-echo "19 finite presets + Unlimited."
+echo "18 finite presets + Unlimited (19 total choices; 38 Download/Upload metrics)."
 echo "Real UI selection for Download and Upload, then Verify Speed, record, stop VPN, next preset."
 echo
 
-# Strict preflight: prove the emulator can deliver at least 1.2x the highest finite
-# target in both physical directions before consuming the 19-preset acceptance run.
-# This measures real traffic through the same app/profile and runner-local fixture.
+# Measure whether the emulator can deliver at least 1.2x the highest finite
+# target in both physical directions. A failed headroom check blocks acceptance,
+# but does not prevent lower presets from producing useful diagnostic measurements.
 preflight_fail() {
   local reason="$1"
   echo "BASELINE_PREFLIGHT_FAIL=$reason" | tee -a "$RUN_DIR/sweep-console.log"
@@ -631,12 +635,19 @@ if [ "$preflight_collected" -ne 1 ]; then
   cp "$preflight_json" "$RUN_DIR/baseline-preflight-failed.json"
   exit 1
 fi
-if ! python3 scripts/e2e/verify_metrics.py validate-headroom "$preflight_json" 88000 2>&1 | tee -a "$RUN_DIR/sweep-console.log"; then
-  preflight_fail "Physical baseline did not provide required 1.2x headroom for 88 Mbps in both directions."
+BASELINE_PREFLIGHT_DOWNLOAD="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1], encoding="utf-8")); print(d.get("baseline_preflight_download_value", "unknown"))' "$preflight_json")"
+BASELINE_PREFLIGHT_UPLOAD="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1], encoding="utf-8")); print(d.get("baseline_preflight_upload_value", "unknown"))' "$preflight_json")"
+if python3 scripts/e2e/verify_metrics.py validate-headroom "$preflight_json" 88000 2>&1 | tee -a "$RUN_DIR/sweep-console.log"; then
+  BASELINE_PREFLIGHT_STATUS="PASS"
+  BASELINE_PREFLIGHT_REASON="Both directions met the 105.6 Mbps minimum."
+  echo "BASELINE_PREFLIGHT_PASS=2/2; required=105.6 Mbps per direction." | tee -a "$RUN_DIR/sweep-console.log"
+else
+  BASELINE_PREFLIGHT_STATUS="ENV_LIMITED"
+  BASELINE_PREFLIGHT_REASON="At least one baseline direction was below 105.6 Mbps; diagnostics will continue, but strict acceptance remains blocked."
   cp "$preflight_json" "$RUN_DIR/baseline-preflight-failed.json"
-  exit 1
+  FAIL_COUNT=$((FAIL_COUNT+1))
+  echo "BASELINE_PREFLIGHT_ENV_LIMITED=$BASELINE_PREFLIGHT_REASON" | tee -a "$RUN_DIR/sweep-console.log"
 fi
-echo "BASELINE_PREFLIGHT_PASS=2/2; required=105.6 Mbps per direction." | tee -a "$RUN_DIR/sweep-console.log"
 if ! cleanup_vpn; then
   preflight_fail "VPN TUN was not stopped after baseline preflight."
   exit 1
@@ -907,6 +918,8 @@ cat > "$RUN_DIR/speed-limit-sweep-summary.md" <<MD
 - Summary generated at (UTC): $SUMMARY_RECORDED_AT_UTC
 - Presets attempted: $TESTED_PRESET_COUNT/$TOTAL
 - Download/Upload metric results recorded: $METRIC_RESULT_COUNT/$EXPECTED_METRIC_RESULTS
+- 88 Mbps baseline preflight: $BASELINE_PREFLIGHT_STATUS (Download=$BASELINE_PREFLIGHT_DOWNLOAD; Upload=$BASELINE_PREFLIGHT_UPLOAD; minimum=105.6 Mbps each)
+- Preflight detail: $BASELINE_PREFLIGHT_REASON
 - Metric PASS: $PASS_COUNT
 - Metric FAIL (validly collected but outside criteria, or invalid verification result): $METRIC_FAIL_COUNT
 - Metric ENV_LIMITED (insufficient physical-baseline headroom): $ENV_LIMITED_COUNT

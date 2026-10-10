@@ -64,6 +64,8 @@ object SpeedTestEngine {
     // A single bad endpoint must not consume the entire 300-second E2E wait.
     // A blocking request may finish its own bounded OkHttp timeout before the next budget check.
     internal const val PHASE_TIMEOUT_MS = 75_000L
+    internal const val MIN_VERIFICATION_CALL_TIMEOUT_MS = 12_000L
+    internal const val MAX_VERIFICATION_CALL_TIMEOUT_MS = 70_000L
 
     private const val CONNECT_TIMEOUT_SECONDS = 8L
     private const val READ_TIMEOUT_SECONDS = 25L
@@ -193,7 +195,7 @@ object SpeedTestEngine {
             var measured: Long? = null
             var requestElapsedMs: Long? = null
 
-            for (attempt in 1..MAX_RETRIES) {
+            for (attempt in 1..(if (verificationProfile) 1 else MAX_RETRIES)) {
                 if (phaseBudgetExceeded(phaseStartedNs, System.nanoTime(), PHASE_TIMEOUT_MS)) {
                     throw IOException(
                         "$directionName measurement exceeded its ${PHASE_TIMEOUT_MS}ms total phase budget; " +
@@ -206,9 +208,9 @@ object SpeedTestEngine {
                     Log.d(TAG, "Request start direction=$directionName bytes=$sizeBytes attempt=$attempt")
                     val requestStartedNs = System.nanoTime()
                     measured = if (isUpload) {
-                        measureUploadRequest(client, sizeBytes)
+                        measureUploadRequest(client, sizeBytes, expectedKbps, verificationProfile)
                     } else {
-                        measureDownloadRequest(client, sizeBytes)
+                        measureDownloadRequest(client, sizeBytes, expectedKbps, verificationProfile)
                     }
                     requestElapsedMs = TimeUnit.NANOSECONDS.toMillis(
                         (System.nanoTime() - requestStartedNs).coerceAtLeast(1L),
@@ -237,6 +239,13 @@ object SpeedTestEngine {
                 ) {
                     break
                 }
+            }
+            if (phaseBudgetExceeded(phaseStartedNs, System.nanoTime(), PHASE_TIMEOUT_MS)) {
+                throw IOException(
+                    "$directionName measurement exceeded its ${PHASE_TIMEOUT_MS}ms total phase budget " +
+                        "after request ${sizeBytes}B; validSamples=${samples.size}/$requiredSamples",
+                    lastFailure,
+                )
             }
             val remainingSampleCount = requestSizes.size - sizeIndex - 1
             if (measured == null &&
@@ -335,6 +344,24 @@ object SpeedTestEngine {
     internal fun phaseBudgetExceeded(startedAtNanos: Long, nowNanos: Long, budgetMs: Long): Boolean =
         nowNanos - startedAtNanos >= TimeUnit.MILLISECONDS.toNanos(budgetMs)
 
+    internal fun measurementCallTimeoutMs(
+        sizeBytes: Long,
+        expectedKbps: Long?,
+        verificationProfile: Boolean,
+    ): Long {
+        if (!verificationProfile || expectedKbps == null || expectedKbps <= 0L) {
+            return TimeUnit.SECONDS.toMillis(CALL_TIMEOUT_SECONDS)
+        }
+        // sizeBytes * 8 / Kbps is the theoretical transfer duration in milliseconds.
+        // Allow 50% scheduling/relay overhead plus 2 seconds, while bounding stalled requests.
+        val targetDurationMs = sizeBytes.coerceAtLeast(1L).toDouble() * 8.0 / expectedKbps.toDouble()
+        val recommendedMs = (targetDurationMs * 1.5 + 2_000.0).toLong()
+        return recommendedMs.coerceIn(
+            MIN_VERIFICATION_CALL_TIMEOUT_MS,
+            MAX_VERIFICATION_CALL_TIMEOUT_MS,
+        )
+    }
+
     internal fun enoughRemainingSamples(
         validSamples: Int,
         remainingSampleCount: Int,
@@ -382,10 +409,17 @@ object SpeedTestEngine {
     private fun measureDownloadRequest(
         client: OkHttpClient,
         sizeBytes: Long,
+        expectedKbps: Long?,
+        verificationProfile: Boolean,
     ): Long {
         val request = buildDownloadRequest(sizeBytes)
+        val call = client.newCall(request)
+        call.timeout().timeout(
+            measurementCallTimeoutMs(sizeBytes, expectedKbps, verificationProfile),
+            TimeUnit.MILLISECONDS,
+        )
         val started = System.nanoTime()
-        client.newCall(request).execute().use { response ->
+        call.execute().use { response ->
             if (!response.isSuccessful) {
                 throw IOException("Download HTTP ${response.code}")
             }
@@ -418,10 +452,17 @@ object SpeedTestEngine {
     private fun measureUploadRequest(
         client: OkHttpClient,
         sizeBytes: Long,
+        expectedKbps: Long?,
+        verificationProfile: Boolean,
     ): Long {
         val request = buildUploadRequest(sizeBytes, FixedUploadBody(sizeBytes))
+        val call = client.newCall(request)
+        call.timeout().timeout(
+            measurementCallTimeoutMs(sizeBytes, expectedKbps, verificationProfile),
+            TimeUnit.MILLISECONDS,
+        )
         val started = System.nanoTime()
-        client.newCall(request).execute().use { response ->
+        call.execute().use { response ->
             if (!response.isSuccessful) {
                 throw IOException("Upload HTTP ${response.code}")
             }

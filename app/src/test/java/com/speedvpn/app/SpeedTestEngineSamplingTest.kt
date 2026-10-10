@@ -3,6 +3,7 @@ package com.speedvpn.app
 import org.junit.Assert.assertArrayEquals
 import okhttp3.Dns
 import okhttp3.OkHttpClient
+import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotSame
@@ -115,6 +116,30 @@ class SpeedTestEngineSamplingTest {
     }
 
     @Test
+    fun verificationCallTimeoutScalesForSlowPlansWithoutChangingPublicTimeout() {
+        assertEquals(
+            40_400L,
+            SpeedTestEngine.measurementCallTimeoutMs(256_000L, 80L, verificationProfile = true),
+        )
+        assertEquals(
+            17_000L,
+            SpeedTestEngine.measurementCallTimeoutMs(1_000_000L, 800L, verificationProfile = true),
+        )
+        assertEquals(
+            30_000L,
+            SpeedTestEngine.measurementCallTimeoutMs(20_000_000L, 0L, verificationProfile = true),
+        )
+        assertEquals(
+            30_000L,
+            SpeedTestEngine.measurementCallTimeoutMs(256_000L, 80L, verificationProfile = false),
+        )
+        assertEquals(
+            SpeedTestEngine.MAX_VERIFICATION_CALL_TIMEOUT_MS,
+            SpeedTestEngine.measurementCallTimeoutMs(20_000_000L, 80L, verificationProfile = true),
+        )
+    }
+
+    @Test
     fun sampleLadderStopsWhenRequiredCoverageBecomesImpossible() {
         assertTrue(SpeedTestEngine.enoughRemainingSamples(0, 3, 3))
         assertTrue(SpeedTestEngine.enoughRemainingSamples(1, 2, 3))
@@ -124,7 +149,9 @@ class SpeedTestEngineSamplingTest {
 
     @Test
     fun eachMeasurementClientUsesAnIsolatedConnectionPool() {
-        val sharedClient = OkHttpClient.Builder().build()
+        val sharedClient = OkHttpClient.Builder()
+            .callTimeout(30, TimeUnit.SECONDS)
+            .build()
         val baselineClient = SpeedTestEngine.createIsolatedMeasurementClient(sharedClient, Dns.SYSTEM)
         val vpnClient = SpeedTestEngine.createIsolatedMeasurementClient(sharedClient, Dns.SYSTEM)
 
