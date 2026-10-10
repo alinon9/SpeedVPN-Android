@@ -6,9 +6,11 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import okhttp3.MediaType.Companion.toMediaType
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import okhttp3.ConnectionPool
 import okhttp3.Dns
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -29,9 +31,11 @@ data class SpeedTestResult(
 
 object SpeedTestEngine {
     private const val TAG = "SpeedTestEngine"
-    private const val DOWNLOAD_URL = "https://speed.cloudflare.com/__down"
-    private const val UPLOAD_URL = "https://speed.cloudflare.com/__up"
-    private const val REFERER = "https://speed.cloudflare.com/"
+    private const val DEFAULT_TEST_BASE_URL = "https://speed.cloudflare.com"
+    private val testBaseUrl = resolveTestBaseUrl(BuildConfig.SPEED_TEST_BASE_URL)
+    private val DOWNLOAD_URL = endpointUrl("__down", BuildConfig.SPEED_TEST_BASE_URL)
+    private val UPLOAD_URL = endpointUrl("__up", BuildConfig.SPEED_TEST_BASE_URL)
+    private val REFERER = "$testBaseUrl/"
 
     // Sequential, adaptive requests. Cloudflare public speedtest also uses
     // progressively larger request sizes instead of a fixed concurrent window.
@@ -46,16 +50,23 @@ object SpeedTestEngine {
     )
 
     private const val WARMUP_BYTES = 100_000L
-    private const val CHUNK_BYTES = 64 * 1024
+    private const val CHUNK_BYTES = 256 * 1024
     private const val MIN_SAMPLE_DURATION_MS = 10L
     private const val TARGET_STABLE_DURATION_MS = 250L
     private const val MIN_VALID_SAMPLES = 2
+    private const val MIN_CAPPED_RANGE_SAMPLES = 3
+    private const val BASELINE_STABLE_DURATION_MS = 250L
+    internal const val FINITE_SAMPLE_TARGET_DURATION_MS = 1_500L
+    private const val MIN_FINITE_SAMPLE_BYTES = 256_000L
+    private const val MAX_FINITE_SAMPLE_BYTES = 20_000_000L
+    private const val UNLIMITED_VERIFICATION_SAMPLE_BYTES = 10_000_000L
     private const val MAX_RETRIES = 2
 
     private const val CONNECT_TIMEOUT_SECONDS = 8L
     private const val READ_TIMEOUT_SECONDS = 25L
     private const val WRITE_TIMEOUT_SECONDS = 25L
     private const val CALL_TIMEOUT_SECONDS = 30L
+    private const val MEASUREMENT_POOL_KEEP_ALIVE_SECONDS = 30L
 
     private val client: OkHttpClient by lazy {
         OkHttpClient.Builder()
@@ -71,6 +82,7 @@ object SpeedTestEngine {
         context: Context,
         expectedDownloadKbps: Long? = null,
         expectedUploadKbps: Long? = null,
+        verificationProfile: Boolean = false,
         onProgress: (SpeedTestPhase) -> Unit = {},
     ): SpeedTestResult =
         withContext(Dispatchers.IO) {
@@ -78,21 +90,37 @@ object SpeedTestEngine {
             var firstError: String? = null
             val testClient = buildTestClient(context)
 
-            val download = runCatching {
+            val download = try {
                 onProgress(SpeedTestPhase.DOWNLOAD)
-                measurePhase(testClient, isUpload = false, expectedKbps = expectedDownloadKbps)
-            }.onFailure { error ->
+                measurePhase(
+                    testClient,
+                    isUpload = false,
+                    expectedKbps = expectedDownloadKbps,
+                    verificationProfile = verificationProfile,
+                )
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
                 firstError = errorMessage(error)
                 Log.w(TAG, "Download failed: ${errorMessage(error)}", error)
-            }.getOrNull()
+                null
+            }
 
-            val upload = runCatching {
+            val upload = try {
                 onProgress(SpeedTestPhase.UPLOAD)
-                measurePhase(testClient, isUpload = true, expectedKbps = expectedUploadKbps)
-            }.onFailure { error ->
+                measurePhase(
+                    testClient,
+                    isUpload = true,
+                    expectedKbps = expectedUploadKbps,
+                    verificationProfile = verificationProfile,
+                )
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
                 firstError = firstError ?: errorMessage(error)
                 Log.w(TAG, "Upload failed: ${errorMessage(error)}", error)
-            }.getOrNull()
+                null
+            }
 
             SpeedTestResult(
                 downloadBps = download,
@@ -109,26 +137,57 @@ object SpeedTestEngine {
         client: OkHttpClient,
         isUpload: Boolean,
         expectedKbps: Long?,
+        verificationProfile: Boolean,
     ): Long {
-        val requestSizes = requestSizesFor(expectedKbps)
-        val warmupBytes = warmupBytesFor(expectedKbps)
-        runCatching { warmup(client, isUpload, warmupBytes) }
-            .onFailure { Log.i(TAG, "Warm-up failed for ${if (isUpload) "upload" else "download"}; continuing", it) }
+        val requestSizes = requestSizesFor(expectedKbps, verificationProfile)
+        val warmupBytes = warmupBytesFor(expectedKbps, verificationProfile)
+        try {
+            warmup(client, isUpload, warmupBytes)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            Log.i(TAG, "Warm-up failed for ${if (isUpload) "upload" else "download"}; continuing", error)
+        }
 
+        // A small HTTP body can overstate a rate-limited flow because the relay
+        // lets the first 16 KiB chunk through immediately after an idle gap.
+        // For the finite 200–1,000 Kbps plans, collect three larger samples so
+        // the initial burst cannot dominate the result.
+        val unlimitedVerification = verificationProfile && (expectedKbps == null || expectedKbps <= 0L)
+        val requiredSamples = if (unlimitedVerification || (expectedKbps != null && expectedKbps > 100L)) {
+            MIN_CAPPED_RANGE_SAMPLES
+        } else {
+            MIN_VALID_SAMPLES
+        }
+        // Public speed tests stop when the adaptive samples are stable enough.
+        // Verification uses the same plan-shaped requests for the uncapped
+        // baseline and VPN measurements, with a fixed sample count on both sides.
+        val targetDurationMs = if (unlimitedVerification || (expectedKbps != null && expectedKbps > 1_000L)) {
+            FINITE_SAMPLE_TARGET_DURATION_MS
+        } else {
+            BASELINE_STABLE_DURATION_MS
+        }
         val samples = ArrayList<Long>()
         var lastFailure: Throwable? = null
 
         for (sizeBytes in requestSizes) {
             var measured: Long? = null
+            var requestElapsedMs: Long? = null
 
             for (attempt in 1..MAX_RETRIES) {
                 try {
+                    val requestStartedNs = System.nanoTime()
                     measured = if (isUpload) {
                         measureUploadRequest(client, sizeBytes)
                     } else {
                         measureDownloadRequest(client, sizeBytes)
                     }
+                    requestElapsedMs = TimeUnit.NANOSECONDS.toMillis(
+                        (System.nanoTime() - requestStartedNs).coerceAtLeast(1L),
+                    )
                     break
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
                 } catch (error: Throwable) {
                     lastFailure = error
                     Log.w(
@@ -141,52 +200,94 @@ object SpeedTestEngine {
 
             if (measured != null && measured > 0L) {
                 samples += measured
-                Log.d(TAG, "Sample ${if (isUpload) "upload" else "download"} ${sizeBytes}B = $measured bps")
+                Log.d(TAG, "Sample ${if (isUpload) "upload" else "download"} bytes=$sizeBytes rateBps=$measured actualRequestMs=${requestElapsedMs ?: -1L}")
 
                 // Once a real request lasts long enough to amortize connection
                 // overhead, do not keep issuing large transfers needlessly.
-                if (samples.size >= MIN_VALID_SAMPLES &&
-                    requestDurationFor(sizeBytes, measured) >= TARGET_STABLE_DURATION_MS
+                if (samples.size >= requiredSamples &&
+                    (verificationProfile || requestDurationFor(sizeBytes, measured) >= targetDurationMs)
                 ) {
                     break
                 }
             }
         }
 
-        if (samples.size < MIN_VALID_SAMPLES) {
+        if (samples.size < requiredSamples) {
             throw IOException(
                 lastFailure?.let(::errorMessage)
                     ?: "Not enough valid throughput samples",
             )
         }
 
-        return percentile(samples, 0.90)
+        // The public speed-test screen reports a high percentile. Verification
+        // uses the median for both the uncapped baseline and VPN side so one
+        // optimistic or slow sample cannot skew only one side of the comparison.
+        return percentile(
+            samples,
+            if (verificationProfile || (expectedKbps != null && expectedKbps > 0L)) 0.50 else 0.90,
+        )
     }
 
-    private fun requestSizesFor(expectedKbps: Long?): LongArray =
+    internal fun endpointUrl(path: String, configuredBaseUrl: String?): String {
+        require(path == "__down" || path == "__up") { "Unsupported speed-test endpoint: $path" }
+        return "${resolveTestBaseUrl(configuredBaseUrl)}/$path"
+    }
+
+    internal fun createIsolatedMeasurementClient(baseClient: OkHttpClient, dns: Dns): OkHttpClient =
+        baseClient.newBuilder()
+            .connectionPool(ConnectionPool(5, MEASUREMENT_POOL_KEEP_ALIVE_SECONDS, TimeUnit.SECONDS))
+            .dns(dns)
+            .build()
+
+    private fun resolveTestBaseUrl(configuredBaseUrl: String?): String =
+        configuredBaseUrl
+            ?.trim()
+            ?.trimEnd('/')
+            ?.takeIf { it.isNotEmpty() }
+            ?: DEFAULT_TEST_BASE_URL
+
+    internal fun requestSizesFor(expectedKbps: Long?, verificationProfile: Boolean = false): LongArray =
         when {
+            verificationProfile && (expectedKbps == null || expectedKbps <= 0L) ->
+                longArrayOf(
+                    UNLIMITED_VERIFICATION_SAMPLE_BYTES,
+                    UNLIMITED_VERIFICATION_SAMPLE_BYTES,
+                    UNLIMITED_VERIFICATION_SAMPLE_BYTES,
+                )
             expectedKbps == null || expectedKbps <= 0L -> REQUEST_SIZES
-            // Tiny requests can fit in one or two 16 KiB relay reads, measuring the
-            // initial burst rather than sustained throughput. Use larger samples
-            // while staying under the 30s HTTP call timeout at 80 Kbps (10 KB/s).
+            // At the slowest presets, keep progressively larger bounded requests
+            // so the run stays practical while still covering many relay reads.
             expectedKbps <= 100L -> longArrayOf(128_000L, 192_000L, 256_000L)
-            expectedKbps <= 1_000L -> longArrayOf(32_000L, 64_000L, 128_000L, 256_000L, 512_000L)
-            expectedKbps <= 5_000L -> longArrayOf(64_000L, 128_000L, 256_000L, 512_000L, 1_000_000L)
-            expectedKbps <= 20_000L -> longArrayOf(128_000L, 256_000L, 512_000L, 1_000_000L, 2_000_000L)
-            expectedKbps <= 100_000L -> longArrayOf(256_000L, 512_000L, 1_000_000L, 2_000_000L, 5_000_000L)
-            else -> REQUEST_SIZES
+            expectedKbps <= 1_000L -> longArrayOf(128_000L, 256_000L, 512_000L, 1_000_000L)
+            else -> {
+                // Each sample aims for 1.5 seconds at the selected rate, bounded
+                // by the endpoint's practical 20 MB request ceiling.
+                // Repeating a stable payload gives the median three independent
+                // long transfers rather than mixing short slow-start and long samples.
+                // Stay below the public endpoint's practical 25 MB request ceiling.
+                val sampleBytes = (
+                    expectedKbps.toDouble() * FINITE_SAMPLE_TARGET_DURATION_MS / 8.0
+                ).toLong().coerceIn(MIN_FINITE_SAMPLE_BYTES, MAX_FINITE_SAMPLE_BYTES)
+                longArrayOf(sampleBytes, sampleBytes, sampleBytes)
+            }
         }
 
-    private fun warmupBytesFor(expectedKbps: Long?): Long =
+    private fun warmupBytesFor(expectedKbps: Long?, verificationProfile: Boolean = false): Long =
         when {
+            verificationProfile && (expectedKbps == null || expectedKbps <= 0L) -> min(
+                1_000_000L,
+                requestSizesFor(expectedKbps, verificationProfile).firstOrNull()?.div(4L) ?: WARMUP_BYTES,
+            ).coerceAtLeast(WARMUP_BYTES)
             expectedKbps == null || expectedKbps <= 0L -> WARMUP_BYTES
             expectedKbps <= 100L -> 8_000L
             expectedKbps <= 1_000L -> 16_000L
-            expectedKbps <= 5_000L -> 32_000L
-            else -> WARMUP_BYTES
+            else -> min(
+                1_000_000L,
+                requestSizesFor(expectedKbps).firstOrNull()?.div(4L) ?: WARMUP_BYTES,
+            ).coerceAtLeast(WARMUP_BYTES)
         }
 
-    private fun requestDurationFor(sizeBytes: Long, bitsPerSecond: Long): Long {
+    internal fun requestDurationFor(sizeBytes: Long, bitsPerSecond: Long): Long {
         if (bitsPerSecond <= 0L) return 0L
         return (sizeBytes.toDouble() * 8_000.0 / bitsPerSecond.toDouble()).toLong()
     }
@@ -383,9 +484,7 @@ object SpeedTestEngine {
             }
         }
 
-        return client.newBuilder()
-            .dns(dns)
-            .build()
+        return createIsolatedMeasurementClient(client, dns)
     }
 
     /**

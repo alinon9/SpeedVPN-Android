@@ -256,7 +256,7 @@ jobs:
           adb start-server
 
           echo "Starting emulator..."
-          nohup emulator -avd speedvpn-ci -no-window -no-audio -no-boot-anim -no-snapshot -no-snapshot-save -no-metrics -gpu swiftshader_indirect -accel on -cores 2 -memory 1536 -partition-size 2048 -netdelay none -netspeed full -dns-server 8.8.8.8,1.1.1.1 > emulator-console.log 2>&1 &
+          nohup emulator -avd speedvpn-ci -no-window -no-audio -no-boot-anim -no-snapshot -no-snapshot-save -no-metrics -gpu swiftshader_indirect -accel on -cores 4 -memory 4096 -partition-size 2048 -netdelay none -netspeed full -dns-server 8.8.8.8,1.1.1.1 > emulator-console.log 2>&1 &
           EMULATOR_PID=$!
 
           diagnostics() {
@@ -265,6 +265,13 @@ jobs:
             uname -a || true
             echo "Memory:"
             free -h || true
+            echo "Cgroup memory limits:"
+            for file in /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory.current /sys/fs/cgroup/memory.events; do
+              if [ -r "$file" ]; then echo "--- $file"; cat "$file"; fi
+            done
+            echo "Android guest memory:"
+            adb -s emulator-5554 shell cat /proc/meminfo 2>/dev/null | head -n 25 || true
+            adb -s emulator-5554 shell dumpsys meminfo 2>/dev/null | head -n 100 || true
             echo "Disk:"
             df -h "${RUNNER_TEMP}" "${ANDROID_SDK_ROOT}" || true
             echo "KVM:"
@@ -284,6 +291,8 @@ jobs:
           }
 
           cleanup() {
+            echo "Capturing Android logcat before emulator shutdown..."
+            adb -s emulator-5554 logcat -d -t 5000 > verify-speed-logcat.txt 2>/dev/null || true
             echo "Stopping Android Emulator..."
             adb -s emulator-5554 emu kill >/dev/null 2>&1 || true
             kill "${EMULATOR_PID}" >/dev/null 2>&1 || true
@@ -333,8 +342,50 @@ jobs:
           adb -s emulator-5554 shell settings put global transition_animation_scale 0
           adb -s emulator-5554 shell settings put global animator_duration_scale 0
 
-          echo "Installing debug APK..."
-          adb -s emulator-5554 install -r app/build/outputs/apk/debug/app-debug.apk
+          echo "Checking Package Manager health before install..."
+          pm_ready=0
+          for attempt in $(seq 1 30); do
+            pm_output="$(adb -s emulator-5554 shell cmd package list packages 2>&1)" && {
+              echo "$pm_output" | grep -q 'package:' && { echo "Package Manager ready after attempt $attempt."; pm_ready=1; break; }
+            }
+            echo "Package Manager unhealthy (attempt $attempt/30): $pm_output"
+            adb -s emulator-5554 logcat -d -v threadtime -t 1500 > "package-manager-attempt-$attempt-logcat.txt" 2>&1 || true
+            sleep 2
+          done
+          if [ "$pm_ready" -ne 1 ]; then
+            echo "Package Manager health check failed; installation cannot proceed."
+            diagnostics
+            exit 1
+          fi
+
+          echo "Installing debug APK with bounded diagnostic retries..."
+          install_ok=0
+          for attempt in 1 2 3; do
+            echo "APK install attempt $attempt/3 at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            adb -s emulator-5554 logcat -c || true
+            set +e
+            adb -s emulator-5554 install -r app/build/outputs/apk/debug/app-debug.apk 2>&1 | tee "apk-install-attempt-$attempt.log"
+            install_status=${PIPESTATUS[0]}
+            set -e
+            adb -s emulator-5554 logcat -d -v threadtime -t 5000 > "apk-install-attempt-$attempt-logcat.txt" 2>&1 || true
+            if [ "$install_status" -eq 0 ]; then
+              install_ok=1
+              echo "APK install succeeded on attempt $attempt."
+              break
+            fi
+            adb -s emulator-5554 shell cmd package list packages > "apk-install-attempt-$attempt-packages.txt" 2>&1 || true
+            adb -s emulator-5554 shell dumpsys meminfo > "apk-install-attempt-$attempt-meminfo.txt" 2>&1 || true
+            adb -s emulator-5554 shell dumpsys activity processes > "apk-install-attempt-$attempt-processes.txt" 2>&1 || true
+            if grep -Eiq 'OutOfMemoryError|FATAL EXCEPTION IN SYSTEM PROCESS|system_server.*died|Failure calling service package: Broken pipe' "apk-install-attempt-$attempt-logcat.txt"; then
+              echo "Package Manager/system_server instability observed on attempt $attempt."
+            fi
+            [ "$attempt" -eq 3 ] || sleep 5
+          done
+          if [ "$install_ok" -ne 1 ]; then
+            echo "APK installation failed after three attempts; this remains a hard failure."
+            diagnostics
+            exit 1
+          fi
 
           echo "Launching app for smoke test..."
           adb -s emulator-5554 shell am force-stop com.speedvpn.app
@@ -359,9 +410,14 @@ jobs:
 
               if timeout 10s adb -s emulator-5554 shell uiautomator dump "${remote}" >"${dump_log}" 2>&1 &&
                  timeout 10s adb -s emulator-5554 exec-out cat "${remote}" >"${output}" 2>>"${dump_log}" &&
-                 [ -s "${output}" ]; then
+                 [ -s "${output}" ] &&
+                 python3 -c 'import sys, xml.etree.ElementTree as ET; ET.parse(sys.argv[1])' "${output}" >/dev/null 2>&1; then
                 adb -s emulator-5554 shell rm -f "${remote}" >/dev/null 2>&1 || true
                 return 0
+              fi
+
+              if [ -s "${output}" ] && ! python3 -c 'import sys, xml.etree.ElementTree as ET; ET.parse(sys.argv[1])' "${output}" >/dev/null 2>&1; then
+                echo "UI hierarchy XML is malformed (attempt ${attempt}/5); retrying."
               fi
 
               echo "ADB UI dump/read failed (attempt ${attempt}/5):"
@@ -400,21 +456,25 @@ jobs:
           path, wanted, occurrence = sys.argv[1], sys.argv[2], int(sys.argv[3])
           root = ET.parse(path).getroot()
 
-          def wanted_match(text):
-              if not text:
-                  return False
+          def normalize(value):
+              return " ".join((value or "").split())
+
+          def wanted_match(text, content_desc):
+              candidates = {normalize(text), normalize(content_desc)}
+              candidates.discard("")
               if wanted == "🚀":
-                  return text == "🚀 فحص السرعة"
-              return text == wanted
+                  return bool(candidates & {"🚀 فحص السرعة", "فحص السرعة"})
+              return normalize(wanted) in candidates
 
           matches = []
           for node in root.iter("node"):
-              text = node.attrib.get("text", "")
-              if wanted_match(text):
+              text = normalize(node.attrib.get("text", ""))
+              content_desc = normalize(node.attrib.get("content-desc", ""))
+              if wanted_match(text, content_desc):
                   bounds = node.attrib.get("bounds", "")
                   match = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
                   if match:
-                      matches.append((text, tuple(map(int, match.groups()))))
+                      matches.append((text or content_desc or wanted, tuple(map(int, match.groups()))))
 
           if len(matches) >= occurrence:
               text, (x1, y1, x2, y2) = matches[occurrence - 1]
@@ -725,107 +785,45 @@ jobs:
             return 1
           }
 
-          validate_verify_result() {
-            local xml="$1"
-
-            python3 - "${xml}" <<'PY' | tee -a verify-speed-results.txt
-          import re
-          import sys
-          import xml.etree.ElementTree as ET
-
-          path = sys.argv[1]
-          root = ET.parse(path).getroot()
-          texts = [
-              node.attrib.get("text", "").strip()
-              for node in root.iter("node")
-              if node.attrib.get("text", "").strip()
-          ]
-
-          if "نتيجة التحقق" not in texts:
-              raise SystemExit("VERIFY: missing result card")
-
-          if "جاري التحقق من الخطة…" in texts:
-              raise SystemExit("VERIFY: verification is still running")
-
-          if "فشل القياس" in texts:
-              raise SystemExit("VERIFY: one or more measurements failed")
-
-          notes = [text for text in texts if text.startswith("ملاحظة:")]
-          if notes:
-              raise SystemExit(f"VERIFY: verification reported an error/note: {notes}")
-
-          rate_re = re.compile(r"^(?:\d+(?:\.\d+)?)[ ]?(?:bps|Kbps|Mbps|Gbps)$")
-          status_labels = {
-              "✅ السرعة متطابقة",
-              "❌ السرعة غير متطابقة",
-              "⚠️ لا يمكن الحكم",
-              "✅ لا يظهر سقف واضح",
-          }
-
-          for metric, next_metric in (("Download", "Upload"), ("Upload", None)):
-              try:
-                  start = texts.index(metric)
-              except ValueError:
-                  raise SystemExit(f"VERIFY: missing {metric} metric section")
-
-              end = texts.index(next_metric, start + 1) if next_metric and next_metric in texts[start + 1:] else len(texts)
-              section = texts[start:end]
-
-              if not any(status in section for status in status_labels):
-                  raise SystemExit(f"VERIFY: {metric} has no final verdict")
-
-              def value_after(label):
-                  try:
-                      idx = section.index(label)
-                  except ValueError:
-                      raise SystemExit(f"VERIFY: {metric} missing label {label}")
-
-                  for candidate in section[idx + 1:idx + 8]:
-                      if candidate in {
-                          "🌐 سرعة الإنترنت الأصلية",
-                          "🔒 السرعة المحجوزة / المحددة",
-                          "🚀 السرعة الفعلية داخل VPN",
-                          "الدقة مقارنة بالخيار",
-                      }:
-                          continue
-                      if candidate in status_labels:
-                          break
-                      if rate_re.fullmatch(candidate):
-                          return candidate
-                  raise SystemExit(f"VERIFY: {metric} missing numeric value after {label}")
-
-              baseline = value_after("🌐 سرعة الإنترنت الأصلية")
-              plan = value_after("🔒 السرعة المحجوزة / المحددة")
-              vpn = value_after("🚀 السرعة الفعلية داخل VPN")
-
-              if plan == "بدون حد":
-                  raise SystemExit(f"VERIFY: {metric} plan is unexpectedly unlimited")
-
-              print(f"VERIFY {metric}: baseline={baseline}, plan={plan}, vpn={vpn}")
-              print(f"VERIFY {metric}: verdict={next(status for status in status_labels if status in section)}")
-          PY
-          }
 
           : > verify-speed-results.txt
           verify_result_xml="verify-speed-result.xml"
 
           wait_for_verify_result "${verify_result_xml}"
 
-          # Bring the metric rows into the small emulator viewport before
-          # parsing, in case only the result heading is currently visible.
-          for reveal in 0 1 2 3 4; do
-            if validate_verify_result "${verify_result_xml}" 2>/dev/null; then
+          # Merge stable Compose-tagged fields across viewport snapshots.
+          verify_metrics_json="verify-speed-metrics.json"
+          printf '{}' > "$verify_metrics_json"
+          metrics_valid=0
+          for reset in $(seq 1 10); do
+            dump_ui "${verify_result_xml}" || true
+            if python3 scripts/e2e/verify_metrics.py collect "${verify_result_xml}" "$verify_metrics_json" >> verify-speed-results.txt 2>&1; then
+              metrics_valid=1
               break
             fi
-            if [ "${reveal}" -eq 4 ]; then
-              echo "Could not expose complete Verify Speed metrics."
-              validate_verify_result "${verify_result_xml}"
-              exit 1
-            fi
-            adb -s emulator-5554 shell input swipe 160 500 160 220 600
-            sleep 1
-            dump_ui "${verify_result_xml}"
+            adb -s emulator-5554 shell input swipe 160 220 160 560 550 || true
+            sleep 0.3
           done
+          if [ "$metrics_valid" -ne 1 ]; then
+            for reveal in $(seq 1 30); do
+              dump_ui "${verify_result_xml}" || true
+              if python3 scripts/e2e/verify_metrics.py collect "${verify_result_xml}" "$verify_metrics_json" >> verify-speed-results.txt 2>&1; then
+                metrics_valid=1
+                break
+              fi
+              adb -s emulator-5554 shell input swipe 160 550 160 220 550 || true
+              sleep 0.3
+            done
+          fi
+          if [ "$metrics_valid" -ne 1 ]; then
+            echo "Could not collect all tagged Verify Speed fields."
+            cat verify-speed-results.txt
+            exit 1
+          fi
+
+          # The CI scenario sets both directions to 800 Kbps. Reject any
+          # MISMATCH, unjudgeable baseline, wrong plan, or VPN rate outside ±20%.
+          python3 scripts/e2e/verify_metrics.py validate-json "$verify_metrics_json" 800 800 | tee -a verify-speed-results.txt
 
           echo "===== VERIFY SPEED COMPLETE =====" | tee -a verify-speed-results.txt
           cat verify-speed-results.txt
@@ -847,11 +845,18 @@ jobs:
           path: |
             emulator-logcat.txt
             emulator-console.log
+            package-manager-attempt-*-logcat.txt
+            apk-install-attempt-*.log
+            apk-install-attempt-*-logcat.txt
+            apk-install-attempt-*-packages.txt
+            apk-install-attempt-*-meminfo.txt
+            apk-install-attempt-*-processes.txt
             speed-test-logcat.txt
             speed-test-results.txt
             ui-result-*.xml
             verify-speed-logcat.txt
             verify-speed-results.txt
+            verify-speed-metrics.json
             verify-speed-result.xml
             verify-speed-result.xml.loading.xml
           if-no-files-found: ignore

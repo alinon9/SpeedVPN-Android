@@ -10,7 +10,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: speedvpn-emulator-e2e-main
+  # Keep unrelated PR/main runs from cancelling one another; newer commits on the same ref still supersede stale runs.
+  group: speedvpn-emulator-e2e-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -42,8 +43,18 @@ jobs:
           bash ./setup.sh
           test "$(git -C app/src/main/jni/hev-socks5-tunnel rev-parse HEAD)" = 'd9dca26c7ad0e494492244f0309e80ee583e739e'
 
+      - name: Validate E2E harness helpers
+        run: |
+          set -euo pipefail
+          bash -n scripts/e2e/speed-limit-sweep.sh
+          python3 -m py_compile scripts/e2e/preference_matches.py scripts/e2e/verify_metrics.py scripts/e2e/local_speed_test_server.py scripts/e2e/metric_result_status.py scripts/e2e/tests/test_local_speed_test_server.py scripts/e2e/tests/test_metric_result_status.py
+          python3 -m unittest discover -s scripts/e2e/tests -v
+
       - name: Build debug APK
-        run: ./gradlew :app:assembleDebug --stacktrace --no-daemon
+        run: ./gradlew :app:assembleDebug -PspeedTestBaseUrl=http://10.0.2.2:18765 --stacktrace --no-daemon
+
+      - name: Run Android JVM unit tests
+        run: ./gradlew :app:testDebugUnitTest -PspeedTestBaseUrl=http://10.0.2.2:18765 --stacktrace --no-daemon
 
       - name: Install Android Emulator
         run: |
@@ -64,6 +75,26 @@ jobs:
           sudo chmod 666 /dev/kvm
           emulator -accel-check
 
+      - name: Start deterministic local speed-test fixture
+        run: |
+          nohup python3 -u scripts/e2e/local_speed_test_server.py --host 0.0.0.0 --port 18765 < /dev/null > speed-test-server.log 2>&1 &
+          echo "$!" > speed-test-server.pid
+          python3 - <<'PY'
+          import time
+          from urllib.request import urlopen
+
+          for attempt in range(40):
+              try:
+                  with urlopen("http://127.0.0.1:18765/healthz", timeout=1) as response:
+                      if response.status == 200:
+                          print("Deterministic local speed-test fixture is healthy.")
+                          break
+              except Exception:
+                  time.sleep(0.25)
+          else:
+              raise SystemExit("Local speed-test fixture did not become ready")
+          PY
+
       - name: Run full Android E2E
         run: |
           set -euo pipefail
@@ -72,10 +103,11 @@ jobs:
           echo no | avdmanager create avd -n speedvpn-e2e -k 'system-images;android-29;google_apis;x86_64' --force
           adb kill-server >/dev/null 2>&1 || true
           adb start-server
-          nohup emulator -avd speedvpn-e2e -no-window -no-audio -no-boot-anim -no-snapshot -no-snapshot-save -no-metrics -gpu swiftshader_indirect -accel on -cores 2 -memory 1536 -partition-size 2048 -netdelay none -netspeed full -dns-server 8.8.8.8,1.1.1.1 > emulator-console.log 2>&1 &
+          nohup emulator -avd speedvpn-e2e -no-window -no-audio -no-boot-anim -no-snapshot -no-snapshot-save -no-metrics -gpu swiftshader_indirect -accel on -cores 4 -memory 4096 -partition-size 2048 -netdelay none -netspeed full -dns-server 8.8.8.8,1.1.1.1 > emulator-console.log 2>&1 &
           EMULATOR_PID=$!
 
           cleanup() {
+            adb -s emulator-5554 logcat -d -v threadtime > e2e-logcat.txt 2>&1 || true
             adb -s emulator-5554 emu kill >/dev/null 2>&1 || true
             kill "$EMULATOR_PID" >/dev/null 2>&1 || true
             wait "$EMULATOR_PID" >/dev/null 2>&1 || true
@@ -107,16 +139,64 @@ jobs:
           adb -s emulator-5554 shell settings put global window_animation_scale 0
           adb -s emulator-5554 shell settings put global transition_animation_scale 0
           adb -s emulator-5554 shell settings put global animator_duration_scale 0
-          adb -s emulator-5554 install -r app/build/outputs/apk/debug/app-debug.apk
+          echo "===== PACKAGE MANAGER HEALTH PRECHECK ====="
+          package_ready=0
+          for attempt in $(seq 1 30); do
+            output="$(adb -s emulator-5554 shell cmd package list packages 2>&1)" && {
+              echo "$output" | grep -q 'package:' && { echo "Package Manager healthy after attempt $attempt."; package_ready=1; break; }
+            }
+            echo "Package Manager unhealthy (attempt $attempt/30): $output"
+            adb -s emulator-5554 logcat -d -v threadtime -t 1500 > "package-manager-attempt-$attempt-logcat.txt" 2>&1 || true
+            sleep 2
+          done
+          if [ "$package_ready" -ne 1 ]; then
+            echo "Package Manager health check failed; preserving diagnostics."
+            adb -s emulator-5554 logcat -d -v threadtime > package-manager-fatal-logcat.txt 2>&1 || true
+            cat emulator-console.log || true
+            exit 1
+          fi
+          echo "===== APK INSTALL WITH DIAGNOSTIC RETRIES ====="
+          installed=0
+          for attempt in 1 2 3; do
+            echo "Install attempt $attempt/3 at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            adb -s emulator-5554 logcat -c || true
+            set +e
+            adb -s emulator-5554 install -r app/build/outputs/apk/debug/app-debug.apk 2>&1 | tee "apk-install-attempt-$attempt.log"
+            install_status=${PIPESTATUS[0]}
+            set -e
+            adb -s emulator-5554 logcat -d -v threadtime -t 5000 > "apk-install-attempt-$attempt-logcat.txt" 2>&1 || true
+            if [ "$install_status" -eq 0 ]; then installed=1; break; fi
+            adb -s emulator-5554 shell cmd package list packages > "apk-install-attempt-$attempt-packages.txt" 2>&1 || true
+            adb -s emulator-5554 shell dumpsys meminfo > "apk-install-attempt-$attempt-meminfo.txt" 2>&1 || true
+            [ "$attempt" -eq 3 ] || sleep 5
+          done
+          if [ "$installed" -ne 1 ]; then
+            echo "APK install failed all three attempts; failure is not suppressed."
+            adb -s emulator-5554 logcat -d -v threadtime > package-manager-fatal-logcat.txt 2>&1 || true
+            cat emulator-console.log || true
+            exit 1
+          fi
+
+          echo '===== ISOLATE EMULATOR BACKGROUND NETWORK NOISE ====='
+          adb -s emulator-5554 shell settings put global private_dns_mode off
+          adb -s emulator-5554 shell settings delete global private_dns_specifier || true
+          adb -s emulator-5554 shell settings put global master_sync_enabled 0
+          adb -s emulator-5554 shell settings put global wifi_scan_always_enabled 0
+          adb -s emulator-5554 shell settings put global ble_scan_always_enabled 0
+          echo "private_dns_mode=$(adb -s emulator-5554 shell settings get global private_dns_mode | tr -d '\r')"
+          echo "master_sync_enabled=$(adb -s emulator-5554 shell settings get global master_sync_enabled | tr -d '\r')"
 
           dump_ui() {
             local out="$1"
             local remote=/sdcard/speedvpn-ui.xml
             for attempt in 1 2 3 4 5; do
               rm -f "$out"
-              if adb -s emulator-5554 shell uiautomator dump "$remote" >/dev/null 2>&1 && adb -s emulator-5554 exec-out cat "$remote" > "$out" 2>/dev/null && [ -s "$out" ]; then
+              if adb -s emulator-5554 shell uiautomator dump "$remote" >/dev/null 2>&1 && adb -s emulator-5554 exec-out cat "$remote" > "$out" 2>/dev/null && [ -s "$out" ] && python3 -c 'import sys, xml.etree.ElementTree as ET; ET.parse(sys.argv[1])' "$out" >/dev/null 2>&1; then
                 adb -s emulator-5554 shell rm -f "$remote" >/dev/null 2>&1 || true
                 return 0
+              fi
+              if [ -s "$out" ] && ! python3 -c 'import sys, xml.etree.ElementTree as ET; ET.parse(sys.argv[1])' "$out" >/dev/null 2>&1; then
+                echo "UI hierarchy XML is malformed (attempt ${attempt}/5); retrying."
               fi
               sleep 1
             done
@@ -132,13 +212,22 @@ jobs:
           import re, subprocess, sys, xml.etree.ElementTree as ET
           path, wanted = sys.argv[1], sys.argv[2]
           root = ET.parse(path).getroot()
+          def normalize(value):
+              return ' '.join((value or '').split())
           for node in root.iter('node'):
-              if node.attrib.get('text','') == wanted:
-                  m = re.fullmatch(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', node.attrib.get('bounds',''))
-                  if m:
-                      x1,y1,x2,y2 = map(int,m.groups())
-                      subprocess.run(['adb','-s','emulator-5554','shell','input','tap',str((x1+x2)//2),str((y1+y2)//2)],check=True)
-                      raise SystemExit(0)
+              text = normalize(node.attrib.get('text',''))
+              content_desc = normalize(node.attrib.get('content-desc',''))
+              matches = {text, content_desc}
+              if wanted == '🚀 فحص السرعة':
+                  if not (matches & {wanted, 'فحص السرعة'}):
+                      continue
+              elif normalize(wanted) not in matches:
+                  continue
+              m = re.fullmatch(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', node.attrib.get('bounds',''))
+              if m:
+                  x1,y1,x2,y2 = map(int,m.groups())
+                  subprocess.run(['adb','-s','emulator-5554','shell','input','tap',str((x1+x2)//2),str((y1+y2)//2)],check=True)
+                  raise SystemExit(0)
           raise SystemExit(1)
           PY
               then return 0; fi
@@ -221,7 +310,7 @@ jobs:
           ! grep -Eiq 'FATAL EXCEPTION|AndroidRuntime.*FATAL' smoke-logcat.txt
 
           echo '===== NETWORK + SPEED TEST ====='
-          echo 'The SpeedVPN app HTTPS SpeedTest is the authoritative network check.'
+          echo 'Speed-limiter E2E uses the runner-local deterministic fixture. Public HTTPS endpoint smoke coverage remains in Build SpeedVPN APK.'
 
           echo '===== SPEED TEST: 3 RUNS =====' | tee speed-results.txt
           adb -s emulator-5554 shell am force-stop com.speedvpn.app
@@ -280,6 +369,13 @@ jobs:
           bash scripts/e2e/speed-limit-sweep.sh
           echo '===== ALL SPEEDVPN EMULATOR E2E TESTS PASSED ====='
 
+      - name: Strict 38/38 speed-limiter gate
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          test -s speed-limit-sweep-results.csv || { echo "Missing speed-limit-sweep-results.csv"; exit 1; }
+          python3 scripts/e2e/verify_metrics.py validate-sweep speed-limit-sweep-results.csv
+
       - name: Upload emulator logs
         if: ${{ always() }}
         uses: actions/upload-artifact@v7
@@ -287,6 +383,12 @@ jobs:
           name: speedvpn-full-emulator-e2e-logs
           path: |
             emulator-console.log
+            package-manager-attempt-*-logcat.txt
+            package-manager-fatal-logcat.txt
+            apk-install-attempt-*.log
+            apk-install-attempt-*-logcat.txt
+            apk-install-attempt-*-packages.txt
+            apk-install-attempt-*-meminfo.txt
             smoke-logcat.txt
             e2e-logcat.txt
             speed-results.txt
@@ -295,3 +397,9 @@ jobs:
             speed-limit-sweep-summary.md
             speed-limit-sweep/**
           if-no-files-found: ignore
+      - name: Stop deterministic local speed-test fixture
+        if: always()
+        run: |
+          if [ -f speed-test-server.pid ]; then
+            kill "$(cat speed-test-server.pid)" >/dev/null 2>&1 || true
+          fi

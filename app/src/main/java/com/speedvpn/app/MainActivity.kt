@@ -32,6 +32,9 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.ExperimentalComposeUiApi
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
@@ -198,6 +201,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun saveLocalLimit(download: Boolean, kbps: Long?) {
+        if (SpeedLimiter.verificationInProgress.value) return
         // SharedPreferences.commit() is synchronous. Keep disk I/O off the main
         // thread while serializing writes so rapid slider changes cannot reorder
         // the persisted value.
@@ -241,10 +245,11 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun SpeedVpnApp(signedIn: Boolean, onLink: () -> Unit, onSignOut: () -> Unit) {
         val s by VpnRuntime.state.collectAsStateWithLifecycle()
+        val verificationInProgress by SpeedLimiter.verificationInProgress.collectAsStateWithLifecycle()
         var tab by remember { mutableStateOf(0) }
         Scaffold(
             containerColor = Bg,
-            bottomBar = { BottomBar(tab, onTab = { tab = it }) },
+            bottomBar = { BottomBar(tab, enabled = !verificationInProgress, onTab = { tab = it }) },
         ) { padding ->
             if (showVpnDisclosure.value) {
                 AlertDialog(
@@ -273,9 +278,9 @@ class MainActivity : ComponentActivity() {
             Box(Modifier.fillMaxSize().padding(padding)) {
                 when (tab) {
                     0 -> HomeScreen(signedIn, s) { requestVpnPermission() }
-                    1 -> SpeedScreen(s)
+                    1 -> SpeedScreen(s, verificationInProgress)
                     2 -> AppsScreen(s)
-                    3 -> SmartScreen(s)
+                    3 -> SmartScreen(s, verificationInProgress)
                     else -> SettingsScreen(s, signedIn, onLink, onSignOut)
                 }
             }
@@ -306,8 +311,9 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    @OptIn(ExperimentalComposeUiApi::class)
     @Composable
-    private fun SpeedScreen(s: Snapshot) {
+    private fun SpeedScreen(s: Snapshot, verificationInProgress: Boolean) {
         var testBusy by remember { mutableStateOf(false) }
         var testProgress by remember { mutableStateOf<String?>(null) }
         var lastTest by remember { mutableStateOf<SpeedTestResult?>(null) }
@@ -317,21 +323,30 @@ class MainActivity : ComponentActivity() {
         var verificationHistory by remember { mutableStateOf(SpeedVerificationStore.loadRecent(this@MainActivity, 8)) }
 
         Column(
-            Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(18.dp),
+            Modifier.fillMaxSize()
+                .semantics { testTagsAsResourceId = true }
+                .testTag("speed_screen")
+                .verticalScroll(rememberScrollState())
+                .padding(18.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
             ScreenTitle("التحكم بالسرعة", "اختر مستوى جاهزًا أو اضبطه بالمؤشر — الوحدات KB/s وMB/s")
-            LimitSlider("سرعة التحميل", s.downloadLimitKbps) { saveLocalLimit(true, it) }
-            LimitSlider("سرعة الرفع", s.uploadLimitKbps) { saveLocalLimit(false, it) }
+            LimitSlider("سرعة التحميل", s.downloadLimitKbps, enabled = !testBusy && !verifyBusy && !verificationInProgress) {
+                saveLocalLimit(true, it)
+            }
+            LimitSlider("سرعة الرفع", s.uploadLimitKbps, enabled = !testBusy && !verifyBusy && !verificationInProgress) {
+                saveLocalLimit(false, it)
+            }
 
             GlassCard {
                 SectionLabel("اختبارات الاعتماد • Stage 0", "قياس فعلي قبل بناء الخطط على التحكم بالسرعة")
 
                 Button(
-                    enabled = !testBusy && !verifyBusy,
+                    enabled = !testBusy && !verifyBusy && !verificationInProgress,
                     onClick = {
                         lifecycleScope.launch {
                             testBusy = true
+                            lastTest = null
                             testProgress = "جاري بدء الفحص…"
                             lastTest = SpeedTestEngine.measure(this@MainActivity) { phase ->
                                 val label = if (phase == SpeedTestPhase.DOWNLOAD) "جاري قياس Download…" else "جاري قياس Upload…"
@@ -348,13 +363,16 @@ class MainActivity : ComponentActivity() {
                 }
 
                 Button(
-                    enabled = !testBusy && !verifyBusy,
+                    enabled = !testBusy && !verifyBusy && !verificationInProgress,
                     onClick = {
                         if (!s.permissionGranted) {
                             requestVpnPermission()
                         } else {
                             lifecycleScope.launch {
                                 verifyBusy = true
+                                // Do not expose a previous run's tagged metrics while the new
+                                // baseline/VPN measurements are still in progress.
+                                lastVerification = null
                                 verifyProgress = "جاري تحضير التحقق…"
                                 lastVerification = SpeedVerificationEngine.verify(
                                     context = this@MainActivity,
@@ -371,7 +389,7 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                     },
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth().testTag("verify_speed_button"),
                     shape = RoundedCornerShape(14.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = Blue2),
                 ) {
@@ -461,7 +479,7 @@ class MainActivity : ComponentActivity() {
         }
     }
     @Composable
-    private fun SmartScreen(s: Snapshot) {
+    private fun SmartScreen(s: Snapshot, verificationInProgress: Boolean) {
         var statsEnabled by remember { mutableStateOf(SmartSettings.isStatsEnabled(this@MainActivity)) }
         var today by remember { mutableStateOf(0L) }
         var week by remember { mutableStateOf(0L) }
@@ -521,7 +539,7 @@ class MainActivity : ComponentActivity() {
                 } else {
                     InfoRow("تحميل", rec.downloadKbps?.let { fmt(it) } ?: "بدون حد")
                     InfoRow("رفع", rec.uploadKbps?.let { fmt(it) } ?: "بدون حد")
-                    Button(onClick = {
+                    Button(enabled = !verificationInProgress, onClick = {
                         saveLocalLimit(true, rec.downloadKbps)
                         saveLocalLimit(false, rec.uploadKbps)
                         DiagnosticsRepository.record(this@MainActivity, "INFO", "SmartOptimizer", "SMART_SPEED_APPLIED", "Smart speed recommendation applied")
@@ -1182,13 +1200,45 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     private fun SpeedMetricResult(title: String, metric: SpeedMetricVerification) {
-        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Text(title, color = TextPrimary, fontWeight = FontWeight.Bold, fontSize = 12.sp)
-            InfoRow("🌐 سرعة الإنترنت الأصلية", metric.baselineBps?.let(::formatBitRate) ?: "فشل القياس")
-            InfoRow("🔒 السرعة المحجوزة / المحددة", formatPlanBits(metric.planKbps))
-            InfoRow("🚀 السرعة الفعلية داخل VPN", metric.vpnBps?.let(::formatBitRate) ?: "فشل القياس")
-            InfoRow("الدقة مقارنة بالخيار", metric.accuracyPercent?.let { String.format(Locale.US, "%.1f%%", it) } ?: "—")
-            Text(speedStatusLabel(metric.status), color = speedStatusColor(metric.status), fontSize = 11.sp, fontWeight = FontWeight.Bold)
+        val directionTag = if (title == "Download") "download" else "upload"
+        Column(
+            modifier = Modifier.testTag("verify_${directionTag}_metric"),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Text(
+                title,
+                color = TextPrimary,
+                fontWeight = FontWeight.Bold,
+                fontSize = 12.sp,
+                modifier = Modifier.testTag("verify_${directionTag}_heading"),
+            )
+            InfoRow(
+                "🌐 سرعة الإنترنت الأصلية",
+                metric.baselineBps?.let(::formatBitRate) ?: "فشل القياس",
+                valueTestTag = "verify_${directionTag}_baseline_value",
+            )
+            InfoRow(
+                "🔒 السرعة المحجوزة / المحددة",
+                formatPlanBits(metric.planKbps),
+                valueTestTag = "verify_${directionTag}_plan_value",
+            )
+            InfoRow(
+                "🚀 السرعة الفعلية داخل VPN",
+                metric.vpnBps?.let(::formatBitRate) ?: "فشل القياس",
+                valueTestTag = "verify_${directionTag}_vpn_value",
+            )
+            InfoRow(
+                "الدقة مقارنة بالخيار",
+                metric.accuracyPercent?.let { String.format(Locale.US, "%.1f%%", it) } ?: "—",
+                valueTestTag = "verify_${directionTag}_accuracy_value",
+            )
+            Text(
+                speedStatusLabel(metric.status),
+                color = speedStatusColor(metric.status),
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.testTag("verify_${directionTag}_verdict"),
+            )
             metric.reason?.let { Text(it, color = TextSecondary, fontSize = 10.sp) }
         }
     }
@@ -1252,8 +1302,10 @@ class MainActivity : ComponentActivity() {
         values: List<Pair<String, Long>>,
         accent: Color,
         accessibilityPrefix: String,
+        enabled: Boolean,
         onApply: (Long?) -> Unit,
     ) {
+        val directionTag = if (accessibilityPrefix == "سرعة التحميل") "download" else "upload"
         Column(Modifier.fillMaxWidth()) {
             Text(label, color = accent, fontSize = 10.sp, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(4.dp))
@@ -1263,12 +1315,14 @@ class MainActivity : ComponentActivity() {
             ) {
                 values.forEach { (labelText, speedKbps) ->
                     OutlinedButton(
+                        enabled = enabled,
                         onClick = { onApply(speedKbps) },
                         shape = RoundedCornerShape(9.dp),
                         border = androidx.compose.foundation.BorderStroke(1.dp, accent.copy(alpha = 0.45f)),
                         contentPadding = PaddingValues(horizontal = 9.dp, vertical = 0.dp),
                         modifier = Modifier
                             .height(32.dp)
+                            .testTag("speed_preset_${directionTag}_${speedKbps}")
                             .semantics {
                                 contentDescription = "$accessibilityPrefix: $labelText"
                             },
@@ -1288,7 +1342,12 @@ class MainActivity : ComponentActivity() {
         } else "${kbps} KB/s"
 
     @Composable
-    private fun LimitSlider(title: String, current: Long?, onApply: (Long?) -> Unit) {
+    private fun LimitSlider(
+        title: String,
+        current: Long?,
+        enabled: Boolean = true,
+        onApply: (Long?) -> Unit,
+    ) {
         // 1 KB/s → 100 MB/s on a logarithmic scale. Preset buttons provide exact
         // business-friendly values; the slider remains continuous for fine tuning.
         val minKBps = 1.0
@@ -1309,6 +1368,7 @@ class MainActivity : ComponentActivity() {
             exp(minLog + (maxLog - minLog) * pos.coerceIn(0f, 1f)).roundToLong().coerceIn(1L, 100_000L)
         }
         val kbps: Long? = selectedKBps?.let { it * 8L }
+        val directionTag = if (title == "سرعة التحميل") "download" else "upload"
 
         GlassCard {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -1316,21 +1376,26 @@ class MainActivity : ComponentActivity() {
                 Text(fmt(kbps), color = Blue, fontWeight = FontWeight.ExtraBold, fontSize = 15.sp)
             }
             Spacer(Modifier.height(10.dp))
-            PresetGroup("منخفض", slowPresets, Amber, title, onApply)
-            PresetGroup("متوسط", mediumPresets, Blue, title, onApply)
-            PresetGroup("مرتفع", fastPresets, Purple, title, onApply)
+            PresetGroup("منخفض", slowPresets, Amber, title, enabled, onApply)
+            PresetGroup("متوسط", mediumPresets, Blue, title, enabled, onApply)
+            PresetGroup("مرتفع", fastPresets, Purple, title, enabled, onApply)
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                 OutlinedButton(
+                    enabled = enabled,
                     onClick = { onApply(null) },
                     shape = RoundedCornerShape(11.dp),
                     border = androidx.compose.foundation.BorderStroke(1.dp, Green.copy(alpha = 0.45f)),
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
-                    modifier = Modifier.height(34.dp),
+                    modifier = Modifier
+                        .height(34.dp)
+                        .testTag("speed_preset_${directionTag}_unlimited")
+                        .semantics { contentDescription = "$title: $unlimitedPreset" },
                 ) { Text(unlimitedPreset, fontSize = 11.sp, color = TextPrimary) }
             }
             Spacer(Modifier.height(4.dp))
             Slider(
                 value = pos,
+                enabled = enabled,
                 onValueChange = { pos = it },
                 valueRange = 0f..unlimitedSentinel,
                 onValueChangeFinished = { onApply(kbps) },
@@ -1504,13 +1569,13 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun BottomBar(tab: Int, onTab: (Int) -> Unit) {
+    private fun BottomBar(tab: Int, enabled: Boolean, onTab: (Int) -> Unit) {
         NavigationBar(containerColor = Color(0xFF070D19), tonalElevation = 0.dp) {
-            NavigationBarItem(selected = tab == 0, onClick = { onTab(0) }, icon = { Text("⌂", fontSize = 20.sp) }, label = { Text("الرئيسية", fontSize = 10.sp) })
-            NavigationBarItem(selected = tab == 1, onClick = { onTab(1) }, icon = { Text("↯", fontSize = 20.sp) }, label = { Text("السرعة", fontSize = 10.sp) })
-            NavigationBarItem(selected = tab == 2, onClick = { onTab(2) }, icon = { Text("◉", fontSize = 19.sp) }, label = { Text("التطبيقات", fontSize = 10.sp) })
-            NavigationBarItem(selected = tab == 3, onClick = { onTab(3) }, icon = { Text("🧠", fontSize = 17.sp) }, label = { Text("الذكي", fontSize = 10.sp) })
-            NavigationBarItem(selected = tab == 4, onClick = { onTab(4) }, icon = { Text("⚙", fontSize = 19.sp) }, label = { Text("الإعدادات", fontSize = 10.sp) })
+            NavigationBarItem(selected = tab == 0, enabled = enabled, onClick = { onTab(0) }, icon = { Text("⌂", fontSize = 20.sp) }, label = { Text("الرئيسية", fontSize = 10.sp) })
+            NavigationBarItem(selected = tab == 1, enabled = enabled, onClick = { onTab(1) }, icon = { Text("↯", fontSize = 20.sp) }, label = { Text("السرعة", fontSize = 10.sp) })
+            NavigationBarItem(selected = tab == 2, enabled = enabled, onClick = { onTab(2) }, icon = { Text("◉", fontSize = 19.sp) }, label = { Text("التطبيقات", fontSize = 10.sp) })
+            NavigationBarItem(selected = tab == 3, enabled = enabled, onClick = { onTab(3) }, icon = { Text("🧠", fontSize = 17.sp) }, label = { Text("الذكي", fontSize = 10.sp) })
+            NavigationBarItem(selected = tab == 4, enabled = enabled, onClick = { onTab(4) }, icon = { Text("⚙", fontSize = 19.sp) }, label = { Text("الإعدادات", fontSize = 10.sp) })
         }
     }
 
@@ -1560,10 +1625,26 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun InfoRow(label: String, value: String) {
+    private fun InfoRow(
+        label: String,
+        value: String,
+        labelTestTag: String? = null,
+        valueTestTag: String? = null,
+    ) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-            Text(label, color = TextSecondary, fontSize = 10.sp)
-            Text(value, color = TextPrimary, fontSize = 10.sp, fontWeight = FontWeight.SemiBold)
+            Text(
+                label,
+                color = TextSecondary,
+                fontSize = 10.sp,
+                modifier = labelTestTag?.let { Modifier.testTag(it) } ?: Modifier,
+            )
+            Text(
+                value,
+                color = TextPrimary,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.SemiBold,
+                modifier = valueTestTag?.let { Modifier.testTag(it) } ?: Modifier,
+            )
         }
     }
 }

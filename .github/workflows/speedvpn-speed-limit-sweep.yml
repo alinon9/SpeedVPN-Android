@@ -5,6 +5,39 @@ on:
     branches: [main, master]
     paths:
       - 'scripts/e2e/speed-limit-sweep.sh'
+      - 'scripts/e2e/local_speed_test_server.py'
+      - 'scripts/e2e/verify_metrics.py'
+      - 'scripts/e2e/tests/**'
+      - 'app/build.gradle.kts'
+      - 'app/src/main/java/com/speedvpn/app/SpeedTestEngine.kt'
+      - 'app/src/main/java/com/speedvpn/app/SpeedLimiter.kt'
+      - 'app/src/main/java/com/speedvpn/app/Socks5Server.kt'
+      - 'app/src/main/java/com/speedvpn/app/SpeedVpnService.kt'
+      - 'app/src/main/java/com/speedvpn/app/SpeedVerificationEngine.kt'
+      - 'app/src/main/java/com/speedvpn/app/SpeedVerificationPolicy.kt'
+      - 'app/src/test/java/com/speedvpn/app/SpeedLimiterConversionTest.kt'
+      - 'app/src/test/java/com/speedvpn/app/SpeedVerificationPolicyTest.kt'
+      - 'app/src/test/java/com/speedvpn/app/SpeedTestEngineSamplingTest.kt'
+      - 'app/src/debug/res/xml/network_security_config.xml'
+      - '.github/workflows/speedvpn-speed-limit-sweep.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'scripts/e2e/speed-limit-sweep.sh'
+      - 'scripts/e2e/local_speed_test_server.py'
+      - 'scripts/e2e/verify_metrics.py'
+      - 'scripts/e2e/tests/**'
+      - 'app/build.gradle.kts'
+      - 'app/src/main/java/com/speedvpn/app/SpeedTestEngine.kt'
+      - 'app/src/main/java/com/speedvpn/app/SpeedLimiter.kt'
+      - 'app/src/main/java/com/speedvpn/app/Socks5Server.kt'
+      - 'app/src/main/java/com/speedvpn/app/SpeedVpnService.kt'
+      - 'app/src/main/java/com/speedvpn/app/SpeedVerificationEngine.kt'
+      - 'app/src/main/java/com/speedvpn/app/SpeedVerificationPolicy.kt'
+      - 'app/src/test/java/com/speedvpn/app/SpeedLimiterConversionTest.kt'
+      - 'app/src/test/java/com/speedvpn/app/SpeedVerificationPolicyTest.kt'
+      - 'app/src/test/java/com/speedvpn/app/SpeedTestEngineSamplingTest.kt'
+      - 'app/src/debug/res/xml/network_security_config.xml'
       - '.github/workflows/speedvpn-speed-limit-sweep.yml'
   workflow_dispatch:
 
@@ -12,7 +45,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: speedvpn-speed-limit-sweep-main
+  # Keep unrelated PR/main runs from cancelling one another; newer commits on the same ref still supersede stale runs.
+  group: speedvpn-speed-limit-sweep-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -43,8 +77,18 @@ jobs:
           bash ./setup.sh
           test "$(git -C app/src/main/jni/hev-socks5-tunnel rev-parse HEAD)" = 'd9dca26c7ad0e494492244f0309e80ee583e739e'
 
+      - name: Validate E2E harness helpers
+        run: |
+          set -euo pipefail
+          bash -n scripts/e2e/speed-limit-sweep.sh
+          python3 -m py_compile scripts/e2e/preference_matches.py scripts/e2e/verify_metrics.py scripts/e2e/local_speed_test_server.py scripts/e2e/metric_result_status.py scripts/e2e/tests/test_local_speed_test_server.py scripts/e2e/tests/test_metric_result_status.py
+          python3 -m unittest discover -s scripts/e2e/tests -v
+
       - name: Build debug APK
-        run: ./gradlew :app:assembleDebug --stacktrace --no-daemon
+        run: ./gradlew :app:assembleDebug -PspeedTestBaseUrl=http://10.0.2.2:18765 --stacktrace --no-daemon
+
+      - name: Run Android JVM unit tests
+        run: ./gradlew :app:testDebugUnitTest -PspeedTestBaseUrl=http://10.0.2.2:18765 --stacktrace --no-daemon
 
       - name: Install Android Emulator
         run: |
@@ -65,6 +109,26 @@ jobs:
           sudo chmod 666 /dev/kvm
           emulator -accel-check
 
+      - name: Start deterministic local speed-test fixture
+        run: |
+          nohup python3 -u scripts/e2e/local_speed_test_server.py --host 0.0.0.0 --port 18765 < /dev/null > speed-test-server.log 2>&1 &
+          echo "$!" > speed-test-server.pid
+          python3 - <<'PY'
+          import time
+          from urllib.request import urlopen
+
+          for attempt in range(40):
+              try:
+                  with urlopen("http://127.0.0.1:18765/healthz", timeout=1) as response:
+                      if response.status == 200:
+                          print("Deterministic local speed-test fixture is healthy.")
+                          break
+              except Exception:
+                  time.sleep(0.25)
+          else:
+              raise SystemExit("Local speed-test fixture did not become ready")
+          PY
+
       - name: Run exhaustive speed-limit sweep
         run: |
           set -euo pipefail
@@ -73,7 +137,7 @@ jobs:
           echo no | avdmanager create avd -n speedvpn-sweep -k 'system-images;android-29;google_apis;x86_64' --force
           adb kill-server >/dev/null 2>&1 || true
           adb start-server
-          nohup emulator -avd speedvpn-sweep -no-window -no-audio -no-boot-anim -no-snapshot -no-snapshot-save -no-metrics -gpu swiftshader_indirect -accel on -cores 2 -memory 1536 -partition-size 2048 -netdelay none -netspeed full -dns-server 8.8.8.8,1.1.1.1 > emulator-console.log 2>&1 &
+          nohup emulator -avd speedvpn-sweep -no-window -no-audio -no-boot-anim -no-snapshot -no-snapshot-save -no-metrics -gpu swiftshader_indirect -accel on -cores 4 -memory 4096 -partition-size 2048 -netdelay none -netspeed full -dns-server 8.8.8.8,1.1.1.1 > emulator-console.log 2>&1 &
           EMULATOR_PID=$!
 
           cleanup() {
@@ -107,13 +171,65 @@ jobs:
           adb -s emulator-5554 shell settings put global window_animation_scale 0
           adb -s emulator-5554 shell settings put global transition_animation_scale 0
           adb -s emulator-5554 shell settings put global animator_duration_scale 0
-          adb -s emulator-5554 install -r app/build/outputs/apk/debug/app-debug.apk
+          echo "===== PACKAGE MANAGER HEALTH PRECHECK ====="
+          package_ready=0
+          for attempt in $(seq 1 30); do
+            output="$(adb -s emulator-5554 shell cmd package list packages 2>&1)" && {
+              echo "$output" | grep -q 'package:' && { echo "Package Manager healthy after attempt $attempt."; package_ready=1; break; }
+            }
+            echo "Package Manager unhealthy (attempt $attempt/30): $output"
+            adb -s emulator-5554 logcat -d -v threadtime -t 1500 > "package-manager-attempt-$attempt-logcat.txt" 2>&1 || true
+            sleep 2
+          done
+          if [ "$package_ready" -ne 1 ]; then
+            echo "Package Manager health check failed; preserving diagnostics."
+            adb -s emulator-5554 logcat -d -v threadtime > package-manager-fatal-logcat.txt 2>&1 || true
+            cat emulator-console.log || true
+            exit 1
+          fi
+          echo "===== APK INSTALL WITH DIAGNOSTIC RETRIES ====="
+          installed=0
+          for attempt in 1 2 3; do
+            echo "Install attempt $attempt/3 at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            adb -s emulator-5554 logcat -c || true
+            set +e
+            adb -s emulator-5554 install -r app/build/outputs/apk/debug/app-debug.apk 2>&1 | tee "apk-install-attempt-$attempt.log"
+            install_status=${PIPESTATUS[0]}
+            set -e
+            adb -s emulator-5554 logcat -d -v threadtime -t 5000 > "apk-install-attempt-$attempt-logcat.txt" 2>&1 || true
+            if [ "$install_status" -eq 0 ]; then installed=1; break; fi
+            adb -s emulator-5554 shell cmd package list packages > "apk-install-attempt-$attempt-packages.txt" 2>&1 || true
+            adb -s emulator-5554 shell dumpsys meminfo > "apk-install-attempt-$attempt-meminfo.txt" 2>&1 || true
+            [ "$attempt" -eq 3 ] || sleep 5
+          done
+          if [ "$installed" -ne 1 ]; then
+            echo "APK install failed all three attempts; failure is not suppressed."
+            adb -s emulator-5554 logcat -d -v threadtime > package-manager-fatal-logcat.txt 2>&1 || true
+            cat emulator-console.log || true
+            exit 1
+          fi
+
+          echo '===== ISOLATE EMULATOR BACKGROUND NETWORK NOISE ====='
+          adb -s emulator-5554 shell settings put global private_dns_mode off
+          adb -s emulator-5554 shell settings delete global private_dns_specifier || true
+          adb -s emulator-5554 shell settings put global master_sync_enabled 0
+          adb -s emulator-5554 shell settings put global wifi_scan_always_enabled 0
+          adb -s emulator-5554 shell settings put global ble_scan_always_enabled 0
+          echo "private_dns_mode=$(adb -s emulator-5554 shell settings get global private_dns_mode | tr -d '\r')"
+          echo "master_sync_enabled=$(adb -s emulator-5554 shell settings get global master_sync_enabled | tr -d '\r')"
 
           echo '===== SWEEP NETWORK PRECHECK ====='
           adb -s emulator-5554 shell ip route || true
           adb -s emulator-5554 shell dumpsys connectivity | head -n 140 || true
 
           bash scripts/e2e/speed-limit-sweep.sh
+
+      - name: Strict 38/38 speed-limiter gate
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          test -s speed-limit-sweep-results.csv || { echo "Missing speed-limit-sweep-results.csv"; exit 1; }
+          python3 scripts/e2e/verify_metrics.py validate-sweep speed-limit-sweep-results.csv
 
       - name: Upload exhaustive sweep results
         if: always()
@@ -122,7 +238,21 @@ jobs:
           name: speedvpn-exhaustive-speed-limit-sweep
           path: |
             emulator-console.log
+            package-manager-attempt-*-logcat.txt
+            package-manager-fatal-logcat.txt
+            apk-install-attempt-*.log
+            apk-install-attempt-*-logcat.txt
+            apk-install-attempt-*-packages.txt
+            apk-install-attempt-*-meminfo.txt
+            speed-test-server.log
             speed-limit-sweep-results.csv
             speed-limit-sweep-summary.md
             speed-limit-sweep/**
           if-no-files-found: ignore
+
+      - name: Stop deterministic local speed-test fixture
+        if: always()
+        run: |
+          if [ -f speed-test-server.pid ]; then
+            kill "$(cat speed-test-server.pid)" >/dev/null 2>&1 || true
+          fi

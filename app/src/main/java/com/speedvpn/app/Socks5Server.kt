@@ -509,18 +509,47 @@ class Socks5Server(
         closeBoth: () -> Unit,
     ) {
         var eof = false
+        val pipeStartedNs = System.nanoTime()
+        var firstForwardedNs = 0L
+        var lastForwardedNs = 0L
+        var forwardedBytes = 0L
+        var readCalls = 0L
+        var writeCalls = 0L
+        var maxReadBytes = 0
+        var sourceReadNs = 0L
+        var limiterCallNs = 0L
+        var destinationWriteNs = 0L
         try {
-            val buf = ByteArray(16 * 1024)
+            // Match relay read granularity to the current pacing bucket. A 16 KiB
+            // read requires hundreds of scheduler wakeups per second at high rates;
+            // larger reads reduce that overhead while staying inside the bucket's
+            // bounded burst window. The bucket can change while the pipe is active.
+            val buf = ByteArray(256 * 1024)
             while (running && SpeedLimiter.isGenerationActive(generation)) {
-                val n = src.read(buf)
+                val readStartedNs = System.nanoTime()
+                val readSize = bucket.recommendedReadBytes().coerceAtMost(buf.size)
+                val n = src.read(buf, 0, readSize)
+                sourceReadNs += System.nanoTime() - readStartedNs
                 if (n < 0) {
                     eof = true
                     break
                 }
-                if (!SpeedLimiter.acquire(bucket, n, generation)) break
+                readCalls++
+                maxReadBytes = maxOf(maxReadBytes, n)
+                val limiterStartedNs = System.nanoTime()
+                val mayProceed = SpeedLimiter.acquire(bucket, n, generation)
+                limiterCallNs += System.nanoTime() - limiterStartedNs
+                if (!mayProceed) break
                 if (!running || !SpeedLimiter.isGenerationActive(generation)) break
+                val writeStartedNs = System.nanoTime()
                 dst.write(buf, 0, n)
+                writeCalls++
+                val writeFinishedNs = System.nanoTime()
+                destinationWriteNs += writeFinishedNs - writeStartedNs
+                if (firstForwardedNs == 0L) firstForwardedNs = writeStartedNs
+                lastForwardedNs = writeFinishedNs
                 bucket.recordForwarded(n, generation)
+                forwardedBytes += n.toLong()
             }
             runCatching { dst.flush() }
         } catch (_: SocketException) {
@@ -528,6 +557,27 @@ class Socks5Server(
         } catch (_: Exception) {
             // connection teardown
         } finally {
+            val wallDurationNs = (System.nanoTime() - pipeStartedNs).coerceAtLeast(1L)
+            val transferDurationNs = if (firstForwardedNs > 0L) {
+                (lastForwardedNs - firstForwardedNs).coerceAtLeast(1L)
+            } else {
+                0L
+            }
+            if (forwardedBytes >= 1_000_000L && transferDurationNs > 0L) {
+                val direction = if (bucket === SpeedLimiter.download) "download" else "upload"
+                val throughputBps = (
+                    forwardedBytes.toDouble() * 8_000_000_000.0 / transferDurationNs.toDouble()
+                ).toLong()
+                log(
+                    "Relay pipe stats direction=$direction bytes=$forwardedBytes " +
+                        "firstToLastForwardedSpanMs=${TimeUnit.NANOSECONDS.toMillis(transferDurationNs).coerceAtLeast(1L)} " +
+                        "pipeWallMs=${TimeUnit.NANOSECONDS.toMillis(wallDurationNs)} " +
+                        "firstToLastSpanBps=$throughputBps readCalls=$readCalls writeCalls=$writeCalls maxReadBytes=$maxReadBytes " +
+                        "sourceReadMs=${TimeUnit.NANOSECONDS.toMillis(sourceReadNs)} " +
+                        "limiterCallMs=${TimeUnit.NANOSECONDS.toMillis(limiterCallNs)} " +
+                        "destinationWriteMs=${TimeUnit.NANOSECONDS.toMillis(destinationWriteNs)}"
+                )
+            }
             if (eof && running) {
                 runCatching { destination.shutdownOutput() }.onFailure { closeBoth() }
             } else {
