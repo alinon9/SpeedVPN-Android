@@ -20,11 +20,15 @@ class SpeedLimiterConversionTest {
         bucket.setRate(4_000_000L)
         assertEquals(40_000, bucket.recommendedReadBytes())
 
-        // High rates and Unlimited remain bounded by the existing 64 KiB cap.
-        bucket.setRate(11_000_000L)
-        assertEquals(64 * 1024, bucket.recommendedReadBytes())
+        // The recommended read size follows the 10 ms pacing window, bounded to 256 KiB.
+        bucket.setRate(9_000_000L) // 72 Mbps
+        assertEquals(90_000, bucket.recommendedReadBytes())
+        bucket.setRate(11_000_000L) // 88 Mbps
+        assertEquals(110_000, bucket.recommendedReadBytes())
+        bucket.setRate(100_000_000L)
+        assertEquals(256 * 1024, bucket.recommendedReadBytes())
         bucket.setRate(0L)
-        assertEquals(64 * 1024, bucket.recommendedReadBytes())
+        assertEquals(256 * 1024, bucket.recommendedReadBytes())
     }
 
     @Test

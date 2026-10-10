@@ -524,7 +524,7 @@ class Socks5Server(
             // read requires hundreds of scheduler wakeups per second at high rates;
             // larger reads reduce that overhead while staying inside the bucket's
             // bounded burst window. The bucket can change while the pipe is active.
-            val buf = ByteArray(64 * 1024)
+            val buf = ByteArray(256 * 1024)
             while (running && SpeedLimiter.isGenerationActive(generation)) {
                 val readStartedNs = System.nanoTime()
                 val readSize = bucket.recommendedReadBytes().coerceAtMost(buf.size)

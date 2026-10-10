@@ -28,9 +28,9 @@ class TokenBucket {
         private const val NANOS_PER_SECOND = 1_000_000_000.0
         private const val BURST_WINDOW_NS = 10_000_000L
         // Preserve the relay's normal 16 KiB TCP read size as the minimum burst.
-        // At higher rates, permit at most 64 KiB of accumulated credit.
+        // At higher rates, permit at most 256 KiB of accumulated credit.
         private const val MIN_BURST_BYTES = 16 * 1024
-        private const val MAX_BURST_BYTES = 64 * 1024
+        private const val MAX_BURST_BYTES = 256 * 1024
     }
 
     @Volatile
@@ -115,7 +115,7 @@ class TokenBucket {
      *
      * Small plans retain the 16 KiB minimum so a single read cannot create a
      * large burst. Faster plans use larger reads to reduce per-chunk scheduler
-     * and lock overhead, up to the same 64 KiB maximum used by the bucket.
+     * and lock overhead, up to the same 256 KiB maximum used by the bucket.
      */
     internal fun recommendedReadBytes(): Int = lock.withLock {
         if (bytesPerSec <= 0L) {
