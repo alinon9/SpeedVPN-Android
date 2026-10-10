@@ -2,6 +2,7 @@ package com.speedvpn.app
 
 import android.content.Context
 import android.net.VpnService
+import android.util.Log
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
@@ -17,6 +18,7 @@ data class SpeedVerificationResult(
 )
 
 object SpeedVerificationEngine {
+    private const val TAG = "SpeedVerificationEngine"
     private const val STATE_POLL_MS = 250L
     private const val STATE_TIMEOUT_MS = 30_000L
 
@@ -27,6 +29,11 @@ object SpeedVerificationEngine {
         onProgress: (String) -> Unit = {},
     ): SpeedVerificationResult {
         val started = System.currentTimeMillis()
+        Log.i(
+            TAG,
+            "Verification started downloadKbps=${planDownloadKbps ?: "unlimited"} " +
+                "uploadKbps=${planUploadKbps ?: "unlimited"}",
+        )
 
         if (VpnService.prepare(context) != null) {
             return unavailable(started, "إذن VPN غير متاح. امنح الإذن أولًا ثم أعد التحقق.", planDownloadKbps, planUploadKbps)
@@ -51,6 +58,7 @@ object SpeedVerificationEngine {
         val initiallyConnected = VpnRuntime.state.value.status == VpnStatus.CONNECTED
 
         try {
+            Log.i(TAG, "Stage=disconnect-vpn-for-baseline")
             onProgress("فصل VPN لقياس سرعة الشبكة الأصلية…")
             val disconnectedForBaseline = if (VpnRuntime.state.value.status != VpnStatus.DISCONNECTED) {
                 SpeedVpnService.stop(context)
@@ -62,6 +70,7 @@ object SpeedVerificationEngine {
             if (!disconnectedForBaseline) {
                 result = unavailable(started, "تعذر فصل VPN قبل الاختبار.", planDownloadKbps, planUploadKbps)
             } else {
+                Log.i(TAG, "Stage=measure-physical-baseline")
                 onProgress("قياس Download للشبكة الأصلية…")
                 // Use the selected plans only to choose the sample size/count and
                 // percentile. The limiter is still disabled, so these are uncapped
@@ -87,12 +96,18 @@ object SpeedVerificationEngine {
                     SpeedLimiter.setVerificationTrafficRoutingEnabled(true)
                     verifierTunnelRouteEnabled = true
 
+                    Log.i(TAG, "Stage=start-verification-vpn")
                     onProgress("تشغيل VPN للتحقق من الخطة…")
                     SpeedVpnService.start(context)
                     if (!waitForStatus(VpnStatus.CONNECTED)) {
                         result = unavailable(started, "تعذر الوصول إلى حالة VPN متصل.", planDownloadKbps, planUploadKbps)
                     } else {
                         SpeedLimiter.setVerificationLimits(planDownloadKbps, planUploadKbps)
+                        Log.i(
+                            TAG,
+                            "Stage=measure-through-vpn tunnelStatus=${VpnRuntime.state.value.status} " +
+                                "ownUidRouted=${SpeedLimiter.routeVerificationTrafficThroughVpn}",
+                        )
 
                         onProgress("قياس Download عبر VPN…")
                         vpn = SpeedTestEngine.measure(
@@ -138,6 +153,7 @@ object SpeedVerificationEngine {
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (t: Throwable) {
+            Log.e(TAG, "Verification failed: ${t.message ?: t.javaClass.simpleName}", t)
             result = unavailable(started, "فشل التحقق: " + (t.message ?: t.javaClass.simpleName), planDownloadKbps, planUploadKbps)
         } finally {
             withContext(NonCancellable) {
@@ -195,6 +211,7 @@ object SpeedVerificationEngine {
                     }
                 }
                 if (restorationError != null) {
+                    Log.e(TAG, "VPN state restoration failed: $restorationError")
                     val measured = result ?: unavailable(started, "تعذر إكمال قياس السرعة.", planDownloadKbps, planUploadKbps)
                     result = withRestorationFailure(measured, restorationError!!)
                 }

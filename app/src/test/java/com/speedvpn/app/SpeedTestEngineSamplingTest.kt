@@ -4,6 +4,7 @@ import org.junit.Assert.assertArrayEquals
 import okhttp3.Dns
 import okhttp3.OkHttpClient
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -104,6 +105,21 @@ class SpeedTestEngineSamplingTest {
             longArrayOf(20_000_000L, 20_000_000L, 20_000_000L),
             SpeedTestEngine.requestSizesFor(800_000L, verificationProfile = true),
         )
+    }
+
+    @Test
+    fun phaseBudgetUsesMonotonicElapsedTimeAndAnInclusiveDeadline() {
+        val started = 1_000_000_000L
+        assertFalse(SpeedTestEngine.phaseBudgetExceeded(started, 1_074_999_999L, 75L))
+        assertTrue(SpeedTestEngine.phaseBudgetExceeded(started, 1_075_000_000L, 75L))
+    }
+
+    @Test
+    fun sampleLadderStopsWhenRequiredCoverageBecomesImpossible() {
+        assertTrue(SpeedTestEngine.enoughRemainingSamples(0, 3, 3))
+        assertTrue(SpeedTestEngine.enoughRemainingSamples(1, 2, 3))
+        assertFalse(SpeedTestEngine.enoughRemainingSamples(0, 2, 3))
+        assertFalse(SpeedTestEngine.enoughRemainingSamples(1, 1, 3))
     }
 
     @Test

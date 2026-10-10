@@ -61,6 +61,9 @@ object SpeedTestEngine {
     private const val MAX_FINITE_SAMPLE_BYTES = 20_000_000L
     private const val UNLIMITED_VERIFICATION_SAMPLE_BYTES = 20_000_000L
     private const val MAX_RETRIES = 2
+    // A single bad endpoint must not consume the entire 300-second E2E wait.
+    // A blocking request may finish its own bounded OkHttp timeout before the next budget check.
+    internal const val PHASE_TIMEOUT_MS = 75_000L
 
     private const val CONNECT_TIMEOUT_SECONDS = 8L
     private const val READ_TIMEOUT_SECONDS = 25L
@@ -87,6 +90,12 @@ object SpeedTestEngine {
     ): SpeedTestResult =
         withContext(Dispatchers.IO) {
             val startedAt = System.currentTimeMillis()
+            Log.i(
+                TAG,
+                "Measurement begin verificationProfile=$verificationProfile " +
+                    "downloadTargetKbps=${expectedDownloadKbps ?: "unlimited"} " +
+                    "uploadTargetKbps=${expectedUploadKbps ?: "unlimited"}",
+            )
             var firstError: String? = null
             val testClient = buildTestClient(context)
 
@@ -139,10 +148,20 @@ object SpeedTestEngine {
         expectedKbps: Long?,
         verificationProfile: Boolean,
     ): Long {
+        val phaseStartedNs = System.nanoTime()
+        val directionName = if (isUpload) "upload" else "download"
         val requestSizes = requestSizesFor(expectedKbps, verificationProfile)
         val warmupBytes = warmupBytesFor(expectedKbps, verificationProfile)
+        Log.i(
+            TAG,
+            "Phase start direction=$directionName targetKbps=${expectedKbps ?: "unlimited"} " +
+                "verification=$verificationProfile samplesRequired=$requiredSamples " +
+                "requestCount=${requestSizes.size} phaseBudgetMs=$PHASE_TIMEOUT_MS",
+        )
         try {
+            Log.d(TAG, "Warm-up start direction=$directionName bytes=$warmupBytes")
             warmup(client, isUpload, warmupBytes)
+            Log.d(TAG, "Warm-up complete direction=$directionName bytes=$warmupBytes")
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: Throwable) {
@@ -170,12 +189,21 @@ object SpeedTestEngine {
         val samples = ArrayList<Long>()
         var lastFailure: Throwable? = null
 
-        for (sizeBytes in requestSizes) {
+        for ((sizeIndex, sizeBytes) in requestSizes.withIndex()) {
             var measured: Long? = null
             var requestElapsedMs: Long? = null
 
             for (attempt in 1..MAX_RETRIES) {
+                if (phaseBudgetExceeded(phaseStartedNs, System.nanoTime(), PHASE_TIMEOUT_MS)) {
+                    throw IOException(
+                        "$directionName measurement exceeded its ${PHASE_TIMEOUT_MS}ms total phase budget; " +
+                            "validSamples=${samples.size}/$requiredSamples; " +
+                            "lastError=${lastFailure?.let(::errorMessage) ?: "none"}",
+                        lastFailure,
+                    )
+                }
                 try {
+                    Log.d(TAG, "Request start direction=$directionName bytes=$sizeBytes attempt=$attempt")
                     val requestStartedNs = System.nanoTime()
                     measured = if (isUpload) {
                         measureUploadRequest(client, sizeBytes)
@@ -210,6 +238,18 @@ object SpeedTestEngine {
                     break
                 }
             }
+            val remainingSampleCount = requestSizes.size - sizeIndex - 1
+            if (measured == null &&
+                !enoughRemainingSamples(samples.size, remainingSampleCount, requiredSamples)
+            ) {
+                throw IOException(
+                    "Unable to collect enough $directionName samples: " +
+                        "validSamples=${samples.size}/$requiredSamples; " +
+                        "remainingSamples=$remainingSampleCount; " +
+                        "lastError=${lastFailure?.let(::errorMessage) ?: "unknown"}",
+                    lastFailure,
+                )
+            }
         }
 
         if (samples.size < requiredSamples) {
@@ -218,6 +258,11 @@ object SpeedTestEngine {
                     ?: "Not enough valid throughput samples",
             )
         }
+        Log.i(
+            TAG,
+            "Phase complete direction=$directionName validSamples=${samples.size}/$requiredSamples " +
+                "elapsedMs=${TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - phaseStartedNs)}",
+        )
 
         // The public speed-test screen reports a high percentile. Verification
         // uses the median for both the uncapped baseline and VPN side so one
@@ -286,6 +331,15 @@ object SpeedTestEngine {
                 requestSizesFor(expectedKbps).firstOrNull()?.div(4L) ?: WARMUP_BYTES,
             ).coerceAtLeast(WARMUP_BYTES)
         }
+
+    internal fun phaseBudgetExceeded(startedAtNanos: Long, nowNanos: Long, budgetMs: Long): Boolean =
+        nowNanos - startedAtNanos >= TimeUnit.MILLISECONDS.toNanos(budgetMs)
+
+    internal fun enoughRemainingSamples(
+        validSamples: Int,
+        remainingSampleCount: Int,
+        requiredSamples: Int,
+    ): Boolean = validSamples + remainingSampleCount >= requiredSamples
 
     internal fun requestDurationFor(sizeBytes: Long, bitsPerSecond: Long): Long {
         if (bitsPerSecond <= 0L) return 0L

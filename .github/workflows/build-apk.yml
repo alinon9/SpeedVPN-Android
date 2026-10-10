@@ -290,7 +290,13 @@ jobs:
             echo "================================"
           }
 
+          LIVE_LOGCAT_PID=""
           cleanup() {
+            if [ -n "$LIVE_LOGCAT_PID" ]; then
+              kill "$LIVE_LOGCAT_PID" >/dev/null 2>&1 || true
+              wait "$LIVE_LOGCAT_PID" >/dev/null 2>&1 || true
+              LIVE_LOGCAT_PID=""
+            fi
             echo "Capturing Android logcat before emulator shutdown..."
             adb -s emulator-5554 logcat -d -t 5000 > verify-speed-logcat.txt 2>/dev/null || true
             echo "Stopping Android Emulator..."
@@ -682,6 +688,10 @@ jobs:
           fi
 
           echo "Starting Verify Speed end-to-end test..."
+          adb -s emulator-5554 logcat -c || true
+          adb -s emulator-5554 logcat -v threadtime > verify-speed-live-logcat.txt 2>&1 &
+          LIVE_LOGCAT_PID=$!
+          echo "Continuous Verify Speed logcat PID=$LIVE_LOGCAT_PID"
 
           # Configure the finite CI plan through the app's real persistent store.
           # This avoids relying on a horizontally-scrolled Compose preset button.
@@ -855,6 +865,7 @@ jobs:
             speed-test-results.txt
             ui-result-*.xml
             verify-speed-logcat.txt
+            verify-speed-live-logcat.txt
             verify-speed-results.txt
             verify-speed-metrics.json
             verify-speed-result.xml

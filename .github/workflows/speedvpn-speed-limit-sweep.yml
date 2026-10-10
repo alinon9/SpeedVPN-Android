@@ -252,8 +252,8 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
-          test -s speed-limit-sweep-results.csv || { echo "Missing speed-limit-sweep-results.csv"; exit 1; }
-          python3 scripts/e2e/verify_metrics.py validate-sweep speed-limit-sweep-results.csv
+          test -s speed-limit-sweep/speed-limit-sweep-results.csv || { echo "Missing speed-limit-sweep/speed-limit-sweep-results.csv"; exit 1; }
+          python3 scripts/e2e/verify_metrics.py validate-sweep speed-limit-sweep/speed-limit-sweep-results.csv
 
       - name: Upload exhaustive sweep results
         if: always()
