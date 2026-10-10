@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -15,10 +16,23 @@ from urllib.parse import parse_qs, urlsplit
 
 MAX_PAYLOAD_BYTES = 25_000_000
 CHUNK_BYTES = 1024 * 1024
+SOCKET_RECEIVE_BUFFER_BYTES = 4 * 1024 * 1024
 
 
 class SpeedTestRequestHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+
+    def setup(self) -> None:
+        super().setup()
+        # Apply a larger receive window before reading an upload body. The listener
+        # sets the same option before listen(), so TCP window scaling is negotiated
+        # with the larger requested capacity from the beginning of the connection.
+        self.connection.setsockopt(
+            socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_RECEIVE_BUFFER_BYTES
+        )
+        self.socket_receive_buffer_bytes = self.connection.getsockopt(
+            socket.SOL_SOCKET, socket.SO_RCVBUF
+        )
     server_version = "SpeedVPN-CI-SpeedTest/1.0"
     sys_version = ""
 
@@ -92,7 +106,8 @@ class SpeedTestRequestHandler(BaseHTTPRequestHandler):
             outcome = "complete" if completed else "aborted"
             self._record_transfer_event(
                 f"TRANSFER method=GET path=/__down requested_bytes={size} "
-                f"sent_bytes={sent} elapsed_ms={elapsed_ms:.3f} outcome={outcome}"
+                f"sent_bytes={sent} elapsed_ms={elapsed_ms:.3f} outcome={outcome} "
+                f"socket_receive_buffer_bytes={self.socket_receive_buffer_bytes}"
             )
     def do_POST(self) -> None:
         if urlsplit(self.path).path != "/__up":
@@ -144,7 +159,8 @@ class SpeedTestRequestHandler(BaseHTTPRequestHandler):
             outcome = "complete" if completed else "aborted"
             self._record_transfer_event(
                 f"TRANSFER method=POST path=/__up requested_bytes={size} "
-                f"received_bytes={received} elapsed_ms={elapsed_ms:.3f} outcome={outcome}"
+                f"received_bytes={received} elapsed_ms={elapsed_ms:.3f} outcome={outcome} "
+                f"socket_receive_buffer_bytes={self.socket_receive_buffer_bytes}"
             )
     def log_message(self, format_string: str, *args: object) -> None:
         # Request counts are high during the sweep; keep the artifact log concise.
@@ -156,6 +172,14 @@ class SpeedTestRequestHandler(BaseHTTPRequestHandler):
 class ReusableThreadingHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
+
+    def server_bind(self) -> None:
+        # Enlarge the passive socket before listen/accept so the receive window
+        # can be negotiated for the local Android-emulator upload path.
+        self.socket.setsockopt(
+            socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_RECEIVE_BUFFER_BYTES
+        )
+        super().server_bind()
 
     def __init__(self, server_address: tuple[str, int], handler_class: type[BaseHTTPRequestHandler]) -> None:
         super().__init__(server_address, handler_class)
@@ -184,7 +208,13 @@ def main() -> int:
     if not 1 <= args.port <= 65535:
         parser.error("--port must be in 1..65535")
     server = make_server(args.host, args.port)
-    print(f"SpeedVPN local speed-test fixture listening on {args.host}:{args.port}", flush=True)
+    effective_rcvbuf = server.socket.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+    print(
+        f"SpeedVPN local speed-test fixture listening on {args.host}:{args.port}; "
+        f"requested_receive_buffer_bytes={SOCKET_RECEIVE_BUFFER_BYTES} "
+        f"effective_listener_receive_buffer_bytes={effective_rcvbuf}",
+        flush=True,
+    )
     try:
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:

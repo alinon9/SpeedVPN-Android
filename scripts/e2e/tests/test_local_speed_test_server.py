@@ -11,7 +11,7 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from local_speed_test_server import MAX_PAYLOAD_BYTES, make_server
+from local_speed_test_server import MAX_PAYLOAD_BYTES, SOCKET_RECEIVE_BUFFER_BYTES, make_server
 
 
 class LocalSpeedTestServerTests(unittest.TestCase):
@@ -25,6 +25,11 @@ class LocalSpeedTestServerTests(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)
+
+    def test_listener_and_accepted_sockets_request_large_receive_buffers(self) -> None:
+        listener_bytes = self.server.socket.getsockopt(1, 8)  # SOL_SOCKET / SO_RCVBUF on Linux
+        self.assertGreater(listener_bytes, 64 * 1024)
+        self.assertEqual(4 * 1024 * 1024, SOCKET_RECEIVE_BUFFER_BYTES)
 
     def test_health_check_returns_json(self) -> None:
         with urlopen(self.base_url + "/healthz", timeout=2) as response:
