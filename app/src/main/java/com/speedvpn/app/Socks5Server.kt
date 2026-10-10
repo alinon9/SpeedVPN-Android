@@ -553,23 +553,9 @@ class Socks5Server(
             }
             runCatching { dst.flush() }
         } catch (error: SocketException) {
-            when {
-                !running || !SpeedLimiter.isGenerationActive(generation) -> Unit
-                classifySocketError(error) == SockErrKind.EXPECTED_CLOSE -> Unit
-                classifySocketError(error) == SockErrKind.NETWORK_EVENT ->
-                    logE("SOCKS relay pipe network event direction=${if (bucket === SpeedLimiter.download) "download" else "upload"}", error)
-                else ->
-                    logE("Unexpected SOCKS relay pipe socket failure direction=${if (bucket === SpeedLimiter.download) "download" else "upload"}", error)
-            }
+            logPipeException(error, bucket, generation)
         } catch (error: Exception) {
-            when {
-                !running || !SpeedLimiter.isGenerationActive(generation) -> Unit
-                classifySocketError(error) == SockErrKind.EXPECTED_CLOSE -> Unit
-                classifySocketError(error) == SockErrKind.NETWORK_EVENT ->
-                    logE("SOCKS relay pipe network event direction=${if (bucket === SpeedLimiter.download) "download" else "upload"}", error)
-                else ->
-                    logE("Unexpected SOCKS relay pipe failure direction=${if (bucket === SpeedLimiter.download) "download" else "upload"}", error)
-            }
+            logPipeException(error, bucket, generation)
         } finally {
             val wallDurationNs = (System.nanoTime() - pipeStartedNs).coerceAtLeast(1L)
             val transferDurationNs = if (firstForwardedNs > 0L) {
@@ -599,6 +585,24 @@ class Socks5Server(
             }
             if (remaining.decrementAndGet() == 0) closeBoth()
             done.countDown()
+        }
+    }
+
+    /**
+     * Ignore an error only when the pipe is already shutting down or when the
+     * exception type/message classifies it as an expected close. All active-session
+     * network events and unknown exceptions retain their stack traces in Logcat.
+     */
+    private fun logPipeException(error: Throwable, bucket: TokenBucket, generation: Long) {
+        if (!running || !SpeedLimiter.isGenerationActive(generation)) return
+        val direction = if (bucket === SpeedLimiter.download) "download" else "upload"
+        val detail = error.message ?: "no message"
+        when (classifySocketError(error)) {
+            SockErrKind.EXPECTED_CLOSE -> Unit
+            SockErrKind.NETWORK_EVENT ->
+                logE("SOCKS relay pipe network event direction=$direction error=${error.javaClass.simpleName}: $detail", error)
+            SockErrKind.UNKNOWN ->
+                logE("Unexpected SOCKS relay pipe failure direction=$direction error=${error.javaClass.simpleName}: $detail", error)
         }
     }
 

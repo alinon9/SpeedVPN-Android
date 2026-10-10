@@ -3,12 +3,16 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import json
+import tempfile
+
 from verify_metrics import (
     STATUS_MISMATCH,
     STATUS_PASS,
     STATUS_UNJUDGEABLE,
     STATUS_UNLIMITED,
     baseline_headroom_errors,
+    collect_preflight,
     check_metric,
 )
 
@@ -24,6 +28,34 @@ def values(direction, baseline, plan, vpn, verdict, accuracy="—"):
 
 
 class VerifyMetricClassificationTests(unittest.TestCase):
+    def test_preflight_xml_collection_requires_both_tagged_real_metrics(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            xml_path = Path(temp_dir) / "ui.xml"
+            json_path = Path(temp_dir) / "metrics.json"
+            xml_path.write_text(
+                '<hierarchy>'
+                '<node resource-id="com.speedvpn.app:id/baseline_preflight_download_value" text="110.00 Mbps" />'
+                '<node resource-id="com.speedvpn.app:id/baseline_preflight_upload_value" text="112.00 Mbps" />'
+                '</hierarchy>',
+                encoding="utf-8",
+            )
+            json_path.write_text("{}", encoding="utf-8")
+            self.assertEqual(0, collect_preflight(str(xml_path), str(json_path)))
+            captured = json.loads(json_path.read_text(encoding="utf-8"))
+            self.assertEqual("110.00 Mbps", captured["baseline_preflight_download_value"])
+            self.assertEqual("112.00 Mbps", captured["baseline_preflight_upload_value"])
+
+    def test_preflight_xml_collection_rejects_a_missing_direction(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            xml_path = Path(temp_dir) / "ui.xml"
+            json_path = Path(temp_dir) / "metrics.json"
+            xml_path.write_text(
+                '<hierarchy><node resource-id="com.speedvpn.app:id/baseline_preflight_download_value" text="110.00 Mbps" /></hierarchy>',
+                encoding="utf-8",
+            )
+            json_path.write_text("{}", encoding="utf-8")
+            self.assertEqual(1, collect_preflight(str(xml_path), str(json_path)))
+
     def test_preflight_passes_only_when_both_directions_have_12x_headroom(self):
         enough = {
             "baseline_preflight_download_value": "110.00 Mbps",
