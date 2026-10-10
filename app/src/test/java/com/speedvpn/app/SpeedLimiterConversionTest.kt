@@ -79,6 +79,34 @@ class SpeedLimiterConversionTest {
     }
 
     @Test
+    fun switchingBetweenFiniteAndUnlimitedDoesNotRetainPacingState() {
+        val bucket = TokenBucket()
+        bucket.setRate(2_000L)
+
+        // Empty the initial burst and prove the finite rate really waits.
+        assertTrue(bucket.acquire(16 * 1024))
+        var started = System.nanoTime()
+        assertTrue(bucket.acquire(100))
+        var finiteWaitMs = (System.nanoTime() - started) / 1_000_000L
+        assertTrue("Finite plan did not pace: ${finiteWaitMs}ms", finiteWaitMs >= 35L)
+
+        // Unlimited must bypass the previous plan immediately, including large chunks.
+        bucket.setRate(0L)
+        started = System.nanoTime()
+        repeat(32) { assertTrue(bucket.acquire(256 * 1024)) }
+        val unlimitedElapsedMs = (System.nanoTime() - started) / 1_000_000L
+        assertTrue("Unlimited retained pacing delay: ${unlimitedElapsedMs}ms", unlimitedElapsedMs < 100L)
+
+        // Returning to a finite plan must restore the configured cap.
+        bucket.setRate(2_000L)
+        assertTrue(bucket.acquire(16 * 1024))
+        started = System.nanoTime()
+        assertTrue(bucket.acquire(100))
+        finiteWaitMs = (System.nanoTime() - started) / 1_000_000L
+        assertTrue("Finite cap was not restored after Unlimited: ${finiteWaitMs}ms", finiteWaitMs >= 35L)
+    }
+
+    @Test
     fun limiterAccruesCreditDuringOutsideIoWork() {
         val bucket = TokenBucket()
         bucket.setRate(20_000L)
