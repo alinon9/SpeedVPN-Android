@@ -109,6 +109,34 @@ class SpeedTestEngineSamplingTest {
     }
 
     @Test
+    fun highCapacityAndUnlimitedVerificationUseThreeStreamsButLowPlansStaySingleStream() {
+        assertEquals(3, SpeedTestEngine.sampleParallelismFor(32_000L, verificationProfile = true))
+        assertEquals(3, SpeedTestEngine.sampleParallelismFor(88_000L, verificationProfile = true))
+        assertEquals(3, SpeedTestEngine.sampleParallelismFor(null, verificationProfile = true))
+        assertEquals(3, SpeedTestEngine.sampleParallelismFor(0L, verificationProfile = true))
+        assertEquals(1, SpeedTestEngine.sampleParallelismFor(800L, verificationProfile = true))
+        assertEquals(1, SpeedTestEngine.sampleParallelismFor(88_000L, verificationProfile = false))
+    }
+
+    @Test
+    fun parallelSampleSplitPreservesTotalBytesWithoutEmptyRequests() {
+        assertArrayEquals(
+            longArrayOf(5_500_000L, 5_500_000L, 5_500_000L),
+            SpeedTestEngine.splitSampleBytes(16_500_000L, 3),
+        )
+        assertArrayEquals(
+            longArrayOf(34L, 33L, 33L),
+            SpeedTestEngine.splitSampleBytes(100L, 3),
+        )
+        assertArrayEquals(
+            longArrayOf(1L, 1L),
+            SpeedTestEngine.splitSampleBytes(2L, 3),
+        )
+        assertArrayEquals(longArrayOf(), SpeedTestEngine.splitSampleBytes(0L, 3))
+        assertArrayEquals(longArrayOf(), SpeedTestEngine.splitSampleBytes(100L, 0))
+    }
+
+    @Test
     fun phaseBudgetUsesMonotonicElapsedTimeAndAnInclusiveDeadline() {
         val started = 1_000_000_000L
         assertFalse(SpeedTestEngine.phaseBudgetExceeded(started, 1_074_999_999L, 75L))

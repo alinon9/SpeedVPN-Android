@@ -5,11 +5,14 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.util.Log
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
-import okhttp3.MediaType.Companion.toMediaType
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.ConnectionPool
 import okhttp3.Dns
 import okhttp3.OkHttpClient
@@ -37,8 +40,9 @@ object SpeedTestEngine {
     private val UPLOAD_URL = endpointUrl("__up", BuildConfig.SPEED_TEST_BASE_URL)
     private val REFERER = "$testBaseUrl/"
 
-    // Sequential, adaptive requests. Cloudflare public speedtest also uses
-    // progressively larger request sizes instead of a fixed concurrent window.
+    // Progressive sample sizes avoid oversampling. For high-capacity verification,
+    // each sample can use three parallel HTTP streams so a single TCP flow does not
+    // become the physical-baseline bottleneck; baseline and VPN use the same profile.
     private val REQUEST_SIZES = longArrayOf(
         100_000L,
         250_000L,
@@ -223,15 +227,14 @@ object SpeedTestEngine {
                     } else {
                         Long.MAX_VALUE
                     }
-                    measured = if (isUpload) {
-                        measureUploadRequest(
-                            client, sizeBytes, expectedKbps, verificationProfile, remainingPhaseMs,
-                        )
-                    } else {
-                        measureDownloadRequest(
-                            client, sizeBytes, expectedKbps, verificationProfile, remainingPhaseMs,
-                        )
-                    }
+                    measured = measureSampleRequest(
+                        client = client,
+                        isUpload = isUpload,
+                        sizeBytes = sizeBytes,
+                        expectedKbps = expectedKbps,
+                        verificationProfile = verificationProfile,
+                        remainingPhaseMs = remainingPhaseMs,
+                    )
                     requestElapsedMs = TimeUnit.NANOSECONDS.toMillis(
                         (System.nanoTime() - requestStartedNs).coerceAtLeast(1L),
                     )
@@ -362,6 +365,78 @@ object SpeedTestEngine {
                 requestSizesFor(expectedKbps).firstOrNull()?.div(4L) ?: WARMUP_BYTES,
             ).coerceAtLeast(WARMUP_BYTES)
         }
+
+    /**
+     * Use the same aggregate throughput profile for baseline and VPN measurements.
+     * A rate-limited device-wide token bucket still caps the sum of all streams.
+     * Unlimited verification uses parallel streams to measure available capacity,
+     * not a single-flow TCP ceiling.
+     */
+    internal fun sampleParallelismFor(expectedKbps: Long?, verificationProfile: Boolean): Int =
+        if (
+            verificationProfile &&
+            (expectedKbps == null || expectedKbps <= 0L || expectedKbps >= 32_000L)
+        ) {
+            3
+        } else {
+            1
+        }
+
+    internal fun splitSampleBytes(sizeBytes: Long, requestedParallelism: Int): LongArray {
+        if (sizeBytes <= 0L || requestedParallelism <= 0) return longArrayOf()
+        val streamCount = min(sizeBytes, requestedParallelism.toLong()).toInt()
+        val baseBytes = sizeBytes / streamCount
+        val remainder = (sizeBytes % streamCount).toInt()
+        return LongArray(streamCount) { index ->
+            baseBytes + if (index < remainder) 1L else 0L
+        }
+    }
+
+    private suspend fun measureSampleRequest(
+        client: OkHttpClient,
+        isUpload: Boolean,
+        sizeBytes: Long,
+        expectedKbps: Long?,
+        verificationProfile: Boolean,
+        remainingPhaseMs: Long,
+    ): Long {
+        val parallelism = sampleParallelismFor(expectedKbps, verificationProfile)
+        if (parallelism <= 1) {
+            return if (isUpload) {
+                measureUploadRequest(client, sizeBytes, expectedKbps, verificationProfile, remainingPhaseMs)
+            } else {
+                measureDownloadRequest(client, sizeBytes, expectedKbps, verificationProfile, remainingPhaseMs)
+            }
+        }
+
+        val chunks = splitSampleBytes(sizeBytes, parallelism)
+        val startedNs = System.nanoTime()
+        val streamRates = coroutineScope {
+            chunks.map { chunkBytes ->
+                async(Dispatchers.IO) {
+                    if (isUpload) {
+                        measureUploadRequest(
+                            client, chunkBytes, expectedKbps, verificationProfile, remainingPhaseMs,
+                        )
+                    } else {
+                        measureDownloadRequest(
+                            client, chunkBytes, expectedKbps, verificationProfile, remainingPhaseMs,
+                        )
+                    }
+                }
+            }.awaitAll()
+        }
+        val elapsedNs = (System.nanoTime() - startedNs).coerceAtLeast(1L)
+        val aggregateRate = bitsPerSecond(sizeBytes, elapsedNs)
+        Log.i(
+            TAG,
+            "Aggregate sample direction=${if (isUpload) "upload" else "download"} " +
+                "payloadBytes=$sizeBytes streams=${chunks.size} " +
+                "elapsedMs=${TimeUnit.NANOSECONDS.toMillis(elapsedNs)} " +
+                "aggregateBps=$aggregateRate perStreamBps=${streamRates.joinToString(",")}",
+        )
+        return aggregateRate
+    }
 
     internal fun phaseBudgetExceeded(startedAtNanos: Long, nowNanos: Long, budgetMs: Long): Boolean =
         nowNanos - startedAtNanos >= TimeUnit.MILLISECONDS.toNanos(budgetMs)
