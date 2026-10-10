@@ -67,6 +67,31 @@ class VerifyMetricClassificationTests(unittest.TestCase):
         )
         self.assertEqual("PASS", result[4])
 
+    def test_accuracy_rounding_matches_displayed_rate_precision(self):
+        result = check_metric(
+            "download",
+            values("download", "96.32 Mbps", "80 Kbps", "83 Kbps", STATUS_PASS, "96.7%"),
+            80,
+        )
+        self.assertEqual("PASS", result[4])
+
+    def test_accuracy_outside_rate_rounding_range_still_fails(self):
+        result = check_metric(
+            "download",
+            values("download", "96.32 Mbps", "80 Kbps", "83 Kbps", STATUS_PASS, "90.0%"),
+            80,
+        )
+        self.assertTrue(result[4].startswith("FAIL|"), result[4])
+        self.assertIn("accuracy", result[4])
+
+    def test_baseline_rounding_at_headroom_boundary_is_environment_limited(self):
+        result = check_metric(
+            "download",
+            values("download", "96.00 Mbps", "80.00 Mbps", "80.00 Mbps", STATUS_UNJUDGEABLE, "—"),
+            80_000,
+        )
+        self.assertTrue(result[4].startswith("ENV_LIMITED|"), result[4])
+
     def test_unlimited_requires_behavioral_verdict_and_independent_rate_check(self):
         valid_values = values("upload", "66.24 Mbps", "بدون حد", "77.56 Mbps", STATUS_UNLIMITED, "100.0%")
         self.assertEqual("PASS_UNLIMITED", check_metric("upload", valid_values, 0)[4])

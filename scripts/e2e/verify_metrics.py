@@ -51,23 +51,61 @@ def rate_bps(value: str | None) -> float | None:
     return None if not match else float(match.group(1)) * MULTIPLIERS[match.group(2)]
 
 
+def rate_display_step_bps(value: str | None) -> float | None:
+    """Return the resolution of a displayed rate so checks can account for UI rounding."""
+    if not value:
+        return None
+    match = RATE_RE.fullmatch(value.strip())
+    if not match:
+        return None
+    decimals = len(match.group(1).partition(".")[2])
+    return MULTIPLIERS[match.group(2)] / (10 ** decimals)
+
+
 def normalise_resource_id(value: str) -> str:
     return value.rsplit("/", 1)[-1].rsplit(":", 1)[-1]
 
 
-def expected_accuracy_percent(baseline_bps: float | None, vpn_bps: float | None, expected_kbps: int) -> float | None:
+def expected_accuracy_range(
+    baseline_bps: float | None,
+    vpn_bps: float | None,
+    expected_kbps: int,
+    baseline_step_bps: float | None,
+    vpn_step_bps: float | None,
+) -> tuple[float, float] | None:
     if baseline_bps is None or baseline_bps <= 0 or vpn_bps is None or vpn_bps < 0:
         return None
+    baseline_half_step = (baseline_step_bps or 0.0) / 2.0
+    vpn_half_step = (vpn_step_bps or 0.0) / 2.0
+    baseline_low = max(0.0, baseline_bps - baseline_half_step)
+    baseline_high = baseline_bps + baseline_half_step
+    vpn_low = max(0.0, vpn_bps - vpn_half_step)
+    vpn_high = vpn_bps + vpn_half_step
     if expected_kbps == 0:
-        return min(100.0, vpn_bps / baseline_bps * 100.0)
+        return (
+            min(100.0, vpn_low / baseline_high * 100.0),
+            min(100.0, vpn_high / max(baseline_low, 1.0) * 100.0),
+        )
     target_bps = expected_kbps * 1_000.0
-    if baseline_bps < target_bps * 1.2:
+    if baseline_low < target_bps * 1.2:
         return None
-    return max(0.0, min(100.0, 100.0 - abs(vpn_bps - target_bps) / target_bps * 100.0))
+    def accuracy(rate: float) -> float:
+        return max(0.0, min(100.0, 100.0 - abs(rate - target_bps) / target_bps * 100.0))
+    upper = 100.0 if vpn_low <= target_bps <= vpn_high else max(accuracy(vpn_low), accuracy(vpn_high))
+    return min(accuracy(vpn_low), accuracy(vpn_high)), upper
 
 
-def check_accuracy(raw: str, baseline_bps: float | None, vpn_bps: float | None, expected_kbps: int) -> str | None:
-    expected = expected_accuracy_percent(baseline_bps, vpn_bps, expected_kbps)
+def check_accuracy(
+    raw: str,
+    baseline_bps: float | None,
+    vpn_bps: float | None,
+    expected_kbps: int,
+    baseline_step_bps: float | None = None,
+    vpn_step_bps: float | None = None,
+) -> str | None:
+    expected = expected_accuracy_range(
+        baseline_bps, vpn_bps, expected_kbps, baseline_step_bps, vpn_step_bps,
+    )
     value = (raw or "").strip()
     if expected is None:
         return None if value == "—" else f"accuracy should be unavailable (—), got {value!r}"
@@ -75,9 +113,12 @@ def check_accuracy(raw: str, baseline_bps: float | None, vpn_bps: float | None, 
     if not match:
         return f"invalid/missing accuracy '{value}'"
     actual = float(match.group(1))
-    # The app displays one decimal place; allow only that display rounding.
-    if abs(actual - expected) > 0.11:
-        return f"accuracy {actual:.1f}% disagrees with independently calculated {expected:.3f}%"
+    # Rate values are rounded for display (integer Kbps, two decimal Mbps/Gbps),
+    # while the app computes accuracy from the underlying Bps values. Accept only
+    # the mathematically possible range from those display units plus 0.1% text rounding.
+    lower, upper = expected
+    if actual < lower - 0.051 or actual > upper + 0.051:
+        return f"accuracy {actual:.1f}% disagrees with independently calculated range [{lower:.3f}%, {upper:.3f}%]"
     return None
 
 
@@ -119,7 +160,9 @@ def check_metric(direction: str, values: dict[str, str], expected_kbps: int) -> 
         reasons.append(f"{direction}: invalid/missing Original network rate '{baseline}'")
     if vpn_bps is None or vpn_bps <= 0:
         reasons.append(f"{direction}: invalid/missing VPN measured rate '{vpn}'")
-    accuracy_error = check_accuracy(accuracy, baseline_bps, vpn_bps, expected_kbps)
+    baseline_step = rate_display_step_bps(baseline)
+    vpn_step = rate_display_step_bps(vpn)
+    accuracy_error = check_accuracy(accuracy, baseline_bps, vpn_bps, expected_kbps, baseline_step, vpn_step)
     if accuracy_error:
         reasons.append(f"{direction}: {accuracy_error}")
 
@@ -163,7 +206,11 @@ def check_metric(direction: str, values: dict[str, str], expected_kbps: int) -> 
             f"±20% interval [{target_bps * 0.8 / 1000:.2f}, {target_bps * 1.2 / 1000:.2f}] Kbps"
         )
 
-    baseline_limited = baseline_bps is not None and 0 < baseline_bps < target_bps * 1.2
+    baseline_limited = (
+        baseline_bps is not None
+        and 0 < baseline_bps
+        and baseline_bps - (baseline_step or 0.0) / 2.0 < target_bps * 1.2
+    )
     if baseline_limited:
         reasons.append(
             f"{direction}: environment baseline {baseline_bps / 1000:.2f} Kbps "
