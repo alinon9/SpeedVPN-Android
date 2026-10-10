@@ -59,7 +59,7 @@ object SpeedTestEngine {
     internal const val FINITE_SAMPLE_TARGET_DURATION_MS = 1_500L
     private const val MIN_FINITE_SAMPLE_BYTES = 256_000L
     private const val MAX_FINITE_SAMPLE_BYTES = 20_000_000L
-    private const val UNLIMITED_VERIFICATION_SAMPLE_BYTES = 10_000_000L
+    private const val UNLIMITED_VERIFICATION_SAMPLE_BYTES = 20_000_000L
     private const val MAX_RETRIES = 2
 
     private const val CONNECT_TIMEOUT_SECONDS = 8L

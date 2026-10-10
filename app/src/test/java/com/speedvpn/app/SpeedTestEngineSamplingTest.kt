@@ -78,8 +78,8 @@ class SpeedTestEngineSamplingTest {
     }
 
     @Test
-    fun unlimitedVerificationUsesThreeEqualSizeSamplesOnBothSides() {
-        val expected = longArrayOf(10_000_000L, 10_000_000L, 10_000_000L)
+    fun unlimitedVerificationUsesThreeEqualSustainedSamplesOnBothSides() {
+        val expected = longArrayOf(20_000_000L, 20_000_000L, 20_000_000L)
         assertArrayEquals(expected, SpeedTestEngine.requestSizesFor(null, verificationProfile = true))
         assertArrayEquals(expected, SpeedTestEngine.requestSizesFor(0L, verificationProfile = true))
         assertArrayEquals(
