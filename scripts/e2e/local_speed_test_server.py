@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 MAX_PAYLOAD_BYTES = 25_000_000
-CHUNK_BYTES = 64 * 1024
+CHUNK_BYTES = 1024 * 1024
 
 
 class SpeedTestRequestHandler(BaseHTTPRequestHandler):
