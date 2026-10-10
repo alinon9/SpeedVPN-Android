@@ -153,9 +153,9 @@ class SpeedTestEngineSamplingTest {
             expectedKbps = 200L,
             verificationProfile = true,
         )
-        assertEquals(32_720, slowPlan.callTimeoutMillis())
-        assertEquals(32_720, slowPlan.readTimeoutMillis())
-        assertEquals(32_720, slowPlan.writeTimeoutMillis())
+        assertEquals(32_720, slowPlan.callTimeoutMillis)
+        assertEquals(32_720, slowPlan.readTimeoutMillis)
+        assertEquals(32_720, slowPlan.writeTimeoutMillis)
 
         val almostOutOfTime = SpeedTestEngine.clientForMeasurementRequest(
             base,
@@ -164,9 +164,9 @@ class SpeedTestEngineSamplingTest {
             verificationProfile = true,
             remainingPhaseMs = 8_000L,
         )
-        assertEquals(8_000, almostOutOfTime.callTimeoutMillis())
-        assertEquals(8_000, almostOutOfTime.readTimeoutMillis())
-        assertEquals(8_000, almostOutOfTime.writeTimeoutMillis())
+        assertEquals(8_000, almostOutOfTime.callTimeoutMillis)
+        assertEquals(8_000, almostOutOfTime.readTimeoutMillis)
+        assertEquals(8_000, almostOutOfTime.writeTimeoutMillis)
 
         val publicTest = SpeedTestEngine.clientForMeasurementRequest(
             base,
@@ -174,9 +174,9 @@ class SpeedTestEngineSamplingTest {
             expectedKbps = 200L,
             verificationProfile = false,
         )
-        assertEquals(30_000, publicTest.callTimeoutMillis())
-        assertEquals(25_000, publicTest.readTimeoutMillis())
-        assertEquals(25_000, publicTest.writeTimeoutMillis())
+        assertEquals(30_000, publicTest.callTimeoutMillis)
+        assertEquals(25_000, publicTest.readTimeoutMillis)
+        assertEquals(25_000, publicTest.writeTimeoutMillis)
 
         slowPlan.connectionPool.evictAll()
         almostOutOfTime.connectionPool.evictAll()
