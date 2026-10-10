@@ -139,7 +139,43 @@ jobs:
           adb -s emulator-5554 shell settings put global window_animation_scale 0
           adb -s emulator-5554 shell settings put global transition_animation_scale 0
           adb -s emulator-5554 shell settings put global animator_duration_scale 0
-          adb -s emulator-5554 install -r app/build/outputs/apk/debug/app-debug.apk
+          echo "===== PACKAGE MANAGER HEALTH PRECHECK ====="
+          package_ready=0
+          for attempt in $(seq 1 30); do
+            output="$(adb -s emulator-5554 shell cmd package list packages 2>&1)" && {
+              echo "$output" | grep -q 'package:' && { echo "Package Manager healthy after attempt $attempt."; package_ready=1; break; }
+            }
+            echo "Package Manager unhealthy (attempt $attempt/30): $output"
+            adb -s emulator-5554 logcat -d -v threadtime -t 1500 > "package-manager-attempt-$attempt-logcat.txt" 2>&1 || true
+            sleep 2
+          done
+          if [ "$package_ready" -ne 1 ]; then
+            echo "Package Manager health check failed; preserving diagnostics."
+            adb -s emulator-5554 logcat -d -v threadtime > package-manager-fatal-logcat.txt 2>&1 || true
+            cat emulator-console.log || true
+            exit 1
+          fi
+          echo "===== APK INSTALL WITH DIAGNOSTIC RETRIES ====="
+          installed=0
+          for attempt in 1 2 3; do
+            echo "Install attempt $attempt/3 at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            adb -s emulator-5554 logcat -c || true
+            set +e
+            adb -s emulator-5554 install -r app/build/outputs/apk/debug/app-debug.apk 2>&1 | tee "apk-install-attempt-$attempt.log"
+            install_status=${PIPESTATUS[0]}
+            set -e
+            adb -s emulator-5554 logcat -d -v threadtime -t 5000 > "apk-install-attempt-$attempt-logcat.txt" 2>&1 || true
+            if [ "$install_status" -eq 0 ]; then installed=1; break; fi
+            adb -s emulator-5554 shell cmd package list packages > "apk-install-attempt-$attempt-packages.txt" 2>&1 || true
+            adb -s emulator-5554 shell dumpsys meminfo > "apk-install-attempt-$attempt-meminfo.txt" 2>&1 || true
+            [ "$attempt" -eq 3 ] || sleep 5
+          done
+          if [ "$installed" -ne 1 ]; then
+            echo "APK install failed all three attempts; failure is not suppressed."
+            adb -s emulator-5554 logcat -d -v threadtime > package-manager-fatal-logcat.txt 2>&1 || true
+            cat emulator-console.log || true
+            exit 1
+          fi
 
           echo '===== ISOLATE EMULATOR BACKGROUND NETWORK NOISE ====='
           adb -s emulator-5554 shell settings put global private_dns_mode off
@@ -347,7 +383,12 @@ jobs:
           name: speedvpn-full-emulator-e2e-logs
           path: |
             emulator-console.log
-            speed-test-server.log
+            package-manager-attempt-*-logcat.txt
+            package-manager-fatal-logcat.txt
+            apk-install-attempt-*.log
+            apk-install-attempt-*-logcat.txt
+            apk-install-attempt-*-packages.txt
+            apk-install-attempt-*-meminfo.txt
             smoke-logcat.txt
             e2e-logcat.txt
             speed-results.txt
