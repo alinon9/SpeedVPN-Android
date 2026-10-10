@@ -787,6 +787,14 @@ jobs:
                 diagnostics
                 return 1
               fi
+
+              # The completed Verify Speed card is appended below the plan
+              # controls on compact emulator screens. The verification can finish
+              # successfully while UIAutomator still sees only the top viewport.
+              # Scroll periodically so the result card becomes observable.
+              if [ "$((i % 5))" -eq 0 ]; then
+                adb -s emulator-5554 shell input swipe 160 500 160 220 600 || true
+              fi
               sleep 1
             done
 
