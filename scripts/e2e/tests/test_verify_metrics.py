@@ -8,6 +8,7 @@ from verify_metrics import (
     STATUS_PASS,
     STATUS_UNJUDGEABLE,
     STATUS_UNLIMITED,
+    baseline_headroom_errors,
     check_metric,
 )
 
@@ -23,6 +24,28 @@ def values(direction, baseline, plan, vpn, verdict, accuracy="—"):
 
 
 class VerifyMetricClassificationTests(unittest.TestCase):
+    def test_preflight_passes_only_when_both_directions_have_12x_headroom(self):
+        enough = {
+            "baseline_preflight_download_value": "110.00 Mbps",
+            "baseline_preflight_upload_value": "112.00 Mbps",
+        }
+        self.assertEqual([], baseline_headroom_errors(enough, 88_000))
+
+        low_upload = dict(enough, baseline_preflight_upload_value="105.59 Mbps")
+        errors = baseline_headroom_errors(low_upload, 88_000)
+        self.assertEqual(1, len(errors))
+        self.assertIn("upload", errors[0])
+        self.assertIn("105.60 Mbps", errors[0])
+
+    def test_preflight_rejects_missing_or_invalid_baseline_measurements(self):
+        values = {
+            "baseline_preflight_download_value": "110.00 Mbps",
+            "baseline_preflight_upload_value": "—",
+        }
+        errors = baseline_headroom_errors(values, 88_000)
+        self.assertEqual(1, len(errors))
+        self.assertIn("invalid baseline", errors[0])
+
     def test_low_baseline_and_rate_mismatch_is_environment_limited(self):
         result = check_metric(
             "upload",

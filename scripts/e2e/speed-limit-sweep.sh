@@ -95,6 +95,26 @@ print(x,y)
 PY
 }
 
+tap_resource_id() {
+  local wanted="$1"
+  local xml="$RUN_DIR/current-ui.xml"
+  for scroll in 0 1 2 3 4 5 6 7; do
+    dump_ui "$xml" || true
+    local c=""
+    c="$(coord_for_resource_id "$xml" "$wanted" 2>/dev/null || true)"
+    if [ -n "$c" ]; then
+      read -r x y <<< "$c"
+      adb -s "$DEVICE" shell input tap "$x" "$y"
+      return 0
+    fi
+    [ "$scroll" -lt 7 ] || break
+    adb -s "$DEVICE" shell input swipe 160 500 160 220 650
+    sleep 1
+  done
+  echo "UI_ERROR: resource id '$wanted' is not visible."
+  return 1
+}
+
 tap_text() {
   local wanted="$1"
   local mode="any"
@@ -542,6 +562,84 @@ echo "===== SPEED LIMIT SWEEP START ====="
 echo "19 finite presets + Unlimited."
 echo "Real UI selection for Download and Upload, then Verify Speed, record, stop VPN, next preset."
 echo
+
+# Strict preflight: prove the emulator can deliver at least 1.2x the highest finite
+# target in both physical directions before consuming the 19-preset acceptance run.
+# This measures real traffic through the same app/profile and runner-local fixture.
+preflight_fail() {
+  local reason="$1"
+  echo "BASELINE_PREFLIGHT_FAIL=$reason" | tee -a "$RUN_DIR/sweep-console.log"
+  adb -s "$DEVICE" logcat -d -v threadtime > "$RUN_DIR/baseline-preflight-logcat.txt" 2>&1 || true
+  {
+    echo "# SpeedVPN baseline preflight"
+    echo
+    echo "- GitHub run ID: $CSV_RUN_ID"
+    echo "- Result: FAILED"
+    echo "- Target: 88 Mbps"
+    echo "- Required baseline in each direction: 105.6 Mbps (1.2x)"
+    echo "- Failure: $reason"
+    echo "- No speed presets were counted as tested; the 38-metric sweep was not started."
+  } > "$RUN_DIR/speed-limit-sweep-summary.md"
+  cp "$RUN_DIR/speed-limit-sweep-summary.md" speed-limit-sweep-summary.md
+  return 1
+}
+
+if ! cleanup_vpn; then
+  preflight_fail "VPN TUN could not be confirmed stopped before baseline measurement."
+  exit 1
+fi
+adb -s "$DEVICE" shell am start -n "$PACKAGE/.MainActivity" >/dev/null
+sleep 4
+if ! tap_text "السرعة"; then
+  preflight_fail "Speed screen could not be opened for baseline measurement."
+  exit 1
+fi
+if ! select_preset_and_wait "11 MB" top 88000 dl none; then
+  preflight_fail "Could not select/persist 88 Mbps Download plan for preflight."
+  exit 1
+fi
+adb -s "$DEVICE" shell input swipe 160 570 160 190 850
+sleep 1
+if ! select_preset_and_wait "11 MB" bottom 88000 ul both; then
+  preflight_fail "Could not select/persist 88 Mbps Upload plan for preflight."
+  exit 1
+fi
+if ! tap_resource_id "baseline_preflight_button"; then
+  preflight_fail "Baseline preflight button could not be selected."
+  exit 1
+fi
+
+preflight_json="$RUN_DIR/baseline-preflight.json"
+preflight_xml="$RUN_DIR/baseline-preflight.xml"
+printf '{}' > "$preflight_json"
+preflight_collected=0
+for preflight_attempt in $(seq 1 90); do
+  dump_ui "$preflight_xml" || true
+  if python3 scripts/e2e/verify_metrics.py collect-preflight "$preflight_xml" "$preflight_json" >> "$RUN_DIR/sweep-console.log" 2>&1; then
+    preflight_collected=1
+    echo "Baseline preflight measurements collected after ${preflight_attempt}s." | tee -a "$RUN_DIR/sweep-console.log"
+    break
+  fi
+  if [ "$((preflight_attempt % 2))" -eq 0 ]; then
+    adb -s "$DEVICE" shell input swipe 160 500 160 220 650 || true
+  fi
+  sleep 1
+done
+if [ "$preflight_collected" -ne 1 ]; then
+  preflight_fail "The UI did not expose both real baseline measurements within 90 seconds."
+  cp "$preflight_json" "$RUN_DIR/baseline-preflight-failed.json"
+  exit 1
+fi
+if ! python3 scripts/e2e/verify_metrics.py validate-headroom "$preflight_json" 88000 2>&1 | tee -a "$RUN_DIR/sweep-console.log"; then
+  preflight_fail "Physical baseline did not provide required 1.2x headroom for 88 Mbps in both directions."
+  cp "$preflight_json" "$RUN_DIR/baseline-preflight-failed.json"
+  exit 1
+fi
+echo "BASELINE_PREFLIGHT_PASS=2/2; required=105.6 Mbps per direction." | tee -a "$RUN_DIR/sweep-console.log"
+if ! cleanup_vpn; then
+  preflight_fail "VPN TUN was not stopped after baseline preflight."
+  exit 1
+fi
 
 # Keep the case list on FD 3 rather than stdin: adb shell can consume
 # stdin and otherwise discard all remaining speed presets after the first one.

@@ -25,6 +25,10 @@ VALUE_TAGS = {
     for direction in ("download", "upload")
 }
 REQUIRED_FIELDS = sorted(VALUE_TAGS)
+PREFLIGHT_VALUE_TAGS = {
+    "baseline_preflight_download_value",
+    "baseline_preflight_upload_value",
+}
 
 RATE_RE = re.compile(r"^([0-9]+(?:\.[0-9]+)?)\s?(bps|Kbps|Mbps|Gbps)$")
 ACCURACY_RE = re.compile(r"^([0-9]+(?:\.[0-9]+)?)%$")
@@ -143,6 +147,81 @@ def collect(xml_path: str, json_path: str) -> int:
         print("VERIFY_FIELDS_MISSING=" + ",".join(missing))
         return 1
     print("VERIFY_FIELDS_CAPTURED_ALL=1")
+    return 0
+
+
+def collect_preflight(xml_path: str, json_path: str) -> int:
+    """Accumulate only the real baseline measurements rendered by the debug UI."""
+    output = Path(json_path)
+    try:
+        state = json.loads(output.read_text(encoding="utf-8"))
+        if not isinstance(state, dict):
+            state = {}
+    except (OSError, json.JSONDecodeError):
+        state = {}
+    root = ET.parse(xml_path).getroot()
+    for node in root.iter("node"):
+        tag = normalise_resource_id(node.attrib.get("resource-id", ""))
+        value = (node.attrib.get("text", "") or "").strip()
+        if tag in PREFLIGHT_VALUE_TAGS and value:
+            state[tag] = value
+    output.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    missing = sorted(PREFLIGHT_VALUE_TAGS - {key for key, value in state.items() if str(value).strip()})
+    print(f"PREFLIGHT_FIELDS_CAPTURED={len(PREFLIGHT_VALUE_TAGS) - len(missing)}/2")
+    if missing:
+        print("PREFLIGHT_FIELDS_MISSING=" + ",".join(missing))
+        return 1
+    print("PREFLIGHT_FIELDS_CAPTURED_ALL=1")
+    return 0
+
+
+def baseline_headroom_errors(values: dict[str, str], expected_kbps: int) -> list[str]:
+    """Independently enforce the 1.2x physical-baseline floor using displayed-rate precision."""
+    if expected_kbps <= 0:
+        return ["preflight target must be a positive Kbps value"]
+    threshold_bps = expected_kbps * 1_000.0 * 1.2
+    errors: list[str] = []
+    for direction in ("download", "upload"):
+        key = f"baseline_preflight_{direction}_value"
+        raw = (values.get(key) or "").strip()
+        measured_bps = rate_bps(raw)
+        display_step_bps = rate_display_step_bps(raw)
+        if measured_bps is None or measured_bps <= 0:
+            errors.append(f"{direction}: missing or invalid baseline rate {raw!r}")
+            continue
+        # Use the lower edge of the displayed value, never a rounded-up number,
+        # so values near the 1.2x boundary cannot become a false-positive pass.
+        conservative_bps = measured_bps - (display_step_bps or 0.0) / 2.0
+        if conservative_bps < threshold_bps:
+            errors.append(
+                f"{direction}: baseline {measured_bps / 1_000_000:.2f} Mbps is below "
+                f"the required {threshold_bps / 1_000_000:.2f} Mbps (1.2x target)"
+            )
+        else:
+            print(
+                f"PREFLIGHT {direction.upper()}: baseline={measured_bps / 1_000_000:.2f} Mbps; "
+                f"minimum={threshold_bps / 1_000_000:.2f} Mbps"
+            )
+    return errors
+
+
+def validate_headroom(json_path: str, expected_kbps: int) -> int:
+    path = Path(json_path)
+    try:
+        values = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        print(f"PREFLIGHT_FAIL=unable to read baseline JSON: {error}", file=sys.stderr)
+        return 1
+    if not isinstance(values, dict):
+        print("PREFLIGHT_FAIL=baseline JSON must be an object", file=sys.stderr)
+        return 1
+    errors = baseline_headroom_errors(values, expected_kbps)
+    if errors:
+        print(f"PREFLIGHT_FAIL={len(errors)} issue(s)", file=sys.stderr)
+        for error in errors:
+            print(" - " + error, file=sys.stderr)
+        return 1
+    print("PREFLIGHT_HEADROOM_PASS=2/2")
     return 0
 
 
@@ -370,12 +449,16 @@ def validate_sweep(csv_path: str) -> int:
 
 def main(argv: list[str]) -> int:
     if len(argv) < 2:
-        print("Usage: verify_metrics.py collect XML JSON | parse-json JSON PRESET EXPECTED_KBPS INDEX OUTPUT_CSV | validate-json JSON EXPECTED_DOWNLOAD_KBPS EXPECTED_UPLOAD_KBPS | validate-sweep CSV", file=sys.stderr)
+        print("Usage: verify_metrics.py collect XML JSON | collect-preflight XML JSON | validate-headroom JSON TARGET_KBPS | parse-json JSON PRESET EXPECTED_KBPS INDEX OUTPUT_CSV | validate-json JSON EXPECTED_DOWNLOAD_KBPS EXPECTED_UPLOAD_KBPS | validate-sweep CSV", file=sys.stderr)
         return 2
     command = argv[1]
     try:
         if command == "collect" and len(argv) == 4:
             return collect(argv[2], argv[3])
+        if command == "collect-preflight" and len(argv) == 4:
+            return collect_preflight(argv[2], argv[3])
+        if command == "validate-headroom" and len(argv) == 4:
+            return validate_headroom(argv[2], int(argv[3]))
         if command == "parse-json" and len(argv) == 7:
             return parse_json(argv[2], argv[3], int(argv[4]), int(argv[5]), argv[6])
         if command == "validate-json" and len(argv) == 5:

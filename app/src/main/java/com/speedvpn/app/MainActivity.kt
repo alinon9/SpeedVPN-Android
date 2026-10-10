@@ -317,6 +317,9 @@ class MainActivity : ComponentActivity() {
         var testBusy by remember { mutableStateOf(false) }
         var testProgress by remember { mutableStateOf<String?>(null) }
         var lastTest by remember { mutableStateOf<SpeedTestResult?>(null) }
+        var preflightBusy by remember { mutableStateOf(false) }
+        var preflightProgress by remember { mutableStateOf<String?>(null) }
+        var lastPreflight by remember { mutableStateOf<SpeedTestResult?>(null) }
         var verifyBusy by remember { mutableStateOf(false) }
         var verifyProgress by remember { mutableStateOf<String?>(null) }
         var lastVerification by remember { mutableStateOf<SpeedVerificationResult?>(null) }
@@ -331,18 +334,57 @@ class MainActivity : ComponentActivity() {
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
             ScreenTitle("التحكم بالسرعة", "اختر مستوى جاهزًا أو اضبطه بالمؤشر — الوحدات KB/s وMB/s")
-            LimitSlider("سرعة التحميل", s.downloadLimitKbps, enabled = !testBusy && !verifyBusy && !verificationInProgress) {
+            LimitSlider("سرعة التحميل", s.downloadLimitKbps, enabled = !testBusy && !preflightBusy && !verifyBusy && !verificationInProgress) {
                 saveLocalLimit(true, it)
             }
-            LimitSlider("سرعة الرفع", s.uploadLimitKbps, enabled = !testBusy && !verifyBusy && !verificationInProgress) {
+            LimitSlider("سرعة الرفع", s.uploadLimitKbps, enabled = !testBusy && !preflightBusy && !verifyBusy && !verificationInProgress) {
                 saveLocalLimit(false, it)
             }
 
             GlassCard {
                 SectionLabel("اختبارات الاعتماد • Stage 0", "قياس فعلي قبل بناء الخطط على التحكم بالسرعة")
 
+                if (BuildConfig.DEBUG) {
+                    Button(
+                        enabled = !testBusy && !preflightBusy && !verifyBusy &&
+                            !verificationInProgress && s.status == VpnStatus.DISCONNECTED,
+                        onClick = {
+                            lifecycleScope.launch {
+                                preflightBusy = true
+                                lastPreflight = null
+                                preflightProgress = "جاري قياس خط الأساس دون VPN…"
+                                lastPreflight = SpeedTestEngine.measure(
+                                    context = this@MainActivity,
+                                    expectedDownloadKbps = 88_000L,
+                                    expectedUploadKbps = 88_000L,
+                                    verificationProfile = true,
+                                ) { phase ->
+                                    val label = if (phase == SpeedTestPhase.DOWNLOAD) {
+                                        "قياس Download لخط الأساس…"
+                                    } else {
+                                        "قياس Upload لخط الأساس…"
+                                    }
+                                    lifecycleScope.launch(Dispatchers.Main.immediate) {
+                                        preflightProgress = label
+                                    }
+                                }
+                                preflightBusy = false
+                                preflightProgress = null
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth().testTag("baseline_preflight_button"),
+                        shape = RoundedCornerShape(14.dp),
+                    ) {
+                        Text(if (preflightBusy) "جاري فحص جاهزية الشبكة…" else "فحص جاهزية خط الأساس")
+                    }
+                    if (preflightBusy) {
+                        Text(preflightProgress ?: "جاري فحص الجاهزية…", color = Cyan, fontSize = 11.sp)
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                    }
+                }
+
                 Button(
-                    enabled = !testBusy && !verifyBusy && !verificationInProgress,
+                    enabled = !testBusy && !preflightBusy && !verifyBusy && !verificationInProgress,
                     onClick = {
                         lifecycleScope.launch {
                             testBusy = true
@@ -363,7 +405,7 @@ class MainActivity : ComponentActivity() {
                 }
 
                 Button(
-                    enabled = !testBusy && !verifyBusy && !verificationInProgress,
+                    enabled = !testBusy && !preflightBusy && !verifyBusy && !verificationInProgress,
                     onClick = {
                         if (!s.permissionGranted) {
                             requestVpnPermission()
@@ -425,6 +467,26 @@ class MainActivity : ComponentActivity() {
                     InfoRow("Upload", result.uploadBps?.let(::formatBitRate) ?: "فشل القياس")
                     InfoRow("المدة", "${result.durationMs / 1000.0} ثانية")
                     result.error?.let { Text("ملاحظة: $it", color = Amber, fontSize = 10.sp) }
+                }
+            }
+
+            if (BuildConfig.DEBUG) {
+                lastPreflight?.let { result ->
+                    GlassCard {
+                        SectionLabel("نتيجة فحص خط الأساس", "قياس فعلي للتنزيل والرفع دون تشغيل VPN")
+                        InfoRow(
+                            "Baseline Download",
+                            result.downloadBps?.let(::formatBitRate) ?: "فشل القياس",
+                            valueTestTag = "baseline_preflight_download_value",
+                        )
+                        InfoRow(
+                            "Baseline Upload",
+                            result.uploadBps?.let(::formatBitRate) ?: "فشل القياس",
+                            valueTestTag = "baseline_preflight_upload_value",
+                        )
+                        InfoRow("المدة", "${result.durationMs / 1000.0} ثانية")
+                        result.error?.let { Text("ملاحظة: $it", color = Amber, fontSize = 10.sp) }
+                    }
                 }
             }
 
