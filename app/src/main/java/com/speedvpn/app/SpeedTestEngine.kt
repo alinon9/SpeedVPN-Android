@@ -362,6 +362,23 @@ object SpeedTestEngine {
         )
     }
 
+    internal fun clientForMeasurementRequest(
+        baseClient: OkHttpClient,
+        sizeBytes: Long,
+        expectedKbps: Long?,
+        verificationProfile: Boolean,
+    ): OkHttpClient {
+        if (!verificationProfile) return baseClient
+        val timeoutMs = measurementCallTimeoutMs(sizeBytes, expectedKbps, verificationProfile = true)
+        // Read/write timeouts must scale with the same target-aware call deadline.
+        // Otherwise a valid 512 KiB upload at 200 Kbps would hit the default 25-second I/O timeout.
+        return baseClient.newBuilder()
+            .callTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+            .readTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+            .writeTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+            .build()
+    }
+
     internal fun enoughRemainingSamples(
         validSamples: Int,
         remainingSampleCount: Int,
@@ -413,11 +430,8 @@ object SpeedTestEngine {
         verificationProfile: Boolean,
     ): Long {
         val request = buildDownloadRequest(sizeBytes)
-        val call = client.newCall(request)
-        call.timeout().timeout(
-            measurementCallTimeoutMs(sizeBytes, expectedKbps, verificationProfile),
-            TimeUnit.MILLISECONDS,
-        )
+        val requestClient = clientForMeasurementRequest(client, sizeBytes, expectedKbps, verificationProfile)
+        val call = requestClient.newCall(request)
         val started = System.nanoTime()
         call.execute().use { response ->
             if (!response.isSuccessful) {
@@ -456,11 +470,8 @@ object SpeedTestEngine {
         verificationProfile: Boolean,
     ): Long {
         val request = buildUploadRequest(sizeBytes, FixedUploadBody(sizeBytes))
-        val call = client.newCall(request)
-        call.timeout().timeout(
-            measurementCallTimeoutMs(sizeBytes, expectedKbps, verificationProfile),
-            TimeUnit.MILLISECONDS,
-        )
+        val requestClient = clientForMeasurementRequest(client, sizeBytes, expectedKbps, verificationProfile)
+        val call = requestClient.newCall(request)
         val started = System.nanoTime()
         call.execute().use { response ->
             if (!response.isSuccessful) {

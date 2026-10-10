@@ -140,6 +140,38 @@ class SpeedTestEngineSamplingTest {
     }
 
     @Test
+    fun verificationClientScalesReadAndWriteTimeoutsAlongWithTheCallDeadline() {
+        val base = OkHttpClient.Builder()
+            .connectTimeout(8, TimeUnit.SECONDS)
+            .readTimeout(25, TimeUnit.SECONDS)
+            .writeTimeout(25, TimeUnit.SECONDS)
+            .callTimeout(30, TimeUnit.SECONDS)
+            .build()
+        val slowPlan = SpeedTestEngine.clientForMeasurementRequest(
+            base,
+            sizeBytes = 512_000L,
+            expectedKbps = 200L,
+            verificationProfile = true,
+        )
+        assertEquals(32_720, slowPlan.callTimeoutMillis())
+        assertEquals(32_720, slowPlan.readTimeoutMillis())
+        assertEquals(32_720, slowPlan.writeTimeoutMillis())
+
+        val publicTest = SpeedTestEngine.clientForMeasurementRequest(
+            base,
+            sizeBytes = 512_000L,
+            expectedKbps = 200L,
+            verificationProfile = false,
+        )
+        assertEquals(30_000, publicTest.callTimeoutMillis())
+        assertEquals(25_000, publicTest.readTimeoutMillis())
+        assertEquals(25_000, publicTest.writeTimeoutMillis())
+
+        slowPlan.connectionPool.evictAll()
+        base.connectionPool.evictAll()
+    }
+
+    @Test
     fun sampleLadderStopsWhenRequiredCoverageBecomesImpossible() {
         assertTrue(SpeedTestEngine.enoughRemainingSamples(0, 3, 3))
         assertTrue(SpeedTestEngine.enoughRemainingSamples(1, 2, 3))
