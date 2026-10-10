@@ -157,6 +157,17 @@ class SpeedTestEngineSamplingTest {
         assertEquals(32_720, slowPlan.readTimeoutMillis())
         assertEquals(32_720, slowPlan.writeTimeoutMillis())
 
+        val almostOutOfTime = SpeedTestEngine.clientForMeasurementRequest(
+            base,
+            sizeBytes = 512_000L,
+            expectedKbps = 200L,
+            verificationProfile = true,
+            remainingPhaseMs = 8_000L,
+        )
+        assertEquals(8_000, almostOutOfTime.callTimeoutMillis())
+        assertEquals(8_000, almostOutOfTime.readTimeoutMillis())
+        assertEquals(8_000, almostOutOfTime.writeTimeoutMillis())
+
         val publicTest = SpeedTestEngine.clientForMeasurementRequest(
             base,
             sizeBytes = 512_000L,
@@ -168,6 +179,7 @@ class SpeedTestEngineSamplingTest {
         assertEquals(25_000, publicTest.writeTimeoutMillis())
 
         slowPlan.connectionPool.evictAll()
+        almostOutOfTime.connectionPool.evictAll()
         base.connectionPool.evictAll()
     }
 

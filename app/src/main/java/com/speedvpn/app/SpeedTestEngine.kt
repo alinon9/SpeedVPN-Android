@@ -196,7 +196,9 @@ object SpeedTestEngine {
             var requestElapsedMs: Long? = null
 
             for (attempt in 1..(if (verificationProfile) 1 else MAX_RETRIES)) {
-                if (phaseBudgetExceeded(phaseStartedNs, System.nanoTime(), PHASE_TIMEOUT_MS)) {
+                if (verificationProfile &&
+                    phaseBudgetExceeded(phaseStartedNs, System.nanoTime(), PHASE_TIMEOUT_MS)
+                ) {
                     throw IOException(
                         "$directionName measurement exceeded its ${PHASE_TIMEOUT_MS}ms total phase budget; " +
                             "validSamples=${samples.size}/$requiredSamples; " +
@@ -207,10 +209,21 @@ object SpeedTestEngine {
                 try {
                     Log.d(TAG, "Request start direction=$directionName bytes=$sizeBytes attempt=$attempt")
                     val requestStartedNs = System.nanoTime()
-                    measured = if (isUpload) {
-                        measureUploadRequest(client, sizeBytes, expectedKbps, verificationProfile)
+                    val remainingPhaseMs = if (verificationProfile) {
+                        (PHASE_TIMEOUT_MS -
+                            TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - phaseStartedNs)
+                        ).coerceAtLeast(1L)
                     } else {
-                        measureDownloadRequest(client, sizeBytes, expectedKbps, verificationProfile)
+                        Long.MAX_VALUE
+                    }
+                    measured = if (isUpload) {
+                        measureUploadRequest(
+                            client, sizeBytes, expectedKbps, verificationProfile, remainingPhaseMs,
+                        )
+                    } else {
+                        measureDownloadRequest(
+                            client, sizeBytes, expectedKbps, verificationProfile, remainingPhaseMs,
+                        )
                     }
                     requestElapsedMs = TimeUnit.NANOSECONDS.toMillis(
                         (System.nanoTime() - requestStartedNs).coerceAtLeast(1L),
@@ -240,7 +253,9 @@ object SpeedTestEngine {
                     break
                 }
             }
-            if (phaseBudgetExceeded(phaseStartedNs, System.nanoTime(), PHASE_TIMEOUT_MS)) {
+            if (verificationProfile &&
+                phaseBudgetExceeded(phaseStartedNs, System.nanoTime(), PHASE_TIMEOUT_MS)
+            ) {
                 throw IOException(
                     "$directionName measurement exceeded its ${PHASE_TIMEOUT_MS}ms total phase budget " +
                         "after request ${sizeBytes}B; validSamples=${samples.size}/$requiredSamples",
@@ -367,9 +382,11 @@ object SpeedTestEngine {
         sizeBytes: Long,
         expectedKbps: Long?,
         verificationProfile: Boolean,
+        remainingPhaseMs: Long = PHASE_TIMEOUT_MS,
     ): OkHttpClient {
         if (!verificationProfile) return baseClient
-        val timeoutMs = measurementCallTimeoutMs(sizeBytes, expectedKbps, verificationProfile = true)
+        val requestTimeoutMs = measurementCallTimeoutMs(sizeBytes, expectedKbps, verificationProfile = true)
+        val timeoutMs = min(requestTimeoutMs, remainingPhaseMs.coerceAtLeast(1L))
         // Read/write timeouts must scale with the same target-aware call deadline.
         // Otherwise a valid 512 KiB upload at 200 Kbps would hit the default 25-second I/O timeout.
         return baseClient.newBuilder()
@@ -428,9 +445,12 @@ object SpeedTestEngine {
         sizeBytes: Long,
         expectedKbps: Long?,
         verificationProfile: Boolean,
+        remainingPhaseMs: Long,
     ): Long {
         val request = buildDownloadRequest(sizeBytes)
-        val requestClient = clientForMeasurementRequest(client, sizeBytes, expectedKbps, verificationProfile)
+        val requestClient = clientForMeasurementRequest(
+            client, sizeBytes, expectedKbps, verificationProfile, remainingPhaseMs,
+        )
         val call = requestClient.newCall(request)
         val started = System.nanoTime()
         call.execute().use { response ->
@@ -468,9 +488,12 @@ object SpeedTestEngine {
         sizeBytes: Long,
         expectedKbps: Long?,
         verificationProfile: Boolean,
+        remainingPhaseMs: Long,
     ): Long {
         val request = buildUploadRequest(sizeBytes, FixedUploadBody(sizeBytes))
-        val requestClient = clientForMeasurementRequest(client, sizeBytes, expectedKbps, verificationProfile)
+        val requestClient = clientForMeasurementRequest(
+            client, sizeBytes, expectedKbps, verificationProfile, remainingPhaseMs,
+        )
         val call = requestClient.newCall(request)
         val started = System.nanoTime()
         call.execute().use { response ->
