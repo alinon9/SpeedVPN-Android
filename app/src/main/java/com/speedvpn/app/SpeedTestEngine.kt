@@ -155,7 +155,7 @@ object SpeedTestEngine {
         Log.i(
             TAG,
             "Phase start direction=$directionName targetKbps=${expectedKbps ?: "unlimited"} " +
-                "verification=$verificationProfile samplesRequired=$requiredSamples " +
+                "verification=$verificationProfile " +
                 "requestCount=${requestSizes.size} phaseBudgetMs=$PHASE_TIMEOUT_MS",
         )
         try {
