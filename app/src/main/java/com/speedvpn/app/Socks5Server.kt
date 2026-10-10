@@ -39,6 +39,54 @@ import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 
 /**
+ * A relay batch may include additional bytes that are already queued by the socket.
+ * Draining only available bytes avoids delaying interactive traffic while reducing
+ * pacing-lock and OutputStream write calls for sustained high-throughput transfers.
+ */
+internal data class RelayReadBatch(val bytesRead: Int, val readCalls: Int)
+
+private const val HIGH_RATE_COALESCE_THRESHOLD_BYTES_PER_SEC = 4_000_000L // 32 Mbps
+
+internal fun shouldCoalesceRelayReads(bytesPerSec: Long): Boolean =
+    bytesPerSec <= 0L || bytesPerSec >= HIGH_RATE_COALESCE_THRESHOLD_BYTES_PER_SEC
+
+/**
+ * Performs one blocking read, then drains already-available bytes up to [maxBytes].
+ * Follow-up reads never wait for new network data: they are made only while
+ * InputStream.available() says data can be read immediately. Low-rate plans can
+ * disable coalescing to preserve their small-packet latency.
+ */
+internal fun readRelayBatch(
+    source: InputStream,
+    buffer: ByteArray,
+    maxBytes: Int,
+    coalesceAvailable: Boolean,
+): RelayReadBatch {
+    require(maxBytes in 1..buffer.size) { "maxBytes must fit inside the relay buffer" }
+
+    var total = source.read(buffer, 0, maxBytes)
+    var calls = if (total < 0) 0 else 1
+    if (!coalesceAvailable || total <= 0) {
+        return RelayReadBatch(total, calls)
+    }
+
+    while (total < maxBytes) {
+        val immediatelyAvailable = source.available()
+        if (immediatelyAvailable <= 0) break
+
+        val count = source.read(
+            buffer,
+            total,
+            minOf(maxBytes - total, immediatelyAvailable),
+        )
+        calls++
+        if (count <= 0) break
+        total += count
+    }
+    return RelayReadBatch(total, calls)
+}
+
+/**
  * Local SOCKS5 relay used by the native tun2socks engine.
  *
  * Security: a fresh random username/password is generated per VPN session and
@@ -515,6 +563,7 @@ class Socks5Server(
         var forwardedBytes = 0L
         var readCalls = 0L
         var writeCalls = 0L
+        var coalescedChunks = 0L
         var maxReadBytes = 0
         var sourceReadNs = 0L
         var limiterCallNs = 0L
@@ -528,13 +577,20 @@ class Socks5Server(
             while (running && SpeedLimiter.isGenerationActive(generation)) {
                 val readStartedNs = System.nanoTime()
                 val readSize = bucket.recommendedReadBytes().coerceAtMost(buf.size)
-                val n = src.read(buf, 0, readSize)
+                val batch = readRelayBatch(
+                    source = src,
+                    buffer = buf,
+                    maxBytes = readSize,
+                    coalesceAvailable = shouldCoalesceRelayReads(bucket.bytesPerSec),
+                )
                 sourceReadNs += System.nanoTime() - readStartedNs
+                val n = batch.bytesRead
                 if (n < 0) {
                     eof = true
                     break
                 }
-                readCalls++
+                readCalls += batch.readCalls.toLong()
+                if (batch.readCalls > 1) coalescedChunks++
                 maxReadBytes = maxOf(maxReadBytes, n)
                 val limiterStartedNs = System.nanoTime()
                 val mayProceed = SpeedLimiter.acquire(bucket, n, generation)
@@ -572,7 +628,8 @@ class Socks5Server(
                     "Relay pipe stats direction=$direction bytes=$forwardedBytes " +
                         "firstToLastForwardedSpanMs=${TimeUnit.NANOSECONDS.toMillis(transferDurationNs).coerceAtLeast(1L)} " +
                         "pipeWallMs=${TimeUnit.NANOSECONDS.toMillis(wallDurationNs)} " +
-                        "firstToLastSpanBps=$throughputBps readCalls=$readCalls writeCalls=$writeCalls maxReadBytes=$maxReadBytes " +
+                        "firstToLastSpanBps=$throughputBps readCalls=$readCalls writeCalls=$writeCalls " +
+                        "coalescedChunks=$coalescedChunks maxReadBytes=$maxReadBytes " +
                         "sourceReadMs=${TimeUnit.NANOSECONDS.toMillis(sourceReadNs)} " +
                         "limiterCallMs=${TimeUnit.NANOSECONDS.toMillis(limiterCallNs)} " +
                         "destinationWriteMs=${TimeUnit.NANOSECONDS.toMillis(destinationWriteNs)}"
