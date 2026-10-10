@@ -66,7 +66,14 @@ class SpeedTestRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
         if path == "/healthz":
-            self._send_body(200, json.dumps({"status": "ok"}).encode(), "application/json")
+            self._send_body(
+                200,
+                json.dumps({
+                    "status": "ok",
+                    "socket_receive_buffer_bytes": self.socket_receive_buffer_bytes,
+                }).encode(),
+                "application/json",
+            )
             return
         if path != "/__down":
             self._send_body(404, b"not found")

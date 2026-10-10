@@ -31,10 +31,15 @@ class LocalSpeedTestServerTests(unittest.TestCase):
         self.assertGreater(listener_bytes, 64 * 1024)
         self.assertEqual(4 * 1024 * 1024, SOCKET_RECEIVE_BUFFER_BYTES)
 
-    def test_health_check_returns_json(self) -> None:
+    def test_health_check_reports_effective_accepted_socket_receive_buffer(self) -> None:
         with urlopen(self.base_url + "/healthz", timeout=2) as response:
             self.assertEqual(200, response.status)
-            self.assertEqual({"status": "ok"}, json.loads(response.read()))
+            payload = json.loads(response.read())
+            self.assertEqual("ok", payload["status"])
+            # Linux may clamp SO_RCVBUF according to the runner's kernel policy;
+            # the test confirms we expose what was actually negotiated, not just
+            # the requested 4 MiB value.
+            self.assertGreater(int(payload["socket_receive_buffer_bytes"]), 64 * 1024)
 
     def test_download_returns_exact_requested_bytes(self) -> None:
         expected = 123_457
