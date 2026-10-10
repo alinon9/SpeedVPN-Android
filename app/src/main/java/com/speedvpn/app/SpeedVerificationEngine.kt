@@ -33,10 +33,13 @@ object SpeedVerificationEngine {
         // The limiter is process-wide. Disable it during the baseline measurement
         // so "internet speed without VPN" is never accidentally capped by the
         // user's previous VPN plan.
-        val savedLimits = SpeedLimitStore.load(context)
         var baseline: SpeedTestResult? = null
         var vpn: SpeedTestResult? = null
         var note: String? = null
+
+        if (!SpeedLimiter.beginVerification(null, null)) {
+            return unavailable(started, "يوجد تحقق سرعة آخر قيد التنفيذ.", planDownloadKbps, planUploadKbps)
+        }
 
         try {
             onProgress("فصل VPN لقياس سرعة الشبكة الأصلية…")
@@ -47,11 +50,18 @@ object SpeedVerificationEngine {
                 }
             }
 
-            SpeedLimiter.setDownloadKbps(null)
-            SpeedLimiter.setUploadKbps(null)
-
             onProgress("قياس Download للشبكة الأصلية…")
-            baseline = SpeedTestEngine.measure(context) { phase ->
+            // Use the selected plans only to choose the sample size/count and
+            // percentile. The limiter is still disabled, so these are uncapped
+            // physical-network measurements with the same request profile as
+            // the VPN half of the comparison. Unlimited verification also uses
+            // fixed larger samples instead of the short public speed-test ladder.
+            baseline = SpeedTestEngine.measure(
+                context = context,
+                expectedDownloadKbps = planDownloadKbps,
+                expectedUploadKbps = planUploadKbps,
+                verificationProfile = true,
+            ) { phase ->
                 onProgress(if (phase == SpeedTestPhase.DOWNLOAD) "قياس Download للشبكة الأصلية…" else "قياس Upload للشبكة الأصلية…")
             }
 
@@ -59,23 +69,24 @@ object SpeedVerificationEngine {
                 return unavailable(started, "فشل قياس الشبكة الأصلية.", planDownloadKbps, planUploadKbps)
             }
 
-            // Restore the selected plan before the VPN-side measurement. The VPN
-            // service also reapplies persisted limits during startup, but restoring
-            // here closes the race between service start and the first measurement.
-            SpeedLimiter.setDownloadKbps(planDownloadKbps ?: savedLimits.first)
-            SpeedLimiter.setUploadKbps(planUploadKbps ?: savedLimits.second)
+            // The selected plan is explicit; null means Unlimited. Apply it before
+            // startup and again after CONNECTED because the service restores saved
+            // preferences during startup and those may lag a recent UI selection.
+            SpeedLimiter.setVerificationLimits(planDownloadKbps, planUploadKbps)
 
             onProgress("تشغيل VPN للتحقق من الخطة…")
             SpeedVpnService.start(context)
             if (!waitForStatus(VpnStatus.CONNECTED)) {
                 return unavailable(started, "تعذر الوصول إلى حالة VPN متصل.", planDownloadKbps, planUploadKbps)
             }
+            SpeedLimiter.setVerificationLimits(planDownloadKbps, planUploadKbps)
 
             onProgress("قياس Download عبر VPN…")
             vpn = SpeedTestEngine.measure(
                 context = context,
                 expectedDownloadKbps = planDownloadKbps,
                 expectedUploadKbps = planUploadKbps,
+                verificationProfile = true,
             ) { phase ->
                 onProgress(if (phase == SpeedTestPhase.DOWNLOAD) "قياس Download عبر VPN…" else "قياس Upload عبر VPN…")
             }
@@ -111,21 +122,23 @@ object SpeedVerificationEngine {
         } catch (t: Throwable) {
             return unavailable(started, "فشل التحقق: " + (t.message ?: t.javaClass.simpleName), planDownloadKbps, planUploadKbps)
         } finally {
-            // Always restore the user's persistent limiter state, even if the
-            // verification exits early or the VPN cannot reconnect.
-            SpeedLimiter.setDownloadKbps(savedLimits.first)
-            SpeedLimiter.setUploadKbps(savedLimits.second)
-            onProgress("استعادة حالة VPN السابقة…")
-            if (initiallyConnected) {
-                if (VpnRuntime.state.value.status != VpnStatus.CONNECTED) {
-                    SpeedVpnService.start(context)
-                    waitForStatus(VpnStatus.CONNECTED)
+            try {
+                onProgress("استعادة حالة VPN السابقة…")
+                if (initiallyConnected) {
+                    if (VpnRuntime.state.value.status != VpnStatus.CONNECTED) {
+                        SpeedVpnService.start(context)
+                        waitForStatus(VpnStatus.CONNECTED)
+                    }
+                } else {
+                    if (VpnRuntime.state.value.status != VpnStatus.DISCONNECTED) {
+                        SpeedVpnService.stop(context)
+                        waitForStatus(VpnStatus.DISCONNECTED)
+                    }
                 }
-            } else {
-                if (VpnRuntime.state.value.status != VpnStatus.DISCONNECTED) {
-                    SpeedVpnService.stop(context)
-                    waitForStatus(VpnStatus.DISCONNECTED)
-                }
+            } finally {
+                // Keep the selected plan and reject external changes until VPN
+                // restoration finishes. Null is explicit Unlimited.
+                SpeedLimiter.endVerification(planDownloadKbps, planUploadKbps)
             }
         }
     }

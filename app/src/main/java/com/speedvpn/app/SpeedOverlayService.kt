@@ -267,6 +267,7 @@ internal class SpeedOverlayService : Service() {
     }
 
     private fun change(download: Boolean, direction: Int) {
+        if (SpeedLimiter.verificationInProgress.value) return
         val current = if (download) current().first else current().second
 
         // Unlimited is a real state, not "0". From Unlimited, minus moves to the
@@ -285,6 +286,7 @@ internal class SpeedOverlayService : Service() {
     }
 
     private fun set(download: Boolean, kbps: Long?) {
+        if (SpeedLimiter.verificationInProgress.value) return
         if (targetPackage == null) {
             if (download) SpeedLimitStore.saveDownload(this, kbps) else SpeedLimitStore.saveUpload(this, kbps)
             if (download) SpeedLimiter.setDownloadKbps(kbps) else SpeedLimiter.setUploadKbps(kbps)
@@ -305,11 +307,22 @@ internal class SpeedOverlayService : Service() {
     private fun refresh() {
         val (dl, ul) = current()
         val runtime = VpnRuntime.state.value
+        setSpeedControlsEnabled(!SpeedLimiter.verificationInProgress.value)
         title?.text = "SpeedVPN • ${if (targetPackage == null) "عام" else targetLabel}"
         downloadValue?.text = "↓ VPN ${formatBitRate(runtime.downloadBps)}"
         downloadReserved?.text = "محجوز: ${formatRate(dl)}"
         uploadValue?.text = "↑ VPN ${formatBitRate(runtime.uploadBps)}"
         uploadReserved?.text = "محجوز: ${formatRate(ul)}"
+    }
+
+    private fun setSpeedControlsEnabled(enabled: Boolean) {
+        fun update(view: View) {
+            if (view is Button) view.isEnabled = enabled
+            if (view is ViewGroup) {
+                for (index in 0 until view.childCount) update(view.getChildAt(index))
+            }
+        }
+        root?.let(::update)
     }
 
     private fun formatRate(kbps: Long?): String {

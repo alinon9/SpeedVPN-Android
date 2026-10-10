@@ -76,6 +76,36 @@ class SpeedTestEngineSamplingTest {
         assertTrue(baseline.asList().zipWithNext().all { (left, right) -> left < right })
         assertArrayEquals(baseline, SpeedTestEngine.requestSizesFor(0L))
     }
+
+    @Test
+    fun unlimitedVerificationUsesThreeEqualSizeSamplesOnBothSides() {
+        val expected = longArrayOf(10_000_000L, 10_000_000L, 10_000_000L)
+        assertArrayEquals(expected, SpeedTestEngine.requestSizesFor(null, verificationProfile = true))
+        assertArrayEquals(expected, SpeedTestEngine.requestSizesFor(0L, verificationProfile = true))
+        assertArrayEquals(
+            SpeedTestEngine.requestSizesFor(null, verificationProfile = true),
+            SpeedTestEngine.requestSizesFor(0L, verificationProfile = true),
+        )
+    }
+
+    @Test
+    fun finiteVerificationUsesTheSelectedPlanSampleSizes() {
+        for (targetKbps in listOf(80L, 800L, 16_000L, 88_000L)) {
+            assertArrayEquals(
+                SpeedTestEngine.requestSizesFor(targetKbps),
+                SpeedTestEngine.requestSizesFor(targetKbps, verificationProfile = true),
+            )
+        }
+    }
+
+    @Test
+    fun finiteVerificationCapsRequestsAtTheFixtureCeilingForVeryHighPlans() {
+        assertArrayEquals(
+            longArrayOf(20_000_000L, 20_000_000L, 20_000_000L),
+            SpeedTestEngine.requestSizesFor(800_000L, verificationProfile = true),
+        )
+    }
+
     @Test
     fun eachMeasurementClientUsesAnIsolatedConnectionPool() {
         val sharedClient = OkHttpClient.Builder().build()

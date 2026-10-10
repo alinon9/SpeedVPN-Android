@@ -58,6 +58,7 @@ object SpeedTestEngine {
     internal const val FINITE_SAMPLE_TARGET_DURATION_MS = 1_500L
     private const val MIN_FINITE_SAMPLE_BYTES = 256_000L
     private const val MAX_FINITE_SAMPLE_BYTES = 20_000_000L
+    private const val UNLIMITED_VERIFICATION_SAMPLE_BYTES = 10_000_000L
     private const val MAX_RETRIES = 2
 
     private const val CONNECT_TIMEOUT_SECONDS = 8L
@@ -80,6 +81,7 @@ object SpeedTestEngine {
         context: Context,
         expectedDownloadKbps: Long? = null,
         expectedUploadKbps: Long? = null,
+        verificationProfile: Boolean = false,
         onProgress: (SpeedTestPhase) -> Unit = {},
     ): SpeedTestResult =
         withContext(Dispatchers.IO) {
@@ -89,7 +91,12 @@ object SpeedTestEngine {
 
             val download = runCatching {
                 onProgress(SpeedTestPhase.DOWNLOAD)
-                measurePhase(testClient, isUpload = false, expectedKbps = expectedDownloadKbps)
+                measurePhase(
+                    testClient,
+                    isUpload = false,
+                    expectedKbps = expectedDownloadKbps,
+                    verificationProfile = verificationProfile,
+                )
             }.onFailure { error ->
                 firstError = errorMessage(error)
                 Log.w(TAG, "Download failed: ${errorMessage(error)}", error)
@@ -97,7 +104,12 @@ object SpeedTestEngine {
 
             val upload = runCatching {
                 onProgress(SpeedTestPhase.UPLOAD)
-                measurePhase(testClient, isUpload = true, expectedKbps = expectedUploadKbps)
+                measurePhase(
+                    testClient,
+                    isUpload = true,
+                    expectedKbps = expectedUploadKbps,
+                    verificationProfile = verificationProfile,
+                )
             }.onFailure { error ->
                 firstError = firstError ?: errorMessage(error)
                 Log.w(TAG, "Upload failed: ${errorMessage(error)}", error)
@@ -118,9 +130,10 @@ object SpeedTestEngine {
         client: OkHttpClient,
         isUpload: Boolean,
         expectedKbps: Long?,
+        verificationProfile: Boolean,
     ): Long {
-        val requestSizes = requestSizesFor(expectedKbps)
-        val warmupBytes = warmupBytesFor(expectedKbps)
+        val requestSizes = requestSizesFor(expectedKbps, verificationProfile)
+        val warmupBytes = warmupBytesFor(expectedKbps, verificationProfile)
         runCatching { warmup(client, isUpload, warmupBytes) }
             .onFailure { Log.i(TAG, "Warm-up failed for ${if (isUpload) "upload" else "download"}; continuing", it) }
 
@@ -128,14 +141,16 @@ object SpeedTestEngine {
         // lets the first 16 KiB chunk through immediately after an idle gap.
         // For the finite 200–1,000 Kbps plans, collect three larger samples so
         // the initial burst cannot dominate the result.
-        val requiredSamples = if (expectedKbps != null && expectedKbps > 100L) {
+        val unlimitedVerification = verificationProfile && (expectedKbps == null || expectedKbps <= 0L)
+        val requiredSamples = if (unlimitedVerification || (expectedKbps != null && expectedKbps > 100L)) {
             MIN_CAPPED_RANGE_SAMPLES
         } else {
             MIN_VALID_SAMPLES
         }
-        // Baseline tests retain the short adaptive ladder; capped plans use
-        // repeatable ~1.5-second payloads to reduce TCP-startup and short-request bias.
-        val targetDurationMs = if (expectedKbps != null && expectedKbps > 1_000L) {
+        // Public speed tests stop when the adaptive samples are stable enough.
+        // Verification uses the same plan-shaped requests for the uncapped
+        // baseline and VPN measurements, with a fixed sample count on both sides.
+        val targetDurationMs = if (unlimitedVerification || (expectedKbps != null && expectedKbps > 1_000L)) {
             FINITE_SAMPLE_TARGET_DURATION_MS
         } else {
             BASELINE_STABLE_DURATION_MS
@@ -176,7 +191,7 @@ object SpeedTestEngine {
                 // Once a real request lasts long enough to amortize connection
                 // overhead, do not keep issuing large transfers needlessly.
                 if (samples.size >= requiredSamples &&
-                    requestDurationFor(sizeBytes, measured) >= targetDurationMs
+                    (verificationProfile || requestDurationFor(sizeBytes, measured) >= targetDurationMs)
                 ) {
                     break
                 }
@@ -190,10 +205,13 @@ object SpeedTestEngine {
             )
         }
 
-        // The public speed-test screen reports a high percentile, while a cap
-        // verification must be resistant to one optimistic sample. Use the
-        // median for finite plans; an uncapped baseline continues to use p90.
-        return percentile(samples, if (expectedKbps != null && expectedKbps > 0L) 0.50 else 0.90)
+        // The public speed-test screen reports a high percentile. Verification
+        // uses the median for both the uncapped baseline and VPN side so one
+        // optimistic or slow sample cannot skew only one side of the comparison.
+        return percentile(
+            samples,
+            if (verificationProfile || (expectedKbps != null && expectedKbps > 0L)) 0.50 else 0.90,
+        )
     }
 
     internal fun endpointUrl(path: String, configuredBaseUrl: String?): String {
@@ -214,15 +232,22 @@ object SpeedTestEngine {
             ?.takeIf { it.isNotEmpty() }
             ?: DEFAULT_TEST_BASE_URL
 
-    internal fun requestSizesFor(expectedKbps: Long?): LongArray =
+    internal fun requestSizesFor(expectedKbps: Long?, verificationProfile: Boolean = false): LongArray =
         when {
+            verificationProfile && (expectedKbps == null || expectedKbps <= 0L) ->
+                longArrayOf(
+                    UNLIMITED_VERIFICATION_SAMPLE_BYTES,
+                    UNLIMITED_VERIFICATION_SAMPLE_BYTES,
+                    UNLIMITED_VERIFICATION_SAMPLE_BYTES,
+                )
             expectedKbps == null || expectedKbps <= 0L -> REQUEST_SIZES
             // At the slowest presets, keep progressively larger bounded requests
             // so the run stays practical while still covering many relay reads.
             expectedKbps <= 100L -> longArrayOf(128_000L, 192_000L, 256_000L)
             expectedKbps <= 1_000L -> longArrayOf(128_000L, 256_000L, 512_000L, 1_000_000L)
             else -> {
-                // Each capped sample aims for 1.5 seconds at the selected rate.
+                // Each sample aims for 1.5 seconds at the selected rate, bounded
+                // by the endpoint's practical 20 MB request ceiling.
                 // Repeating a stable payload gives the median three independent
                 // long transfers rather than mixing short slow-start and long samples.
                 // Stay below the public endpoint's practical 25 MB request ceiling.
@@ -233,8 +258,12 @@ object SpeedTestEngine {
             }
         }
 
-    private fun warmupBytesFor(expectedKbps: Long?): Long =
+    private fun warmupBytesFor(expectedKbps: Long?, verificationProfile: Boolean = false): Long =
         when {
+            verificationProfile && (expectedKbps == null || expectedKbps <= 0L) -> min(
+                1_000_000L,
+                requestSizesFor(expectedKbps, verificationProfile).firstOrNull()?.div(4L) ?: WARMUP_BYTES,
+            ).coerceAtLeast(WARMUP_BYTES)
             expectedKbps == null || expectedKbps <= 0L -> WARMUP_BYTES
             expectedKbps <= 100L -> 8_000L
             expectedKbps <= 1_000L -> 16_000L

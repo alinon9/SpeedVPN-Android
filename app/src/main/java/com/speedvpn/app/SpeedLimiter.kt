@@ -7,6 +7,7 @@ import kotlin.concurrent.withLock
 import kotlin.math.ceil
 import kotlin.math.max
 import kotlin.math.min
+import kotlinx.coroutines.flow.MutableStateFlow
 
 internal data class SessionCounter(
     val generation: Long,
@@ -201,6 +202,12 @@ object SpeedLimiter {
     val download = TokenBucket()
     val upload = TokenBucket()
 
+    /** True while a speed verification owns the global limiter configuration. */
+    val verificationInProgress = MutableStateFlow(false)
+
+    private val verificationLock = Any()
+    private var verificationLimits: Pair<Long?, Long?>? = null
+
     private val activeSessionGeneration = AtomicLong(0L)
     // Serializes generation ownership changes and the paired scheduler reset, but is
     // never held while a traffic waiter sleeps.
@@ -275,13 +282,59 @@ object SpeedLimiter {
             ?.times(125L)
             ?: 0L
 
+    /** Begins a verification and freezes the limiter at the requested rates. */
+    fun beginVerification(downloadKbps: Long?, uploadKbps: Long?): Boolean =
+        synchronized(verificationLock) {
+            if (verificationLimits != null) {
+                false
+            } else {
+                verificationLimits = downloadKbps to uploadKbps
+                verificationInProgress.value = true
+                applyDownloadKbps(downloadKbps)
+                applyUploadKbps(uploadKbps)
+                true
+            }
+        }
+
+    /** Changes rates for the active verification while rejecting outside updates. */
+    fun setVerificationLimits(downloadKbps: Long?, uploadKbps: Long?) {
+        synchronized(verificationLock) {
+            check(verificationLimits != null) { "No speed verification is active" }
+            verificationLimits = downloadKbps to uploadKbps
+            applyDownloadKbps(downloadKbps)
+            applyUploadKbps(uploadKbps)
+        }
+    }
+
+    /** Applies the selected plan and releases the verification lock. */
+    fun endVerification(downloadKbps: Long?, uploadKbps: Long?) {
+        synchronized(verificationLock) {
+            applyDownloadKbps(downloadKbps)
+            applyUploadKbps(uploadKbps)
+            verificationLimits = null
+            verificationInProgress.value = false
+        }
+    }
+
     fun setDownloadKbps(kbps: Long?) {
+        synchronized(verificationLock) {
+            if (verificationLimits == null) applyDownloadKbps(kbps)
+        }
+    }
+
+    fun setUploadKbps(kbps: Long?) {
+        synchronized(verificationLock) {
+            if (verificationLimits == null) applyUploadKbps(kbps)
+        }
+    }
+
+    private fun applyDownloadKbps(kbps: Long?) {
         download.setRate(kbpsToBytesPerSec(kbps))
         VpnRuntime.update { it.copy(downloadLimitKbps = kbps) }
         log("Download limit applied: ${kbps?.let { "$it Kbps" } ?: "unlimited"}")
     }
 
-    fun setUploadKbps(kbps: Long?) {
+    private fun applyUploadKbps(kbps: Long?) {
         upload.setRate(kbpsToBytesPerSec(kbps))
         VpnRuntime.update { it.copy(uploadLimitKbps = kbps) }
         log("Upload limit applied: ${kbps?.let { "$it Kbps" } ?: "unlimited"}")
