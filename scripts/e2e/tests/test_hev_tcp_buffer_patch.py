@@ -21,7 +21,7 @@ class HevTcpBufferPatchTests(unittest.TestCase):
         self.assertTrue(changed)
         values = check_lwip_options_content(patched)
         self.assertEqual("8191", values["TCP_MSS"])
-        self.assertEqual("(32 * TCP_MSS)", values["TCP_WND"])
+        self.assertEqual("(16 * TCP_MSS)", values["TCP_WND"])
         self.assertEqual("(32 * TCP_MSS)", values["TCP_SND_BUF"])
         self.assertEqual("(4 * TCP_MSS)", values["TCP_SNDLOWAT"])
         self.assertEqual("128", values["PBUF_POOL_SIZE"])
