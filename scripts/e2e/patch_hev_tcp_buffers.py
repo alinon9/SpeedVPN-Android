@@ -212,7 +212,7 @@ tcp_splice_b (HevSocks5SessionTCP *self)
                 if (len > (size_t)available)
                     len = (size_t)available;
 
-                write_err = tcp_write (self->pcb, ptr, (u16_t)len, 0);
+                write_err = tcp_write (self->pcb, ptr, (u16_t)len, TCP_WRITE_FLAG_COPY);
                 if (write_err == ERR_MEM)
                     break;
                 if (write_err != ERR_OK) {
