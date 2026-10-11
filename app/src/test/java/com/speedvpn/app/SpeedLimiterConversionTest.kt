@@ -124,4 +124,13 @@ class SpeedLimiterConversionTest {
         // A refillable bucket has accumulated enough credit to grant this chunk now.
         assertTrue("Credit was not accrued during outside I/O: ${elapsedMs}ms", elapsedMs < 150L)
     }
+
+    @Test
+    fun selected80MbpsPlanConvertsToExactlyTenMillionBytesPerSecond() {
+        assertEquals(80_000L, SpeedLimiter.toKbps(80.0, "Mbps"))
+        assertTrue(SpeedLimiter.setDownloadKbps(80_000L))
+        assertEquals(10_000_000L, SpeedLimiter.download.bytesPerSec)
+        assertTrue(SpeedLimiter.setDownloadKbps(null))
+    }
+
 }
