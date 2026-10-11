@@ -762,11 +762,15 @@ object SpeedTestEngine {
         body: RequestBody,
     ): Request {
         val sampleId = "upload-${System.nanoTime()}"
+        val diagnosticOnly = BuildConfig.SPEED_TEST_DIAGNOSTIC_PHASE != "both" ||
+            BuildConfig.SPEED_TEST_DIAGNOSTIC_STREAMS != 0
+        val diagnosticQuery = if (diagnosticOnly) "&diagId=$sampleId" else ""
         return Request.Builder()
             .url(
                 UPLOAD_URL +
                     "?bytes=" + sizeBytes +
-                    "&cacheBust=" + System.nanoTime(),
+                    "&cacheBust=" + System.nanoTime() +
+                    diagnosticQuery,
             )
             .tag(UploadStreamDiagnostics.Tag::class.java, UploadStreamDiagnostics.Tag(sampleId, sizeBytes))
             .header("Cache-Control", "no-cache, no-store")
