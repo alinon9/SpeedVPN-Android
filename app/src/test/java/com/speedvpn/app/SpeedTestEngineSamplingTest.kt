@@ -131,7 +131,8 @@ class SpeedTestEngineSamplingTest {
     fun parallelStreamTimeoutUsesItsShareOfTheDeviceWidePlanRate() {
         assertEquals(14_667L, SpeedTestEngine.expectedKbpsPerStream(88_000L, 6))
         assertEquals(88_000L, SpeedTestEngine.expectedKbpsPerStream(88_000L, 1))
-        assertEquals(80L, SpeedTestEngine.expectedKbpsPerStream(80L, 6))
+        assertEquals(14L, SpeedTestEngine.expectedKbpsPerStream(80L, 6))
+        assertEquals(80L, SpeedTestEngine.expectedKbpsPerStream(80L, 1))
         assertEquals(null, SpeedTestEngine.expectedKbpsPerStream(null, 6))
         assertEquals(
             5_272L,

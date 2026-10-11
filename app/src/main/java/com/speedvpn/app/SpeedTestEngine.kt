@@ -415,11 +415,10 @@ object SpeedTestEngine {
             expectedKbps <= 100L -> longArrayOf(128_000L, 192_000L, 256_000L)
             expectedKbps <= 1_000L -> longArrayOf(128_000L, 256_000L, 512_000L, 1_000_000L)
             else -> {
-                // Each sample aims for 1.5 seconds at the selected rate, bounded
-                // by the endpoint's practical 20 MB request ceiling.
-                // Repeating a stable payload gives the median three independent
-                // long transfers rather than mixing short slow-start and long samples.
-                // Stay below the public endpoint's practical 25 MB request ceiling.
+                // Public samples target 1.5 seconds; strict verification uses 3 seconds
+                // per sample to amortize request startup. Repeating equal payloads provides
+                // three comparable transfers rather than mixing short and long samples.
+                // Both profiles remain below the endpoint's practical payload ceiling.
                 val targetDurationMs = if (verificationProfile) {
                     FINITE_VERIFICATION_SAMPLE_TARGET_DURATION_MS
                 } else {
