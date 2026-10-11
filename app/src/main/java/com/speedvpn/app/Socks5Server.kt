@@ -624,7 +624,7 @@ class Socks5Server(
             }
             if (!eof && pipeError == null && exitReason == "eof") exitReason = "session_stopped"
             val direction = if (bucket === SpeedLimiter.download) "download" else "upload"
-            val clientSocketForLog = if (uploadDirectionForLog(bucket)) other else destination
+            val clientSocketForLog = if ((bucket === SpeedLimiter.upload)) other else destination
             val upstreamSocketForLog = if (uploadDirectionForLog(bucket)) destination else other
             val throughputBps = if (transferDurationNs > 0L) {
                 (forwardedBytes.toDouble() * 8_000_000_000.0 / transferDurationNs.toDouble()).toLong()
