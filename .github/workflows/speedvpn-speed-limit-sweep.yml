@@ -6,6 +6,9 @@ on:
     paths:
       - 'scripts/e2e/speed-limit-sweep.sh'
       - 'scripts/e2e/local_speed_test_server.py'
+      - 'scripts/e2e/patch_hev_tcp_buffers.py'
+      - 'scripts/e2e/benchmark_local_speed_test_server.py'
+      - 'setup.sh'
       - 'scripts/e2e/verify_metrics.py'
       - 'scripts/e2e/tests/**'
       - 'app/build.gradle.kts'
@@ -26,6 +29,9 @@ on:
     paths:
       - 'scripts/e2e/speed-limit-sweep.sh'
       - 'scripts/e2e/local_speed_test_server.py'
+      - 'scripts/e2e/patch_hev_tcp_buffers.py'
+      - 'scripts/e2e/benchmark_local_speed_test_server.py'
+      - 'setup.sh'
       - 'scripts/e2e/verify_metrics.py'
       - 'scripts/e2e/tests/**'
       - 'app/build.gradle.kts'
@@ -78,12 +84,13 @@ jobs:
           echo "ANDROID_NDK_ROOT=${ANDROID_SDK_ROOT}/ndk/30.0.16248370" >> "$GITHUB_ENV"
           bash ./setup.sh
           test "$(git -C app/src/main/jni/hev-socks5-tunnel rev-parse HEAD)" = 'd9dca26c7ad0e494492244f0309e80ee583e739e'
+          python3 scripts/e2e/patch_hev_tcp_buffers.py --check app/src/main/jni/hev-socks5-tunnel/third-part/lwip/src/ports/include/lwipopts.h
 
       - name: Validate E2E harness helpers
         run: |
           set -euo pipefail
           bash -n scripts/e2e/speed-limit-sweep.sh
-          python3 -m py_compile scripts/e2e/preference_matches.py scripts/e2e/verify_metrics.py scripts/e2e/local_speed_test_server.py scripts/e2e/metric_result_status.py scripts/e2e/tests/test_local_speed_test_server.py scripts/e2e/tests/test_metric_result_status.py
+          python3 -m py_compile scripts/e2e/preference_matches.py scripts/e2e/verify_metrics.py scripts/e2e/local_speed_test_server.py scripts/e2e/metric_result_status.py scripts/e2e/patch_hev_tcp_buffers.py scripts/e2e/benchmark_local_speed_test_server.py scripts/e2e/tests/test_hev_tcp_buffer_patch.py scripts/e2e/tests/test_local_speed_test_server.py scripts/e2e/tests/test_metric_result_status.py
           python3 -m unittest discover -s scripts/e2e/tests -v
 
       - name: Build debug APK
@@ -152,6 +159,9 @@ jobs:
           else:
               raise SystemExit("Local speed-test fixture did not become ready")
           PY
+
+      - name: Benchmark local fixture throughput before emulator execution
+        run: python3 scripts/e2e/benchmark_local_speed_test_server.py --base-url http://127.0.0.1:18765 --rounds 3 --streams 6 --bytes-per-stream 8000000 --min-mbps 211.2 --output fixture-throughput-benchmark.json
 
       - name: Run exhaustive speed-limit sweep
         run: |
@@ -269,6 +279,7 @@ jobs:
             apk-install-attempt-*-packages.txt
             apk-install-attempt-*-meminfo.txt
             speed-test-server.log
+            fixture-throughput-benchmark.json
             speed-limit-sweep-results.csv
             speed-limit-sweep-summary.md
             speed-limit-sweep/**

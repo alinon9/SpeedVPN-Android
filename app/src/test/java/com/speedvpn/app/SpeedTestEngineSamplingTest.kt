@@ -109,11 +109,11 @@ class SpeedTestEngineSamplingTest {
     }
 
     @Test
-    fun highCapacityAndUnlimitedVerificationUseThreeStreamsButLowPlansStaySingleStream() {
-        assertEquals(3, SpeedTestEngine.sampleParallelismFor(32_000L, verificationProfile = true))
-        assertEquals(3, SpeedTestEngine.sampleParallelismFor(88_000L, verificationProfile = true))
-        assertEquals(3, SpeedTestEngine.sampleParallelismFor(null, verificationProfile = true))
-        assertEquals(3, SpeedTestEngine.sampleParallelismFor(0L, verificationProfile = true))
+    fun highCapacityAndUnlimitedVerificationUseSixStreamsButLowPlansStaySingleStream() {
+        assertEquals(6, SpeedTestEngine.sampleParallelismFor(32_000L, verificationProfile = true))
+        assertEquals(6, SpeedTestEngine.sampleParallelismFor(88_000L, verificationProfile = true))
+        assertEquals(6, SpeedTestEngine.sampleParallelismFor(null, verificationProfile = true))
+        assertEquals(6, SpeedTestEngine.sampleParallelismFor(0L, verificationProfile = true))
         assertEquals(1, SpeedTestEngine.sampleParallelismFor(800L, verificationProfile = true))
         assertEquals(1, SpeedTestEngine.sampleParallelismFor(88_000L, verificationProfile = false))
     }
@@ -121,12 +121,12 @@ class SpeedTestEngineSamplingTest {
     @Test
     fun parallelSampleSplitPreservesTotalBytesWithoutEmptyRequests() {
         assertArrayEquals(
-            longArrayOf(5_500_000L, 5_500_000L, 5_500_000L),
-            SpeedTestEngine.splitSampleBytes(16_500_000L, 3),
+            longArrayOf(2_750_000L, 2_750_000L, 2_750_000L, 2_750_000L, 2_750_000L, 2_750_000L),
+            SpeedTestEngine.splitSampleBytes(16_500_000L, 6),
         )
         assertArrayEquals(
-            longArrayOf(34L, 33L, 33L),
-            SpeedTestEngine.splitSampleBytes(100L, 3),
+            longArrayOf(17L, 17L, 17L, 17L, 16L, 16L),
+            SpeedTestEngine.splitSampleBytes(100L, 6),
         )
         assertArrayEquals(
             longArrayOf(1L, 1L),

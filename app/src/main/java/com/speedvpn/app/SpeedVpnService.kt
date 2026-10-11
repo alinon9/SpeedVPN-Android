@@ -493,7 +493,7 @@ class SpeedVpnService : VpnService() {
             appendLine("  cache-size: 10000")
             appendLine("misc:")
             appendLine("  task-stack-size: 86016")
-            appendLine("  tcp-buffer-size: 65536")
+            appendLine("  tcp-buffer-size: 131056") // 16 * TCP_MSS (8191); matches the patched lwIP send window.
             appendLine("  udp-recv-buffer-size: 262144")
             appendLine("  udp-copy-buffer-nums: 12")
             appendLine("  max-session-count: 80")
