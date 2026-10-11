@@ -127,7 +127,8 @@ def patch_lwip_options_content(content: str) -> tuple[str, bool]:
                 raise PatchError(f"TCP_WND: expected exactly one definition, found {len(tcp_wnd_indexes)}")
             index = tcp_wnd_indexes[0]
             newline = "\r\n" if index > 0 and lines[index - 1].endswith("\r\n") else "\n"
-            lines.insert(index, f"#define {name:<29} 1{newline}")
+            inserted_value = "1" if name == "LWIP_WND_SCALE" else "3"
+            lines.insert(index, f"#define {name:<29} {inserted_value}{newline}")
             changed = True
         else:
             if name == "LWIP_WND_SCALE":
