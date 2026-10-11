@@ -113,8 +113,19 @@ object SpeedTestEngine {
             )
             var firstError: String? = null
             val testClient = buildTestClient(context)
+            val diagnosticPhase = BuildConfig.SPEED_TEST_DIAGNOSTIC_PHASE
+            Log.i(
+                TAG,
+                "DIAGNOSTIC_PROFILE phase=$diagnosticPhase " +
+                    "streamOverride=${BuildConfig.SPEED_TEST_DIAGNOSTIC_STREAMS} " +
+                    "downloadTargetKbps=${expectedDownloadKbps ?: "unlimited"} " +
+                    "uploadTargetKbps=${expectedUploadKbps ?: "unlimited"}",
+            )
 
-            val download = try {
+            val download = if (diagnosticPhase == "upload") {
+                Log.i(TAG, "DIAGNOSTIC_PHASE_SKIPPED direction=download reason=upload_only_profile")
+                null
+            } else try {
                 onProgress(SpeedTestPhase.DOWNLOAD)
                 measurePhase(
                     testClient,
@@ -130,7 +141,10 @@ object SpeedTestEngine {
                 null
             }
 
-            val upload = try {
+            val upload = if (diagnosticPhase == "download") {
+                Log.i(TAG, "DIAGNOSTIC_PHASE_SKIPPED direction=upload reason=download_only_profile")
+                null
+            } else try {
                 onProgress(SpeedTestPhase.UPLOAD)
                 measurePhase(
                     testClient,
@@ -457,8 +471,14 @@ object SpeedTestEngine {
      * Unlimited verification uses parallel streams to measure available capacity,
      * not a single-flow TCP ceiling.
      */
-    internal fun sampleParallelismFor(expectedKbps: Long?, verificationProfile: Boolean): Int =
-        if (
+    internal fun sampleParallelismFor(expectedKbps: Long?, verificationProfile: Boolean): Int {
+        // Non-zero overrides exist only in the separately built diagnostic APK.
+        // Production/release builds pin this field to 0 and retain the established policy.
+        val diagnosticOverride = BuildConfig.SPEED_TEST_DIAGNOSTIC_STREAMS
+        if (verificationProfile && diagnosticOverride in setOf(1, 3)) {
+            return diagnosticOverride
+        }
+        return if (
             verificationProfile &&
             (expectedKbps == null || expectedKbps <= 0L || expectedKbps >= 32_000L)
         ) {
@@ -466,6 +486,7 @@ object SpeedTestEngine {
         } else {
             1
         }
+    }
 
     internal fun splitSampleBytes(sizeBytes: Long, requestedParallelism: Int): LongArray {
         if (sizeBytes <= 0L || requestedParallelism <= 0) return longArrayOf()
