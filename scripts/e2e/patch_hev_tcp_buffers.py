@@ -63,7 +63,7 @@ def check_lwip_options_content(content: str) -> dict[str, str]:
     lines = content.splitlines(keepends=True)
     expected = {
         "TCP_MSS": "8191",
-        "TCP_WND": "(16 * TCP_MSS)",
+        "TCP_WND": "(32 * TCP_MSS)",
         "TCP_SND_BUF": "(16 * TCP_MSS)",
         "TCP_SNDLOWAT": "(4 * TCP_MSS)",
         "PBUF_POOL_SIZE": "128",
@@ -85,8 +85,8 @@ def patch_lwip_options_content(content: str) -> tuple[str, bool]:
     lines = content.splitlines(keepends=True)
     changed = False
     changed |= _set_macro(lines, "TCP_MSS", {"8191"}, "8191")
-    changed |= _set_macro(lines, "TCP_WND", {"(8 * TCP_MSS)", "(16 * TCP_MSS)"}, "(16 * TCP_MSS)")
-    changed |= _set_macro(lines, "TCP_SND_BUF", {"(8 * TCP_MSS)", "(16 * TCP_MSS)"}, "(16 * TCP_MSS)")
+    changed |= _set_macro(lines, "TCP_WND", {"(8 * TCP_MSS)", "(16 * TCP_MSS)", "(32 * TCP_MSS)"}, "(32 * TCP_MSS)")
+    changed |= _set_macro(lines, "TCP_SND_BUF", {"(8 * TCP_MSS)", "(16 * TCP_MSS)", "(32 * TCP_MSS)"}, "(32 * TCP_MSS)")
     sndlowat_indexes = _macro_lines(lines, "TCP_SNDLOWAT")
     if not sndlowat_indexes:
         anchor_indexes = _macro_lines(lines, "TCP_SND_BUF")
@@ -150,7 +150,7 @@ def main() -> int:
                 "TCP_MSS", "TCP_WND", "TCP_SND_BUF", "PBUF_POOL_SIZE",
                 "LWIP_WND_SCALE", "TCP_RCV_SCALE",
             ))
-            + f" tcp-buffer-size=131056 changed={str(changed).lower()} sha256={digest}"
+            + f" tcp-buffer-size=262112 changed={str(changed).lower()} sha256={digest}"
         )
         return 0
     except (OSError, PatchError) as error:

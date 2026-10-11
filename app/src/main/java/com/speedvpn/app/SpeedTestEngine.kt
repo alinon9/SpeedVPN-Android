@@ -201,8 +201,12 @@ object SpeedTestEngine {
             BASELINE_STABLE_DURATION_MS
         }
         val samples = ArrayList<Long>()
+        var completedSampleBytes = 0L
         var lastFailure: Throwable? = null
 
+        // Exclude warm-up from numerator and denominator, but include all completed sample
+        // payloads and real wall-clock gaps between requests to expose relay stalls.
+        val measurementStartedNs = System.nanoTime()
         for ((sizeIndex, sizeBytes) in requestSizes.withIndex()) {
             var measured: Long? = null
             var requestElapsedMs: Long? = null
@@ -254,6 +258,7 @@ object SpeedTestEngine {
 
             if (measured != null && measured > 0L) {
                 samples += measured
+                completedSampleBytes += sizeBytes
                 Log.d(TAG, "Sample ${if (isUpload) "upload" else "download"} bytes=$sizeBytes rateBps=$measured actualRequestMs=${requestElapsedMs ?: -1L}")
 
                 // Once a real request lasts long enough to amortize connection
@@ -293,19 +298,21 @@ object SpeedTestEngine {
                     ?: "Not enough valid throughput samples",
             )
         }
+        val measurementElapsedNs = (System.nanoTime() - measurementStartedNs).coerceAtLeast(1L)
+        val sampleMedianBps = percentile(samples, 0.50)
+        val sustainedBps = verificationThroughputBps(completedSampleBytes, measurementElapsedNs)
         Log.i(
             TAG,
             "Phase complete direction=$directionName validSamples=${samples.size}/$requiredSamples " +
-                "elapsedMs=${TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - phaseStartedNs)}",
+                "payloadBytes=$completedSampleBytes measurementElapsedMs=${TimeUnit.NANOSECONDS.toMillis(measurementElapsedNs)} " +
+                "sustainedBps=$sustainedBps sampleMedianBps=$sampleMedianBps " +
+                "totalPhaseElapsedMs=${TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - phaseStartedNs)}",
         )
 
-        // The public speed-test screen reports a high percentile. Verification
-        // uses the median for both the uncapped baseline and VPN side so one
-        // optimistic or slow sample cannot skew only one side of the comparison.
-        return percentile(
-            samples,
-            if (verificationProfile || (expectedKbps != null && expectedKbps > 0L)) 0.50 else 0.90,
-        )
+        // Strict verification divides completed payload bytes by the whole sample window,
+        // including inter-request delays and relay backpressure. Public UI keeps percentiles.
+        if (verificationProfile) return sustainedBps
+        return percentile(samples, if (expectedKbps != null && expectedKbps > 0L) 0.50 else 0.90)
     }
 
     internal fun endpointUrl(path: String, configuredBaseUrl: String?): String {
@@ -793,6 +800,9 @@ object SpeedTestEngine {
                 (values[upper] - values[lower]) * fraction
             ).toLong().coerceAtLeast(0L)
     }
+
+    internal fun verificationThroughputBps(totalBytes: Long, elapsedNanos: Long): Long =
+        bitsPerSecond(totalBytes.coerceAtLeast(0L), elapsedNanos)
 
     private fun bitsPerSecond(bytes: Long, elapsedNanos: Long): Long =
         (

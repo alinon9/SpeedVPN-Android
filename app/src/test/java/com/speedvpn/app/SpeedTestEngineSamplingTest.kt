@@ -144,6 +144,15 @@ class SpeedTestEngineSamplingTest {
     }
 
     @Test
+    fun verificationRateUsesCompletedBytesOverTheWholeSampleWindow() {
+        val bytes = 60_000_000L
+        val baseline = SpeedTestEngine.verificationThroughputBps(bytes, TimeUnit.MILLISECONDS.toNanos(648L))
+        val vpn = SpeedTestEngine.verificationThroughputBps(bytes, TimeUnit.MILLISECONDS.toNanos(1_697L))
+        assertTrue("Expected baseline aggregate near 741 Mbps, got $baseline", baseline in 740_000_000L..742_000_000L)
+        assertTrue("Expected VPN aggregate near 283 Mbps, got $vpn", vpn in 282_000_000L..284_000_000L)
+        assertTrue("Whole-window rate must expose inter-request stalls, not median burst rate", vpn < 572_000_000L)
+    }
+    @Test
     fun verificationCallTimeoutScalesForSlowPlansWithoutChangingPublicTimeout() {
         assertEquals(
             40_400L,
