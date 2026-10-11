@@ -23,6 +23,7 @@ class HevTcpBufferPatchTests(unittest.TestCase):
         self.assertEqual("1220", values["TCP_MSS"])
         self.assertEqual("(256 * TCP_MSS)", values["TCP_WND"])
         self.assertEqual("(256 * TCP_MSS)", values["TCP_SND_BUF"])
+        self.assertEqual("((4 * (TCP_SND_BUF) + (TCP_MSS - 1))/(TCP_MSS))", values["TCP_SND_QUEUELEN"])
         self.assertEqual("(4 * TCP_MSS)", values["TCP_SNDLOWAT"])
         self.assertEqual("512", values["PBUF_POOL_SIZE"])
         self.assertEqual("1", values["LWIP_WND_SCALE"])

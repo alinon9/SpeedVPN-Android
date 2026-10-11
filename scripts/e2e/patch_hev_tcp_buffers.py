@@ -69,6 +69,7 @@ def check_lwip_options_content(content: str) -> dict[str, str]:
         # the high presets before the app-level token bucket can be evaluated.
         "TCP_WND": "(256 * TCP_MSS)",
         "TCP_SND_BUF": "(256 * TCP_MSS)",
+        "TCP_SND_QUEUELEN": "((4 * (TCP_SND_BUF) + (TCP_MSS - 1))/(TCP_MSS))",
         "TCP_SNDLOWAT": "(4 * TCP_MSS)",
         "PBUF_POOL_SIZE": "512",
         "LWIP_WND_SCALE": "1",
@@ -103,6 +104,29 @@ def patch_lwip_options_content(content: str) -> tuple[str, bool]:
         {"(8 * TCP_MSS)", "(16 * TCP_MSS)", "(32 * TCP_MSS)", "(256 * TCP_MSS)"},
         "(256 * TCP_MSS)",
     )
+    # Keep queued segments proportional to the send buffer. The vendor formula
+    # multiplies SND_BUF by 128; at 256 MSS that requests 32768 segments, exceeding
+    # the pinned lwIP pool of 8192.
+    snd_queue_indexes = _macro_lines(lines, "TCP_SND_QUEUELEN")
+    queue_value = "((4 * (TCP_SND_BUF) + (TCP_MSS - 1))/(TCP_MSS))"
+    if not snd_queue_indexes:
+        anchor_indexes = _macro_lines(lines, "TCP_SND_BUF")
+        if len(anchor_indexes) != 1:
+            raise PatchError(f"TCP_SND_BUF: expected exactly one definition, found {len(anchor_indexes)}")
+        anchor = anchor_indexes[0]
+        newline = "\r\n" if anchor > 0 and lines[anchor - 1].endswith("\r\n") else "\n"
+        lines.insert(anchor + 1, f'#define {"TCP_SND_QUEUELEN":<29} {queue_value}{newline}')
+        changed = True
+    else:
+        changed |= _set_macro(
+            lines,
+            "TCP_SND_QUEUELEN",
+            {
+                "((128 * (TCP_SND_BUF) + (TCP_MSS - 1))/(TCP_MSS))",
+                queue_value,
+            },
+            queue_value,
+        )
     sndlowat_indexes = _macro_lines(lines, "TCP_SNDLOWAT")
     if not sndlowat_indexes:
         anchor_indexes = _macro_lines(lines, "TCP_SND_BUF")
