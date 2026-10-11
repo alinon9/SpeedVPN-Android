@@ -493,7 +493,7 @@ class SpeedVpnService : VpnService() {
             appendLine("  cache-size: 10000")
             appendLine("misc:")
             appendLine("  task-stack-size: 86016")
-            appendLine("  tcp-buffer-size: 312320") // 256 * TCP_MSS (1220); matches the patched lwIP send buffer.
+            appendLine("  tcp-buffer-size: 65535") // u16_t TCP_SND_BUF ceiling; keep HEV ring buffer within the lwIP send budget.
             appendLine("  udp-recv-buffer-size: 262144")
             appendLine("  udp-copy-buffer-nums: 12")
             appendLine("  max-session-count: 80")
