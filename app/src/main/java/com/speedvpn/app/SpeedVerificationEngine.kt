@@ -87,7 +87,7 @@ object SpeedVerificationEngine {
                 }
 
                 if (baseline.downloadBps == null && baseline.uploadBps == null) {
-                    result = unavailable(started, "فشل قياس الشبكة الأصلية.", planDownloadKbps, planUploadKbps)
+                    result = unavailable(started, "فشل قياس الشبكة الأصلية.", planDownloadKbps, planUploadKbps, baseline)
                 } else {
                     // The selected plan is explicit; null means Unlimited. Apply it before
                     // startup and again after CONNECTED because the service restores saved
@@ -140,7 +140,7 @@ object SpeedVerificationEngine {
                         )
 
                         if (vpn.downloadBps == null && vpn.uploadBps == null) {
-                            result = unavailable(started, "فشل القياس أثناء مرور الترافيك عبر VPN.", planDownloadKbps, planUploadKbps)
+                            result = unavailable(started, "فشل القياس أثناء مرور الترافيك عبر VPN.", planDownloadKbps, planUploadKbps, baseline)
                         } else {
                             note = listOfNotNull(
                                 baseline.error?.let { "الشبكة: $it" },
@@ -315,23 +315,39 @@ object SpeedVerificationEngine {
         return false
     }
 
-    private fun unavailable(started: Long, note: String, planDownloadKbps: Long? = null, planUploadKbps: Long? = null): SpeedVerificationResult {
+    internal fun unavailable(
+        started: Long,
+        note: String,
+        planDownloadKbps: Long? = null,
+        planUploadKbps: Long? = null,
+        baseline: SpeedTestResult? = null,
+    ): SpeedVerificationResult {
+        // Failure of the VPN phase must not erase a valid physical-baseline sample.
+        // Preserve each direction independently so diagnostics cannot turn measured
+        // baseline speed into a synthetic "measurement failed" value.
+        val diagnosticNote = listOfNotNull(
+            note,
+            baseline?.error?.takeIf { it.isNotBlank() }?.let { "الشبكة الأصلية: $it" },
+        ).joinToString(" • ")
         val downloadMetric = SpeedMetricVerification(
             planKbps = planDownloadKbps,
-            baselineBps = null,
+            baselineBps = baseline?.downloadBps,
             vpnBps = null,
             status = SpeedVerificationStatus.NOT_VERIFIABLE,
             accuracyPercent = null,
-            reason = note,
+            reason = diagnosticNote,
         )
-        val uploadMetric = downloadMetric.copy(planKbps = planUploadKbps)
+        val uploadMetric = downloadMetric.copy(
+            planKbps = planUploadKbps,
+            baselineBps = baseline?.uploadBps,
+        )
         return SpeedVerificationResult(
             startedAtMillis = started,
             durationMs = System.currentTimeMillis() - started,
             download = downloadMetric,
             upload = uploadMetric,
             overallStatus = SpeedVerificationStatus.NOT_VERIFIABLE,
-            note = note,
+            note = diagnosticNote,
         )
     }
 }
