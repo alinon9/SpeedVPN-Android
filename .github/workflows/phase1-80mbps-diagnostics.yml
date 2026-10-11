@@ -57,7 +57,8 @@ jobs:
       - name: Run local fixture unit tests and Python syntax checks
         run: |
           set -euo pipefail
-          python3 -m py_compile scripts/e2e/local_speed_test_server.py scripts/e2e/speed-limit-sweep.sh 2>/dev/null || true
+          python3 -m py_compile scripts/e2e/local_speed_test_server.py
+          bash -n scripts/e2e/speed-limit-sweep.sh
           python3 -m unittest discover -s scripts/e2e/tests -p 'test_local_speed_test_server.py' -v
 
       - name: Build isolated direction and stream-count APKs
