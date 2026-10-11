@@ -739,13 +739,15 @@ object SpeedTestEngine {
     internal fun buildUploadRequest(
         sizeBytes: Long,
         body: RequestBody,
-    ): Request =
-        Request.Builder()
+    ): Request {
+        val sampleId = "upload-${System.nanoTime()}"
+        return Request.Builder()
             .url(
                 UPLOAD_URL +
                     "?bytes=" + sizeBytes +
                     "&cacheBust=" + System.nanoTime(),
             )
+            .tag(UploadStreamDiagnostics.Tag::class.java, UploadStreamDiagnostics.Tag(sampleId, sizeBytes))
             .header("Cache-Control", "no-cache, no-store")
             .header("Pragma", "no-cache")
             .header("User-Agent", "SpeedVPN/1.0 Android")
@@ -754,6 +756,7 @@ object SpeedTestEngine {
             .header("Connection", "close")
             .post(body)
             .build()
+    }
 
     private data class CachedDnsEntry(
         val expiresAtNanos: Long,
@@ -827,6 +830,9 @@ object SpeedTestEngine {
         }
 
         return createIsolatedMeasurementClient(client, dns)
+            .newBuilder()
+            .eventListenerFactory(UploadStreamDiagnostics.Factory())
+            .build()
     }
 
     /**
