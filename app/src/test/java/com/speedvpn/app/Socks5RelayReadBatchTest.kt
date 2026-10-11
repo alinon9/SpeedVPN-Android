@@ -56,6 +56,54 @@ class Socks5RelayReadBatchTest {
     }
 
     @Test
+    fun uploadBrokenPipeKeepsReverseResponseFlowAliveForActiveSession() {
+        assertTrue(
+            shouldPreserveReverseFlowAfterUploadHalfClose(
+                isUploadDirection = true,
+                sessionActive = true,
+                destinationWriteBrokenPipe = true,
+                halfCloseFailed = false,
+            ),
+        )
+    }
+
+    @Test
+    fun uploadHalfCloseFailureKeepsReverseResponseFlowAliveForActiveSession() {
+        assertTrue(
+            shouldPreserveReverseFlowAfterUploadHalfClose(
+                isUploadDirection = true,
+                sessionActive = true,
+                destinationWriteBrokenPipe = false,
+                halfCloseFailed = true,
+            ),
+        )
+    }
+
+    @Test
+    fun downloadWriteFailureDoesNotKeepReverseFlowAlive() {
+        assertTrue(
+            !shouldPreserveReverseFlowAfterUploadHalfClose(
+                isUploadDirection = false,
+                sessionActive = true,
+                destinationWriteBrokenPipe = true,
+                halfCloseFailed = true,
+            ),
+        )
+    }
+
+    @Test
+    fun inactiveVpnSessionDoesNotKeepReverseFlowAlive() {
+        assertTrue(
+            !shouldPreserveReverseFlowAfterUploadHalfClose(
+                isUploadDirection = true,
+                sessionActive = false,
+                destinationWriteBrokenPipe = true,
+                halfCloseFailed = true,
+            ),
+        )
+    }
+
+    @Test
     fun oversizedRelayReadIsRejected() {
         val source = SingleReadInputStream(byteArrayOf(1), maxReadBytes = 1)
         assertThrows(IllegalArgumentException::class.java) {
