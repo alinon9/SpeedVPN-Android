@@ -57,6 +57,13 @@ class SpeedTestEngineSamplingTest {
             "Expected a sustained sample, got $durationMs ms",
             durationMs >= SpeedTestEngine.FINITE_SAMPLE_TARGET_DURATION_MS,
         )
+        val verificationSize = SpeedTestEngine.requestSizesFor(targetKbps, verificationProfile = true).first()
+        val verificationDurationMs = SpeedTestEngine.requestDurationFor(verificationSize, targetKbps * 1_000L)
+        assertTrue(
+            "Expected verification sample to cover at least " +
+                "${SpeedTestEngine.FINITE_VERIFICATION_SAMPLE_TARGET_DURATION_MS}ms, got $verificationDurationMs ms",
+            verificationDurationMs >= SpeedTestEngine.FINITE_VERIFICATION_SAMPLE_TARGET_DURATION_MS,
+        )
     }
 
     @Test
@@ -91,20 +98,48 @@ class SpeedTestEngineSamplingTest {
     }
 
     @Test
-    fun finiteVerificationUsesTheSelectedPlanSampleSizes() {
-        for (targetKbps in listOf(80L, 800L, 16_000L, 88_000L)) {
+    fun finiteVerificationKeepsLowPlanLadderAndExtendsHighRateSamples() {
+        for (targetKbps in listOf(80L, 800L)) {
             assertArrayEquals(
                 SpeedTestEngine.requestSizesFor(targetKbps),
                 SpeedTestEngine.requestSizesFor(targetKbps, verificationProfile = true),
             )
         }
+        assertArrayEquals(
+            longArrayOf(6_000_000L, 6_000_000L, 6_000_000L),
+            SpeedTestEngine.requestSizesFor(16_000L, verificationProfile = true),
+        )
+        assertArrayEquals(
+            longArrayOf(24_000_000L, 24_000_000L, 24_000_000L),
+            SpeedTestEngine.requestSizesFor(88_000L, verificationProfile = true),
+        )
+        assertArrayEquals(
+            longArrayOf(3_000_000L, 3_000_000L, 3_000_000L),
+            SpeedTestEngine.requestSizesFor(16_000L, verificationProfile = false),
+        )
     }
 
     @Test
-    fun finiteVerificationCapsRequestsAtTheFixtureCeilingForVeryHighPlans() {
+    fun finiteVerificationCapsRequestsBelowTheFixtureCeilingForVeryHighPlans() {
         assertArrayEquals(
-            longArrayOf(20_000_000L, 20_000_000L, 20_000_000L),
+            longArrayOf(24_000_000L, 24_000_000L, 24_000_000L),
             SpeedTestEngine.requestSizesFor(800_000L, verificationProfile = true),
+        )
+    }
+
+    @Test
+    fun parallelStreamTimeoutUsesItsShareOfTheDeviceWidePlanRate() {
+        assertEquals(14_667L, SpeedTestEngine.expectedKbpsPerStream(88_000L, 6))
+        assertEquals(88_000L, SpeedTestEngine.expectedKbpsPerStream(88_000L, 1))
+        assertEquals(80L, SpeedTestEngine.expectedKbpsPerStream(80L, 6))
+        assertEquals(null, SpeedTestEngine.expectedKbpsPerStream(null, 6))
+        assertEquals(
+            5_272L,
+            SpeedTestEngine.measurementCallTimeoutMs(
+                4_000_000L,
+                SpeedTestEngine.expectedKbpsPerStream(88_000L, 6),
+                verificationProfile = true,
+            ),
         )
     }
 
@@ -239,7 +274,7 @@ class SpeedTestEngineSamplingTest {
     fun requiredRelayBytesCoverTheMinimumSuccessfulSampleSetForEachPlanType() {
         assertEquals(320_000L, SpeedTestEngine.minimumRequiredSampleBytes(80L, verificationProfile = true))
         assertEquals(896_000L, SpeedTestEngine.minimumRequiredSampleBytes(800L, verificationProfile = true))
-        assertEquals(49_500_000L, SpeedTestEngine.minimumRequiredSampleBytes(88_000L, verificationProfile = true))
+        assertEquals(72_000_000L, SpeedTestEngine.minimumRequiredSampleBytes(88_000L, verificationProfile = true))
         assertEquals(60_000_000L, SpeedTestEngine.minimumRequiredSampleBytes(0L, verificationProfile = true))
     }
 

@@ -63,8 +63,15 @@ object SpeedTestEngine {
     private const val MIN_CAPPED_RANGE_SAMPLES = 3
     private const val BASELINE_STABLE_DURATION_MS = 250L
     internal const val FINITE_SAMPLE_TARGET_DURATION_MS = 1_500L
+    // Verification uses longer payloads so connection and HTTP startup overhead do
+    // not dominate a strict whole-window rate check. Public speed-test behavior stays
+    // on the shorter adaptive sample target above.
+    internal const val FINITE_VERIFICATION_SAMPLE_TARGET_DURATION_MS = 3_000L
     private const val MIN_FINITE_SAMPLE_BYTES = 256_000L
     private const val MAX_FINITE_SAMPLE_BYTES = 20_000_000L
+    // Keep below the local fixture's 25 MB request ceiling and the public endpoint's
+    // practical payload size while amortizing per-request overhead at high plan rates.
+    private const val MAX_FINITE_VERIFICATION_SAMPLE_BYTES = 24_000_000L
     private const val UNLIMITED_VERIFICATION_SAMPLE_BYTES = 20_000_000L
     private const val MAX_RETRIES = 2
     // A single bad endpoint must not consume the entire 300-second E2E wait.
@@ -413,9 +420,19 @@ object SpeedTestEngine {
                 // Repeating a stable payload gives the median three independent
                 // long transfers rather than mixing short slow-start and long samples.
                 // Stay below the public endpoint's practical 25 MB request ceiling.
+                val targetDurationMs = if (verificationProfile) {
+                    FINITE_VERIFICATION_SAMPLE_TARGET_DURATION_MS
+                } else {
+                    FINITE_SAMPLE_TARGET_DURATION_MS
+                }
+                val maxSampleBytes = if (verificationProfile) {
+                    MAX_FINITE_VERIFICATION_SAMPLE_BYTES
+                } else {
+                    MAX_FINITE_SAMPLE_BYTES
+                }
                 val sampleBytes = (
-                    expectedKbps.toDouble() * FINITE_SAMPLE_TARGET_DURATION_MS / 8.0
-                ).toLong().coerceIn(MIN_FINITE_SAMPLE_BYTES, MAX_FINITE_SAMPLE_BYTES)
+                    expectedKbps.toDouble() * targetDurationMs / 8.0
+                ).toLong().coerceIn(MIN_FINITE_SAMPLE_BYTES, maxSampleBytes)
                 longArrayOf(sampleBytes, sampleBytes, sampleBytes)
             }
         }
@@ -461,6 +478,13 @@ object SpeedTestEngine {
         }
     }
 
+    internal fun expectedKbpsPerStream(expectedKbps: Long?, parallelism: Int): Long? {
+        if (expectedKbps == null || expectedKbps <= 0L || parallelism <= 1) return expectedKbps
+        val quotient = expectedKbps / parallelism
+        val remainder = expectedKbps % parallelism
+        return (quotient + if (remainder == 0L) 0L else 1L).coerceAtLeast(1L)
+    }
+
     private suspend fun measureSampleRequest(
         client: OkHttpClient,
         isUpload: Boolean,
@@ -479,17 +503,22 @@ object SpeedTestEngine {
         }
 
         val chunks = splitSampleBytes(sizeBytes, parallelism)
+        // The limiter is device-wide: six parallel streams share the selected aggregate
+        // rate, rather than each receiving the full plan rate. Size per-stream deadlines
+        // against its approximate share, otherwise longer verification samples can time
+        // out even while the aggregate transfer is operating at the configured plan.
+        val perStreamTargetKbps = expectedKbpsPerStream(expectedKbps, parallelism)
         val startedNs = System.nanoTime()
         val streamRates = coroutineScope {
             chunks.map { chunkBytes ->
                 async(Dispatchers.IO) {
                     if (isUpload) {
                         measureUploadRequest(
-                            client, chunkBytes, expectedKbps, verificationProfile, remainingPhaseMs,
+                            client, chunkBytes, perStreamTargetKbps, verificationProfile, remainingPhaseMs,
                         )
                     } else {
                         measureDownloadRequest(
-                            client, chunkBytes, expectedKbps, verificationProfile, remainingPhaseMs,
+                            client, chunkBytes, perStreamTargetKbps, verificationProfile, remainingPhaseMs,
                         )
                     }
                 }
