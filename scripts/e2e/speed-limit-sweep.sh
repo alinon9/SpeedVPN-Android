@@ -6,7 +6,7 @@ PACKAGE="com.speedvpn.app"
 SCREEN_SIZE="$(adb -s "$DEVICE" shell wm size 2>/dev/null | awk -F': ' '/Override size:/{size=$2} /Physical size:/{if(size=="")size=$2} END{print size}')"
 SCREEN_WIDTH="${SCREEN_SIZE%x*}"
 SCREEN_HEIGHT="${SCREEN_SIZE#*x}"
-RUN_DIR="speed-limit-sweep"
+RUN_DIR="${SPEEDVPN_RUN_DIR:-speed-limit-sweep}"
 CSV_RUN_ID="${GITHUB_RUN_ID:-local}"
 recorded_at_utc() { date -u +"%Y-%m-%dT%H:%M:%S.%3NZ"; }
 RUN_STARTED_AT="$(recorded_at_utc)"
@@ -42,6 +42,9 @@ SPEED_CASES=$(cat <<'CASES'
 19|بدون حد|0
 CASES
 )
+if [ -n "${SPEEDVPN_CASES_OVERRIDE:-}" ]; then
+  SPEED_CASES="$SPEEDVPN_CASES_OVERRIDE"
+fi
 
 dump_ui() {
   local out="$1"
@@ -565,7 +568,7 @@ record_failed_pair() {
     "$RUN_DIR/speed-limit-sweep-results.csv" "$index" "$preset" "$expected" "$status" "$reason"
 }
 
-TOTAL=19
+TOTAL="${SPEEDVPN_TOTAL_PRESETS:-19}"
 FAIL_COUNT=0
 METRIC_FAIL_COUNT=0
 ENV_LIMITED_COUNT=0
@@ -606,6 +609,12 @@ preflight_fail() {
   return 0
 }
 
+if [ "${SPEEDVPN_SKIP_BASELINE_PREFLIGHT:-0}" = "1" ]; then
+  BASELINE_PREFLIGHT_STATUS="SKIPPED_DIAGNOSTIC_ONLY"
+  BASELINE_PREFLIGHT_DOWNLOAD="not-run"
+  BASELINE_PREFLIGHT_UPLOAD="not-run"
+  BASELINE_PREFLIGHT_REASON="Each isolated verification records its own direction-specific physical baseline."
+else
 if ! cleanup_vpn; then
   preflight_fail "VPN TUN could not be confirmed stopped before baseline measurement."
   exit 1
@@ -668,6 +677,9 @@ fi
 if ! cleanup_vpn; then
   preflight_fail "VPN TUN was not stopped after baseline preflight."
   exit 1
+fi
+
+
 fi
 
 # Keep the case list on FD 3 rather than stdin: adb shell can consume
@@ -908,6 +920,7 @@ PY
   echo
 done 3<<< "$SPEED_CASES"
 
+if [ "${SPEEDVPN_DIAGNOSTIC_ONLY:-0}" != "1" ]; then
 # Enforce full coverage so a prematurely terminated loop can never pass CI.
 if [ "$TESTED_PRESET_COUNT" -ne "$TOTAL" ]; then
   echo "COVERAGE FAIL: tested $TESTED_PRESET_COUNT/$TOTAL presets."
@@ -930,6 +943,11 @@ fi
 if ! python3 scripts/e2e/verify_metrics.py validate-sweep "$RUN_DIR/speed-limit-sweep-results.csv"; then
   echo "STRICT GATE FAIL: independent CSV validation did not reach PASS=38/38."
   FAIL_COUNT=$((FAIL_COUNT+1))
+fi
+
+
+else
+  echo "DIAGNOSTIC_CAPTURE_ONLY=1; strict PASS/FAIL acceptance is evaluated separately from the capture job."
 fi
 
 SUMMARY_RECORDED_AT_UTC="$(recorded_at_utc)"
@@ -995,6 +1013,11 @@ echo "METRIC_FAIL=$METRIC_FAIL_COUNT"
 echo "ENV_LIMITED=$ENV_LIMITED_COUNT"
 echo "ADDITIONAL_HARD_FAIL_EVENTS=$((FAIL_COUNT-METRIC_FAIL_COUNT))"
 echo "HARD_FAIL=$FAIL_COUNT"
+
+if [ "${SPEEDVPN_DIAGNOSTIC_ONLY:-0}" = "1" ]; then
+  echo "DIAGNOSTIC_CAPTURE_COMPLETE=1; this run is evidence collection, not an acceptance PASS."
+  exit 0
+fi
 
 if [ "$FAIL_COUNT" -gt 0 ]; then
   exit 1
