@@ -65,6 +65,7 @@ def check_lwip_options_content(content: str) -> dict[str, str]:
         "TCP_MSS": "8191",
         "TCP_WND": "(16 * TCP_MSS)",
         "TCP_SND_BUF": "(16 * TCP_MSS)",
+        "TCP_SNDLOWAT": "(4 * TCP_MSS)",
         "PBUF_POOL_SIZE": "128",
         "LWIP_WND_SCALE": "1",
         "TCP_RCV_SCALE": "1",
@@ -86,6 +87,17 @@ def patch_lwip_options_content(content: str) -> tuple[str, bool]:
     changed |= _set_macro(lines, "TCP_MSS", {"8191"}, "8191")
     changed |= _set_macro(lines, "TCP_WND", {"(8 * TCP_MSS)", "(16 * TCP_MSS)"}, "(16 * TCP_MSS)")
     changed |= _set_macro(lines, "TCP_SND_BUF", {"(8 * TCP_MSS)", "(16 * TCP_MSS)"}, "(16 * TCP_MSS)")
+    sndlowat_indexes = _macro_lines(lines, "TCP_SNDLOWAT")
+    if not sndlowat_indexes:
+        anchor_indexes = _macro_lines(lines, "TCP_SND_BUF")
+        if len(anchor_indexes) != 1:
+            raise PatchError(f"TCP_SND_BUF: expected exactly one definition, found {len(anchor_indexes)}")
+        anchor = anchor_indexes[0]
+        newline = "\r\n" if anchor > 0 and lines[anchor - 1].endswith("\r\n") else "\n"
+        lines.insert(anchor, f'#define {"TCP_SNDLOWAT":<29} (4 * TCP_MSS){newline}')
+        changed = True
+    else:
+        changed |= _set_macro(lines, "TCP_SNDLOWAT", {"(4 * TCP_MSS)"}, "(4 * TCP_MSS)")
     changed |= _set_macro(lines, "PBUF_POOL_SIZE", {"32", "128"}, "128")
 
     # lwIP's generic defaults disable scaling when these macros are absent.

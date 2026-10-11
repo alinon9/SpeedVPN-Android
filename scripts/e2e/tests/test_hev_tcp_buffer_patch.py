@@ -23,6 +23,7 @@ class HevTcpBufferPatchTests(unittest.TestCase):
         self.assertEqual("8191", values["TCP_MSS"])
         self.assertEqual("(16 * TCP_MSS)", values["TCP_WND"])
         self.assertEqual("(16 * TCP_MSS)", values["TCP_SND_BUF"])
+        self.assertEqual("(4 * TCP_MSS)", values["TCP_SNDLOWAT"])
         self.assertEqual("128", values["PBUF_POOL_SIZE"])
         self.assertEqual("1", values["LWIP_WND_SCALE"])
         self.assertEqual("1", values["TCP_RCV_SCALE"])
@@ -41,6 +42,11 @@ class HevTcpBufferPatchTests(unittest.TestCase):
 
     def test_duplicate_native_macros_fail_closed(self) -> None:
         broken = BASELINE + "#define TCP_WND (8 * TCP_MSS)\n"
+        with self.assertRaises(PatchError):
+            patch_lwip_options_content(broken)
+
+    def test_existing_unsafe_send_low_water_mark_is_rejected(self) -> None:
+        broken = BASELINE + "#define TCP_SNDLOWAT (8 * TCP_MSS)\n"
         with self.assertRaises(PatchError):
             patch_lwip_options_content(broken)
 

@@ -99,7 +99,7 @@ def _measure_round(
         "bytes_per_stream": bytes_per_stream,
         "total_bytes": total_bytes,
         "elapsed_ms": round(elapsed * 1000.0, 3),
-        "mbps": round(rate_mbps(total_bytes, elapsed), 3),
+        "mbps": rate_mbps(total_bytes, elapsed),
     }
 
 
@@ -130,7 +130,7 @@ def main() -> int:
                 print(
                     f"FIXTURE_BENCHMARK direction={direction} round={round_number}/{args.rounds} "
                     f"streams={args.streams} bytes={result['total_bytes']} "
-                    f"elapsed_ms={result['elapsed_ms']} Mbps={result['mbps']} "
+                    f"elapsed_ms={result['elapsed_ms']} Mbps={float(result['mbps']):.3f} "
                     f"minimum_mbps={args.min_mbps} verdict={result['verdict']}",
                     flush=True,
                 )

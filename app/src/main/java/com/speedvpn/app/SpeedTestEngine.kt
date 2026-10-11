@@ -40,9 +40,9 @@ object SpeedTestEngine {
     private val UPLOAD_URL = endpointUrl("__up", BuildConfig.SPEED_TEST_BASE_URL)
     private val REFERER = "$testBaseUrl/"
 
-    // Progressive sample sizes avoid oversampling. For high-capacity verification,
-    // each sample can use three parallel HTTP streams so a single TCP flow does not
-    // become the physical-baseline bottleneck; baseline and VPN use the same profile.
+    // Progressive sample sizes avoid oversampling. High-capacity verification uses
+    // parallel HTTP streams so a single TCP flow does not become the physical-baseline
+    // bottleneck; baseline and VPN use the same profile.
     private val REQUEST_SIZES = longArrayOf(
         100_000L,
         250_000L,
