@@ -113,6 +113,7 @@ class HevTcpBufferPatchTests(unittest.TestCase):
         function = patched[start:end]
         self.assertIn("tcp_sndbuf (self->pcb)", function)
         self.assertIn("if (write_err == ERR_MEM)", function)
+        self.assertIn("TCP_WRITE_FLAG_COPY", function)
         self.assertIn("hev_ring_buffer_read_finish (self->buffer, queued);", function)
         self.assertNotIn("hev_ring_buffer_read_finish (self->buffer, s);", function)
         self.assertNotIn("s += len;", function)
