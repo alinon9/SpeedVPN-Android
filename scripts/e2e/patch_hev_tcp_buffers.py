@@ -260,8 +260,8 @@ tcp_splice_b (HevSocks5SessionTCP *self)
 
 
 def _tcp_splice_b_bounds(content: str) -> tuple[int, int]:
-    start_marker = "static int\\ntcp_splice_b (HevSocks5SessionTCP *self)\\n{"
-    end_marker = "\\nstatic err_t\\ntcp_recv_handler"
+    start_marker = "static int\ntcp_splice_b (HevSocks5SessionTCP *self)\n{"
+    end_marker = "\nstatic err_t\ntcp_recv_handler"
     start = content.find(start_marker)
     if start < 0:
         raise PatchError("pinned HEV TCP session source has no tcp_splice_b() anchor")
@@ -277,8 +277,10 @@ def patch_tcp_session_content(content: str) -> tuple[str, bool]:
     if current == TCP_SPLICE_B_PATCHED:
         return content, False
     # Fail closed if the pinned native code has drifted from the reviewed baseline.
-    if "err |= tcp_write (self->pcb, ptr, len, 0);" not in current or \\
-            "hev_ring_buffer_read_finish (self->buffer, s);" not in current:
+    if (
+        "err |= tcp_write (self->pcb, ptr, len, 0);" not in current
+        or "hev_ring_buffer_read_finish (self->buffer, s);" not in current
+    ):
         raise PatchError("pinned HEV tcp_splice_b() differs from the reviewed patch baseline")
     patched = content[:start] + TCP_SPLICE_B_PATCHED + content[end:]
     return patched, True
