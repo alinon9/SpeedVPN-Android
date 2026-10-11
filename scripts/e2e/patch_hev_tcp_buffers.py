@@ -64,7 +64,7 @@ def check_lwip_options_content(content: str) -> dict[str, str]:
     expected = {
         "TCP_MSS": "8191",
         "TCP_WND": "(32 * TCP_MSS)",
-        "TCP_SND_BUF": "(16 * TCP_MSS)",
+        "TCP_SND_BUF": "(32 * TCP_MSS)",
         "TCP_SNDLOWAT": "(4 * TCP_MSS)",
         "PBUF_POOL_SIZE": "128",
         "LWIP_WND_SCALE": "1",
