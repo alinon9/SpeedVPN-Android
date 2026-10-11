@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import socket
 import threading
 import time
@@ -126,6 +127,9 @@ class SpeedTestRequestHandler(BaseHTTPRequestHandler):
             return
 
         size = self._requested_size()
+        diagnostic_id = parse_qs(urlsplit(self.path).query).get("diagId", ["none"])[0]
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", diagnostic_id):
+            diagnostic_id = "invalid"
         try:
             content_length = int(self.headers.get("Content-Length", "-1"))
         except ValueError:
@@ -195,7 +199,7 @@ class SpeedTestRequestHandler(BaseHTTPRequestHandler):
         finally:
             elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000
             self._record_transfer_event(
-                f"UPLOAD_DIAG method=POST path=/__up serverPort={self.server.server_port} "
+                f"UPLOAD_DIAG method=POST path=/__up diagId={diagnostic_id} serverPort={self.server.server_port} "
                 f"peerPort={self.client_address[1]} requestedBytes={size} contentLength={content_length} "
                 f"receivedBytes={received} bodyComplete={str(received == content_length).lower()} "
                 f"responseStarted={str(response_started).lower()} responseSent={str(response_sent).lower()} "
