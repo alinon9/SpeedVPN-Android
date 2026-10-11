@@ -106,11 +106,11 @@ class SpeedTestEngineSamplingTest {
             )
         }
         assertArrayEquals(
-            longArrayOf(6_000_000L, 6_000_000L, 6_000_000L),
+            longArrayOf(3_000_000L, 3_000_000L, 3_000_000L),
             SpeedTestEngine.requestSizesFor(16_000L, verificationProfile = true),
         )
         assertArrayEquals(
-            longArrayOf(24_000_000L, 24_000_000L, 24_000_000L),
+            longArrayOf(16_500_000L, 16_500_000L, 16_500_000L),
             SpeedTestEngine.requestSizesFor(88_000L, verificationProfile = true),
         )
         assertArrayEquals(
@@ -275,7 +275,7 @@ class SpeedTestEngineSamplingTest {
     fun requiredRelayBytesCoverTheMinimumSuccessfulSampleSetForEachPlanType() {
         assertEquals(320_000L, SpeedTestEngine.minimumRequiredSampleBytes(80L, verificationProfile = true))
         assertEquals(896_000L, SpeedTestEngine.minimumRequiredSampleBytes(800L, verificationProfile = true))
-        assertEquals(72_000_000L, SpeedTestEngine.minimumRequiredSampleBytes(88_000L, verificationProfile = true))
+        assertEquals(49_500_000L, SpeedTestEngine.minimumRequiredSampleBytes(88_000L, verificationProfile = true))
         assertEquals(60_000_000L, SpeedTestEngine.minimumRequiredSampleBytes(0L, verificationProfile = true))
     }
 
