@@ -114,13 +114,15 @@ object SpeedTestEngine {
             var firstError: String? = null
             val testClient = buildTestClient(context)
             val diagnosticPhase = BuildConfig.SPEED_TEST_DIAGNOSTIC_PHASE
-            Log.i(
-                TAG,
-                "DIAGNOSTIC_PROFILE phase=$diagnosticPhase " +
-                    "streamOverride=${BuildConfig.SPEED_TEST_DIAGNOSTIC_STREAMS} " +
-                    "downloadTargetKbps=${expectedDownloadKbps ?: "unlimited"} " +
-                    "uploadTargetKbps=${expectedUploadKbps ?: "unlimited"}",
-            )
+            if (diagnosticPhase != "both" || BuildConfig.SPEED_TEST_DIAGNOSTIC_STREAMS != 0) {
+                Log.i(
+                    TAG,
+                    "DIAGNOSTIC_PROFILE phase=$diagnosticPhase " +
+                        "streamOverride=${BuildConfig.SPEED_TEST_DIAGNOSTIC_STREAMS} " +
+                        "downloadTargetKbps=${expectedDownloadKbps ?: "unlimited"} " +
+                        "uploadTargetKbps=${expectedUploadKbps ?: "unlimited"}",
+                )
+            }
 
             val download = if (diagnosticPhase == "upload") {
                 Log.i(TAG, "DIAGNOSTIC_PHASE_SKIPPED direction=download reason=upload_only_profile")
@@ -772,7 +774,10 @@ object SpeedTestEngine {
                     "&cacheBust=" + System.nanoTime() +
                     diagnosticQuery,
             )
-            .tag(UploadStreamDiagnostics.Tag::class.java, UploadStreamDiagnostics.Tag(sampleId, sizeBytes))
+            .tag(
+                UploadStreamDiagnostics.Tag::class.java,
+                if (diagnosticOnly) UploadStreamDiagnostics.Tag(sampleId, sizeBytes) else null,
+            )
             .header("Cache-Control", "no-cache, no-store")
             .header("Pragma", "no-cache")
             .header("User-Agent", "SpeedVPN/1.0 Android")
@@ -854,10 +859,17 @@ object SpeedTestEngine {
             }
         }
 
-        return createIsolatedMeasurementClient(client, dns)
-            .newBuilder()
-            .eventListenerFactory(UploadStreamDiagnostics.Factory())
-            .build()
+        val isolatedClient = createIsolatedMeasurementClient(client, dns)
+        return if (
+            BuildConfig.SPEED_TEST_DIAGNOSTIC_PHASE != "both" ||
+            BuildConfig.SPEED_TEST_DIAGNOSTIC_STREAMS != 0
+        ) {
+            isolatedClient.newBuilder()
+                .eventListenerFactory(UploadStreamDiagnostics.Factory())
+                .build()
+        } else {
+            isolatedClient
+        }
     }
 
     /**
