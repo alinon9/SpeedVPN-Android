@@ -624,6 +624,8 @@ class Socks5Server(
             }
             if (!eof && pipeError == null && exitReason == "eof") exitReason = "session_stopped"
             val direction = if (bucket === SpeedLimiter.download) "download" else "upload"
+            val clientSocketForLog = if (uploadDirectionForLog(bucket)) other else destination
+            val upstreamSocketForLog = if (uploadDirectionForLog(bucket)) destination else other
             val throughputBps = if (transferDurationNs > 0L) {
                 (forwardedBytes.toDouble() * 8_000_000_000.0 / transferDurationNs.toDouble()).toLong()
             } else {
@@ -637,6 +639,9 @@ class Socks5Server(
                     "maxReadBytes=$maxReadBytes sourceReadMs=${TimeUnit.NANOSECONDS.toMillis(sourceReadNs)} " +
                     "limiterCallMs=${TimeUnit.NANOSECONDS.toMillis(limiterCallNs)} " +
                     "destinationWriteMs=${TimeUnit.NANOSECONDS.toMillis(destinationWriteNs)} " +
+                    "socksListenPort=$port socksLocalPort=${clientSocketForLog.localPort} " +
+                    "socksPeerPort=${clientSocketForLog.port} upstreamLocalPort=${upstreamSocketForLog.localPort} " +
+                    "upstreamRemotePort=${upstreamSocketForLog.port} " +
                     "eof=$eof exitReason=$exitReason errorKind=$errorKind " +
                     "error=${pipeError?.let(::classifyPipeErrorForLog) ?: "none"}"
             )
