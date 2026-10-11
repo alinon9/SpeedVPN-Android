@@ -1,10 +1,21 @@
 package com.speedvpn.app
 
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
 
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [34])
 class SpeedLimiterConversionTest {
+    @After
+    fun resetLimiter() {
+        SpeedLimiter.endVerification(null, null)
+    }
+
     @Test
     fun relayReadSizeFollowsBoundedPacingWindow() {
         val bucket = TokenBucket()
