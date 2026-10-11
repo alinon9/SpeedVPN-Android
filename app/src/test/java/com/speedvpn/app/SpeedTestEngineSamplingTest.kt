@@ -9,6 +9,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import okhttp3.MediaType.Companion.toMediaType
 
 class SpeedTestEngineSamplingTest {
     @Test
@@ -302,6 +303,24 @@ class SpeedTestEngineSamplingTest {
         baselineClient.connectionPool.evictAll()
         vpnClient.connectionPool.evictAll()
         sharedClient.connectionPool.evictAll()
+    }
+
+    @Test
+    fun everyMeasurementRequestClosesItsTcpConnectionToAvoidReusingHalfClosedSocksRelays() {
+        val download = SpeedTestEngine.buildDownloadRequest(1_000_000L)
+        val upload = SpeedTestEngine.buildUploadRequest(
+            1_000_000L,
+            object : okhttp3.RequestBody() {
+                override fun contentType() = "application/octet-stream".toMediaType()
+                override fun contentLength() = 1_000_000L
+                override fun writeTo(sink: okio.BufferedSink) {
+                    sink.write(ByteArray(1_000_000))
+                }
+            },
+        )
+
+        assertEquals("close", download.header("Connection"))
+        assertEquals("close", upload.header("Connection"))
     }
 
 }
