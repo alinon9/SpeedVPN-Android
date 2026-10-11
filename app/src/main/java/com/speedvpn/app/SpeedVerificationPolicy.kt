@@ -24,7 +24,7 @@ object SpeedVerificationPolicy {
     const val BASELINE_HEADROOM_MULTIPLIER = 1.20
 
     fun evaluate(planKbps: Long?, baselineBps: Long?, vpnBps: Long?): SpeedMetricVerification {
-        if (planKbps == null) {
+        if (planKbps == null || planKbps <= 0L) {
             if (baselineBps == null || vpnBps == null || baselineBps <= 0L || vpnBps < 0L) {
                 return SpeedMetricVerification(
                     null, baselineBps, vpnBps, SpeedVerificationStatus.NOT_VERIFIABLE, null,
