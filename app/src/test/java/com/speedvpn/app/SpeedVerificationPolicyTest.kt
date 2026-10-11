@@ -100,6 +100,33 @@ class SpeedVerificationPolicyTest {
     }
 
     @Test
+    fun failedVpnMeasurementsPreserveSuccessfulPhysicalBaselineByDirection() {
+        val baseline = SpeedTestResult(
+            downloadBps = 101_860_000L,
+            uploadBps = 63_210_000L,
+            durationMs = 4_000L,
+            error = null,
+        )
+
+        val result = SpeedVerificationEngine.unavailable(
+            started = 1L,
+            note = "VPN measurement failed",
+            planDownloadKbps = 32_000L,
+            planUploadKbps = 32_000L,
+            baseline = baseline,
+        )
+
+        assertEquals(101_860_000L, result.download.baselineBps)
+        assertEquals(63_210_000L, result.upload.baselineBps)
+        assertEquals(null, result.download.vpnBps)
+        assertEquals(null, result.upload.vpnBps)
+        assertEquals(SpeedVerificationStatus.NOT_VERIFIABLE, result.download.status)
+        assertEquals(SpeedVerificationStatus.NOT_VERIFIABLE, result.upload.status)
+        assertEquals(32_000L, result.download.planKbps)
+        assertEquals(32_000L, result.upload.planKbps)
+    }
+
+    @Test
     fun failedVpnRestorationInvalidatesBothMetricVerdicts() {
         val matched = SpeedMetricVerification(
             planKbps = 1_000L,
