@@ -63,10 +63,9 @@ object SpeedTestEngine {
     private const val MIN_CAPPED_RANGE_SAMPLES = 3
     private const val BASELINE_STABLE_DURATION_MS = 250L
     internal const val FINITE_SAMPLE_TARGET_DURATION_MS = 1_500L
-    // Verification uses longer payloads so connection and HTTP startup overhead do
-    // not dominate a strict whole-window rate check. Public speed-test behavior stays
-    // on the shorter adaptive sample target above.
-    internal const val FINITE_VERIFICATION_SAMPLE_TARGET_DURATION_MS = 3_000L
+    // Diagnostic A/B only: restore the previously passing 1.5-second verification
+    // payload duration while keeping current relay, timeout, parallelism, and policy unchanged.
+    internal const val FINITE_VERIFICATION_SAMPLE_TARGET_DURATION_MS = 1_500L
     private const val MIN_FINITE_SAMPLE_BYTES = 256_000L
     private const val MAX_FINITE_SAMPLE_BYTES = 20_000_000L
     // Keep below the local fixture's 25 MB request ceiling and the public endpoint's
