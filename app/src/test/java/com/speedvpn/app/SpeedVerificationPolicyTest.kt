@@ -75,6 +75,31 @@ class SpeedVerificationPolicyTest {
     }
 
     @Test
+    fun zeroSentinelUsesUnlimitedBaselineComparison() {
+        val nullPlan = SpeedVerificationPolicy.evaluate(
+            planKbps = null,
+            baselineBps = 10_000_000L,
+            vpnBps = 9_200_000L,
+        )
+        val zeroPlan = SpeedVerificationPolicy.evaluate(
+            planKbps = 0L,
+            baselineBps = 10_000_000L,
+            vpnBps = 9_200_000L,
+        )
+
+        assertEquals(SpeedVerificationStatus.UNLIMITED_OK, zeroPlan.status)
+        assertEquals(nullPlan.status, zeroPlan.status)
+        assertEquals(nullPlan.accuracyPercent!!, zeroPlan.accuracyPercent!!, 0.001)
+
+        val belowRetentionFloor = SpeedVerificationPolicy.evaluate(
+            planKbps = 0L,
+            baselineBps = 10_000_000L,
+            vpnBps = 7_900_000L,
+        )
+        assertEquals(SpeedVerificationStatus.MISMATCH, belowRetentionFloor.status)
+    }
+
+    @Test
     fun failedVpnRestorationInvalidatesBothMetricVerdicts() {
         val matched = SpeedMetricVerification(
             planKbps = 1_000L,
