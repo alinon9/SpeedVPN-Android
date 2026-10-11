@@ -660,7 +660,7 @@ class Socks5Server(
                     if (preserveReverse) {
                         log(
                             "SOCKS upload half-close failed; preserving reverse response flowId=$flowId " +
-                                "error=${halfCloseError.javaClass.simpleName}:${halfCloseError.message ?: \"no message\"}",
+                                "error=${halfCloseError.javaClass.simpleName}:${halfCloseError.message ?: "no message"}",
                         )
                     } else {
                         closeBoth()
