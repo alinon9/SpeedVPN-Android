@@ -151,24 +151,30 @@ class SpeedTestRequestHandler(BaseHTTPRequestHandler):
         close_reason = "unexpected_eof"
         exception_type = "none"
         response_started = False
+        response_sent = False
+        status = "not_sent"
         try:
             remaining = content_length
             while remaining:
                 chunk = self.rfile.read(min(CHUNK_BYTES, remaining))
                 if not chunk:
                     close_reason = "peer_closed_before_body_complete"
+                    status = "400"
                     response_started = True
                     self._send_body(400, b"upload body ended before Content-Length")
+                    response_sent = True
                     self.close_connection = True
                     return
                 remaining -= len(chunk)
                 received += len(chunk)
 
+            status = "200"
             response_started = True
             self.send_response(200)
             self.send_header("Content-Length", "0")
             self.send_header("Cache-Control", "no-cache, no-store")
             self.end_headers()
+            response_sent = True
             completed = True
             close_reason = "normal"
         except (BrokenPipeError, ConnectionResetError) as error:
@@ -192,8 +198,8 @@ class SpeedTestRequestHandler(BaseHTTPRequestHandler):
                 f"UPLOAD_DIAG method=POST path=/__up serverPort={self.server.server_port} "
                 f"peerPort={self.client_address[1]} requestedBytes={size} contentLength={content_length} "
                 f"receivedBytes={received} bodyComplete={str(received == content_length).lower()} "
-                f"responseStarted={str(response_started).lower()} responseSent={str(completed).lower()} "
-                f"elapsedMs={elapsed_ms:.3f} closeReason={close_reason} exceptionType={exception_type} "
+                f"responseStarted={str(response_started).lower()} responseSent={str(response_sent).lower()} "
+                f"httpStatus={status} elapsedMs={elapsed_ms:.3f} closeReason={close_reason} exceptionType={exception_type} "
                 f"socketClosed={self.connection.fileno() < 0} socketReceiveBufferBytes={self.socket_receive_buffer_bytes}"
             )
     def log_message(self, format_string: str, *args: object) -> None:
