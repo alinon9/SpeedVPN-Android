@@ -62,13 +62,17 @@ def _read_macro(lines: list[str], name: str) -> str:
 def check_lwip_options_content(content: str) -> dict[str, str]:
     lines = content.splitlines(keepends=True)
     expected = {
-        "TCP_MSS": "8191",
-        "TCP_WND": "(16 * TCP_MSS)",
-        "TCP_SND_BUF": "(32 * TCP_MSS)",
+        # Runtime TUN MTU starts at 1280 bytes and IPv6 is enabled by default.
+        # 1280 - 40-byte IPv6 header - 20-byte TCP header = 1220-byte safe MSS.
+        "TCP_MSS": "1220",
+        # Keep >300 KiB in flight so the native stack's TCP window does not cap
+        # the high presets before the app-level token bucket can be evaluated.
+        "TCP_WND": "(256 * TCP_MSS)",
+        "TCP_SND_BUF": "(256 * TCP_MSS)",
         "TCP_SNDLOWAT": "(4 * TCP_MSS)",
-        "PBUF_POOL_SIZE": "128",
+        "PBUF_POOL_SIZE": "512",
         "LWIP_WND_SCALE": "1",
-        "TCP_RCV_SCALE": "1",
+        "TCP_RCV_SCALE": "3",
     }
     actual = {name: _read_macro(lines, name) for name in expected}
     mismatches = [
@@ -84,9 +88,21 @@ def check_lwip_options_content(content: str) -> dict[str, str]:
 def patch_lwip_options_content(content: str) -> tuple[str, bool]:
     lines = content.splitlines(keepends=True)
     changed = False
-    changed |= _set_macro(lines, "TCP_MSS", {"8191"}, "8191")
-    changed |= _set_macro(lines, "TCP_WND", {"(8 * TCP_MSS)", "(16 * TCP_MSS)"}, "(16 * TCP_MSS)")
-    changed |= _set_macro(lines, "TCP_SND_BUF", {"(8 * TCP_MSS)", "(16 * TCP_MSS)", "(32 * TCP_MSS)"}, "(32 * TCP_MSS)")
+    # Runtime supports MTU 1280..1500 and IPv6 by default. Use a conservative
+    # IPv6-safe MSS for the minimum MTU instead of the old 8191-byte pseudo-MSS.
+    changed |= _set_macro(lines, "TCP_MSS", {"8191", "1220"}, "1220")
+    # The old 16-MSS receive window and window-scale shift allowed too little
+    # bandwidth-delay product for sustained high-rate transfers.
+    changed |= _set_macro(
+        lines, "TCP_WND",
+        {"(8 * TCP_MSS)", "(16 * TCP_MSS)", "(256 * TCP_MSS)"},
+        "(256 * TCP_MSS)",
+    )
+    changed |= _set_macro(
+        lines, "TCP_SND_BUF",
+        {"(8 * TCP_MSS)", "(16 * TCP_MSS)", "(32 * TCP_MSS)", "(256 * TCP_MSS)"},
+        "(256 * TCP_MSS)",
+    )
     sndlowat_indexes = _macro_lines(lines, "TCP_SNDLOWAT")
     if not sndlowat_indexes:
         anchor_indexes = _macro_lines(lines, "TCP_SND_BUF")
@@ -98,7 +114,7 @@ def patch_lwip_options_content(content: str) -> tuple[str, bool]:
         changed = True
     else:
         changed |= _set_macro(lines, "TCP_SNDLOWAT", {"(4 * TCP_MSS)"}, "(4 * TCP_MSS)")
-    changed |= _set_macro(lines, "PBUF_POOL_SIZE", {"32", "128"}, "128")
+    changed |= _set_macro(lines, "PBUF_POOL_SIZE", {"32", "128", "256", "512"}, "512")
 
     # lwIP's generic defaults disable scaling when these macros are absent.
     # Define them in the port config before TCP_WND so receive-window scaling
@@ -114,7 +130,12 @@ def patch_lwip_options_content(content: str) -> tuple[str, bool]:
             lines.insert(index, f"#define {name:<29} 1{newline}")
             changed = True
         else:
-            changed |= _set_macro(lines, name, {"0", "1"}, "1")
+            if name == "LWIP_WND_SCALE":
+                changed |= _set_macro(lines, name, {"0", "1"}, "1")
+            else:
+                # TCP_WND=312,320 needs a 3-bit receive-window scale:
+                # 312,320 >> 3 = 39,040, which fits the 16-bit TCP header field.
+                changed |= _set_macro(lines, name, {"0", "1", "2", "3"}, "3")
 
     output = "".join(lines)
     check_lwip_options_content(output)
@@ -150,7 +171,7 @@ def main() -> int:
                 "TCP_MSS", "TCP_WND", "TCP_SND_BUF", "PBUF_POOL_SIZE",
                 "LWIP_WND_SCALE", "TCP_RCV_SCALE",
             ))
-            + f" tcp-buffer-size=262112 changed={str(changed).lower()} sha256={digest}"
+            + f" tcp-buffer-size=312320 changed={str(changed).lower()} sha256={digest}"
         )
         return 0
     except (OSError, PatchError) as error:

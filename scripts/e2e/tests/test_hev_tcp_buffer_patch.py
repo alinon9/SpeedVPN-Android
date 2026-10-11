@@ -20,13 +20,26 @@ class HevTcpBufferPatchTests(unittest.TestCase):
         patched, changed = patch_lwip_options_content(BASELINE)
         self.assertTrue(changed)
         values = check_lwip_options_content(patched)
-        self.assertEqual("8191", values["TCP_MSS"])
-        self.assertEqual("(16 * TCP_MSS)", values["TCP_WND"])
-        self.assertEqual("(32 * TCP_MSS)", values["TCP_SND_BUF"])
+        self.assertEqual("1220", values["TCP_MSS"])
+        self.assertEqual("(256 * TCP_MSS)", values["TCP_WND"])
+        self.assertEqual("(256 * TCP_MSS)", values["TCP_SND_BUF"])
         self.assertEqual("(4 * TCP_MSS)", values["TCP_SNDLOWAT"])
-        self.assertEqual("128", values["PBUF_POOL_SIZE"])
+        self.assertEqual("512", values["PBUF_POOL_SIZE"])
         self.assertEqual("1", values["LWIP_WND_SCALE"])
-        self.assertEqual("1", values["TCP_RCV_SCALE"])
+        self.assertEqual("3", values["TCP_RCV_SCALE"])
+
+    def test_native_tcp_profile_fits_minimum_ipv6_tun_mtu_and_high_rate_window(self) -> None:
+        patched, _ = patch_lwip_options_content(BASELINE)
+        values = check_lwip_options_content(patched)
+
+        # VpnSettings allows MTU >= 1280 and IPv6 is enabled by default.
+        self.assertLessEqual(int(values["TCP_MSS"]), 1280 - 40 - 20)
+        self.assertEqual(256 * int(values["TCP_MSS"]), 312_320)
+        self.assertEqual("(256 * TCP_MSS)", values["TCP_WND"])
+        self.assertEqual("(256 * TCP_MSS)", values["TCP_SND_BUF"])
+        # lwIP advertises TCP_WND >> TCP_RCV_SCALE in the 16-bit field.
+        self.assertLessEqual((256 * int(values["TCP_MSS"])) >> int(values["TCP_RCV_SCALE"]), 65_535)
+        self.assertGreaterEqual(int(values["PBUF_POOL_SIZE"]), 256)
 
     def test_patch_is_idempotent(self) -> None:
         patched, first_changed = patch_lwip_options_content(BASELINE)
