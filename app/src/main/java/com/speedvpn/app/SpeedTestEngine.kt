@@ -720,7 +720,7 @@ object SpeedTestEngine {
         return bitsPerSecond(sizeBytes, elapsed)
     }
 
-    private fun buildDownloadRequest(sizeBytes: Long): Request =
+    internal fun buildDownloadRequest(sizeBytes: Long): Request =
         Request.Builder()
             .url(
                 DOWNLOAD_URL +
@@ -733,9 +733,10 @@ object SpeedTestEngine {
             .header("User-Agent", "SpeedVPN/1.0 Android")
             .header("Referer", REFERER)
             .header("Accept", "*/*")
+            .header("Connection", "close")
             .build()
 
-    private fun buildUploadRequest(
+    internal fun buildUploadRequest(
         sizeBytes: Long,
         body: RequestBody,
     ): Request =
@@ -750,6 +751,7 @@ object SpeedTestEngine {
             .header("User-Agent", "SpeedVPN/1.0 Android")
             .header("Referer", REFERER)
             .header("Accept", "*/*")
+            .header("Connection", "close")
             .post(body)
             .build()
 
