@@ -149,4 +149,45 @@ class SpeedVerificationPolicyTest {
         assertEquals(SpeedVerificationStatus.NOT_VERIFIABLE, invalidated.download.status)
         assertEquals(SpeedVerificationStatus.NOT_VERIFIABLE, invalidated.upload.status)
     }
+
+    @Test
+    fun eightyMbpsPlanAcceptsExact64MbpsLowerBoundary() {
+        val result = SpeedVerificationPolicy.evaluate(
+            planKbps = 80_000L,
+            baselineBps = 100_000_000L,
+            vpnBps = 64_000_000L,
+        )
+        assertEquals(SpeedVerificationStatus.MATCH, result.status)
+    }
+
+    @Test
+    fun eightyMbpsPlanRejectsRateImmediatelyBelow64Mbps() {
+        val result = SpeedVerificationPolicy.evaluate(
+            planKbps = 80_000L,
+            baselineBps = 100_000_000L,
+            vpnBps = 63_999_999L,
+        )
+        assertEquals(SpeedVerificationStatus.MISMATCH, result.status)
+    }
+
+    @Test
+    fun missingVpnMeasurementCannotPass80MbpsPlan() {
+        val result = SpeedVerificationPolicy.evaluate(
+            planKbps = 80_000L,
+            baselineBps = 120_000_000L,
+            vpnBps = null,
+        )
+        assertEquals(SpeedVerificationStatus.NOT_VERIFIABLE, result.status)
+    }
+
+    @Test
+    fun uploadBaselineBelow96MbpsRemainsNotVerifiableFor80MbpsPlan() {
+        val result = SpeedVerificationPolicy.evaluate(
+            planKbps = 80_000L,
+            baselineBps = 95_999_999L,
+            vpnBps = 80_000_000L,
+        )
+        assertEquals(SpeedVerificationStatus.NOT_VERIFIABLE, result.status)
+    }
+
 }
