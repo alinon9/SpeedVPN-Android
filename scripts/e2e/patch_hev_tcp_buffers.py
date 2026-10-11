@@ -68,8 +68,8 @@ def check_lwip_options_content(content: str) -> dict[str, str]:
         # Keep >300 KiB in flight so the native stack's TCP window does not cap
         # the high presets before the app-level token bucket can be evaluated.
         "TCP_WND": "(256 * TCP_MSS)",
-        "TCP_SND_BUF": "(256 * TCP_MSS)",
-        "TCP_SND_QUEUELEN": "((4 * (TCP_SND_BUF) + (TCP_MSS - 1))/(TCP_MSS))",
+        "TCP_SND_BUF": "65535",
+        "TCP_SND_QUEUELEN": "(4 * (((TCP_SND_BUF) + (TCP_MSS - 1)) / (TCP_MSS)))",
         "TCP_SNDLOWAT": "(4 * TCP_MSS)",
         "PBUF_POOL_SIZE": "512",
         "LWIP_WND_SCALE": "1",
@@ -99,16 +99,17 @@ def patch_lwip_options_content(content: str) -> tuple[str, bool]:
         {"(8 * TCP_MSS)", "(16 * TCP_MSS)", "(256 * TCP_MSS)"},
         "(256 * TCP_MSS)",
     )
+    # lwIP stores each PCB's send-buffer budget in a u16_t. Values larger
+    # than 65,535 overflow the native field and can cause tcp_write() failures.
     changed |= _set_macro(
         lines, "TCP_SND_BUF",
-        {"(8 * TCP_MSS)", "(16 * TCP_MSS)", "(32 * TCP_MSS)", "(256 * TCP_MSS)"},
-        "(256 * TCP_MSS)",
+        {"(8 * TCP_MSS)", "(16 * TCP_MSS)", "(32 * TCP_MSS)", "(256 * TCP_MSS)", "65535"},
+        "65535",
     )
-    # Keep queued segments proportional to the send buffer. The vendor formula
-    # multiplies SND_BUF by 128; at 256 MSS that requests 32768 segments, exceeding
-    # the pinned lwIP pool of 8192.
+    # Bound queued segment slots to four segments per rounded-up MSS slice.
+    # The previous queue-length formula could request far more pbufs than needed.
     snd_queue_indexes = _macro_lines(lines, "TCP_SND_QUEUELEN")
-    queue_value = "((4 * (TCP_SND_BUF) + (TCP_MSS - 1))/(TCP_MSS))"
+    queue_value = "(4 * (((TCP_SND_BUF) + (TCP_MSS - 1)) / (TCP_MSS)))"
     if not snd_queue_indexes:
         anchor_indexes = _macro_lines(lines, "TCP_SND_BUF")
         if len(anchor_indexes) != 1:
@@ -123,6 +124,7 @@ def patch_lwip_options_content(content: str) -> tuple[str, bool]:
             "TCP_SND_QUEUELEN",
             {
                 "((128 * (TCP_SND_BUF) + (TCP_MSS - 1))/(TCP_MSS))",
+                "((4 * (TCP_SND_BUF) + (TCP_MSS - 1))/(TCP_MSS))",
                 queue_value,
             },
             queue_value,
@@ -167,9 +169,135 @@ def patch_lwip_options_content(content: str) -> tuple[str, bool]:
     return output, changed
 
 
+
+# The pinned HEV splice must preserve ring-buffer bytes when lwIP applies
+# backpressure. The upstream code advanced the ring buffer by every iovec length
+# even when tcp_write() returned ERR_MEM, silently dropping unaccepted data.
+TCP_SPLICE_B_PATCHED = """static int
+tcp_splice_b (HevSocks5SessionTCP *self)
+{
+    struct iovec iov[2];
+    err_t err = ERR_OK;
+    int res = 1, iovc;
+
+    iovc = hev_ring_buffer_writing (self->buffer, iov);
+    if (iovc) {
+        ssize_t s = readv (HEV_SOCKS5 (self)->fd, iov, iovc);
+        if (0 >= s) {
+            if ((0 > s) && (EAGAIN == errno))
+                res = 0;
+            else
+                res = -1;
+        } else {
+            hev_ring_buffer_write_finish (self->buffer, s);
+        }
+    } else {
+        res = 0;
+    }
+
+    hev_task_mutex_lock (self->mutex);
+    if (self->pcb) {
+        iovc = hev_ring_buffer_reading (self->buffer, iov);
+        if (iovc) {
+            size_t queued = 0;
+            int i;
+            for (i = 0; i < iovc; i++) {
+                void *ptr = iov[i].iov_base;
+                size_t len = iov[i].iov_len;
+                u16_t available = tcp_sndbuf (self->pcb);
+                err_t write_err;
+
+                if (!available)
+                    break;
+                if (len > (size_t)available)
+                    len = (size_t)available;
+
+                write_err = tcp_write (self->pcb, ptr, (u16_t)len, 0);
+                if (write_err == ERR_MEM)
+                    break;
+                if (write_err != ERR_OK) {
+                    err = write_err;
+                    break;
+                }
+
+                queued += len;
+                if (len < iov[i].iov_len)
+                    break;
+            }
+
+            if (queued) {
+                err_t output_err;
+                hev_ring_buffer_read_finish (self->buffer, queued);
+                output_err = tcp_output (self->pcb);
+                if (err != ERR_OK) {
+                    res = -1;
+                } else if (output_err == ERR_MEM) {
+                    /* Keep the flow alive and retry after lwIP releases memory. */
+                    res = 0;
+                } else if (output_err != ERR_OK) {
+                    err = output_err;
+                    res = -1;
+                } else {
+                    res = 1;
+                }
+            } else if (err != ERR_OK) {
+                res = -1;
+            } else {
+                /* No accepted bytes: keep all remaining ring-buffer data. */
+                res = 0;
+            }
+        } else if (res < 0) {
+            tcp_shutdown (self->pcb, 0, 1);
+        }
+    }
+    hev_task_mutex_unlock (self->mutex);
+    if (!self->pcb || (err != ERR_OK))
+        res = -1;
+
+    return res;
+}
+"""
+
+
+def _tcp_splice_b_bounds(content: str) -> tuple[int, int]:
+    start_marker = "static int\\ntcp_splice_b (HevSocks5SessionTCP *self)\\n{"
+    end_marker = "\\nstatic err_t\\ntcp_recv_handler"
+    start = content.find(start_marker)
+    if start < 0:
+        raise PatchError("pinned HEV TCP session source has no tcp_splice_b() anchor")
+    end = content.find(end_marker, start)
+    if end < 0:
+        raise PatchError("pinned HEV TCP session source has no tcp_recv_handler() anchor")
+    return start, end
+
+
+def patch_tcp_session_content(content: str) -> tuple[str, bool]:
+    start, end = _tcp_splice_b_bounds(content)
+    current = content[start:end]
+    if current == TCP_SPLICE_B_PATCHED:
+        return content, False
+    # Fail closed if the pinned native code has drifted from the reviewed baseline.
+    if "err |= tcp_write (self->pcb, ptr, len, 0);" not in current or \\
+            "hev_ring_buffer_read_finish (self->buffer, s);" not in current:
+        raise PatchError("pinned HEV tcp_splice_b() differs from the reviewed patch baseline")
+    patched = content[:start] + TCP_SPLICE_B_PATCHED + content[end:]
+    return patched, True
+
+
+def check_tcp_session_content(content: str) -> None:
+    start, end = _tcp_splice_b_bounds(content)
+    if content[start:end] != TCP_SPLICE_B_PATCHED:
+        raise PatchError("native TCP splice backpressure fix is not applied")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("path", type=Path, help="path to the pinned HEV/LwIP lwipopts.h")
+    parser.add_argument(
+        "--tcp-source",
+        type=Path,
+        help="path to src/hev-socks5-session-tcp.c (otherwise auto-detected for the pinned checkout)",
+    )
     parser.add_argument(
         "--check",
         action="store_true",
@@ -180,23 +308,59 @@ def main() -> int:
     try:
         if not args.path.is_file():
             raise PatchError(f"native options file does not exist: {args.path}")
+        native_source = args.tcp_source
+        if native_source is None:
+            resolved_path = args.path.resolve()
+            if len(resolved_path.parents) > 5 and resolved_path.parents[5].name == "hev-socks5-tunnel":
+                native_source = resolved_path.parents[5] / "src" / "hev-socks5-session-tcp.c"
+
         original = args.path.read_text(encoding="utf-8")
+        original_tcp = None
+        if native_source is not None:
+            if not native_source.is_file():
+                raise PatchError(f"native TCP session source does not exist: {native_source}")
+            original_tcp = native_source.read_text(encoding="utf-8")
+
         if args.check:
             values = check_lwip_options_content(original)
+            if original_tcp is not None:
+                check_tcp_session_content(original_tcp)
             changed = False
+            tcp_changed = False
         else:
             patched, changed = patch_lwip_options_content(original)
+            patched_tcp = None
+            tcp_changed = False
+            if original_tcp is not None:
+                patched_tcp, tcp_changed = patch_tcp_session_content(original_tcp)
+
+            # Validate both transformations before writing either file.
+            check_lwip_options_content(patched)
+            if patched_tcp is not None:
+                check_tcp_session_content(patched_tcp)
+
             if changed:
                 args.path.write_text(patched, encoding="utf-8", newline="")
+            if tcp_changed and patched_tcp is not None and native_source is not None:
+                native_source.write_text(patched_tcp, encoding="utf-8", newline="")
+
             values = check_lwip_options_content(args.path.read_text(encoding="utf-8"))
+            if native_source is not None:
+                check_tcp_session_content(native_source.read_text(encoding="utf-8"))
+
         digest = hashlib.sha256(args.path.read_bytes()).hexdigest()
+        native_digest = (
+            hashlib.sha256(native_source.read_bytes()).hexdigest()
+            if native_source is not None else "not-detected"
+        )
         print(
             "HEV_TCP_CONFIG "
             + " ".join(f"{name}={values[name]}" for name in (
-                "TCP_MSS", "TCP_WND", "TCP_SND_BUF", "PBUF_POOL_SIZE",
-                "LWIP_WND_SCALE", "TCP_RCV_SCALE",
+                "TCP_MSS", "TCP_WND", "TCP_SND_BUF", "TCP_SND_QUEUELEN",
+                "PBUF_POOL_SIZE", "LWIP_WND_SCALE", "TCP_RCV_SCALE",
             ))
-            + f" tcp-buffer-size=312320 changed={str(changed).lower()} sha256={digest}"
+            + f" tcp-buffer-size=65535 splice-backpressure-patch={'verified' if native_source is not None else 'not-detected'} "
+            + f"changed={str(changed or tcp_changed).lower()} sha256={digest} native_sha256={native_digest}"
         )
         return 0
     except (OSError, PatchError) as error:
