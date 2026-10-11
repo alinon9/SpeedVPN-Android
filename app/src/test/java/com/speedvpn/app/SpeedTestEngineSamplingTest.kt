@@ -135,7 +135,7 @@ class SpeedTestEngineSamplingTest {
         assertEquals(80L, SpeedTestEngine.expectedKbpsPerStream(80L, 1))
         assertEquals(null, SpeedTestEngine.expectedKbpsPerStream(null, 6))
         assertEquals(
-            5_272L,
+            SpeedTestEngine.MIN_VERIFICATION_CALL_TIMEOUT_MS,
             SpeedTestEngine.measurementCallTimeoutMs(
                 4_000_000L,
                 SpeedTestEngine.expectedKbpsPerStream(88_000L, 6),
