@@ -21,9 +21,10 @@ data class SpeedMetricVerification(
 
 object SpeedVerificationPolicy {
     const val TOLERANCE = 0.20
+    const val BASELINE_HEADROOM_MULTIPLIER = 1.20
 
     fun evaluate(planKbps: Long?, baselineBps: Long?, vpnBps: Long?): SpeedMetricVerification {
-        if (planKbps == null) {
+        if (planKbps == null || planKbps <= 0L) {
             if (baselineBps == null || vpnBps == null || baselineBps <= 0L || vpnBps < 0L) {
                 return SpeedMetricVerification(
                     null, baselineBps, vpnBps, SpeedVerificationStatus.NOT_VERIFIABLE, null,
@@ -54,10 +55,10 @@ object SpeedVerificationPolicy {
             )
         }
 
-        if (baselineBps < targetBps) {
+        if (baselineBps.toDouble() < targetBps.toDouble() * BASELINE_HEADROOM_MULTIPLIER) {
             return SpeedMetricVerification(
                 planKbps, baselineBps, vpnBps, SpeedVerificationStatus.NOT_VERIFIABLE, null,
-                "سرعة الشبكة الأصلية أقل من الخطة؛ لا يمكن الحكم على التحديد.",
+                "سرعة الشبكة الأصلية يجب أن تبلغ 1.2 مرة من الخطة على الأقل.",
             )
         }
 

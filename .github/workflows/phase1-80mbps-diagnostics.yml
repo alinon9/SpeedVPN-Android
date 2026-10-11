@@ -1,0 +1,194 @@
+name: SpeedVPN Phase 1 — 80 Mbps Root-Cause Diagnostics
+
+on:
+  push:
+    branches: [fix/phase1-80mbps-root-cause-v2]
+  pull_request:
+    branches: [main]
+    paths:
+      - 'app/build.gradle.kts'
+      - 'app/src/main/java/com/speedvpn/app/SpeedTestEngine.kt'
+      - 'app/src/main/java/com/speedvpn/app/UploadStreamDiagnostics.kt'
+      - 'app/src/main/java/com/speedvpn/app/Socks5Server.kt'
+      - 'app/src/main/java/com/speedvpn/app/SpeedVerificationPolicy.kt'
+      - 'app/src/main/java/com/speedvpn/app/SpeedLimiter.kt'
+      - 'app/src/test/java/com/speedvpn/app/SpeedLimiterConversionTest.kt'
+      - 'app/src/test/java/com/speedvpn/app/SpeedVerificationPolicyTest.kt'
+      - 'scripts/e2e/speed-limit-sweep.sh'
+      - 'scripts/e2e/local_speed_test_server.py'
+      - 'scripts/e2e/tests/test_local_speed_test_server.py'
+      - '.github/workflows/phase1-80mbps-diagnostics.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: phase1-80mbps-diagnostics-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  diagnostic-capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout diagnostic branch
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools platforms;android-36 build-tools;36.0.0 ndk;30.0.16248370'
+
+      - name: Prepare native tunnel
+        run: |
+          set -euo pipefail
+          echo 'ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/30.0.16248370' >> "$GITHUB_ENV"
+          echo 'ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/30.0.16248370' >> "$GITHUB_ENV"
+          bash ./setup.sh
+
+      - name: Run local fixture unit tests and Python syntax checks
+        run: |
+          set -euo pipefail
+          python3 -m py_compile scripts/e2e/local_speed_test_server.py
+          bash -n scripts/e2e/speed-limit-sweep.sh
+          python3 -m unittest discover -s scripts/e2e/tests -p 'test_local_speed_test_server.py' -v
+
+      - name: Build isolated direction and stream-count APKs
+        run: |
+          set -euo pipefail
+          ./gradlew :app:assembleDebug -PspeedTestBaseUrl=http://10.0.2.2:18765 -PspeedTestDiagnosticPhase=download -PspeedTestDiagnosticStreams=3 --rerun-tasks --stacktrace --no-daemon
+          cp app/build/outputs/apk/debug/app-debug.apk "$RUNNER_TEMP/phase1-download-3.apk"
+          ./gradlew :app:assembleDebug -PspeedTestBaseUrl=http://10.0.2.2:18765 -PspeedTestDiagnosticPhase=upload -PspeedTestDiagnosticStreams=3 --rerun-tasks --stacktrace --no-daemon
+          cp app/build/outputs/apk/debug/app-debug.apk "$RUNNER_TEMP/phase1-upload-3.apk"
+          ./gradlew :app:assembleDebug -PspeedTestBaseUrl=http://10.0.2.2:18765 -PspeedTestDiagnosticPhase=upload -PspeedTestDiagnosticStreams=1 --rerun-tasks --stacktrace --no-daemon
+          cp app/build/outputs/apk/debug/app-debug.apk "$RUNNER_TEMP/phase1-upload-1.apk"
+          {
+            echo "commit=$(git rev-parse HEAD)"
+            sha256sum "$RUNNER_TEMP/phase1-download-3.apk"
+            sha256sum "$RUNNER_TEMP/phase1-upload-3.apk"
+            sha256sum "$RUNNER_TEMP/phase1-upload-1.apk"
+          } | tee phase1-debug-apk-hashes.txt
+
+      - name: Configure fixture socket buffers and start local server
+        run: |
+          set -euo pipefail
+          sudo sysctl -w net.core.rmem_max=16777216
+          sudo sysctl -w net.core.wmem_max=16777216
+          sudo sysctl -w net.ipv4.tcp_rmem='4096 131072 16777216'
+          sudo sysctl -w net.ipv4.tcp_wmem='4096 131072 16777216'
+          nohup python3 -u scripts/e2e/local_speed_test_server.py --host 0.0.0.0 --port 18765 < /dev/null > speed-test-server.log 2>&1 &
+          echo "$!" > speed-test-server.pid
+          python3 - <<'PY'
+          import json, time
+          from urllib.request import urlopen
+          for attempt in range(60):
+              try:
+                  with urlopen("http://127.0.0.1:18765/healthz", timeout=1) as response:
+                      payload = json.loads(response.read())
+                      print("FIXTURE_HEALTH=" + json.dumps(payload, sort_keys=True))
+                      if response.status == 200 and payload.get("status") == "ok":
+                          break
+              except Exception as error:
+                  print(f"FIXTURE_WAIT attempt={attempt + 1} error={type(error).__name__}")
+              time.sleep(0.5)
+          else:
+              raise SystemExit("Local fixture did not become healthy")
+          PY
+
+      - name: Install Android Emulator
+        run: |
+          set -euo pipefail
+          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/platform-tools:$ANDROID_SDK_ROOT/emulator" >> "$GITHUB_PATH"
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" --install emulator 'system-images;android-29;google_apis;x86_64'
+          sudo apt-get update
+          sudo apt-get install -y cpu-checker
+          sudo kvm-ok
+          sudo chmod 666 /dev/kvm
+          emulator -accel-check
+
+      - name: Run 3 Download attempts, 3 parallel Upload attempts, and 1 single-stream Upload comparison
+        run: |
+          set -euo pipefail
+          export ANDROID_AVD_HOME="${RUNNER_TEMP}/android-avd"
+          mkdir -p "$ANDROID_AVD_HOME" phase1-80mbps-diagnostics
+          echo no | avdmanager create avd -n phase1-80mbps -k 'system-images;android-29;google_apis;x86_64' --force
+          adb kill-server >/dev/null 2>&1 || true
+          adb start-server
+          nohup emulator -avd phase1-80mbps -no-window -no-audio -no-boot-anim -no-snapshot -no-snapshot-save -no-metrics -gpu swiftshader_indirect -accel on -cores 4 -memory 4096 -partition-size 2048 -netdelay none -netspeed full -dns-server 8.8.8.8,1.1.1.1 > emulator-console.log 2>&1 &
+          EMULATOR_PID=$!
+          cleanup() {
+            adb -s emulator-5554 logcat -d -v threadtime > phase1-full-logcat.txt 2>&1 || true
+            adb -s emulator-5554 emu kill >/dev/null 2>&1 || true
+            kill "$EMULATOR_PID" >/dev/null 2>&1 || true
+            wait "$EMULATOR_PID" >/dev/null 2>&1 || true
+            if [ -f speed-test-server.pid ]; then kill "$(cat speed-test-server.pid)" >/dev/null 2>&1 || true; fi
+          }
+          trap cleanup EXIT
+          for i in $(seq 1 180); do
+            adb -s emulator-5554 get-state >/dev/null 2>&1 && break
+            kill -0 "$EMULATOR_PID" >/dev/null 2>&1 || { cat emulator-console.log; exit 1; }
+            sleep 1
+          done
+          adb -s emulator-5554 wait-for-device
+          for i in $(seq 1 180); do
+            adb -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' | grep -q '^1$' && break
+            kill -0 "$EMULATOR_PID" >/dev/null 2>&1 || { cat emulator-console.log; exit 1; }
+            sleep 1
+          done
+          adb -s emulator-5554 shell settings put global window_animation_scale 0
+          adb -s emulator-5554 shell settings put global transition_animation_scale 0
+          adb -s emulator-5554 shell settings put global animator_duration_scale 0
+
+          run_capture() {
+            local phase="$1"
+            local streams="$2"
+            local attempt="$3"
+            local apk="$RUNNER_TEMP/phase1-${phase}-${streams}.apk"
+            local name="${phase}-streams-${streams}-attempt-${attempt}"
+            local out="phase1-80mbps-diagnostics/$name"
+            mkdir -p "$out"
+            echo "===== DIAGNOSTIC $name =====" | tee -a "$GITHUB_STEP_SUMMARY"
+            adb -s emulator-5554 install -r "$apk"
+            adb -s emulator-5554 logcat -c || true
+            SPEEDVPN_DIAGNOSTIC_ONLY=1 \
+            SPEEDVPN_SKIP_BASELINE_PREFLIGHT=1 \
+            SPEEDVPN_TOTAL_PRESETS=1 \
+            SPEEDVPN_CASES_OVERRIDE='17|10 MB|80000' \
+            SPEEDVPN_RUN_DIR="$out" \
+              bash scripts/e2e/speed-limit-sweep.sh | tee "$out/driver-console.log"
+            adb -s emulator-5554 logcat -d -v threadtime > "$out/logcat-after-attempt.txt" 2>&1 || true
+          }
+
+          for attempt in 1 2 3; do run_capture download 3 "$attempt"; done
+          for attempt in 1 2 3; do run_capture upload 3 "$attempt"; done
+          run_capture upload 1 single-stream
+
+          cp speed-test-server.log phase1-80mbps-diagnostics/speed-test-server.log
+          cp emulator-console.log phase1-80mbps-diagnostics/emulator-console.log
+          cp phase1-full-logcat.txt phase1-80mbps-diagnostics/phase1-full-logcat.txt 2>/dev/null || true
+
+      - name: Upload phase 1 diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: speedvpn-phase1-80mbps-diagnostic-evidence
+          path: |
+            phase1-80mbps-diagnostics/**
+            phase1-debug-apk-hashes.txt
+            emulator-console.log
+            speed-test-server.log
+            phase1-full-logcat.txt
+            speed-limit-sweep-results.csv
+            speed-limit-sweep-summary.md
+          if-no-files-found: warn
+          compression-level: 6

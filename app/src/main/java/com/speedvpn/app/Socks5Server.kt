@@ -39,6 +39,40 @@ import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 
 /**
+ * Performs one blocking socket read for each relay iteration.
+ *
+ * Do not poll InputStream.available() to build a larger batch: the throughput
+ * sweep regressed after that optimization, while synthetic streams could not
+ * model real socket readiness. The bounded socket read already requests the
+ * maximum supported buffer and preserves natural TCP backpressure.
+ */
+internal data class RelayReadBatch(val bytesRead: Int, val readCalls: Int)
+
+/**
+ * An upstream peer may finish its HTTP request and close its receive half while
+ * the reverse response is still in flight. Preserve the reverse pipe only for
+ * that upload-write/half-close case, never for a dead VPN session or a download
+ * write failure.
+ */
+internal fun shouldPreserveReverseFlowAfterUploadHalfClose(
+    isUploadDirection: Boolean,
+    sessionActive: Boolean,
+    destinationWriteBrokenPipe: Boolean,
+    halfCloseFailed: Boolean,
+): Boolean =
+    isUploadDirection && sessionActive && (destinationWriteBrokenPipe || halfCloseFailed)
+
+internal fun readRelayBatch(
+    source: InputStream,
+    buffer: ByteArray,
+    maxBytes: Int,
+): RelayReadBatch {
+    require(maxBytes in 1..buffer.size) { "maxBytes must fit inside the relay buffer" }
+    val bytesRead = source.read(buffer, 0, maxBytes)
+    return RelayReadBatch(bytesRead, if (bytesRead < 0) 0 else 1)
+}
+
+/**
  * Local SOCKS5 relay used by the native tun2socks engine.
  *
  * Security: a fresh random username/password is generated per VPN session and
@@ -509,32 +543,176 @@ class Socks5Server(
         closeBoth: () -> Unit,
     ) {
         var eof = false
+        val flowSocket = if (bucket === SpeedLimiter.download) other else destination
+        val flowRemoteHost = flowSocket.inetAddress?.hostAddress ?: "unknown"
+        val flowId = "${flowSocket.localPort}->${flowRemoteHost}:${flowSocket.port}"
+        var pipeError: Throwable? = null
+        var exitReason = "eof"
+        val pipeStartedNs = System.nanoTime()
+        var firstForwardedNs = 0L
+        var lastForwardedNs = 0L
+        var forwardedBytes = 0L
+        var readCalls = 0L
+        var writeCalls = 0L
+        var maxReadBytes = 0
+        var sourceReadNs = 0L
+        var limiterCallNs = 0L
+        var destinationWriteNs = 0L
+        var destinationWriteInProgress = false
         try {
-            val buf = ByteArray(16 * 1024)
+            // Match relay read granularity to the current pacing bucket. A 16 KiB
+            // read requires hundreds of scheduler wakeups per second at high rates;
+            // larger reads reduce that overhead while staying inside the bucket's
+            // bounded burst window. The bucket can change while the pipe is active.
+            val buf = ByteArray(256 * 1024)
             while (running && SpeedLimiter.isGenerationActive(generation)) {
-                val n = src.read(buf)
+                destinationWriteInProgress = false
+                val readStartedNs = System.nanoTime()
+                val readSize = bucket.recommendedReadBytes().coerceAtMost(buf.size)
+                val batch = readRelayBatch(
+                    source = src,
+                    buffer = buf,
+                    maxBytes = readSize,
+                )
+                sourceReadNs += System.nanoTime() - readStartedNs
+                val n = batch.bytesRead
                 if (n < 0) {
                     eof = true
+                    exitReason = "eof"
                     break
                 }
-                if (!SpeedLimiter.acquire(bucket, n, generation)) break
-                if (!running || !SpeedLimiter.isGenerationActive(generation)) break
+                readCalls += batch.readCalls.toLong()
+                maxReadBytes = maxOf(maxReadBytes, n)
+                val limiterStartedNs = System.nanoTime()
+                val mayProceed = SpeedLimiter.acquire(bucket, n, generation)
+                limiterCallNs += System.nanoTime() - limiterStartedNs
+                if (!mayProceed) {
+                    exitReason = "limiter_or_session_inactive"
+                    break
+                }
+                if (!running || !SpeedLimiter.isGenerationActive(generation)) {
+                    exitReason = "session_stopped"
+                    break
+                }
+                val writeStartedNs = System.nanoTime()
+                destinationWriteInProgress = true
                 dst.write(buf, 0, n)
+                destinationWriteInProgress = false
+                writeCalls++
+                val writeFinishedNs = System.nanoTime()
+                destinationWriteNs += writeFinishedNs - writeStartedNs
+                if (firstForwardedNs == 0L) firstForwardedNs = writeStartedNs
+                lastForwardedNs = writeFinishedNs
                 bucket.recordForwarded(n, generation)
+                forwardedBytes += n.toLong()
             }
             runCatching { dst.flush() }
-        } catch (_: SocketException) {
-            // peer closed
-        } catch (_: Exception) {
-            // connection teardown
+        } catch (error: SocketException) {
+            pipeError = error
+            exitReason = "socket_error"
+            logPipeException(error, bucket, generation, flowId)
+        } catch (error: Exception) {
+            pipeError = error
+            exitReason = "relay_error"
+            logPipeException(error, bucket, generation, flowId)
         } finally {
+            val wallDurationNs = (System.nanoTime() - pipeStartedNs).coerceAtLeast(1L)
+            val transferDurationNs = if (firstForwardedNs > 0L) {
+                (lastForwardedNs - firstForwardedNs).coerceAtLeast(1L)
+            } else {
+                0L
+            }
+            if (!eof && pipeError == null && exitReason == "eof") exitReason = "session_stopped"
+            val direction = if (bucket === SpeedLimiter.download) "download" else "upload"
+            val clientSocketForLog = if (bucket === SpeedLimiter.upload) other else destination
+            val upstreamSocketForLog = if (bucket === SpeedLimiter.upload) destination else other
+            val throughputBps = if (transferDurationNs > 0L) {
+                (forwardedBytes.toDouble() * 8_000_000_000.0 / transferDurationNs.toDouble()).toLong()
+            } else {
+                0L
+            }
+            val errorKind = pipeError?.let { classifySocketError(it).name } ?: "NONE"
+            log(
+                "Relay pipe completion flowId=$flowId direction=$direction bytesForwarded=$forwardedBytes " +
+                    "rateBps=$throughputBps firstToLastMs=${TimeUnit.NANOSECONDS.toMillis(transferDurationNs)} " +
+                    "pipeWallMs=${TimeUnit.NANOSECONDS.toMillis(wallDurationNs)} readCalls=$readCalls writeCalls=$writeCalls " +
+                    "maxReadBytes=$maxReadBytes sourceReadMs=${TimeUnit.NANOSECONDS.toMillis(sourceReadNs)} " +
+                    "limiterCallMs=${TimeUnit.NANOSECONDS.toMillis(limiterCallNs)} " +
+                    "destinationWriteMs=${TimeUnit.NANOSECONDS.toMillis(destinationWriteNs)} " +
+                    "socksListenPort=$port socksLocalPort=${clientSocketForLog.localPort} " +
+                    "socksPeerPort=${clientSocketForLog.port} upstreamLocalPort=${upstreamSocketForLog.localPort} " +
+                    "upstreamRemotePort=${upstreamSocketForLog.port} " +
+                    "eof=$eof exitReason=$exitReason errorKind=$errorKind " +
+                    "error=${pipeError?.let(::classifyPipeErrorForLog) ?: "none"}"
+            )
+            val uploadDirection = bucket === SpeedLimiter.upload
+            val sessionActive = running && SpeedLimiter.isGenerationActive(generation)
+            val destinationWriteBrokenPipe =
+                uploadDirection &&
+                    destinationWriteInProgress &&
+                    pipeError is SocketException &&
+                    pipeError.message?.contains("broken pipe", ignoreCase = true) == true
+
             if (eof && running) {
-                runCatching { destination.shutdownOutput() }.onFailure { closeBoth() }
+                val halfCloseError = runCatching { destination.shutdownOutput() }.exceptionOrNull()
+                if (halfCloseError != null) {
+                    val preserveReverse = shouldPreserveReverseFlowAfterUploadHalfClose(
+                        isUploadDirection = uploadDirection,
+                        sessionActive = sessionActive,
+                        destinationWriteBrokenPipe = false,
+                        halfCloseFailed = true,
+                    )
+                    if (preserveReverse) {
+                        log(
+                            "SOCKS upload half-close failed; preserving reverse response flowId=$flowId " +
+                                "error=${halfCloseError.javaClass.simpleName}:${halfCloseError.message ?: "no message"}",
+                        )
+                    } else {
+                        closeBoth()
+                    }
+                }
+            } else if (
+                shouldPreserveReverseFlowAfterUploadHalfClose(
+                    isUploadDirection = uploadDirection,
+                    sessionActive = sessionActive,
+                    destinationWriteBrokenPipe = destinationWriteBrokenPipe,
+                    halfCloseFailed = false,
+                )
+            ) {
+                // A Broken pipe while forwarding the request does not prove the
+                // reverse HTTP response is unusable. Do not close the client socket
+                // here: drain the server's response on the sibling download pipe.
+                runCatching { destination.shutdownOutput() }
+                log(
+                    "SOCKS upload destination Broken pipe; preserving reverse response flowId=$flowId " +
+                        "bytesForwarded=$forwardedBytes",
+                )
             } else {
                 closeBoth()
             }
             if (remaining.decrementAndGet() == 0) closeBoth()
             done.countDown()
+        }
+    }
+
+    /**
+     * Ignore an error only when the pipe is already shutting down or when the
+     * exception type/message classifies it as an expected close. All active-session
+     * network events and unknown exceptions retain their stack traces in Logcat.
+     */
+    private fun classifyPipeErrorForLog(error: Throwable): String =
+        "${classifySocketError(error).name}:${error.javaClass.simpleName}:${error.message ?: "no message"}"
+
+    private fun logPipeException(error: Throwable, bucket: TokenBucket, generation: Long, flowId: String) {
+        if (!running || !SpeedLimiter.isGenerationActive(generation)) return
+        val direction = if (bucket === SpeedLimiter.download) "download" else "upload"
+        val detail = error.message ?: "no message"
+        when (classifySocketError(error)) {
+            SockErrKind.EXPECTED_CLOSE -> Unit
+            SockErrKind.NETWORK_EVENT ->
+                logE("SOCKS relay pipe network event flowId=$flowId direction=$direction error=${error.javaClass.simpleName}: $detail", error)
+            SockErrKind.UNKNOWN ->
+                logE("Unexpected SOCKS relay pipe failure flowId=$flowId direction=$direction error=${error.javaClass.simpleName}: $detail", error)
         }
     }
 

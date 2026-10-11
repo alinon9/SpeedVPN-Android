@@ -4,6 +4,32 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+val configuredSpeedTestBaseUrl = providers.gradleProperty("speedTestBaseUrl")
+    .orNull
+    ?.trim()
+    ?.trimEnd('/')
+    .orEmpty()
+val configuredDiagnosticPhase = providers.gradleProperty("speedTestDiagnosticPhase")
+    .orElse("both")
+    .get()
+    .trim()
+    .lowercase()
+val configuredDiagnosticStreams = providers.gradleProperty("speedTestDiagnosticStreams")
+    .orElse("0")
+    .get()
+    .toIntOrNull() ?: throw GradleException("speedTestDiagnosticStreams must be 0, 1, or 3")
+
+if (configuredSpeedTestBaseUrl.isNotEmpty() &&
+    configuredSpeedTestBaseUrl != "http://10.0.2.2:18765") {
+    throw GradleException("speedTestBaseUrl is restricted to the CI local fixture endpoint")
+}
+if (configuredDiagnosticPhase !in setOf("both", "download", "upload")) {
+    throw GradleException("speedTestDiagnosticPhase must be both, download, or upload")
+}
+if (configuredDiagnosticStreams !in setOf(0, 1, 3)) {
+    throw GradleException("speedTestDiagnosticStreams must be 0, 1, or 3")
+}
+
 android {
     namespace = "com.speedvpn.app"
     compileSdk = 36
@@ -51,7 +77,17 @@ android {
     }
 
     buildTypes {
+        debug {
+            // Only the CI Debug APK can target the runner-local deterministic fixture.
+            buildConfigField("String", "SPEED_TEST_BASE_URL", "\"$configuredSpeedTestBaseUrl\"")
+            buildConfigField("String", "SPEED_TEST_DIAGNOSTIC_PHASE", "\"$configuredDiagnosticPhase\"")
+            buildConfigField("int", "SPEED_TEST_DIAGNOSTIC_STREAMS", configuredDiagnosticStreams.toString())
+        }
         release {
+            // Release builds always keep the public production speed-test service.
+            buildConfigField("String", "SPEED_TEST_BASE_URL", "\"\"")
+            buildConfigField("String", "SPEED_TEST_DIAGNOSTIC_PHASE", "\"both\"")
+            buildConfigField("int", "SPEED_TEST_DIAGNOSTIC_STREAMS", "0")
             isMinifyEnabled = false
             // R8 stays disabled until a real release build verifies Compose + JNI
             // reflection/entry points. Release signing is injected only by CI env vars.
