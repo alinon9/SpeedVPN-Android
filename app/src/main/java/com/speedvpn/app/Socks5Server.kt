@@ -529,6 +529,11 @@ class Socks5Server(
         closeBoth: () -> Unit,
     ) {
         var eof = false
+        val flowSocket = if (bucket === SpeedLimiter.download) other else destination
+        val flowRemoteHost = flowSocket.inetAddress?.hostAddress ?: "unknown"
+        val flowId = "${flowSocket.localPort}->${flowRemoteHost}:${flowSocket.port}"
+        var pipeError: Throwable? = null
+        var exitReason = "eof"
         val pipeStartedNs = System.nanoTime()
         var firstForwardedNs = 0L
         var lastForwardedNs = 0L
@@ -557,6 +562,7 @@ class Socks5Server(
                 val n = batch.bytesRead
                 if (n < 0) {
                     eof = true
+                    exitReason = "eof"
                     break
                 }
                 readCalls += batch.readCalls.toLong()
@@ -564,8 +570,14 @@ class Socks5Server(
                 val limiterStartedNs = System.nanoTime()
                 val mayProceed = SpeedLimiter.acquire(bucket, n, generation)
                 limiterCallNs += System.nanoTime() - limiterStartedNs
-                if (!mayProceed) break
-                if (!running || !SpeedLimiter.isGenerationActive(generation)) break
+                if (!mayProceed) {
+                    exitReason = "limiter_or_session_inactive"
+                    break
+                }
+                if (!running || !SpeedLimiter.isGenerationActive(generation)) {
+                    exitReason = "session_stopped"
+                    break
+                }
                 val writeStartedNs = System.nanoTime()
                 dst.write(buf, 0, n)
                 writeCalls++
@@ -578,9 +590,13 @@ class Socks5Server(
             }
             runCatching { dst.flush() }
         } catch (error: SocketException) {
-            logPipeException(error, bucket, generation)
+            pipeError = error
+            exitReason = "socket_error"
+            logPipeException(error, bucket, generation, flowId)
         } catch (error: Exception) {
-            logPipeException(error, bucket, generation)
+            pipeError = error
+            exitReason = "relay_error"
+            logPipeException(error, bucket, generation, flowId)
         } finally {
             val wallDurationNs = (System.nanoTime() - pipeStartedNs).coerceAtLeast(1L)
             val transferDurationNs = if (firstForwardedNs > 0L) {
@@ -588,22 +604,24 @@ class Socks5Server(
             } else {
                 0L
             }
-            if (forwardedBytes >= 1_000_000L && transferDurationNs > 0L) {
-                val direction = if (bucket === SpeedLimiter.download) "download" else "upload"
-                val throughputBps = (
-                    forwardedBytes.toDouble() * 8_000_000_000.0 / transferDurationNs.toDouble()
-                ).toLong()
-                log(
-                    "Relay pipe stats direction=$direction bytes=$forwardedBytes " +
-                        "firstToLastForwardedSpanMs=${TimeUnit.NANOSECONDS.toMillis(transferDurationNs).coerceAtLeast(1L)} " +
-                        "pipeWallMs=${TimeUnit.NANOSECONDS.toMillis(wallDurationNs)} " +
-                        "firstToLastSpanBps=$throughputBps readCalls=$readCalls writeCalls=$writeCalls " +
-                        "maxReadBytes=$maxReadBytes " +
-                        "sourceReadMs=${TimeUnit.NANOSECONDS.toMillis(sourceReadNs)} " +
-                        "limiterCallMs=${TimeUnit.NANOSECONDS.toMillis(limiterCallNs)} " +
-                        "destinationWriteMs=${TimeUnit.NANOSECONDS.toMillis(destinationWriteNs)}"
-                )
+            if (!eof && pipeError == null && exitReason == "eof") exitReason = "session_stopped"
+            val direction = if (bucket === SpeedLimiter.download) "download" else "upload"
+            val throughputBps = if (transferDurationNs > 0L) {
+                (forwardedBytes.toDouble() * 8_000_000_000.0 / transferDurationNs.toDouble()).toLong()
+            } else {
+                0L
             }
+            val errorKind = pipeError?.let { classifySocketError(it).name } ?: "NONE"
+            log(
+                "Relay pipe completion flowId=$flowId direction=$direction bytesForwarded=$forwardedBytes " +
+                    "rateBps=$throughputBps firstToLastMs=${TimeUnit.NANOSECONDS.toMillis(transferDurationNs)} " +
+                    "pipeWallMs=${TimeUnit.NANOSECONDS.toMillis(wallDurationNs)} readCalls=$readCalls writeCalls=$writeCalls " +
+                    "maxReadBytes=$maxReadBytes sourceReadMs=${TimeUnit.NANOSECONDS.toMillis(sourceReadNs)} " +
+                    "limiterCallMs=${TimeUnit.NANOSECONDS.toMillis(limiterCallNs)} " +
+                    "destinationWriteMs=${TimeUnit.NANOSECONDS.toMillis(destinationWriteNs)} " +
+                    "eof=$eof exitReason=$exitReason errorKind=$errorKind " +
+                    "error=${pipeError?.let(::classifyPipeErrorForLog) ?: "none"}"
+            )
             if (eof && running) {
                 runCatching { destination.shutdownOutput() }.onFailure { closeBoth() }
             } else {
@@ -619,16 +637,19 @@ class Socks5Server(
      * exception type/message classifies it as an expected close. All active-session
      * network events and unknown exceptions retain their stack traces in Logcat.
      */
-    private fun logPipeException(error: Throwable, bucket: TokenBucket, generation: Long) {
+    private fun classifyPipeErrorForLog(error: Throwable): String =
+        "${classifySocketError(error).name}:${error.javaClass.simpleName}:${error.message ?: "no message"}"
+
+    private fun logPipeException(error: Throwable, bucket: TokenBucket, generation: Long, flowId: String) {
         if (!running || !SpeedLimiter.isGenerationActive(generation)) return
         val direction = if (bucket === SpeedLimiter.download) "download" else "upload"
         val detail = error.message ?: "no message"
         when (classifySocketError(error)) {
             SockErrKind.EXPECTED_CLOSE -> Unit
             SockErrKind.NETWORK_EVENT ->
-                logE("SOCKS relay pipe network event direction=$direction error=${error.javaClass.simpleName}: $detail", error)
+                logE("SOCKS relay pipe network event flowId=$flowId direction=$direction error=${error.javaClass.simpleName}: $detail", error)
             SockErrKind.UNKNOWN ->
-                logE("Unexpected SOCKS relay pipe failure direction=$direction error=${error.javaClass.simpleName}: $detail", error)
+                logE("Unexpected SOCKS relay pipe failure flowId=$flowId direction=$direction error=${error.javaClass.simpleName}: $detail", error)
         }
     }
 

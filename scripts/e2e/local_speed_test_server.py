@@ -37,10 +37,13 @@ class SpeedTestRequestHandler(BaseHTTPRequestHandler):
     sys_version = ""
 
     def _record_transfer_event(self, event: str) -> None:
-        print(event, flush=True)
+        # Match this peer port to the upstream SOCKS socket's local port in relay logs.
+        peer = f"{self.client_address[0]}:{self.client_address[1]}"
+        correlated = f"{event} peer={peer}"
+        print(correlated, flush=True)
         recorder = getattr(self.server, "record_transfer_event", None)
         if callable(recorder):
-            recorder(event)
+            recorder(correlated)
 
     def _send_body(self, status: int, body: bytes, content_type: str = "text/plain") -> None:
         self.send_response(status)
@@ -170,10 +173,23 @@ class SpeedTestRequestHandler(BaseHTTPRequestHandler):
                 f"socket_receive_buffer_bytes={self.socket_receive_buffer_bytes}"
             )
     def log_message(self, format_string: str, *args: object) -> None:
-        # Request counts are high during the sweep; keep the artifact log concise.
-        if urlsplit(self.path).path == "/healthz":
+        # Never print a malformed request line: it can include binary upload data.
+        # Keep enough information to match an HTTP parse error to its TCP peer.
+        path = urlsplit(self.path).path
+        if path == "/healthz":
             return
-        super().log_message(format_string, *args)
+        peer = f"{self.client_address[0]}:{self.client_address[1]}"
+        if format_string.startswith("code %d, message %s"):
+            status = args[0] if args else "unknown"
+            print(f"HTTP_PARSE_ERROR peer={peer} status={status}", flush=True)
+            return
+        if format_string.startswith('"%s" %s %s'):
+            method = self.command if self.command in {"GET", "POST"} else "UNKNOWN"
+            safe_path = path if path in {"/__up", "/__down"} else "<unknown>"
+            status = args[1] if len(args) > 1 else "unknown"
+            print(f"HTTP_ACCESS peer={peer} method={method} path={safe_path} status={status}", flush=True)
+            return
+        print(f"HTTP_DIAGNOSTIC peer={peer} event={format_string.split('%', 1)[0][:80]}", flush=True)
 
 
 class ReusableThreadingHTTPServer(ThreadingHTTPServer):

@@ -18,6 +18,7 @@ import okhttp3.Dns
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
+import okhttp3.Response
 import okio.BufferedSink
 import java.io.IOException
 import java.util.concurrent.TimeUnit
@@ -148,6 +149,66 @@ object SpeedTestEngine {
 
     private fun errorMessage(error: Throwable): String =
         error.message?.takeIf { it.isNotBlank() } ?: error.javaClass.simpleName
+
+    private fun executeMeasuredRequest(
+        client: OkHttpClient,
+        request: Request,
+        stage: String,
+        requestedBytes: Long,
+        startedNs: Long,
+    ): Response {
+        try {
+            val response = client.newCall(request).execute()
+            val contentType = response.header("Content-Type")?.substringBefore(';') ?: "none"
+            val contentLength = response.header("Content-Length") ?: "unknown"
+            Log.i(
+                TAG,
+                "HTTP $stage response method=${request.method} host=${request.url.host} " +
+                    "path=${request.url.encodedPath} requestedBytes=$requestedBytes status=${response.code} " +
+                    "contentType=$contentType contentLength=$contentLength " +
+                    "headersElapsedMs=${TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNs)}",
+            )
+            return response
+        } catch (error: IOException) {
+            Log.w(
+                TAG,
+                "HTTP $stage request failed method=${request.method} host=${request.url.host} " +
+                    "path=${request.url.encodedPath} requestedBytes=$requestedBytes " +
+                    "elapsedMs=${TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNs)} " +
+                    "errorType=${error.javaClass.simpleName} error=${errorMessage(error)}",
+                error,
+            )
+            throw error
+        }
+    }
+
+    internal fun downloadResponseValidationError(
+        contentType: String?,
+        requestedBytes: Long,
+        responseBytes: Long,
+    ): String? {
+        if (requestedBytes <= 0L) return "Invalid requested Content-Length: $requestedBytes"
+        val normalizedType = contentType?.substringBefore(';')?.trim()?.lowercase()
+        if (normalizedType != "application/octet-stream") {
+            return "Unexpected Download Content-Type '${normalizedType ?: "missing"}'; expected application/octet-stream"
+        }
+        if (responseBytes >= 0L && responseBytes != requestedBytes) {
+            return "Download Content-Length $responseBytes does not match requested $requestedBytes bytes"
+        }
+        return null
+    }
+
+    private fun logHttpResponseError(stage: String, response: Response, requestedBytes: Long) {
+        if (!response.isSuccessful) {
+            Log.w(
+                TAG,
+                "HTTP $stage rejected host=${response.request.url.host} path=${response.request.url.encodedPath} " +
+                    "requestedBytes=$requestedBytes status=${response.code} " +
+                    "contentType=${response.header("Content-Type")?.substringBefore(';') ?: "none"} " +
+                    "contentLength=${response.header("Content-Length") ?: "unknown"}",
+            )
+        }
+    }
 
     private suspend fun measurePhase(
         client: OkHttpClient,
@@ -522,18 +583,25 @@ object SpeedTestEngine {
         if (isUpload) {
             val body = FixedUploadBody(warmupBytes)
             val request = buildUploadRequest(warmupBytes, body)
-            client.newCall(request).execute().use { response ->
+            val startedNs = System.nanoTime()
+            executeMeasuredRequest(client, request, "upload-warmup", warmupBytes, startedNs).use { response ->
+                logHttpResponseError("upload-warmup", response, warmupBytes)
                 if (!response.isSuccessful) {
                     throw IOException("Upload warm-up HTTP ${response.code}")
                 }
             }
         } else {
             val request = buildDownloadRequest(warmupBytes)
-            client.newCall(request).execute().use { response ->
+            val startedNs = System.nanoTime()
+            executeMeasuredRequest(client, request, "download-warmup", warmupBytes, startedNs).use { response ->
+                logHttpResponseError("download-warmup", response, warmupBytes)
                 if (!response.isSuccessful) {
                     throw IOException("Download warm-up HTTP ${response.code}")
                 }
                 val body = response.body ?: throw IOException("Download warm-up body unavailable")
+                downloadResponseValidationError(body.contentType()?.toString(), warmupBytes, body.contentLength())?.let { error ->
+                    throw IOException("Download warm-up invalid response: $error")
+                }
                 body.byteStream().use { input ->
                     val buffer = ByteArray(CHUNK_BYTES)
                     var readTotal = 0L
@@ -562,13 +630,17 @@ object SpeedTestEngine {
         val requestClient = clientForMeasurementRequest(
             client, sizeBytes, expectedKbps, verificationProfile, remainingPhaseMs,
         )
-        val call = requestClient.newCall(request)
         val started = System.nanoTime()
-        call.execute().use { response ->
+        executeMeasuredRequest(requestClient, request, "download", sizeBytes, started).use { response ->
+            logHttpResponseError("download", response, sizeBytes)
             if (!response.isSuccessful) {
                 throw IOException("Download HTTP ${response.code}")
             }
             val body = response.body ?: throw IOException("Download body unavailable")
+            downloadResponseValidationError(body.contentType()?.toString(), sizeBytes, body.contentLength())?.let { error ->
+                Log.w(TAG, "Download response rejected host=${request.url.host} path=${request.url.encodedPath}: $error")
+                throw IOException(error)
+            }
             body.byteStream().use { input ->
                 val buffer = ByteArray(CHUNK_BYTES)
                 var readTotal = 0L
@@ -605,9 +677,9 @@ object SpeedTestEngine {
         val requestClient = clientForMeasurementRequest(
             client, sizeBytes, expectedKbps, verificationProfile, remainingPhaseMs,
         )
-        val call = requestClient.newCall(request)
         val started = System.nanoTime()
-        call.execute().use { response ->
+        executeMeasuredRequest(requestClient, request, "upload", sizeBytes, started).use { response ->
+            logHttpResponseError("upload", response, sizeBytes)
             if (!response.isSuccessful) {
                 throw IOException("Upload HTTP ${response.code}")
             }

@@ -9,7 +9,7 @@ import os
 import re
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -436,6 +436,8 @@ def parse_json(json_path: str, preset: str, expected_kbps: int, index: int, outp
             status = "ENV_LIMITED"
         elif rate_bps(baseline) is None or rate_bps(vpn) is None:
             status = "MEASUREMENT_ERROR"
+        elif verdict == STATUS_UNJUDGEABLE:
+            status = "UNJUDGEABLE"
         else:
             status = "FAIL"
         row = {
@@ -573,6 +575,18 @@ def validate_sweep(csv_path: str) -> int:
                     completed_at_value = parsed_stamp
             except ValueError as error:
                 errors.append(f"CSV line {line}: invalid {field_name}: {error}")
+        run_started_raw = (os.environ.get("SPEEDVPN_SWEEP_STARTED_AT") or "").strip()
+        if run_started_raw:
+            try:
+                if not run_started_raw.endswith("Z"):
+                    raise ValueError("run-start timestamp must end in Z")
+                run_started_value = datetime.fromisoformat(run_started_raw[:-1] + "+00:00")
+                if completed_at_value is not None and completed_at_value < run_started_value:
+                    errors.append(f"CSV line {line}: stale result predates this workflow run")
+                if completed_at_value is not None and completed_at_value > datetime.now(timezone.utc) + timedelta(minutes=2):
+                    errors.append(f"CSV line {line}: completed_at is in the future")
+            except ValueError as error:
+                errors.append(f"invalid SPEEDVPN_SWEEP_STARTED_AT: {error}")
         if started_at_value is not None and completed_at_value is not None and completed_at_value < started_at_value:
             errors.append(f"CSV line {line}: completed_at precedes started_at")
         if row.get("completed_at") != recorded_at:
@@ -581,7 +595,7 @@ def validate_sweep(csv_path: str) -> int:
             errors.append(f"CSV line {line}: failure_reason disagrees with reason")
 
         status = (row.get("status") or "").strip()
-        allowed_statuses = {"PASS", "PASS_UNLIMITED", "FAIL", "ENV_LIMITED", "MEASUREMENT_ERROR", "CONFIGURATION_ERROR"}
+        allowed_statuses = {"PASS", "PASS_UNLIMITED", "FAIL", "UNJUDGEABLE", "ENV_LIMITED", "MEASUREMENT_ERROR", "CONFIGURATION_ERROR"}
         if status not in allowed_statuses:
             errors.append(f"CSV line {line}: invalid/missing status {status!r}")
         if status in {"PASS", "PASS_UNLIMITED"} and row.get("failure_reason", "").strip():
@@ -592,6 +606,10 @@ def validate_sweep(csv_path: str) -> int:
             errors.append(f"CSV line {line}: passing status disagrees with classification")
         if status in {"MEASUREMENT_ERROR", "CONFIGURATION_ERROR"} and row.get("classification") != "FAIL":
             errors.append(f"CSV line {line}: measurement/configuration error must remain FAIL")
+        if status == "UNJUDGEABLE" and row.get("verdict") != STATUS_UNJUDGEABLE:
+            errors.append(f"CSV line {line}: UNJUDGEABLE status does not match app verdict")
+        if status == "UNJUDGEABLE" and row.get("classification") not in {"FAIL", "ENV_LIMITED"}:
+            errors.append(f"CSV line {line}: UNJUDGEABLE cannot be a passing classification")
 
         baseline_bps_contract = rate_bps(row.get("baseline_raw"))
         vpn_bps_contract = rate_bps(row.get("vpn_raw"))

@@ -9,6 +9,11 @@ SCREEN_HEIGHT="${SCREEN_SIZE#*x}"
 RUN_DIR="speed-limit-sweep"
 CSV_RUN_ID="${GITHUB_RUN_ID:-local}"
 recorded_at_utc() { date -u +"%Y-%m-%dT%H:%M:%S.%3NZ"; }
+RUN_STARTED_AT="$(recorded_at_utc)"
+export SPEEDVPN_SWEEP_STARTED_AT="$RUN_STARTED_AT"
+if [ -n "${GITHUB_ENV:-}" ]; then
+  printf 'SPEEDVPN_SWEEP_STARTED_AT=%s\n' "$RUN_STARTED_AT" >> "$GITHUB_ENV"
+fi
 mkdir -p "$RUN_DIR"
 : > "$RUN_DIR/speed-limit-sweep-results.csv"
 : > "$RUN_DIR/sweep-console.log"
@@ -918,8 +923,9 @@ if [ "$PASS_COUNT" -ne "$EXPECTED_METRIC_RESULTS" ]; then
   echo "STRICT COVERAGE FAIL: PASS=$PASS_COUNT/$EXPECTED_METRIC_RESULTS; ENV_LIMITED and mismatches cannot count as verified."
   FAIL_COUNT=$((FAIL_COUNT+1))
 fi
-if [ "$FAIL_COUNT" -ne 0 ]; then
-  export SPEEDVPN_SWEEP_HARD_FAILURE_COUNT="$FAIL_COUNT"
+export SPEEDVPN_SWEEP_HARD_FAILURE_COUNT="$FAIL_COUNT"
+if [ -n "${GITHUB_ENV:-}" ]; then
+  printf 'SPEEDVPN_SWEEP_HARD_FAILURE_COUNT=%s\n' "$FAIL_COUNT" >> "$GITHUB_ENV"
 fi
 if ! python3 scripts/e2e/verify_metrics.py validate-sweep "$RUN_DIR/speed-limit-sweep-results.csv"; then
   echo "STRICT GATE FAIL: independent CSV validation did not reach PASS=38/38."

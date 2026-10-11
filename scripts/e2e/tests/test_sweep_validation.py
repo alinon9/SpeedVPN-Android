@@ -182,6 +182,20 @@ class SweepValidationTests(unittest.TestCase):
         self.write_rows(rows)
         self.assertEqual(1, self.validate_without_ci_run())
 
+    def test_stale_measurement_from_before_this_run_is_rejected(self) -> None:
+        rows = valid_rows()
+        stale = "2020-01-01T00:00:00.000Z"
+        for row in rows:
+            row["started_at"] = stale
+            row["completed_at"] = stale
+            row["recorded_at_utc"] = stale
+        self.write_rows(rows)
+        with patch.dict(os.environ, {
+            "GITHUB_RUN_ID": "",
+            "SPEEDVPN_SWEEP_STARTED_AT": "2026-10-11T10:00:00.000Z",
+        }):
+            self.assertEqual(1, validate_sweep(str(self.csv_path)))
+
 
 if __name__ == "__main__":
     unittest.main()
