@@ -89,8 +89,10 @@ class LocalSpeedTestServerTests(unittest.TestCase):
         self.assertRegex(
             "\n".join(self.server.transfer_events),
             re.compile(
-                rf"TRANSFER method=POST path=/__up requested_bytes={len(payload)} "
-                rf"received_bytes={len(payload)} elapsed_ms=\d+\.\d{{3}} outcome=complete"
+                rf"UPLOAD_DIAG method=POST path=/__up serverPort={self.server.server_port} "
+                rf"peerPort=\d+ requestedBytes={len(payload)} contentLength={len(payload)} "
+                rf"receivedBytes={len(payload)} bodyComplete=true responseStarted=true responseSent=true "
+                rf"httpStatus=200 elapsedMs=\d+\.\d{{3}} closeReason=normal exceptionType=none"
             ),
         )
 
