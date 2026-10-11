@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import csv
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -37,12 +39,23 @@ def valid_rows() -> list[dict[str, str]]:
                     rate_label(target_bps), STATUS_PASS, "PASS"
                 )
                 accuracy = "100.0%"
+            now = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+            commit_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True, timeout=5,
+            ).stdout.strip()
+            unit = {"bps": 1e-6, "Kbps": 1e-3, "Mbps": 1.0, "Gbps": 1000.0}
+            original_mbps = float(baseline.split()[0]) * unit[baseline.split()[1]]
+            vpn_mbps = float(vpn.split()[0]) * unit[vpn.split()[1]]
             rows.append({
                 "index": str(index), "preset": preset, "expected_kbps": str(expected_kbps),
                 "direction": direction, "baseline_raw": baseline, "plan_raw": plan,
                 "vpn_raw": vpn, "accuracy_raw": accuracy, "verdict": verdict, "reason": "",
-                "classification": classification, "run_id": "test-run-123",
-                "recorded_at_utc": "2026-10-09T12:00:00.000Z",
+                "classification": classification, "run_id": "test-run-123", "recorded_at_utc": now,
+                "commit_sha": commit_sha, "scenario_id": "speed-limit-sweep-v1",
+                "preset_id": f"speed-preset-{index:02d}", "preset_name": preset,
+                "measurement_id": f"test-run-123-{index:02d}-{direction.lower()}",
+                "original_speed_mbps": f"{original_mbps:.6f}", "vpn_speed_mbps": f"{vpn_mbps:.6f}",
+                "status": classification, "failure_reason": "", "started_at": now, "completed_at": now,
             })
     return rows
 
@@ -124,8 +137,48 @@ class SweepValidationTests(unittest.TestCase):
         row = next(r for r in rows if r["index"] == "16" and r["direction"] == "Download")
         target = EXPECTED_PRESETS[16][1] * 1_000.0
         row["baseline_raw"] = rate_label(target * 1.1)
+        row["original_speed_mbps"] = f"{target * 1.1 / 1_000_000:.6f}"
         row["accuracy_raw"] = "80.0%"
         row["classification"] = "ENV_LIMITED"
+        row["status"] = "ENV_LIMITED"
+        row["failure_reason"] = "baseline below 1.2x headroom"
+        row["reason"] = row["failure_reason"]
+        self.write_rows(rows)
+        self.assertEqual(1, self.validate_without_ci_run())
+    
+    def test_verify_is_never_a_speed_direction(self) -> None:
+        rows = valid_rows()
+        rows[0]["direction"] = "Verify"
+        self.write_rows(rows)
+        self.assertEqual(1, self.validate_without_ci_run())
+
+    def test_nan_speed_is_rejected(self) -> None:
+        rows = valid_rows()
+        rows[0]["original_speed_mbps"] = "NaN"
+        self.write_rows(rows)
+        self.assertEqual(1, self.validate_without_ci_run())
+
+    def test_infinity_speed_is_rejected(self) -> None:
+        rows = valid_rows()
+        rows[0]["vpn_speed_mbps"] = "Infinity"
+        self.write_rows(rows)
+        self.assertEqual(1, self.validate_without_ci_run())
+
+    def test_stale_commit_provenance_is_rejected(self) -> None:
+        rows = valid_rows()
+        rows[0]["commit_sha"] = "0" * 40
+        self.write_rows(rows)
+        self.assertEqual(1, self.validate_without_ci_run())
+
+    def test_duplicate_measurement_id_is_rejected(self) -> None:
+        rows = valid_rows()
+        rows[1]["measurement_id"] = rows[0]["measurement_id"]
+        self.write_rows(rows)
+        self.assertEqual(1, self.validate_without_ci_run())
+
+    def test_missing_speed_value_cannot_pass(self) -> None:
+        rows = valid_rows()
+        rows[0]["vpn_speed_mbps"] = ""
         self.write_rows(rows)
         self.assertEqual(1, self.validate_without_ci_run())
 

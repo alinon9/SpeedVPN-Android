@@ -773,17 +773,23 @@ jobs:
           LIVE_LOGCAT_PID=$!
           echo "Continuous Verify Speed logcat PID=$LIVE_LOGCAT_PID"
 
-          # Configure the finite CI plan through the app's real persistent store.
-          # This avoids relying on a horizontally-scrolled Compose preset button.
-          # 100 KB/s == 800 Kbps for both directions.
+          # pm clear above removes the app's data tree. Re-create and verify the
+          # app-private preferences; fail closed if the source or destination is absent.
+          echo "Initializing app-private local speed-limit preferences for Verify Speed."
+          adb -s emulator-5554 shell pm path com.speedvpn.app | grep -q '^package:'
+          adb -s emulator-5554 shell run-as com.speedvpn.app id
           adb -s emulator-5554 shell am force-stop com.speedvpn.app
           cat > "${RUNNER_TEMP}/local_limits.xml" <<'EOF'
           <?xml version='1.0' encoding='utf-8' standalone='yes' ?><map><long name="dl" value="800" /><long name="ul" value="800" /></map>
           EOF
+          test -s "${RUNNER_TEMP}/local_limits.xml"
           adb -s emulator-5554 push "${RUNNER_TEMP}/local_limits.xml" /data/local/tmp/speedvpn-local-limits.xml
-          adb -s emulator-5554 shell "run-as com.speedvpn.app sh -c 'cat /data/local/tmp/speedvpn-local-limits.xml > shared_prefs/local_limits.xml'"
-          adb -s emulator-5554 shell run-as com.speedvpn.app cat shared_prefs/local_limits.xml
-          adb -s emulator-5554 shell run-as com.speedvpn.app cat shared_prefs/local_limits.xml
+          adb -s emulator-5554 shell "run-as com.speedvpn.app sh -c 'set -eu; test -s /data/local/tmp/speedvpn-local-limits.xml; mkdir -p shared_prefs; cat /data/local/tmp/speedvpn-local-limits.xml > shared_prefs/local_limits.xml; test -s shared_prefs/local_limits.xml'"
+          echo "Validating injected local speed-limit preferences."
+          adb -s emulator-5554 shell run-as com.speedvpn.app cat shared_prefs/local_limits.xml | tee local_limits-verified.xml
+          grep -Eq '<long name="dl" value="800"' local_limits-verified.xml
+          grep -Eq '<long name="ul" value="800"' local_limits-verified.xml
+          echo "App-private local speed-limit preferences initialized and validated."
 
           adb -s emulator-5554 shell am start -n com.speedvpn.app/.MainActivity
           sleep 4

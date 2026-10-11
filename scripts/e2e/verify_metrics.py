@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import os
 import re
+import subprocess
 import sys
 from datetime import datetime, timezone
 import xml.etree.ElementTree as ET
@@ -42,10 +44,105 @@ EXPECTED_PRESETS = {
     16: ("9 MB", 72000), 17: ("10 MB", 80000), 18: ("11 MB", 88000),
     19: ("بدون حد", 0),
 }
+SCENARIO_ID = "speed-limit-sweep-v1"
 CSV_FIELDS = [
     "index", "preset", "expected_kbps", "direction", "baseline_raw",
-    "plan_raw", "vpn_raw", "accuracy_raw", "verdict", "reason", "classification", "run_id", "recorded_at_utc",
+    "plan_raw", "vpn_raw", "accuracy_raw", "verdict", "reason", "classification",
+    "run_id", "recorded_at_utc", "commit_sha", "scenario_id", "preset_id",
+    "preset_name", "measurement_id", "original_speed_mbps", "vpn_speed_mbps",
+    "status", "failure_reason", "started_at", "completed_at",
 ]
+
+
+def current_commit_sha() -> str:
+    """Resolve provenance from the checked-out source, not a claimed artifact label."""
+    expected = (os.environ.get("SPEEDVPN_EXPECTED_COMMIT_SHA") or "").strip()
+    if expected:
+        return expected
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True, timeout=5,
+        )
+        sha = result.stdout.strip()
+        if re.fullmatch(r"[0-9a-f]{40}", sha):
+            return sha
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return (os.environ.get("GITHUB_SHA") or "").strip()
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def rate_mbps(value: str | None) -> str:
+    bps = rate_bps(value)
+    if bps is None or not math.isfinite(bps) or bps <= 0:
+        return ""
+    return f"{bps / 1_000_000.0:.6f}"
+
+
+def structured_result_fields(
+    index: int, preset: str, direction: str, run_id: str,
+    baseline: str, vpn: str, status: str, failure_reason: str,
+    started_at: str, completed_at: str,
+) -> dict[str, str]:
+    return {
+        "commit_sha": current_commit_sha(),
+        "scenario_id": SCENARIO_ID,
+        "preset_id": f"speed-preset-{index:02d}",
+        "preset_name": preset,
+        "measurement_id": f"{run_id}-{index:02d}-{direction.lower()}",
+        "original_speed_mbps": rate_mbps(baseline),
+        "vpn_speed_mbps": rate_mbps(vpn),
+        "status": status,
+        "failure_reason": failure_reason,
+        "started_at": started_at,
+        "completed_at": completed_at,
+    }
+
+
+def init_csv(csv_path: str) -> int:
+    path = Path(csv_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        csv.DictWriter(handle, fieldnames=CSV_FIELDS).writeheader()
+    return 0
+
+
+def record_failed_pair(
+    csv_path: str, index: int, preset: str, expected_kbps: int, status: str, reason: str,
+) -> int:
+    """Record both expected directions as failed rows; never invent a Verify direction."""
+    if status not in {"MEASUREMENT_ERROR", "CONFIGURATION_ERROR"}:
+        raise ValueError(f"invalid failure status {status!r}")
+    if index not in EXPECTED_PRESETS or EXPECTED_PRESETS[index] != (preset, expected_kbps):
+        raise ValueError(f"preset contract mismatch for index={index}, preset={preset!r}")
+    run_id = (os.environ.get("GITHUB_RUN_ID") or "local").strip()
+    completed_at = utc_now()
+    started_at = (os.environ.get("SPEEDVPN_CASE_STARTED_AT") or "").strip() or completed_at
+    if not started_at.endswith("Z"):
+        raise ValueError("SPEEDVPN_CASE_STARTED_AT must be an ISO-8601 UTC timestamp")
+    rows: list[dict[str, str]] = []
+    for direction in ("Download", "Upload"):
+        row = {
+            "index": str(index), "preset": preset, "expected_kbps": str(expected_kbps),
+            "direction": direction, "baseline_raw": "", "plan_raw": "", "vpn_raw": "",
+            "accuracy_raw": "—", "verdict": STATUS_UNJUDGEABLE, "reason": reason,
+            "classification": "FAIL", "run_id": run_id, "recorded_at_utc": completed_at,
+        }
+        row.update(structured_result_fields(
+            index, preset, direction, run_id, "", "", status, reason, started_at, completed_at,
+        ))
+        rows.append(row)
+    with Path(csv_path).open("a", newline="", encoding="utf-8") as handle:
+        csv.DictWriter(handle, fieldnames=CSV_FIELDS).writerows(rows)
+    for row in rows:
+        print(
+            f"RESULT|{row['index']}|{row['preset']}|{row['expected_kbps']}|"
+            f"{row['direction']}|FAILED|{row['status']}|{row['failure_reason']}"
+        )
+    return 0
 
 
 def rate_bps(value: str | None) -> float | None:
@@ -318,21 +415,44 @@ def check_metric(direction: str, values: dict[str, str], expected_kbps: int) -> 
 
 def parse_json(json_path: str, preset: str, expected_kbps: int, index: int, output_path: str) -> int:
     values = json.loads(Path(json_path).read_text(encoding="utf-8"))
-    rows = []
+    rows: list[dict[str, str]] = []
     failed = False
     run_id = (os.environ.get("GITHUB_RUN_ID") or "local").strip()
-    recorded_at_utc = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    recorded_at_utc = utc_now()
+    started_at = (os.environ.get("SPEEDVPN_CASE_STARTED_AT") or "").strip() or recorded_at_utc
+    if not started_at.endswith("Z"):
+        raise ValueError("SPEEDVPN_CASE_STARTED_AT must be an ISO-8601 UTC timestamp")
+    if index not in EXPECTED_PRESETS or EXPECTED_PRESETS[index] != (preset, expected_kbps):
+        raise ValueError(f"preset contract mismatch for index={index}, preset={preset!r}")
     for direction in ("download", "upload"):
         baseline, plan, vpn, verdict, result = check_metric(direction, values, expected_kbps)
         classification, sep, reason = result.partition("|")
         failed = failed or classification not in {"PASS", "PASS_UNLIMITED"}
         label = "Download" if direction == "download" else "Upload"
         accuracy = (values.get(f"verify_{direction}_accuracy_value") or "").strip()
-        rows.append([index, preset, expected_kbps, label, baseline, plan, vpn, accuracy, verdict, reason if sep else "", classification, run_id, recorded_at_utc])
+        if classification in {"PASS", "PASS_UNLIMITED"}:
+            status = classification
+        elif classification == "ENV_LIMITED":
+            status = "ENV_LIMITED"
+        elif rate_bps(baseline) is None or rate_bps(vpn) is None:
+            status = "MEASUREMENT_ERROR"
+        else:
+            status = "FAIL"
+        row = {
+            "index": str(index), "preset": preset, "expected_kbps": str(expected_kbps),
+            "direction": label, "baseline_raw": baseline, "plan_raw": plan, "vpn_raw": vpn,
+            "accuracy_raw": accuracy, "verdict": verdict, "reason": reason if sep else "",
+            "classification": classification, "run_id": run_id, "recorded_at_utc": recorded_at_utc,
+        }
+        row.update(structured_result_fields(
+            index, preset, label, run_id, baseline, vpn, status,
+            reason if sep else "", started_at, recorded_at_utc,
+        ))
+        rows.append(row)
     with open(output_path, "w", newline="", encoding="utf-8") as handle:
-        csv.writer(handle).writerows(rows)
+        csv.DictWriter(handle, fieldnames=CSV_FIELDS).writerows(rows)
     for row in rows:
-        print("RESULT|" + "|".join(map(str, row)))
+        print("RESULT|" + "|".join(str(row.get(field, "")) for field in CSV_FIELDS[:13]))
     print("OVERALL|" + ("FAIL" if failed else "PASS"))
     return 2 if failed else 0
 
@@ -371,10 +491,14 @@ def validate_sweep(csv_path: str) -> int:
         return 1
 
     errors = []
+    hard_fail_events = int((os.environ.get("SPEEDVPN_SWEEP_HARD_FAILURE_COUNT") or "0").strip() or "0")
+    if hard_fail_events:
+        errors.append(f"run has {hard_fail_events} additional hard-failure event(s); overall strict gate must fail")
     expected_run_id = (os.environ.get("GITHUB_RUN_ID") or "").strip()
     observed_run_ids: set[str] = set()
     expected_keys = {(i, direction) for i in EXPECTED_PRESETS for direction in ("Download", "Upload")}
     found = {}
+    measurement_ids: set[str] = set()
     for line, row in enumerate(rows, start=2):
         row_run_id = (row.get("run_id") or "").strip()
         recorded_at = (row.get("recorded_at_utc") or "").strip()
@@ -413,6 +537,78 @@ def validate_sweep(csv_path: str) -> int:
             errors.append(f"CSV line {line}: duplicate metric {key}")
             continue
         found[key] = row
+        commit_sha = (row.get("commit_sha") or "").strip()
+        expected_commit_sha = current_commit_sha()
+        if not re.fullmatch(r"[0-9a-f]{40}", commit_sha):
+            errors.append(f"CSV line {line}: invalid/missing commit_sha")
+        elif expected_commit_sha and commit_sha != expected_commit_sha:
+            errors.append(f"CSV line {line}: commit_sha does not match checked-out source")
+        if row.get("scenario_id") != SCENARIO_ID:
+            errors.append(f"CSV line {line}: invalid scenario_id {row.get('scenario_id')!r}")
+        if row.get("preset_id") != f"speed-preset-{index:02d}":
+            errors.append(f"CSV line {line}: invalid preset_id {row.get('preset_id')!r}")
+        if row.get("preset_name") != preset:
+            errors.append(f"CSV line {line}: preset_name does not match planned preset")
+        measurement_id = (row.get("measurement_id") or "").strip()
+        expected_measurement_id = f"{row_run_id}-{index:02d}-{row['direction'].lower()}"
+        if measurement_id != expected_measurement_id:
+            errors.append(f"CSV line {line}: measurement_id does not match planned identity")
+        if measurement_id in measurement_ids:
+            errors.append(f"CSV line {line}: duplicate measurement_id {measurement_id!r}")
+        measurement_ids.add(measurement_id)
+
+        started_at_value = None
+        completed_at_value = None
+        for field_name in ("started_at", "completed_at"):
+            stamp = (row.get(field_name) or "").strip()
+            try:
+                if not stamp.endswith("Z"):
+                    raise ValueError("timestamp must end in Z")
+                parsed_stamp = datetime.fromisoformat(stamp[:-1] + "+00:00")
+                if parsed_stamp.tzinfo is None or parsed_stamp.utcoffset() is None:
+                    raise ValueError("timestamp has no timezone")
+                if field_name == "started_at":
+                    started_at_value = parsed_stamp
+                else:
+                    completed_at_value = parsed_stamp
+            except ValueError as error:
+                errors.append(f"CSV line {line}: invalid {field_name}: {error}")
+        if started_at_value is not None and completed_at_value is not None and completed_at_value < started_at_value:
+            errors.append(f"CSV line {line}: completed_at precedes started_at")
+        if row.get("completed_at") != recorded_at:
+            errors.append(f"CSV line {line}: completed_at does not match recorded_at_utc")
+        if row.get("failure_reason", "") != row.get("reason", ""):
+            errors.append(f"CSV line {line}: failure_reason disagrees with reason")
+
+        status = (row.get("status") or "").strip()
+        allowed_statuses = {"PASS", "PASS_UNLIMITED", "FAIL", "ENV_LIMITED", "MEASUREMENT_ERROR", "CONFIGURATION_ERROR"}
+        if status not in allowed_statuses:
+            errors.append(f"CSV line {line}: invalid/missing status {status!r}")
+        if status in {"PASS", "PASS_UNLIMITED"} and row.get("failure_reason", "").strip():
+            errors.append(f"CSV line {line}: passing measurement has failure_reason")
+        if status not in {"PASS", "PASS_UNLIMITED"} and not row.get("failure_reason", "").strip():
+            errors.append(f"CSV line {line}: non-passing status lacks failure_reason")
+        if status in {"PASS", "PASS_UNLIMITED"} and row.get("classification") != status:
+            errors.append(f"CSV line {line}: passing status disagrees with classification")
+        if status in {"MEASUREMENT_ERROR", "CONFIGURATION_ERROR"} and row.get("classification") != "FAIL":
+            errors.append(f"CSV line {line}: measurement/configuration error must remain FAIL")
+
+        baseline_bps_contract = rate_bps(row.get("baseline_raw"))
+        vpn_bps_contract = rate_bps(row.get("vpn_raw"))
+        for field_name, raw_bps in (
+            ("original_speed_mbps", baseline_bps_contract),
+            ("vpn_speed_mbps", vpn_bps_contract),
+        ):
+            raw_value = (row.get(field_name) or "").strip()
+            try:
+                numeric = float(raw_value)
+                if not math.isfinite(numeric) or numeric <= 0.0:
+                    raise ValueError("must be finite and > 0")
+                if raw_bps is None or abs(numeric - raw_bps / 1_000_000.0) > 0.00001:
+                    raise ValueError("does not match corresponding raw rate")
+            except (TypeError, ValueError):
+                errors.append(f"CSV line {line}: invalid/inconsistent {field_name} {raw_value!r}")
+
         direction = "download" if row["direction"] == "Download" else "upload"
         values = {
             f"verify_{direction}_baseline_value": row["baseline_raw"],
@@ -430,6 +626,8 @@ def validate_sweep(csv_path: str) -> int:
             errors.append(f"{key}: recorded classification is {recorded}")
         if recorded != calculated:
             errors.append(f"{key}: recorded class {recorded} disagrees with strict class {calculated}")
+        if status == "FAIL" and recorded != "FAIL":
+            errors.append(f"{key}: status FAIL disagrees with classification {recorded}")
 
     if len(observed_run_ids) > 1:
         errors.append(f"provenance: rows contain mixed run IDs: {sorted(observed_run_ids)}")
@@ -453,6 +651,10 @@ def main(argv: list[str]) -> int:
         return 2
     command = argv[1]
     try:
+        if command == "init-csv" and len(argv) == 3:
+            return init_csv(argv[2])
+        if command == "record-failure" and len(argv) == 8:
+            return record_failed_pair(argv[2], int(argv[3]), argv[4], int(argv[5]), argv[6], argv[7])
         if command == "collect" and len(argv) == 4:
             return collect(argv[2], argv[3])
         if command == "collect-preflight" and len(argv) == 4:
