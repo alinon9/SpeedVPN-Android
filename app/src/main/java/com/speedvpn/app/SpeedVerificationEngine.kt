@@ -100,7 +100,7 @@ object SpeedVerificationEngine {
                     onProgress("تشغيل VPN للتحقق من الخطة…")
                     SpeedVpnService.start(context)
                     if (!waitForStatus(VpnStatus.CONNECTED)) {
-                        result = unavailable(started, "تعذر الوصول إلى حالة VPN متصل.", planDownloadKbps, planUploadKbps)
+                        result = unavailable(started, "تعذر الوصول إلى حالة VPN متصل.", planDownloadKbps, planUploadKbps, baseline)
                     } else {
                         SpeedLimiter.setVerificationLimits(planDownloadKbps, planUploadKbps)
                         Log.i(
@@ -198,7 +198,7 @@ object SpeedVerificationEngine {
             throw cancelled
         } catch (t: Throwable) {
             Log.e(TAG, "Verification failed: ${t.message ?: t.javaClass.simpleName}", t)
-            result = unavailable(started, "فشل التحقق: " + (t.message ?: t.javaClass.simpleName), planDownloadKbps, planUploadKbps)
+            result = unavailable(started, "فشل التحقق: " + (t.message ?: t.javaClass.simpleName), planDownloadKbps, planUploadKbps, baseline)
         } finally {
             withContext(NonCancellable) {
                 try {
@@ -256,12 +256,12 @@ object SpeedVerificationEngine {
                 }
                 if (restorationError != null) {
                     Log.e(TAG, "VPN state restoration failed: $restorationError")
-                    val measured = result ?: unavailable(started, "تعذر إكمال قياس السرعة.", planDownloadKbps, planUploadKbps)
+                    val measured = result ?: unavailable(started, "تعذر إكمال قياس السرعة.", planDownloadKbps, planUploadKbps, baseline)
                     result = withRestorationFailure(measured, restorationError!!)
                 }
             }
         }
-        return result ?: unavailable(started, "تعذر إكمال التحقق.", planDownloadKbps, planUploadKbps)
+        return result ?: unavailable(started, "تعذر إكمال التحقق.", planDownloadKbps, planUploadKbps, baseline)
     }
 
     internal fun withRestorationFailure(result: SpeedVerificationResult, error: String): SpeedVerificationResult {
