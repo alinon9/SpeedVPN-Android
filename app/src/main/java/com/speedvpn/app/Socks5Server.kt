@@ -39,23 +39,51 @@ import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 
 /**
- * Performs one blocking socket read for each relay iteration.
- *
- * Do not poll InputStream.available() to build a larger batch: the throughput
- * sweep regressed after that optimization, while synthetic streams could not
- * model real socket readiness. The bounded socket read already requests the
- * maximum supported buffer and preserves natural TCP backpressure.
+ * A relay batch may include additional bytes that are already queued by the socket.
+ * Draining only available bytes avoids delaying interactive traffic while reducing
+ * pacing-lock and OutputStream write calls for sustained high-throughput transfers.
  */
 internal data class RelayReadBatch(val bytesRead: Int, val readCalls: Int)
 
+private const val HIGH_RATE_COALESCE_THRESHOLD_BYTES_PER_SEC = 4_000_000L // 32 Mbps
+
+internal fun shouldCoalesceRelayReads(bytesPerSec: Long): Boolean =
+    bytesPerSec <= 0L || bytesPerSec >= HIGH_RATE_COALESCE_THRESHOLD_BYTES_PER_SEC
+
+/**
+ * Performs one blocking read, then drains already-available bytes up to [maxBytes].
+ * Follow-up reads never wait for new network data: they are made only while
+ * InputStream.available() says data can be read immediately. Low-rate plans can
+ * disable coalescing to preserve their small-packet latency.
+ */
 internal fun readRelayBatch(
     source: InputStream,
     buffer: ByteArray,
     maxBytes: Int,
+    coalesceAvailable: Boolean,
 ): RelayReadBatch {
     require(maxBytes in 1..buffer.size) { "maxBytes must fit inside the relay buffer" }
-    val bytesRead = source.read(buffer, 0, maxBytes)
-    return RelayReadBatch(bytesRead, if (bytesRead < 0) 0 else 1)
+
+    var total = source.read(buffer, 0, maxBytes)
+    var calls = if (total < 0) 0 else 1
+    if (!coalesceAvailable || total <= 0) {
+        return RelayReadBatch(total, calls)
+    }
+
+    while (total < maxBytes) {
+        val immediatelyAvailable = source.available()
+        if (immediatelyAvailable <= 0) break
+
+        val count = source.read(
+            buffer,
+            total,
+            minOf(maxBytes - total, immediatelyAvailable),
+        )
+        calls++
+        if (count <= 0) break
+        total += count
+    }
+    return RelayReadBatch(total, calls)
 }
 
 /**
@@ -557,6 +585,7 @@ class Socks5Server(
                     source = src,
                     buffer = buf,
                     maxBytes = readSize,
+                    coalesceAvailable = shouldCoalesceRelayReads(bucket.bytesPerSec),
                 )
                 sourceReadNs += System.nanoTime() - readStartedNs
                 val n = batch.bytesRead
