@@ -48,6 +48,20 @@ import kotlin.concurrent.thread
  */
 internal data class RelayReadBatch(val bytesRead: Int, val readCalls: Int)
 
+/**
+ * An upstream peer may finish its HTTP request and close its receive half while
+ * the reverse response is still in flight. Preserve the reverse pipe only for
+ * that upload-write/half-close case, never for a dead VPN session or a download
+ * write failure.
+ */
+internal fun shouldPreserveReverseFlowAfterUploadHalfClose(
+    isUploadDirection: Boolean,
+    sessionActive: Boolean,
+    destinationWriteBrokenPipe: Boolean,
+    halfCloseFailed: Boolean,
+): Boolean =
+    isUploadDirection && sessionActive && (destinationWriteBrokenPipe || halfCloseFailed)
+
 internal fun readRelayBatch(
     source: InputStream,
     buffer: ByteArray,
@@ -544,6 +558,7 @@ class Socks5Server(
         var sourceReadNs = 0L
         var limiterCallNs = 0L
         var destinationWriteNs = 0L
+        var destinationWriteInProgress = false
         try {
             // Match relay read granularity to the current pacing bucket. A 16 KiB
             // read requires hundreds of scheduler wakeups per second at high rates;
@@ -551,6 +566,7 @@ class Socks5Server(
             // bounded burst window. The bucket can change while the pipe is active.
             val buf = ByteArray(256 * 1024)
             while (running && SpeedLimiter.isGenerationActive(generation)) {
+                destinationWriteInProgress = false
                 val readStartedNs = System.nanoTime()
                 val readSize = bucket.recommendedReadBytes().coerceAtMost(buf.size)
                 val batch = readRelayBatch(
@@ -579,7 +595,9 @@ class Socks5Server(
                     break
                 }
                 val writeStartedNs = System.nanoTime()
+                destinationWriteInProgress = true
                 dst.write(buf, 0, n)
+                destinationWriteInProgress = false
                 writeCalls++
                 val writeFinishedNs = System.nanoTime()
                 destinationWriteNs += writeFinishedNs - writeStartedNs
@@ -622,8 +640,48 @@ class Socks5Server(
                     "eof=$eof exitReason=$exitReason errorKind=$errorKind " +
                     "error=${pipeError?.let(::classifyPipeErrorForLog) ?: "none"}"
             )
+            val uploadDirection = bucket === SpeedLimiter.upload
+            val sessionActive = running && SpeedLimiter.isGenerationActive(generation)
+            val destinationWriteBrokenPipe =
+                uploadDirection &&
+                    destinationWriteInProgress &&
+                    pipeError is SocketException &&
+                    pipeError.message?.contains("broken pipe", ignoreCase = true) == true
+
             if (eof && running) {
-                runCatching { destination.shutdownOutput() }.onFailure { closeBoth() }
+                val halfCloseError = runCatching { destination.shutdownOutput() }.exceptionOrNull()
+                if (halfCloseError != null) {
+                    val preserveReverse = shouldPreserveReverseFlowAfterUploadHalfClose(
+                        isUploadDirection = uploadDirection,
+                        sessionActive = sessionActive,
+                        destinationWriteBrokenPipe = false,
+                        halfCloseFailed = true,
+                    )
+                    if (preserveReverse) {
+                        log(
+                            "SOCKS upload half-close failed; preserving reverse response flowId=$flowId " +
+                                "error=${halfCloseError.javaClass.simpleName}:${halfCloseError.message ?: \"no message\"}",
+                        )
+                    } else {
+                        closeBoth()
+                    }
+                }
+            } else if (
+                shouldPreserveReverseFlowAfterUploadHalfClose(
+                    isUploadDirection = uploadDirection,
+                    sessionActive = sessionActive,
+                    destinationWriteBrokenPipe = destinationWriteBrokenPipe,
+                    halfCloseFailed = false,
+                )
+            ) {
+                // A Broken pipe while forwarding the request does not prove the
+                // reverse HTTP response is unusable. Do not close the client socket
+                // here: drain the server's response on the sibling download pipe.
+                runCatching { destination.shutdownOutput() }
+                log(
+                    "SOCKS upload destination Broken pipe; preserving reverse response flowId=$flowId " +
+                        "bytesForwarded=$forwardedBytes",
+                )
             } else {
                 closeBoth()
             }
