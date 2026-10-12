@@ -13,6 +13,57 @@ import okhttp3.MediaType.Companion.toMediaType
 
 class SpeedTestEngineSamplingTest {
     @Test
+    fun completedUploadBodyCanDeferLateBrokenPipeToHttpResponseValidation() {
+        assertTrue(
+            isRecoverableCompletedUploadFlushFailure(
+                writtenBytes = 6_000_000L,
+                expectedBytes = 6_000_000L,
+                bufferedBytes = 0L,
+                error = java.net.SocketException("Broken pipe"),
+            ),
+        )
+    }
+
+    @Test
+    fun completedUploadBodyCanDeferLateConnectionResetToHttpResponseValidation() {
+        assertTrue(
+            isRecoverableCompletedUploadFlushFailure(
+                writtenBytes = 6_000_000L,
+                expectedBytes = 6_000_000L,
+                bufferedBytes = 0L,
+                error = java.net.SocketException("Connection reset"),
+            ),
+        )
+    }
+
+    @Test
+    fun uploadFlushFailureIsNotRecoveredWhenPayloadMayRemainUnsent() {
+        val error = java.net.SocketException("Broken pipe")
+        assertFalse(isRecoverableCompletedUploadFlushFailure(5_999_999L, 6_000_000L, 0L, error))
+        assertFalse(isRecoverableCompletedUploadFlushFailure(6_000_000L, 6_000_000L, 1L, error))
+        assertFalse(isRecoverableCompletedUploadFlushFailure(0L, 0L, 0L, error))
+    }
+
+    @Test
+    fun uploadFlushFailureDoesNotRecoverUnknownOrNonSocketErrors() {
+        assertFalse(
+            isRecoverableCompletedUploadFlushFailure(
+                writtenBytes = 6_000_000L,
+                expectedBytes = 6_000_000L,
+                bufferedBytes = 0L,
+                error = java.io.IOException("timeout"),
+            ),
+        )
+        assertFalse(
+            isRecoverableCompletedUploadFlushFailure(
+                writtenBytes = 6_000_000L,
+                expectedBytes = 6_000_000L,
+                bufferedBytes = 0L,
+                error = java.net.SocketException("Socket closed"),
+            ),
+        )
+    }
+    @Test
     fun configuredDebugFixtureIsUsedForBothEndpoints() {
         val baseUrl = "http://10.0.2.2:18765/"
         assertEquals(
