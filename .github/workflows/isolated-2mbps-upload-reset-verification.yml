@@ -16,6 +16,8 @@ jobs:
   isolated-2mbps-upload:
     runs-on: ubuntu-latest
     timeout-minutes: 140
+    outputs:
+      preflight_status: ${{ steps.validation.outputs.preflight_status }}
 
     steps:
       - name: Checkout exact verification commit
@@ -49,7 +51,7 @@ jobs:
         run: |
           set -euo pipefail
           bash -n scripts/e2e/speed-limit-sweep.sh
-          python3 -m py_compile scripts/e2e/preference_matches.py scripts/e2e/verify_metrics.py scripts/e2e/local_speed_test_server.py scripts/e2e/metric_result_status.py scripts/e2e/patch_hev_tcp_buffers.py scripts/e2e/benchmark_local_speed_test_server.py scripts/e2e/tests/test_hev_tcp_buffer_patch.py scripts/e2e/tests/test_local_speed_test_server.py scripts/e2e/tests/test_metric_result_status.py
+          python3 -m py_compile scripts/e2e/preference_matches.py scripts/e2e/verify_metrics.py scripts/e2e/preflight_baseline.py scripts/e2e/local_speed_test_server.py scripts/e2e/metric_result_status.py scripts/e2e/patch_hev_tcp_buffers.py scripts/e2e/benchmark_local_speed_test_server.py scripts/e2e/tests/test_hev_tcp_buffer_patch.py scripts/e2e/tests/test_local_speed_test_server.py scripts/e2e/tests/test_metric_result_status.py scripts/e2e/tests/test_preflight_baseline.py
           python3 -m unittest discover -s scripts/e2e/tests -v
 
       - name: Build APK and run Android JVM unit tests
@@ -59,6 +61,7 @@ jobs:
           test -s app/build/outputs/apk/debug/app-debug.apk
           echo "verified_source_commit=$(git rev-parse HEAD)" | tee speedvpn-debug-apk-fingerprint.txt
           sha256sum app/build/outputs/apk/debug/app-debug.apk | tee -a speedvpn-debug-apk-fingerprint.txt
+          cp app/build/outputs/apk/debug/app-debug.apk speedvpn-debug-apk.apk
 
       - name: Install Android Emulator
         run: |
@@ -113,6 +116,7 @@ jobs:
         run: python3 scripts/e2e/benchmark_local_speed_test_server.py --base-url http://127.0.0.1:18765 --rounds 3 --streams 6 --bytes-per-stream 8000000 --min-mbps 211.2 --output fixture-throughput-benchmark.json
 
       - name: Boot Android Emulator and test 2 MB/s twice, then protected-plan regression
+        id: validation
         shell: bash
         run: |
           set -uo pipefail
@@ -157,6 +161,25 @@ jobs:
           adb -s emulator-5554 shell settings put global animator_duration_scale 0
           adb -s emulator-5554 install -r app/build/outputs/apk/debug/app-debug.apk
 
+          # Qualify this exact runner before spending time on the two targeted
+          # 2 MB/s attempts or the 19-preset regression sweep.
+          if SPEEDVPN_PREFLIGHT_ONLY=1 SPEEDVPN_RUN_DIR="baseline-preflight/initial" bash scripts/e2e/speed-limit-sweep.sh > baseline-preflight-initial.log 2>&1; then
+            cat baseline-preflight-initial.log
+            echo "preflight_status=PASS" >> "$GITHUB_OUTPUT"
+          else
+            PREFLIGHT_RC=$?
+            cat baseline-preflight-initial.log
+            if [ "$PREFLIGHT_RC" -eq 75 ] || grep -Fq "ENV_INSUFFICIENT — skipped sweep" baseline-preflight-initial.log; then
+              echo "preflight_status=ENV_INSUFFICIENT" >> "$GITHUB_OUTPUT"
+              echo "SPEEDVPN_TARGET_RUNNER_FAIL=1" >> "$GITHUB_ENV"
+              echo "SPEEDVPN_REGRESSION_EXIT=1" >> "$GITHUB_ENV"
+              echo "ENV_INSUFFICIENT — skipped sweep; requesting one retry on a new GitHub-hosted runner." | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "preflight_status=ERROR" >> "$GITHUB_OUTPUT"
+            exit "$PREFLIGHT_RC"
+          fi
+
           TARGET_RUNNER_FAIL=0
           for attempt in 1 2; do
             out="isolated-2mbps/attempt-$attempt"
@@ -165,7 +188,7 @@ jobs:
             adb -s emulator-5554 shell am force-stop com.speedvpn.app >/dev/null 2>&1 || true
             sleep 2
             adb -s emulator-5554 logcat -c || true
-            if SPEEDVPN_DIAGNOSTIC_ONLY=1               SPEEDVPN_SKIP_BASELINE_PREFLIGHT=1               SPEEDVPN_TOTAL_PRESETS=1               SPEEDVPN_CASES_OVERRIDE='12|2 MB|16000'               SPEEDVPN_RUN_DIR="$out"               bash scripts/e2e/speed-limit-sweep.sh 2>&1 | tee -a "$out/driver-console.log"; then
+            if SPEEDVPN_DIAGNOSTIC_ONLY=1               SPEEDVPN_SKIP_BASELINE_PREFLIGHT=1               SPEEDVPN_PREFLIGHT_SUMMARY="baseline-preflight/initial/baseline-preflight/summary.json"               SPEEDVPN_TOTAL_PRESETS=1               SPEEDVPN_CASES_OVERRIDE='12|2 MB|16000'               SPEEDVPN_RUN_DIR="$out"               bash scripts/e2e/speed-limit-sweep.sh 2>&1 | tee -a "$out/driver-console.log"; then
               echo "ATTEMPT_DRIVER_EXIT=0" | tee -a "$out/driver-console.log"
             else
               echo "ATTEMPT_DRIVER_EXIT=1" | tee -a "$out/driver-console.log"
@@ -175,7 +198,7 @@ jobs:
           done
 
           echo "===== PROTECTED SPEED-PLAN REGRESSION: FULL 19-PRESET SWEEP =====" | tee protected-regression-console.log
-          if SPEEDVPN_RUN_DIR=protected-speed-sweep bash scripts/e2e/speed-limit-sweep.sh 2>&1 | tee -a protected-regression-console.log; then
+          if SPEEDVPN_SKIP_BASELINE_PREFLIGHT=1 SPEEDVPN_PREFLIGHT_SUMMARY="baseline-preflight/initial/baseline-preflight/summary.json" SPEEDVPN_RUN_DIR=protected-speed-sweep bash scripts/e2e/speed-limit-sweep.sh 2>&1 | tee -a protected-regression-console.log; then
             REGRESSION_EXIT=0
           else
             REGRESSION_EXIT=$?
@@ -186,7 +209,7 @@ jobs:
           echo "SPEEDVPN_REGRESSION_EXIT=$REGRESSION_EXIT" >> "$GITHUB_ENV"
 
       - name: Enforce isolated acceptance and protected regression
-        if: always()
+        if: always() && steps.validation.outputs.preflight_status != 'ENV_INSUFFICIENT'
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -254,6 +277,9 @@ jobs:
           path: |
             isolated-2mbps/**
             protected-speed-sweep/**
+            baseline-preflight/**
+            baseline-preflight-initial.log
+            speedvpn-debug-apk.apk
             protected-regression-console.log
             speed-test-server.log
             emulator-console.log
@@ -262,3 +288,228 @@ jobs:
             speedvpn-debug-apk-fingerprint.txt
           if-no-files-found: warn
           compression-level: 6
+# A failing preflight is retried once in a separate job. GitHub-hosted jobs
+  # receive a fresh runner VM; the service does not guarantee a different
+  # Azure region, so the second three-sample gate remains authoritative.
+  retry-on-new-runner:
+    needs: isolated-2mbps-upload
+    if: ${{ needs.isolated-2mbps-upload.outputs.preflight_status == 'ENV_INSUFFICIENT' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 140
+    steps:
+      - name: Checkout exact verification commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools platforms;android-36 build-tools;36.0.0'
+
+      - name: Download APK from first-run build
+        uses: actions/download-artifact@v7
+        with:
+          name: speedvpn-isolated-2mbps-upload-verification
+          path: retry-seed
+
+      - name: Install Android Emulator
+        run: |
+          set -euo pipefail
+          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/platform-tools:$ANDROID_SDK_ROOT/emulator" >> "$GITHUB_PATH"
+          export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/platform-tools:$ANDROID_SDK_ROOT/emulator:$PATH"
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" --install emulator 'system-images;android-29;google_apis;x86_64'
+          test -s retry-seed/speedvpn-debug-apk.apk
+          test -x "$ANDROID_SDK_ROOT/emulator/emulator"
+
+      - name: Enable KVM
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y cpu-checker
+          sudo kvm-ok
+          sudo chmod 666 /dev/kvm
+          emulator -accel-check
+
+      - name: Configure controlled fixture TCP buffers and start server
+        run: |
+          set -euo pipefail
+          sudo sysctl -w net.core.rmem_max=16777216
+          sudo sysctl -w net.core.wmem_max=16777216
+          sudo sysctl -w net.ipv4.tcp_rmem='4096 131072 16777216'
+          sudo sysctl -w net.ipv4.tcp_wmem='4096 131072 16777216'
+          nohup python3 -u scripts/e2e/local_speed_test_server.py --host 0.0.0.0 --port 18765 < /dev/null > speed-test-server-retry.log 2>&1 &
+          echo "$!" > speed-test-server-retry.pid
+          python3 - <<'PY'
+          import json, time
+          from urllib.request import urlopen
+          minimum = 4 * 1024 * 1024
+          for attempt in range(60):
+              try:
+                  with urlopen("http://127.0.0.1:18765/healthz", timeout=1) as response:
+                      payload = json.loads(response.read())
+                      effective = int(payload.get("socket_receive_buffer_bytes", 0))
+                      print(f"FIXTURE_HEALTH={json.dumps(payload, sort_keys=True)}")
+                      if response.status == 200 and payload.get("status") == "ok":
+                          if effective < minimum:
+                              raise SystemExit(f"Fixture receive buffer too small: {effective} bytes")
+                          break
+              except Exception as error:
+                  print(f"FIXTURE_WAIT attempt={attempt + 1} error={type(error).__name__}: {error}")
+              time.sleep(0.5)
+          else:
+              raise SystemExit("Local speed-test fixture did not become ready")
+          PY
+
+      - name: Retry preflight once, then validate on this runner
+        id: retry-validation
+        shell: bash
+        run: |
+          set -uo pipefail
+          export ANDROID_AVD_HOME="${RUNNER_TEMP}/android-avd"
+          mkdir -p "$ANDROID_AVD_HOME" isolated-2mbps protected-speed-sweep retry-preflight
+          echo no | avdmanager create avd -n speedvpn-2mbps-retry -k 'system-images;android-29;google_apis;x86_64' --force
+          adb kill-server >/dev/null 2>&1 || true
+          adb start-server
+          nohup emulator -avd speedvpn-2mbps-retry -no-window -no-audio -no-boot-anim -no-snapshot -no-snapshot-save -no-metrics -gpu swiftshader_indirect -accel on -cores 4 -memory 4096 -partition-size 2048 -netdelay none -netspeed full -dns-server 8.8.8.8,1.1.1.1 > emulator-console-retry.log 2>&1 &
+          EMULATOR_PID=$!
+          cleanup() {
+            adb -s emulator-5554 logcat -d -v threadtime > final-logcat-retry.txt 2>&1 || true
+            adb -s emulator-5554 emu kill >/dev/null 2>&1 || true
+            kill "$EMULATOR_PID" >/dev/null 2>&1 || true
+            wait "$EMULATOR_PID" >/dev/null 2>&1 || true
+            if [ -f speed-test-server-retry.pid ]; then
+              kill "$(cat speed-test-server-retry.pid)" >/dev/null 2>&1 || true
+            fi
+          }
+          trap cleanup EXIT
+          diagnostics() {
+            adb devices -l || true
+            adb -s emulator-5554 shell ip route || true
+            adb -s emulator-5554 shell dumpsys connectivity | head -n 180 || true
+            cat emulator-console-retry.log || true
+          }
+          for i in $(seq 1 180); do
+            adb -s emulator-5554 get-state >/dev/null 2>&1 && break
+            kill -0 "$EMULATOR_PID" >/dev/null 2>&1 || { diagnostics; exit 1; }
+            sleep 1
+          done
+          adb -s emulator-5554 wait-for-device
+          for i in $(seq 1 180); do
+            adb -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' | grep -q '^1$' && break
+            kill -0 "$EMULATOR_PID" >/dev/null 2>&1 || { diagnostics; exit 1; }
+            sleep 1
+          done
+          adb -s emulator-5554 shell settings put global window_animation_scale 0
+          adb -s emulator-5554 shell settings put global transition_animation_scale 0
+          adb -s emulator-5554 shell settings put global animator_duration_scale 0
+          adb -s emulator-5554 install -r retry-seed/speedvpn-debug-apk.apk
+
+          if SPEEDVPN_PREFLIGHT_ONLY=1 SPEEDVPN_RUN_DIR="retry-preflight" bash scripts/e2e/speed-limit-sweep.sh > retry-preflight.log 2>&1; then
+            cat retry-preflight.log
+            echo "RETRY_PREFLIGHT_STATUS=PASS" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            PREFLIGHT_RC=$?
+            cat retry-preflight.log
+            echo "ENV_INSUFFICIENT — skipped sweep; one retry has already been used." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit "$PREFLIGHT_RC"
+          fi
+
+          TARGET_RUNNER_FAIL=0
+          for attempt in 1 2; do
+            out="isolated-2mbps/attempt-$attempt"
+            mkdir -p "$out"
+            echo "===== ISOLATED 2 MB/s ACCEPTANCE ATTEMPT $attempt/2 (RETRY RUNNER) =====" | tee "$out/driver-console.log"
+            adb -s emulator-5554 shell am force-stop com.speedvpn.app >/dev/null 2>&1 || true
+            sleep 2
+            adb -s emulator-5554 logcat -c || true
+            if SPEEDVPN_DIAGNOSTIC_ONLY=1 SPEEDVPN_SKIP_BASELINE_PREFLIGHT=1 SPEEDVPN_PREFLIGHT_SUMMARY="retry-preflight/baseline-preflight/summary.json" SPEEDVPN_TOTAL_PRESETS=1 SPEEDVPN_CASES_OVERRIDE='12|2 MB|16000' SPEEDVPN_RUN_DIR="$out" bash scripts/e2e/speed-limit-sweep.sh 2>&1 | tee -a "$out/driver-console.log"; then
+              echo "ATTEMPT_DRIVER_EXIT=0" | tee -a "$out/driver-console.log"
+            else
+              echo "ATTEMPT_DRIVER_EXIT=1" | tee -a "$out/driver-console.log"
+              TARGET_RUNNER_FAIL=1
+            fi
+            adb -s emulator-5554 logcat -d -v threadtime > "$out/logcat-after-attempt.txt" 2>&1 || true
+          done
+
+          echo "===== PROTECTED SPEED-PLAN REGRESSION: FULL 19-PRESET SWEEP (RETRY RUNNER) =====" | tee protected-regression-console.log
+          if SPEEDVPN_SKIP_BASELINE_PREFLIGHT=1 SPEEDVPN_PREFLIGHT_SUMMARY="retry-preflight/baseline-preflight/summary.json" SPEEDVPN_RUN_DIR=protected-speed-sweep bash scripts/e2e/speed-limit-sweep.sh 2>&1 | tee -a protected-regression-console.log; then
+            REGRESSION_EXIT=0
+          else
+            REGRESSION_EXIT=$?
+            echo "PROTECTED_REGRESSION_EXIT=$REGRESSION_EXIT" | tee -a protected-regression-console.log
+          fi
+          echo "SPEEDVPN_TARGET_RUNNER_FAIL=$TARGET_RUNNER_FAIL" >> "$GITHUB_ENV"
+          echo "SPEEDVPN_REGRESSION_EXIT=$REGRESSION_EXIT" >> "$GITHUB_ENV"
+
+      - name: Enforce isolated acceptance and protected regression (retry runner)
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import csv, os, sys
+          from pathlib import Path
+          errors = []
+          expected_commit = os.environ.get("GITHUB_SHA", "")
+          for attempt in (1, 2):
+              path = Path(f"isolated-2mbps/attempt-{attempt}/12-2_MB-parsed.csv")
+              if not path.exists():
+                  errors.append(f"Attempt {attempt}: missing result CSV {path}")
+                  continue
+              with path.open(newline="", encoding="utf-8-sig") as handle:
+                  rows = list(csv.reader(handle))
+              if len(rows) != 2:
+                  errors.append(f"Attempt {attempt}: expected 2 result rows, got {len(rows)}")
+                  continue
+              by_direction = {row[3]: row for row in rows if len(row) >= 24}
+              if set(by_direction) != {"Download", "Upload"}:
+                  errors.append(f"Attempt {attempt}: expected Download and Upload rows; got {sorted(by_direction)}")
+                  continue
+              for direction, row in by_direction.items():
+                  label = f"Attempt {attempt} {direction}"
+                  if row[1] != "2 MB" or row[2] != "16000":
+                      errors.append(f"{label}: wrong preset/target ({row[1]!r}, {row[2]!r})")
+                  if row[10] != "PASS":
+                      errors.append(f"{label}: strict status is {row[10]!r}, not PASS; reason={row[21] if len(row)>21 else 'missing'}")
+                  try:
+                      baseline_mbps = float(row[18])
+                      vpn_mbps = float(row[19])
+                  except (ValueError, IndexError):
+                      errors.append(f"{label}: missing numeric baseline/VPN measurement")
+                      continue
+                  if not (12.8 <= vpn_mbps <= 19.2):
+                      errors.append(f"{label}: measured {vpn_mbps:.3f} Mbps outside [12.8, 19.2] Mbps")
+                  if direction == "Upload" and baseline_mbps * 1000 < 19200:
+                      errors.append(f"{label}: upload baseline {baseline_mbps:.3f} Mbps is below 19.2 Mbps")
+                  if expected_commit and len(row) > 13 and row[13] != expected_commit:
+                      errors.append(f"{label}: result source commit {row[13]!r} differs from workflow commit {expected_commit!r}")
+          if os.environ.get("SPEEDVPN_TARGET_RUNNER_FAIL", "1") != "0":
+              errors.append("The targeted harness reported a driver failure or did not finish both attempts")
+          if os.environ.get("SPEEDVPN_REGRESSION_EXIT", "1") != "0":
+              errors.append(f"Protected-plan regression sweep did not pass (exit={os.environ.get('SPEEDVPN_REGRESSION_EXIT', 'not set')})")
+          if errors:
+              print("ACCEPTANCE_FAIL")
+              for error in errors:
+                  print(f"- {error}")
+              sys.exit(1)
+          print("ACCEPTANCE_PASS: retry runner passed both 2 MB/s attempts and the full protected-plan sweep.")
+          PY
+
+      - name: Upload retry-runner verification evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: speedvpn-isolated-2mbps-upload-retry-verification
+          path: |
+            isolated-2mbps/**
+            protected-speed-sweep/**
+            retry-preflight/**
+            retry-preflight.log
+            speed-test-server-retry.log
+            emulator-console-retry.log
+            final-logcat-retry.txt
+          if-no-files-found: warn
+          compression-level: 6
+
