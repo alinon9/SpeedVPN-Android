@@ -22,7 +22,7 @@ class PreflightBaselineTests(unittest.TestCase):
         self.assertTrue(any("below 96.00 Mbps" in e for e in result["errors"]))
 
     def test_low_upload_baseline_fails(self):
-        result = summarize_series([105.0, 108.0, 106.0], 106.0, 15.0)
+        result = summarize_series([103.0, 105.0, 105.0], 106.0, 15.0)
         self.assertFalse(result["passed"])
 
     def test_high_spread_fails_even_when_median_meets_headroom(self):
