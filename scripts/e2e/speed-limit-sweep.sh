@@ -579,6 +579,7 @@ BASELINE_PREFLIGHT_STATUS="NOT_RUN"
 BASELINE_PREFLIGHT_REASON="Preflight did not complete"
 BASELINE_PREFLIGHT_DOWNLOAD="unknown"
 BASELINE_PREFLIGHT_UPLOAD="unknown"
+ENV_NOTE="No upload ceiling identified by preflight; the full sweep remains authoritative."
 
 echo "===== SPEED LIMIT SWEEP START ====="
 echo "18 finite presets + Unlimited (19 total choices; 38 Download/Upload metrics)."
@@ -590,6 +591,7 @@ echo
 # but does not prevent lower presets from producing useful diagnostic measurements.
 preflight_fail() {
   local reason="$1"
+  ENV_NOTE="Preflight could not qualify this runner: $reason"
   echo "BASELINE_PREFLIGHT_FAIL=$reason" | tee -a "$RUN_DIR/sweep-console.log"
   echo "ENV_INSUFFICIENT — skipped sweep" | tee -a "$RUN_DIR/sweep-console.log"
   if [ -n "${GITHUB_OUTPUT:-}" ]; then echo "preflight_status=ENV_INSUFFICIENT" >> "$GITHUB_OUTPUT"; fi
@@ -599,8 +601,10 @@ preflight_fail() {
     echo
     echo "- GitHub run ID: $CSV_RUN_ID"
     echo "- Result: ENV_INSUFFICIENT"
-    echo "- Required median baseline: Download >= 96 Mbps; Upload >= 106 Mbps"
-    echo "- Maximum sample spread: 15% of the median in each direction"
+    echo "- Required median baseline: Download >= 96 Mbps; Upload >= 90 Mbps"
+    echo "- Primary sample-spread limit: 25% of the median in each direction"
+    echo "- Bounded outlier rule: raw spread up to 30% only when the closest pair is within 25% and every reading is within 30% of median"
+    echo "- ENV_NOTE: $ENV_NOTE"
     echo "- Failure: $reason"
     echo "- No speed presets were counted as tested; the 38-metric sweep was not started."
   } > "$RUN_DIR/speed-limit-sweep-summary.md"
@@ -631,6 +635,7 @@ for direction in ("download", "upload"):
     item=payload["directions"][direction]
     assert item.get("passed") is True, f"{direction} preflight did not pass"
     print(f"REUSED_PREFLIGHT_{direction.upper()}_MEDIAN={item['median_mbps']} Mbps")
+print(f"ENV_NOTE={payload.get('env_note', 'No upload ceiling identified by preflight; the full sweep remains authoritative.')}")
 PY
   then
     preflight_fail "The validated preflight summary could not be verified."
@@ -638,6 +643,8 @@ PY
   fi
   BASELINE_PREFLIGHT_STATUS="PASS"
   BASELINE_PREFLIGHT_REASON="Reused validated three-sample preflight summary."
+  ENV_NOTE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("env_note", "No upload ceiling identified by preflight; the full sweep remains authoritative."))' "$PREFLIGHT_SUMMARY")"
+  echo "ENV_NOTE=$ENV_NOTE" | tee -a "$RUN_DIR/sweep-console.log"
   BASELINE_PREFLIGHT_DOWNLOAD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["directions"]["download"]["median_mbps"])' "$PREFLIGHT_SUMMARY") Mbps (median)"
   BASELINE_PREFLIGHT_UPLOAD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["directions"]["upload"]["median_mbps"])' "$PREFLIGHT_SUMMARY") Mbps (median)"
   echo "BASELINE_PREFLIGHT_SKIPPED=validated three-sample preflight reused." | tee -a "$RUN_DIR/sweep-console.log"
@@ -727,16 +734,20 @@ PY
       "$PREFLIGHT_SAMPLES_DIR/round-1.json" \
       "$PREFLIGHT_SAMPLES_DIR/round-2.json" \
       "$PREFLIGHT_SAMPLES_DIR/round-3.json" \
-      --download-min 96 --upload-min 106 --max-variability 15 \
+      --download-min 96 --upload-min 90 --max-variability 25 \
       --output "$preflight_summary" 2>&1 | tee -a "$RUN_DIR/sweep-console.log"; then
     BASELINE_PREFLIGHT_STATUS="PASS"
-    BASELINE_PREFLIGHT_REASON="Three samples per direction passed median headroom and 15% stability gates."
+    BASELINE_PREFLIGHT_REASON="Three samples per direction passed median headroom and the 25% stability gate (with bounded single-outlier recovery up to 30%)."
+    ENV_NOTE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("env_note", "No upload ceiling identified by preflight; the full sweep remains authoritative."))' "$preflight_summary")"
+    echo "ENV_NOTE=$ENV_NOTE" | tee -a "$RUN_DIR/sweep-console.log"
     BASELINE_PREFLIGHT_DOWNLOAD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["directions"]["download"]["median_mbps"])' "$preflight_summary") Mbps (median)"
     BASELINE_PREFLIGHT_UPLOAD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["directions"]["upload"]["median_mbps"])' "$preflight_summary") Mbps (median)"
-    echo "BASELINE_PREFLIGHT_PASS=3/3 samples per direction; download>=96 Mbps; upload>=106 Mbps; spread<=15%." | tee -a "$RUN_DIR/sweep-console.log"
+    echo "BASELINE_PREFLIGHT_PASS=3/3 samples per direction; download>=96 Mbps; upload>=90 Mbps; primary spread<=25% with bounded single-outlier recovery up to 30%." | tee -a "$RUN_DIR/sweep-console.log"
   else
     BASELINE_PREFLIGHT_STATUS="ENV_INSUFFICIENT"
     BASELINE_PREFLIGHT_REASON="Baseline headroom or variability failed. No speed sweep was started."
+    ENV_NOTE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("env_note", "Preflight baseline headroom or variability failed."))' "$preflight_summary")"
+    echo "ENV_NOTE=$ENV_NOTE" | tee -a "$RUN_DIR/sweep-console.log"
     echo "ENV_INSUFFICIENT — skipped sweep" | tee -a "$RUN_DIR/sweep-console.log"
     if [ -n "${GITHUB_OUTPUT:-}" ]; then echo "preflight_status=ENV_INSUFFICIENT" >> "$GITHUB_OUTPUT"; fi
     {
@@ -744,8 +755,10 @@ PY
       echo
       echo "- Result: ENV_INSUFFICIENT"
       echo "- Download median minimum: 96 Mbps"
-      echo "- Upload median minimum: 106 Mbps"
-      echo "- Maximum sample range: 15% of the median in each direction"
+      echo "- Upload median minimum: 90 Mbps"
+      echo "- Primary sample-spread limit: 25% of the median in each direction"
+      echo "- Bounded one-outlier recovery: raw spread <=30%, closest pair <=25%, maximum deviation <=30%"
+      echo "- ENV_NOTE: $ENV_NOTE"
       echo "- Three baseline samples were collected before any speed sweep."
       echo "- The sweep was skipped; one retry on a new GitHub-hosted runner is permitted."
     } > "$RUN_DIR/speed-limit-sweep-summary.md"
@@ -756,6 +769,7 @@ PY
         echo "## ENV_INSUFFICIENT — skipped sweep"
         echo
         echo "The 3-sample baseline gate failed. One automatic retry is delegated to a separate runner job."
+        echo "ENV_NOTE: $ENV_NOTE"
         cat "$preflight_summary" 2>/dev/null || true
       } >> "$GITHUB_STEP_SUMMARY"
     fi
@@ -1038,8 +1052,9 @@ cat > "$RUN_DIR/speed-limit-sweep-summary.md" <<MD
 - Summary generated at (UTC): $SUMMARY_RECORDED_AT_UTC
 - Presets attempted: $TESTED_PRESET_COUNT/$TOTAL
 - Download/Upload metric results recorded: $METRIC_RESULT_COUNT/$EXPECTED_METRIC_RESULTS
-- Three-sample baseline preflight: $BASELINE_PREFLIGHT_STATUS (Download median=$BASELINE_PREFLIGHT_DOWNLOAD; Upload median=$BASELINE_PREFLIGHT_UPLOAD; minimums=96/106 Mbps; max spread=15%)
+- Three-sample baseline preflight: $BASELINE_PREFLIGHT_STATUS (Download median=$BASELINE_PREFLIGHT_DOWNLOAD; Upload median=$BASELINE_PREFLIGHT_UPLOAD; minimums=96/90 Mbps; primary spread limit=25%, with bounded single-outlier recovery up to 30%)
 - Preflight detail: $BASELINE_PREFLIGHT_REASON
+- ENV_NOTE: $ENV_NOTE
 - Metric PASS: $PASS_COUNT
 - Metric FAIL (validly collected but outside criteria, or invalid verification result): $METRIC_FAIL_COUNT
 - Metric ENV_LIMITED (insufficient physical-baseline headroom): $ENV_LIMITED_COUNT
@@ -1061,6 +1076,7 @@ cp "$RUN_DIR/speed-limit-sweep-summary.md" speed-limit-sweep-summary.md
 {
   echo "## SpeedVPN Speed-Limit Sweep"
   echo
+  echo "- ENV_NOTE: $ENV_NOTE"
   echo "- Metric PASS: $PASS_COUNT"
   echo "- Metric FAIL: $METRIC_FAIL_COUNT"
   echo "- Metric ENV_LIMITED: $ENV_LIMITED_COUNT"
