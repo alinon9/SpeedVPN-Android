@@ -16,6 +16,7 @@ from verify_metrics import (
     collect_preflight,
     check_metric,
     is_accepted_env_limited,
+    is_accepted_env_limited_result,
     parse_json,
 )
 
@@ -213,8 +214,10 @@ class DocumentedEnvironmentLimitationTests(unittest.TestCase):
             values("download", "90.00 Mbps", "80.00 Mbps", "70.00 Mbps", STATUS_MISMATCH, "87.5%"),
             80_000,
         )
-        self.assertTrue(result[4].startswith("FAIL|"), result[4])
-        self.assertIn("accuracy should be unavailable", result[4])
+        classification, separator, reason = result[4].partition("|")
+        self.assertEqual("ENV_LIMITED", classification, result[4])
+        self.assertIn("accuracy should be unavailable", reason)
+        self.assertFalse(is_accepted_env_limited_result("download", 80_000, classification, reason))
 
     def test_parse_json_accepts_but_preserves_allowed_env_limited_rows(self):
         with tempfile.TemporaryDirectory() as temp_dir:

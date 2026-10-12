@@ -51,6 +51,15 @@ def is_accepted_env_limited(direction: str, expected_kbps: int) -> bool:
     return False
 
 
+def is_accepted_env_limited_result(direction: str, expected_kbps: int, classification: str, reason: str) -> bool:
+    """Accept only allow-listed ENV_LIMITED results without independent accuracy errors."""
+    return (
+        classification == "ENV_LIMITED"
+        and is_accepted_env_limited(direction, expected_kbps)
+        and "accuracy" not in reason.lower()
+    )
+
+
 RATE_RE = re.compile(r"^([0-9]+(?:\.[0-9]+)?)\s?(bps|Kbps|Mbps|Gbps)$")
 ACCURACY_RE = re.compile(r"^([0-9]+(?:\.[0-9]+)?)%$")
 MULTIPLIERS = {"bps": 1.0, "Kbps": 1_000.0, "Mbps": 1_000_000.0, "Gbps": 1_000_000_000.0}
@@ -426,7 +435,7 @@ def check_metric(direction: str, values: dict[str, str], expected_kbps: int) -> 
     # an under/over-target VPN result cannot independently prove an app defect.
     # Preserve ENV_LIMITED as a distinct non-PASS classification. The final
     # sweep gate accepts it only for the explicit plan/direction allowlist;
-    # wrong plans, missing rates, unknown verdicts, and independent accuracy errors remain FAIL.
+    # The final gate still rejects wrong plans, missing rates, unknown verdicts, or accuracy errors.
     valid_verdicts = {STATUS_PASS, STATUS_MISMATCH, STATUS_UNJUDGEABLE}
     if (
         baseline_limited
@@ -434,7 +443,6 @@ def check_metric(direction: str, values: dict[str, str], expected_kbps: int) -> 
         and vpn_bps is not None
         and vpn_bps > 0
         and verdict in valid_verdicts
-        and accuracy_error is None
     ):
         return baseline, plan, vpn, verdict, "ENV_LIMITED|" + "; ".join(reasons)
 
@@ -457,9 +465,8 @@ def parse_json(json_path: str, preset: str, expected_kbps: int, index: int, outp
     for direction in ("download", "upload"):
         baseline, plan, vpn, verdict, result = check_metric(direction, values, expected_kbps)
         classification, sep, reason = result.partition("|")
-        accepted_env_limited = (
-            classification == "ENV_LIMITED"
-            and is_accepted_env_limited(direction, expected_kbps)
+        accepted_env_limited = is_accepted_env_limited_result(
+            direction, expected_kbps, classification, reason
         )
         failed = failed or (classification not in {"PASS", "PASS_UNLIMITED"} and not accepted_env_limited)
         label = "Download" if direction == "download" else "Upload"
@@ -501,9 +508,8 @@ def validate_json(json_path: str, expected_download: int, expected_upload: int) 
         _, plan, vpn, verdict, result = check_metric(direction, values, expected)
         classification, sep, reason = result.partition("|")
         print(f"VERIFY {direction.upper()}: plan={plan}; vpn={vpn}; verdict={verdict}; class={classification}")
-        accepted_env_limited = (
-            classification == "ENV_LIMITED"
-            and is_accepted_env_limited(direction, expected)
+        accepted_env_limited = is_accepted_env_limited_result(
+            direction, expected, classification, reason
         )
         if classification not in {"PASS", "PASS_UNLIMITED"} and not accepted_env_limited:
             errors.append(reason or f"{direction}: {classification}")
@@ -684,8 +690,8 @@ def validate_sweep(csv_path: str) -> int:
         calculated, sep, reason = result.partition("|")
         recorded = row["classification"]
         direction_allowlisted = is_accepted_env_limited(direction, expected)
-        calculated_env_accepted = calculated == "ENV_LIMITED" and direction_allowlisted
-        recorded_env_accepted = recorded == "ENV_LIMITED" and direction_allowlisted
+        calculated_env_accepted = (calculated == "ENV_LIMITED" and direction_allowlisted and "accuracy" not in reason.lower())
+        recorded_env_accepted = (recorded == "ENV_LIMITED" and direction_allowlisted and "accuracy" not in reason.lower())
         if calculated in {"PASS", "PASS_UNLIMITED"}:
             pass_count += 1
         elif calculated_env_accepted:
