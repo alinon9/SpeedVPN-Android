@@ -62,6 +62,7 @@ class Socks5RelayReadBatchTest {
                 isUploadDirection = true,
                 sessionActive = true,
                 destinationWriteBrokenPipe = true,
+                destinationWriteConnectionReset = false,
                 halfCloseFailed = false,
             ),
         )
@@ -74,6 +75,7 @@ class Socks5RelayReadBatchTest {
                 isUploadDirection = true,
                 sessionActive = true,
                 destinationWriteBrokenPipe = false,
+                destinationWriteConnectionReset = false,
                 halfCloseFailed = true,
             ),
         )
@@ -112,6 +114,7 @@ class Socks5RelayReadBatchTest {
                 isUploadDirection = false,
                 sessionActive = true,
                 destinationWriteBrokenPipe = true,
+                destinationWriteConnectionReset = false,
                 halfCloseFailed = true,
             ),
         )
@@ -124,6 +127,7 @@ class Socks5RelayReadBatchTest {
                 isUploadDirection = true,
                 sessionActive = false,
                 destinationWriteBrokenPipe = true,
+                destinationWriteConnectionReset = false,
                 halfCloseFailed = true,
             ),
         )
