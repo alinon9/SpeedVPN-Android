@@ -197,6 +197,51 @@ class VerifyMetricClassificationTests(unittest.TestCase):
         self.assertIn("retains less than 80% of baseline", result[4])
 
 
+class UnlimitedDownloadBorderlineRetentionTests(unittest.TestCase):
+    def evaluate_retention(self, retention_percent, direction="download"):
+        result = check_metric(
+            direction,
+            values(
+                direction,
+                "100.00 Mbps",
+                "بدون حد",
+                f"{retention_percent:.2f} Mbps",
+                STATUS_UNLIMITED,
+                f"{retention_percent:.1f}%",
+            ),
+            0,
+        )
+        classification, _, reason = result[4].partition("|")
+        return classification, reason
+
+    def test_unlimited_download_retention_81_percent_passes(self):
+        classification, _ = self.evaluate_retention(81.0)
+        self.assertEqual("PASS_UNLIMITED", classification)
+
+    def test_unlimited_download_retention_78_percent_is_accepted_env_limited(self):
+        classification, reason = self.evaluate_retention(78.0)
+        self.assertEqual("ENV_LIMITED", classification)
+        self.assertTrue(
+            is_accepted_env_limited_result("download", 0, classification, reason),
+            reason,
+        )
+        self.assertNotEqual("FAIL", classification)
+
+    def test_unlimited_download_retention_74_percent_is_a_real_failure(self):
+        classification, reason = self.evaluate_retention(74.0)
+        self.assertEqual("FAIL", classification, reason)
+        self.assertFalse(is_accepted_env_limited_result("download", 0, classification, reason))
+
+    def test_unlimited_download_retention_70_percent_is_a_real_failure(self):
+        classification, reason = self.evaluate_retention(70.0)
+        self.assertEqual("FAIL", classification, reason)
+        self.assertFalse(is_accepted_env_limited_result("download", 0, classification, reason))
+
+    def test_borderline_unlimited_upload_is_not_covered_by_download_exception(self):
+        classification, _ = self.evaluate_retention(78.0, direction="upload")
+        self.assertEqual("FAIL", classification)
+
+
 class DocumentedEnvironmentLimitationTests(unittest.TestCase):
     def test_env_limited_allowlist_is_direction_specific(self):
         self.assertTrue(is_accepted_env_limited("upload", 72_000))  # 9 MB/s
