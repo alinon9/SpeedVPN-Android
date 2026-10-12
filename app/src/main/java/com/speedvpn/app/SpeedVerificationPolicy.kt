@@ -23,6 +23,13 @@ object SpeedVerificationPolicy {
     const val TOLERANCE = 0.20
     const val BASELINE_HEADROOM_MULTIPLIER = 1.20
 
+    // The 75 KB/s and 100 KB/s presets can be judged once the physical baseline
+    // reaches the plan itself. All other presets retain the stricter 1.2x floor.
+    private val LOW_RATE_HEADROOM_TARGETS_KBPS = setOf(600L, 800L)
+
+    private fun headroomMultiplierFor(planKbps: Long): Double =
+        if (planKbps in LOW_RATE_HEADROOM_TARGETS_KBPS) 1.0 else BASELINE_HEADROOM_MULTIPLIER
+
     fun evaluate(planKbps: Long?, baselineBps: Long?, vpnBps: Long?): SpeedMetricVerification {
         if (planKbps == null || planKbps <= 0L) {
             if (baselineBps == null || vpnBps == null || baselineBps <= 0L || vpnBps < 0L) {
@@ -55,7 +62,8 @@ object SpeedVerificationPolicy {
             )
         }
 
-        if (baselineBps.toDouble() < targetBps.toDouble() * BASELINE_HEADROOM_MULTIPLIER) {
+        val headroomMultiplier = headroomMultiplierFor(planKbps)
+        if (baselineBps.toDouble() < targetBps.toDouble() * headroomMultiplier) {
             return SpeedMetricVerification(
                 planKbps, baselineBps, vpnBps, SpeedVerificationStatus.NOT_VERIFIABLE, null,
                 "سرعة الشبكة الأصلية يجب أن تبلغ 1.2 مرة من الخطة على الأقل.",
