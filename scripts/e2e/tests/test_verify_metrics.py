@@ -146,6 +146,14 @@ class VerifyMetricClassificationTests(unittest.TestCase):
         )
         self.assertEqual("PASS", result[4])
 
+    def test_2mb_upload_keeps_twelve_times_headroom_floor(self):
+        result = check_metric(
+            "upload",
+            values("upload", "18.00 Mbps", "16.00 Mbps", "13.43 Mbps", STATUS_PASS, "83.9%"),
+            16_000,
+        )
+        self.assertTrue(result[4].startswith("ENV_LIMITED|"), result[4])
+
     def test_accuracy_rounding_matches_displayed_rate_precision(self):
         result = check_metric(
             "download",
