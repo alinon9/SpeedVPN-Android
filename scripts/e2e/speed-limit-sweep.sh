@@ -42,6 +42,9 @@ SPEED_CASES=$(cat <<'CASES'
 19|بدون حد|0
 CASES
 )
+if [ -n "${SPEEDVPN_CASES_OVERRIDE:-}" ]; then
+  SPEED_CASES="$SPEEDVPN_CASES_OVERRIDE"
+fi
 
 dump_ui() {
   local out="$1"
@@ -565,7 +568,7 @@ record_failed_pair() {
     "$RUN_DIR/speed-limit-sweep-results.csv" "$index" "$preset" "$expected" "$status" "$reason"
 }
 
-TOTAL=19
+TOTAL="${SPEEDVPN_TOTAL_PRESETS:-19}"
 FAIL_COUNT=0
 METRIC_FAIL_COUNT=0
 ENV_LIMITED_COUNT=0
