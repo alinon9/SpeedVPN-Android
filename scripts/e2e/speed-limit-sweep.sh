@@ -592,26 +592,34 @@ preflight_fail() {
   local reason="$1"
   echo "BASELINE_PREFLIGHT_FAIL=$reason" | tee -a "$RUN_DIR/sweep-console.log"
   echo "ENV_INSUFFICIENT — skipped sweep" | tee -a "$RUN_DIR/sweep-console.log"
-  if [ -n "${GITHUB_OUTPUT:-}" ]; then echo "preflight_status=ENV_INSUFFICIENT" >> "$GITHUB_OUTPUT"; fi
+  if [ -n "\${GITHUB_OUTPUT:-}" ]; then echo "preflight_status=ENV_INSUFFICIENT" >> "$GITHUB_OUTPUT"; fi
   adb -s "$DEVICE" logcat -d -v threadtime > "$RUN_DIR/baseline-preflight-logcat.txt" 2>&1 || true
   {
     echo "# SpeedVPN baseline preflight"
     echo
     echo "- GitHub run ID: $CSV_RUN_ID"
-    echo "- Result: INFRASTRUCTURE_BLOCKED"
-    echo "- Target: 88 Mbps"
+    echo "- Result: ENV_INSUFFICIENT"
     echo "- Required median baseline: Download >= 96 Mbps; Upload >= 106 Mbps"
     echo "- Maximum sample spread: 15% of the median in each direction"
     echo "- Failure: $reason"
     echo "- No speed presets were counted as tested; the 38-metric sweep was not started."
   } > "$RUN_DIR/speed-limit-sweep-summary.md"
-  # Preserve a root-level CSV for the strict workflow gate even on early exits.
-  # The header-only CSV remains a hard failure; if [ "${SPEEDVPN_SKIP_BASELINE_PREFLIGHT:-0}" = "1" ]; then
-  PREFLIGHT_SUMMARY="${SPEEDVPN_PREFLIGHT_SUMMARY:-}"
+  cp "$RUN_DIR/speed-limit-sweep-results.csv" speed-limit-sweep-results.csv
+  cp "$RUN_DIR/speed-limit-sweep-summary.md" speed-limit-sweep-summary.md
+  if [ -n "\${GITHUB_STEP_SUMMARY:-}" ]; then
+    {
+      echo "## ENV_INSUFFICIENT — skipped sweep"
+      echo
+      echo "$reason"
+    } >> "$GITHUB_STEP_SUMMARY"
+  fi
+  return 0
+}
+
+if [ "\${SPEEDVPN_SKIP_BASELINE_PREFLIGHT:-0}" = "1" ]; then
+  PREFLIGHT_SUMMARY="\${SPEEDVPN_PREFLIGHT_SUMMARY:-}"
   if [ -z "$PREFLIGHT_SUMMARY" ] || [ ! -s "$PREFLIGHT_SUMMARY" ]; then
-    echo "ENV_INSUFFICIENT — skipped sweep" | tee -a "$RUN_DIR/sweep-console.log"
-    echo "ERROR: SPEEDVPN_SKIP_BASELINE_PREFLIGHT=1 requires a validated SPEEDVPN_PREFLIGHT_SUMMARY file."
-    if [ -n "${GITHUB_OUTPUT:-}" ]; then echo "preflight_status=ENV_INSUFFICIENT" >> "$GITHUB_OUTPUT"; fi
+    preflight_fail "SPEEDVPN_SKIP_BASELINE_PREFLIGHT was requested without a validated summary."
     exit 75
   fi
   if ! python3 - "$PREFLIGHT_SUMMARY" <<'PY' | tee -a "$RUN_DIR/sweep-console.log"
@@ -625,8 +633,7 @@ for direction in ("download", "upload"):
     print(f"REUSED_PREFLIGHT_{direction.upper()}_MEDIAN={item['median_mbps']} Mbps")
 PY
   then
-    echo "ENV_INSUFFICIENT — skipped sweep" | tee -a "$RUN_DIR/sweep-console.log"
-    if [ -n "${GITHUB_OUTPUT:-}" ]; then echo "preflight_status=ENV_INSUFFICIENT" >> "$GITHUB_OUTPUT"; fi
+    preflight_fail "The validated preflight summary could not be verified."
     exit 75
   fi
   BASELINE_PREFLIGHT_STATUS="PASS"
@@ -634,7 +641,7 @@ PY
   BASELINE_PREFLIGHT_DOWNLOAD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["directions"]["download"]["median_mbps"])' "$PREFLIGHT_SUMMARY") Mbps (median)"
   BASELINE_PREFLIGHT_UPLOAD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["directions"]["upload"]["median_mbps"])' "$PREFLIGHT_SUMMARY") Mbps (median)"
   echo "BASELINE_PREFLIGHT_SKIPPED=validated three-sample preflight reused." | tee -a "$RUN_DIR/sweep-console.log"
-  if [ -n "${GITHUB_OUTPUT:-}" ]; then echo "preflight_status=PASS" >> "$GITHUB_OUTPUT"; fi
+  if [ -n "\${GITHUB_OUTPUT:-}" ]; then echo "preflight_status=PASS" >> "$GITHUB_OUTPUT"; fi
 else
   PREFLIGHT_START_EPOCH="$(date +%s)"
   PREFLIGHT_SAMPLES_DIR="$RUN_DIR/baseline-preflight"
@@ -642,8 +649,8 @@ else
 
   for preflight_round in 1 2 3; do
     echo "===== BASELINE PREFLIGHT SAMPLE $preflight_round/3 =====" | tee -a "$RUN_DIR/sweep-console.log"
-    if [ "$(( $(date +%s) - PREFLIGHT_START_EPOCH ))" -ge 165 ]; then
-      preflight_fail "Three-sample preflight exceeded its 165-second time budget."
+    if [ "$(( $(date +%s) - PREFLIGHT_START_EPOCH ))" -ge 155 ]; then
+      preflight_fail "Three-sample preflight exceeded its 155-second time budget."
       exit 75
     fi
     if ! cleanup_vpn; then
@@ -679,13 +686,13 @@ else
       dump_ui "$preflight_xml" || true
       if python3 scripts/e2e/verify_metrics.py collect-preflight "$preflight_xml" "$preflight_json" >> "$RUN_DIR/sweep-console.log" 2>&1; then
         preflight_collected=1
-        echo "Baseline sample $preflight_round collected after ${preflight_poll}s." | tee -a "$RUN_DIR/sweep-console.log"
+        echo "Baseline sample $preflight_round collected after \${preflight_poll}s." | tee -a "$RUN_DIR/sweep-console.log"
         break
       fi
       if [ "$((preflight_poll % 2))" -eq 0 ]; then
         adb -s "$DEVICE" shell input swipe 160 500 160 220 650 || true
       fi
-      if [ "$(( $(date +%s) - PREFLIGHT_START_EPOCH ))" -ge 165 ]; then
+      if [ "$(( $(date +%s) - PREFLIGHT_START_EPOCH ))" -ge 155 ]; then
         break
       fi
       sleep 1
@@ -709,8 +716,8 @@ PY
       preflight_fail "VPN TUN was not stopped after baseline sample $preflight_round."
       exit 75
     fi
-    if [ "$(( $(date +%s) - PREFLIGHT_START_EPOCH ))" -ge 165 ]; then
-      preflight_fail "Three-sample preflight exceeded its 165-second time budget."
+    if [ "$(( $(date +%s) - PREFLIGHT_START_EPOCH ))" -ge 155 ]; then
+      preflight_fail "Three-sample preflight exceeded its 155-second time budget."
       exit 75
     fi
   done
@@ -731,7 +738,7 @@ PY
     BASELINE_PREFLIGHT_STATUS="ENV_INSUFFICIENT"
     BASELINE_PREFLIGHT_REASON="Baseline headroom or variability failed. No speed sweep was started."
     echo "ENV_INSUFFICIENT — skipped sweep" | tee -a "$RUN_DIR/sweep-console.log"
-    if [ -n "${GITHUB_OUTPUT:-}" ]; then echo "preflight_status=ENV_INSUFFICIENT" >> "$GITHUB_OUTPUT"; fi
+    if [ -n "\${GITHUB_OUTPUT:-}" ]; then echo "preflight_status=ENV_INSUFFICIENT" >> "$GITHUB_OUTPUT"; fi
     {
       echo "# SpeedVPN baseline preflight"
       echo
@@ -744,7 +751,7 @@ PY
     } > "$RUN_DIR/speed-limit-sweep-summary.md"
     cp "$RUN_DIR/speed-limit-sweep-results.csv" speed-limit-sweep-results.csv
     cp "$RUN_DIR/speed-limit-sweep-summary.md" speed-limit-sweep-summary.md
-    if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    if [ -n "\${GITHUB_STEP_SUMMARY:-}" ]; then
       {
         echo "## ENV_INSUFFICIENT — skipped sweep"
         echo
@@ -756,16 +763,9 @@ PY
   fi
 fi
 
-if [ "${SPEEDVPN_PREFLIGHT_ONLY:-0}" = "1" ]; then
+if [ "\${SPEEDVPN_PREFLIGHT_ONLY:-0}" = "1" ]; then
   echo "PREFLIGHT_ONLY_COMPLETE status=$BASELINE_PREFLIGHT_STATUS" | tee -a "$RUN_DIR/sweep-console.log"
   exit 0
-fi
-
-"BASELINE_PREFLIGHT_ENV_LIMITED=$BASELINE_PREFLIGHT_REASON" | tee -a "$RUN_DIR/sweep-console.log"
-fi
-if ! cleanup_vpn; then
-  preflight_fail "VPN TUN was not stopped after baseline preflight."
-  exit 1
 fi
 
 # Keep the case list on FD 3 rather than stdin: adb shell can consume
