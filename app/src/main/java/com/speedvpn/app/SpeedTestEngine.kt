@@ -261,6 +261,7 @@ object SpeedTestEngine {
                 expectedKbps = expectedKbps,
                 verificationProfile = verificationProfile,
                 remainingPhaseMs = warmupRemainingMs,
+                isUploadRequest = isUpload,
             )
             warmup(warmupClient, isUpload, warmupBytes)
             Log.d(TAG, "Warm-up complete direction=$directionName bytes=$warmupBytes")
@@ -585,17 +586,32 @@ object SpeedTestEngine {
         expectedKbps: Long?,
         verificationProfile: Boolean,
         remainingPhaseMs: Long = PHASE_TIMEOUT_MS,
+        isUploadRequest: Boolean = false,
     ): OkHttpClient {
-        if (!verificationProfile) return baseClient
-        val requestTimeoutMs = measurementCallTimeoutMs(sizeBytes, expectedKbps, verificationProfile = true)
-        val timeoutMs = min(requestTimeoutMs, remainingPhaseMs.coerceAtLeast(1L))
-        // Read/write timeouts must scale with the same target-aware call deadline.
-        // Otherwise a valid 512 KiB upload at 200 Kbps would hit the default 25-second I/O timeout.
-        return baseClient.newBuilder()
-            .callTimeout(timeoutMs, TimeUnit.MILLISECONDS)
-            .readTimeout(timeoutMs, TimeUnit.MILLISECONDS)
-            .writeTimeout(timeoutMs, TimeUnit.MILLISECONDS)
-            .build()
+        if (!verificationProfile && !isUploadRequest) return baseClient
+
+        val builder = baseClient.newBuilder()
+        if (isUploadRequest) {
+            // Do not ask the upstream to close the TCP connection while OkHttp is
+            // finishing the upload body. The response may arrive as soon as the
+            // server has consumed Content-Length, racing the final client-side flush
+            // through the SOCKS relay and producing Broken pipe instead of a sample.
+            // A zero-idle pool keeps every upload request isolated without relying on
+            // the peer to perform the close at that exact point.
+            builder.connectionPool(ConnectionPool(0, 1L, TimeUnit.SECONDS))
+        }
+
+        if (verificationProfile) {
+            val requestTimeoutMs = measurementCallTimeoutMs(sizeBytes, expectedKbps, verificationProfile = true)
+            val timeoutMs = min(requestTimeoutMs, remainingPhaseMs.coerceAtLeast(1L))
+            // Read/write timeouts must scale with the same target-aware call deadline.
+            // Otherwise a valid 512 KiB upload at 200 Kbps would hit the default 25-second I/O timeout.
+            builder
+                .callTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+                .readTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+                .writeTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+        }
+        return builder.build()
     }
 
     internal fun requiredSamplesFor(expectedKbps: Long?, verificationProfile: Boolean): Int {
@@ -726,7 +742,12 @@ object SpeedTestEngine {
     ): Long {
         val request = buildUploadRequest(sizeBytes, FixedUploadBody(sizeBytes))
         val requestClient = clientForMeasurementRequest(
-            client, sizeBytes, expectedKbps, verificationProfile, remainingPhaseMs,
+            client,
+            sizeBytes,
+            expectedKbps,
+            verificationProfile,
+            remainingPhaseMs,
+            isUploadRequest = true,
         )
         val started = System.nanoTime()
         executeMeasuredRequest(requestClient, request, "upload", sizeBytes, started).use { response ->
@@ -783,7 +804,6 @@ object SpeedTestEngine {
             .header("User-Agent", "SpeedVPN/1.0 Android")
             .header("Referer", REFERER)
             .header("Accept", "*/*")
-            .header("Connection", "close")
             .post(body)
             .build()
     }
