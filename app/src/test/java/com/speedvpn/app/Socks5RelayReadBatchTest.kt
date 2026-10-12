@@ -58,7 +58,7 @@ class Socks5RelayReadBatchTest {
     @Test
     fun uploadBrokenPipeKeepsReverseResponseFlowAliveForActiveSession() {
         assertTrue(
-            shouldPreserveReverseFlowAfterUploadHalfClose(
+            shouldPreserveReverseFlowAfterUploadWriteFailure(
                 isUploadDirection = true,
                 sessionActive = true,
                 destinationWriteBrokenPipe = true,
@@ -70,7 +70,7 @@ class Socks5RelayReadBatchTest {
     @Test
     fun uploadHalfCloseFailureKeepsReverseResponseFlowAliveForActiveSession() {
         assertTrue(
-            shouldPreserveReverseFlowAfterUploadHalfClose(
+            shouldPreserveReverseFlowAfterUploadWriteFailure(
                 isUploadDirection = true,
                 sessionActive = true,
                 destinationWriteBrokenPipe = false,
@@ -80,9 +80,35 @@ class Socks5RelayReadBatchTest {
     }
 
     @Test
+    fun uploadConnectionResetDuringDestinationWriteKeepsReverseResponseFlowAliveForActiveSession() {
+        assertTrue(
+            shouldPreserveReverseFlowAfterUploadWriteFailure(
+                isUploadDirection = true,
+                sessionActive = true,
+                destinationWriteBrokenPipe = false,
+                destinationWriteConnectionReset = true,
+                halfCloseFailed = false,
+            ),
+        )
+    }
+
+    @Test
+    fun downloadConnectionResetDoesNotKeepReverseFlowAlive() {
+        assertTrue(
+            !shouldPreserveReverseFlowAfterUploadWriteFailure(
+                isUploadDirection = false,
+                sessionActive = true,
+                destinationWriteBrokenPipe = false,
+                destinationWriteConnectionReset = true,
+                halfCloseFailed = false,
+            ),
+        )
+    }
+
+    @Test
     fun downloadWriteFailureDoesNotKeepReverseFlowAlive() {
         assertTrue(
-            !shouldPreserveReverseFlowAfterUploadHalfClose(
+            !shouldPreserveReverseFlowAfterUploadWriteFailure(
                 isUploadDirection = false,
                 sessionActive = true,
                 destinationWriteBrokenPipe = true,
@@ -94,7 +120,7 @@ class Socks5RelayReadBatchTest {
     @Test
     fun inactiveVpnSessionDoesNotKeepReverseFlowAlive() {
         assertTrue(
-            !shouldPreserveReverseFlowAfterUploadHalfClose(
+            !shouldPreserveReverseFlowAfterUploadWriteFailure(
                 isUploadDirection = true,
                 sessionActive = false,
                 destinationWriteBrokenPipe = true,
