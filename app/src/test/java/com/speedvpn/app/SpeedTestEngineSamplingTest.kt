@@ -44,8 +44,22 @@ class SpeedTestEngineSamplingTest {
             SpeedTestEngine.requestSizesFor(16_000L),
         )
         assertArrayEquals(
+            longArrayOf(6_000_000L, 6_000_000L, 6_000_000L),
+            SpeedTestEngine.requestSizesFor(16_000L, verificationProfile = true),
+        )
+        // The transport-lifecycle fix must not rewrite the sampling plans for
+        // other medium/fast presets.
+        assertArrayEquals(
+            longArrayOf(12_000_000L, 12_000_000L, 12_000_000L),
+            SpeedTestEngine.requestSizesFor(32_000L, verificationProfile = true),
+        )
+        assertArrayEquals(
+            longArrayOf(15_000_000L, 15_000_000L, 15_000_000L),
+            SpeedTestEngine.requestSizesFor(40_000L, verificationProfile = true),
+        )
+        assertArrayEquals(
             longArrayOf(16_500_000L, 16_500_000L, 16_500_000L),
-            SpeedTestEngine.requestSizesFor(88_000L),
+            SpeedTestEngine.requestSizesFor(88_000L, verificationProfile = true),
         )
     }
 
@@ -306,7 +320,7 @@ class SpeedTestEngineSamplingTest {
     }
 
     @Test
-    fun everyMeasurementRequestClosesItsTcpConnectionToAvoidReusingHalfClosedSocksRelays() {
+    fun uploadRequestDoesNotAskThePeerToCloseWhileTheBodyWriteFinishes() {
         val download = SpeedTestEngine.buildDownloadRequest(1_000_000L)
         val upload = SpeedTestEngine.buildUploadRequest(
             1_000_000L,
@@ -319,8 +333,46 @@ class SpeedTestEngineSamplingTest {
             },
         )
 
+        // Download behavior is intentionally unchanged. Upload connection teardown
+        // is owned by its zero-idle per-request pool after the HTTP response is read.
         assertEquals("close", download.header("Connection"))
-        assertEquals("close", upload.header("Connection"))
+        assertEquals(null, upload.header("Connection"))
+    }
+
+    @Test
+    fun eachUploadRequestGetsItsOwnConnectionPoolAndRetainsVerificationTimeouts() {
+        val base = OkHttpClient.Builder()
+            .callTimeout(30, TimeUnit.SECONDS)
+            .readTimeout(25, TimeUnit.SECONDS)
+            .writeTimeout(25, TimeUnit.SECONDS)
+            .build()
+        val first = SpeedTestEngine.clientForMeasurementRequest(
+            base,
+            sizeBytes = 6_000_000L,
+            expectedKbps = 16_000L,
+            verificationProfile = true,
+            isUploadRequest = true,
+        )
+        val second = SpeedTestEngine.clientForMeasurementRequest(
+            base,
+            sizeBytes = 6_000_000L,
+            expectedKbps = 16_000L,
+            verificationProfile = true,
+            isUploadRequest = true,
+        )
+
+        assertNotSame(base.connectionPool, first.connectionPool)
+        assertNotSame(first.connectionPool, second.connectionPool)
+        assertEquals(
+            SpeedTestEngine.measurementCallTimeoutMs(6_000_000L, 16_000L, verificationProfile = true).toInt(),
+            first.callTimeoutMillis,
+        )
+        assertEquals(first.callTimeoutMillis, first.readTimeoutMillis)
+        assertEquals(first.callTimeoutMillis, first.writeTimeoutMillis)
+
+        first.connectionPool.evictAll()
+        second.connectionPool.evictAll()
+        base.connectionPool.evictAll()
     }
 
 }
