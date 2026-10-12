@@ -209,7 +209,7 @@ jobs:
           echo "SPEEDVPN_REGRESSION_EXIT=$REGRESSION_EXIT" >> "$GITHUB_ENV"
 
       - name: Enforce isolated acceptance and protected regression
-        if: always() && steps.validation.outputs.preflight_status != 'ENV_INSUFFICIENT'
+        if: always() && steps.validation.conclusion == 'success' && steps.validation.outputs.preflight_status != 'ENV_INSUFFICIENT'
         run: |
           set -euo pipefail
           python3 - <<'PY'
