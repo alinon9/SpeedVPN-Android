@@ -217,9 +217,9 @@ class DocumentedEnvironmentLimitationTests(unittest.TestCase):
             input_path.write_text(json.dumps(metrics), encoding="utf-8")
             self.assertEqual(0, parse_json(str(input_path), "10 MB", 80_000, 17, str(output_path)))
             with output_path.open(newline="", encoding="utf-8") as handle:
-                rows = list(csv.DictReader(handle))
-            self.assertEqual(["ENV_LIMITED", "ENV_LIMITED"], [row["classification"] for row in rows])
-            self.assertEqual(["ENV_LIMITED", "ENV_LIMITED"], [row["status"] for row in rows])
+                rows = list(csv.reader(handle))
+            self.assertEqual(["ENV_LIMITED", "ENV_LIMITED"], [row[10] for row in rows])
+            self.assertEqual(["ENV_LIMITED", "ENV_LIMITED"], [row[20] for row in rows])
 
     def test_parse_json_still_fails_unallowlisted_download_env_limited(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -231,8 +231,8 @@ class DocumentedEnvironmentLimitationTests(unittest.TestCase):
             input_path.write_text(json.dumps(metrics), encoding="utf-8")
             self.assertEqual(2, parse_json(str(input_path), "9 MB", 72_000, 16, str(output_path)))
             with output_path.open(newline="", encoding="utf-8") as handle:
-                rows = list(csv.DictReader(handle))
-            self.assertEqual(["ENV_LIMITED", "ENV_LIMITED"], [row["classification"] for row in rows])
+                rows = list(csv.reader(handle))
+            self.assertEqual(["ENV_LIMITED", "ENV_LIMITED"], [row[10] for row in rows])
 
 
 if __name__ == "__main__":
