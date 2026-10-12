@@ -1,0 +1,226 @@
+name: 2 MB/s Upload — Two Consecutive Runs
+
+on:
+  push:
+    branches:
+      - verify/2mbps-two-runs-only-20261012
+
+permissions:
+  contents: read
+
+concurrency:
+  group: speedvpn-2mbps-two-runs-only
+  cancel-in-progress: false
+
+jobs:
+  target-two-runs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout exact verification commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools platforms;android-36 build-tools;36.0.0 ndk;30.0.16248370'
+
+      - name: Prepare pinned native tunnel
+        run: |
+          set -euo pipefail
+          echo 'ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/30.0.16248370' >> "$GITHUB_ENV"
+          echo 'ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/30.0.16248370' >> "$GITHUB_ENV"
+          bash ./setup.sh
+          test "$(git -C app/src/main/jni/hev-socks5-tunnel rev-parse HEAD)" = 'd9dca26c7ad0e494492244f0309e80ee583e739e'
+
+      - name: Validate test helpers
+        run: |
+          set -euo pipefail
+          bash -n scripts/e2e/speed-limit-sweep.sh
+          python3 -m py_compile scripts/e2e/verify_metrics.py scripts/e2e/local_speed_test_server.py scripts/e2e/metric_result_status.py scripts/e2e/patch_hev_tcp_buffers.py
+          python3 -m unittest discover -s scripts/e2e/tests -v
+
+      - name: Build APK and run JVM unit tests
+        run: |
+          set -euo pipefail
+          ./gradlew :app:testDebugUnitTest :app:assembleDebug -PspeedTestBaseUrl=http://10.0.2.2:18765 --stacktrace --no-daemon
+          test -s app/build/outputs/apk/debug/app-debug.apk
+          echo "source_commit=$(git rev-parse HEAD)" | tee speedvpn-debug-apk-fingerprint.txt
+          sha256sum app/build/outputs/apk/debug/app-debug.apk | tee -a speedvpn-debug-apk-fingerprint.txt
+
+      - name: Install Android Emulator
+        run: |
+          set -euo pipefail
+          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/platform-tools:$ANDROID_SDK_ROOT/emulator" >> "$GITHUB_PATH"
+          export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/platform-tools:$ANDROID_SDK_ROOT/emulator:$PATH"
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" --install emulator 'system-images;android-29;google_apis;x86_64'
+          test -x "$ANDROID_SDK_ROOT/emulator/emulator"
+
+      - name: Enable KVM
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y cpu-checker
+          sudo kvm-ok
+          sudo chmod 666 /dev/kvm
+          emulator -accel-check
+
+      - name: Configure and start deterministic fixture
+        run: |
+          set -euo pipefail
+          sudo sysctl -w net.core.rmem_max=16777216
+          sudo sysctl -w net.core.wmem_max=16777216
+          sudo sysctl -w net.ipv4.tcp_rmem='4096 131072 16777216'
+          sudo sysctl -w net.ipv4.tcp_wmem='4096 131072 16777216'
+          nohup python3 -u scripts/e2e/local_speed_test_server.py --host 0.0.0.0 --port 18765 < /dev/null > speed-test-server.log 2>&1 &
+          echo "$!" > speed-test-server.pid
+          python3 - <<'PY'
+          import json, time
+          from urllib.request import urlopen
+          min_buffer = 4 * 1024 * 1024
+          for attempt in range(60):
+              try:
+                  with urlopen("http://127.0.0.1:18765/healthz", timeout=1) as response:
+                      data=json.loads(response.read())
+                      print("FIXTURE_HEALTH="+json.dumps(data, sort_keys=True))
+                      if response.status == 200 and data.get("status") == "ok":
+                          if int(data.get("socket_receive_buffer_bytes",0)) < min_buffer:
+                              raise SystemExit("Fixture receive buffer below 4 MiB")
+                          break
+              except Exception as error:
+                  print(f"FIXTURE_WAIT {attempt+1}: {type(error).__name__}: {error}")
+              time.sleep(0.5)
+          else:
+              raise SystemExit("Fixture did not become healthy")
+          PY
+
+      - name: Benchmark fixture headroom
+        run: python3 scripts/e2e/benchmark_local_speed_test_server.py --base-url http://127.0.0.1:18765 --rounds 3 --streams 6 --bytes-per-stream 8000000 --min-mbps 38.4 --output fixture-throughput-benchmark.json
+
+      - name: Test 2 MB/s twice consecutively
+        shell: bash
+        run: |
+          set -uo pipefail
+          export ANDROID_AVD_HOME="${RUNNER_TEMP}/android-avd"
+          mkdir -p "$ANDROID_AVD_HOME" isolated-2mbps
+          echo no | avdmanager create avd -n speedvpn-2mbps-only -k 'system-images;android-29;google_apis;x86_64' --force
+          adb kill-server >/dev/null 2>&1 || true
+          adb start-server
+          nohup emulator -avd speedvpn-2mbps-only -no-window -no-audio -no-boot-anim -no-snapshot -no-snapshot-save -no-metrics -gpu swiftshader_indirect -accel on -cores 4 -memory 4096 -partition-size 2048 -netdelay none -netspeed full -dns-server 8.8.8.8,1.1.1.1 > emulator-console.log 2>&1 &
+          EMULATOR_PID=$!
+          cleanup() {
+            adb -s emulator-5554 logcat -d -v threadtime > final-logcat.txt 2>&1 || true
+            adb -s emulator-5554 emu kill >/dev/null 2>&1 || true
+            kill "$EMULATOR_PID" >/dev/null 2>&1 || true
+            wait "$EMULATOR_PID" >/dev/null 2>&1 || true
+            if [ -f speed-test-server.pid ]; then kill "$(cat speed-test-server.pid)" >/dev/null 2>&1 || true; fi
+          }
+          trap cleanup EXIT
+          for i in $(seq 1 180); do
+            adb -s emulator-5554 get-state >/dev/null 2>&1 && break
+            kill -0 "$EMULATOR_PID" >/dev/null 2>&1 || { cat emulator-console.log; exit 1; }
+            sleep 1
+          done
+          adb -s emulator-5554 wait-for-device
+          for i in $(seq 1 180); do
+            adb -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' | grep -q '^1$' && break
+            kill -0 "$EMULATOR_PID" >/dev/null 2>&1 || { cat emulator-console.log; exit 1; }
+            sleep 1
+          done
+          adb -s emulator-5554 shell settings put global window_animation_scale 0
+          adb -s emulator-5554 shell settings put global transition_animation_scale 0
+          adb -s emulator-5554 shell settings put global animator_duration_scale 0
+          adb -s emulator-5554 install -r app/build/outputs/apk/debug/app-debug.apk
+
+          TARGET_FAIL=0
+          for attempt in 1 2; do
+            out="isolated-2mbps/attempt-$attempt"
+            mkdir -p "$out"
+            echo "===== 2 MB/s ATTEMPT $attempt/2 =====" | tee "$out/driver-console.log"
+            adb -s emulator-5554 shell am force-stop com.speedvpn.app >/dev/null 2>&1 || true
+            sleep 2
+            adb -s emulator-5554 logcat -c || true
+            if SPEEDVPN_DIAGNOSTIC_ONLY=1               SPEEDVPN_SKIP_BASELINE_PREFLIGHT=1               SPEEDVPN_TOTAL_PRESETS=1               SPEEDVPN_CASES_OVERRIDE='12|2 MB|16000'               SPEEDVPN_RUN_DIR="$out"               bash scripts/e2e/speed-limit-sweep.sh 2>&1 | tee -a "$out/driver-console.log"; then
+              echo "ATTEMPT_DRIVER_EXIT=0" | tee -a "$out/driver-console.log"
+            else
+              echo "ATTEMPT_DRIVER_EXIT=1" | tee -a "$out/driver-console.log"
+              TARGET_FAIL=1
+            fi
+            adb -s emulator-5554 logcat -d -v threadtime > "$out/logcat-after-attempt.txt" 2>&1 || true
+          done
+          echo "SPEEDVPN_TARGET_FAIL=$TARGET_FAIL" >> "$GITHUB_ENV"
+
+      - name: Enforce two-run acceptance
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import csv, os, sys
+          from pathlib import Path
+          errors=[]
+          expected_commit=os.environ.get("GITHUB_SHA","")
+          for attempt in (1,2):
+              path=Path(f"isolated-2mbps/attempt-{attempt}/12-2_MB-parsed.csv")
+              if not path.exists():
+                  errors.append(f"Attempt {attempt}: missing result CSV {path}")
+                  continue
+              with path.open(newline="",encoding="utf-8-sig") as f:
+                  rows=list(csv.reader(f))
+              if len(rows)!=2:
+                  errors.append(f"Attempt {attempt}: expected 2 direction rows, got {len(rows)}")
+                  continue
+              by_direction={row[3]:row for row in rows if len(row)==24}
+              if set(by_direction)!={"Download","Upload"}:
+                  errors.append(f"Attempt {attempt}: expected Download/Upload; got {sorted(by_direction)}")
+                  continue
+              for direction,row in by_direction.items():
+                  label=f"Attempt {attempt} {direction}"
+                  if row[1]!="2 MB" or row[2]!="16000":
+                      errors.append(f"{label}: unexpected plan {row[1]!r}/{row[2]!r}")
+                  if row[10]!="PASS":
+                      errors.append(f"{label}: strict classification {row[10]!r}; reason={row[21]}")
+                  try:
+                      baseline=float(row[18]); vpn=float(row[19])
+                  except (ValueError,IndexError):
+                      errors.append(f"{label}: baseline/VPN rate missing")
+                      continue
+                  if not 12.8<=vpn<=19.2:
+                      errors.append(f"{label}: VPN rate {vpn:.3f} Mbps outside 12.8–19.2 Mbps")
+                  if baseline*1000 < 19200:
+                      errors.append(f"{label}: baseline {baseline:.3f} Mbps below 19.2 Mbps")
+                  if expected_commit and row[13]!=expected_commit:
+                      errors.append(f"{label}: source commit mismatch {row[13]!r} != {expected_commit!r}")
+                  print(f"{label}: baseline={baseline:.3f} Mbps, VPN={vpn:.3f} Mbps, classification={row[10]}")
+          if os.environ.get("SPEEDVPN_TARGET_FAIL","1")!="0":
+              errors.append("At least one target measurement driver failed or did not complete")
+          if errors:
+              print("ACCEPTANCE_FAIL")
+              for e in errors: print("- "+e)
+              sys.exit(1)
+          print("ACCEPTANCE_PASS: both consecutive 2 MB/s attempts passed for Download and Upload.")
+          PY
+
+      - name: Upload two-run evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: speedvpn-2mbps-two-run-evidence
+          path: |
+            isolated-2mbps/**
+            speed-test-server.log
+            emulator-console.log
+            final-logcat.txt
+            fixture-throughput-benchmark.json
+            speedvpn-debug-apk-fingerprint.txt
+          if-no-files-found: warn
+          compression-level: 6
