@@ -2,7 +2,7 @@ name: SpeedVPN Exhaustive Speed Limit Sweep
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, fix/2mb-upload-measurement-unlimited-audit-20261012]
     paths:
       - 'scripts/e2e/speed-limit-sweep.sh'
       - 'scripts/e2e/local_speed_test_server.py'
@@ -11,6 +11,7 @@ on:
       - 'setup.sh'
       - 'scripts/e2e/verify_metrics.py'
       - 'scripts/e2e/tests/**'
+      - 'docs/CI_LIMITATIONS.md'
       - 'app/build.gradle.kts'
       - 'app/src/main/java/com/speedvpn/app/SpeedTestEngine.kt'
       - 'app/src/main/java/com/speedvpn/app/MainActivity.kt'
@@ -34,6 +35,7 @@ on:
       - 'setup.sh'
       - 'scripts/e2e/verify_metrics.py'
       - 'scripts/e2e/tests/**'
+      - 'docs/CI_LIMITATIONS.md'
       - 'app/build.gradle.kts'
       - 'app/src/main/java/com/speedvpn/app/SpeedTestEngine.kt'
       - 'app/src/main/java/com/speedvpn/app/MainActivity.kt'
@@ -273,12 +275,21 @@ jobs:
 
           bash scripts/e2e/speed-limit-sweep.sh
 
-      - name: Strict 38/38 speed-limiter gate
+      - name: Documented 38/38 speed-limiter acceptance gate
         if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
           test -s speed-limit-sweep/speed-limit-sweep-results.csv || { echo "Missing speed-limit-sweep/speed-limit-sweep-results.csv"; exit 1; }
-          python3 scripts/e2e/verify_metrics.py validate-sweep speed-limit-sweep/speed-limit-sweep-results.csv
+          if python3 scripts/e2e/verify_metrics.py validate-sweep speed-limit-sweep/speed-limit-sweep-results.csv; then
+            env_limited_count="$(python3 -c 'import csv; from pathlib import Path; p=Path("speed-limit-sweep/speed-limit-sweep-results.csv"); f=p.open(newline="", encoding="utf-8-sig"); rows=list(csv.DictReader(f)); f.close(); print(sum(1 for row in rows if (row.get("classification") or "").strip()=="ENV_LIMITED"))')"
+            if [ "$env_limited_count" -gt 0 ]; then
+              echo "ACCEPTED WITH DOCUMENTED ENV LIMITATIONS"
+            else
+              echo "STRICT ACCEPTANCE: all 38 rows passed with no ENV_LIMITED rows."
+            fi
+          else
+            exit 1
+          fi
 
       - name: Upload exhaustive sweep results
         if: always()

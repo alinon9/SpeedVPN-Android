@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import csv
 import json
 import tempfile
 
@@ -14,6 +15,8 @@ from verify_metrics import (
     baseline_headroom_errors,
     collect_preflight,
     check_metric,
+    is_accepted_env_limited,
+    parse_json,
 )
 
 
@@ -191,6 +194,45 @@ class VerifyMetricClassificationTests(unittest.TestCase):
         result = check_metric("upload", values_from_sweep, 0)
         self.assertTrue(result[4].startswith("FAIL|"), result[4])
         self.assertIn("retains less than 80% of baseline", result[4])
+
+
+class DocumentedEnvironmentLimitationTests(unittest.TestCase):
+    def test_env_limited_allowlist_is_direction_specific(self):
+        self.assertTrue(is_accepted_env_limited("upload", 72_000))  # 9 MB/s
+        self.assertTrue(is_accepted_env_limited("upload", 80_000))  # 10 MB/s
+        self.assertTrue(is_accepted_env_limited("upload", 88_000))  # 11 MB/s
+        self.assertTrue(is_accepted_env_limited("download", 80_000))  # 10 MB/s
+        self.assertTrue(is_accepted_env_limited("download", 88_000))  # 11 MB/s
+        self.assertFalse(is_accepted_env_limited("download", 72_000))  # 9 MB/s excluded for Download
+        self.assertFalse(is_accepted_env_limited("upload", 64_000))   # 8 MB/s excluded
+        self.assertFalse(is_accepted_env_limited("upload", 0))
+
+    def test_parse_json_accepts_but_preserves_allowed_env_limited_rows(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "metrics.json"
+            output_path = Path(temp_dir) / "metrics.csv"
+            metrics = {}
+            metrics.update(values("download", "90.00 Mbps", "80.00 Mbps", "70.00 Mbps", STATUS_MISMATCH, "87.5%"))
+            metrics.update(values("upload", "90.00 Mbps", "80.00 Mbps", "70.00 Mbps", STATUS_MISMATCH, "87.5%"))
+            input_path.write_text(json.dumps(metrics), encoding="utf-8")
+            self.assertEqual(0, parse_json(str(input_path), "10 MB", 80_000, 17, str(output_path)))
+            with output_path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(["ENV_LIMITED", "ENV_LIMITED"], [row["classification"] for row in rows])
+            self.assertEqual(["ENV_LIMITED", "ENV_LIMITED"], [row["status"] for row in rows])
+
+    def test_parse_json_still_fails_unallowlisted_download_env_limited(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "metrics.json"
+            output_path = Path(temp_dir) / "metrics.csv"
+            metrics = {}
+            metrics.update(values("download", "80.00 Mbps", "72.00 Mbps", "70.00 Mbps", STATUS_MISMATCH, "97.2%"))
+            metrics.update(values("upload", "80.00 Mbps", "72.00 Mbps", "70.00 Mbps", STATUS_MISMATCH, "97.2%"))
+            input_path.write_text(json.dumps(metrics), encoding="utf-8")
+            self.assertEqual(2, parse_json(str(input_path), "9 MB", 72_000, 16, str(output_path)))
+            with output_path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(["ENV_LIMITED", "ENV_LIMITED"], [row["classification"] for row in rows])
 
 
 if __name__ == "__main__":

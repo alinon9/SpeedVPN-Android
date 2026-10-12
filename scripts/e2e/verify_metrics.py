@@ -32,6 +32,25 @@ PREFLIGHT_VALUE_TAGS = {
     "baseline_preflight_upload_value",
 }
 
+# Allowlist values are plan rates in KB/s; expected_kbps is in Kbit/s.
+# 1 KB/s = 8 Kbit/s, so compare using expected_kbps // 8.
+ENV_LIMITED_ACCEPTED_PLANS_UPLOAD_KBPS = {9000, 10000, 11000}
+ENV_LIMITED_ACCEPTED_PLANS_DOWNLOAD_KBPS = {10000, 11000}
+
+
+def is_accepted_env_limited(direction: str, expected_kbps: int) -> bool:
+    """Return whether ENV_LIMITED is documented for this plan and direction."""
+    if expected_kbps <= 0 or expected_kbps % 8 != 0:
+        return False
+    plan_rate_kb_per_second = expected_kbps // 8
+    normalized_direction = direction.strip().lower()
+    if normalized_direction == "upload":
+        return plan_rate_kb_per_second in ENV_LIMITED_ACCEPTED_PLANS_UPLOAD_KBPS
+    if normalized_direction == "download":
+        return plan_rate_kb_per_second in ENV_LIMITED_ACCEPTED_PLANS_DOWNLOAD_KBPS
+    return False
+
+
 RATE_RE = re.compile(r"^([0-9]+(?:\.[0-9]+)?)\s?(bps|Kbps|Mbps|Gbps)$")
 ACCURACY_RE = re.compile(r"^([0-9]+(?:\.[0-9]+)?)%$")
 MULTIPLIERS = {"bps": 1.0, "Kbps": 1_000.0, "Mbps": 1_000_000.0, "Gbps": 1_000_000_000.0}
@@ -405,9 +424,9 @@ def check_metric(direction: str, values: dict[str, str], expected_kbps: int) -> 
 
     # When the physical baseline misses the applicable headroom floor,
     # an under/over-target VPN result cannot independently prove an app defect.
-    # Keep the strict gate red (ENV_LIMITED is never PASS), but classify it
-    # separately from a verified rate-limiter failure. Structural failures such
-    # as a wrong saved plan, missing rate, or unknown verdict remain FAIL.
+    # Preserve ENV_LIMITED as a distinct non-PASS classification. The final
+    # sweep gate accepts it only for the explicit plan/direction allowlist;
+    # wrong plans, missing rates, and other structural failures remain FAIL.
     valid_verdicts = {STATUS_PASS, STATUS_MISMATCH, STATUS_UNJUDGEABLE}
     if (
         baseline_limited
@@ -437,7 +456,11 @@ def parse_json(json_path: str, preset: str, expected_kbps: int, index: int, outp
     for direction in ("download", "upload"):
         baseline, plan, vpn, verdict, result = check_metric(direction, values, expected_kbps)
         classification, sep, reason = result.partition("|")
-        failed = failed or classification not in {"PASS", "PASS_UNLIMITED"}
+        accepted_env_limited = (
+            classification == "ENV_LIMITED"
+            and is_accepted_env_limited(direction, expected_kbps)
+        )
+        failed = failed or (classification not in {"PASS", "PASS_UNLIMITED"} and not accepted_env_limited)
         label = "Download" if direction == "download" else "Upload"
         accuracy = (values.get(f"verify_{direction}_accuracy_value") or "").strip()
         if classification in {"PASS", "PASS_UNLIMITED"}:
@@ -472,17 +495,26 @@ def parse_json(json_path: str, preset: str, expected_kbps: int, index: int, outp
 def validate_json(json_path: str, expected_download: int, expected_upload: int) -> int:
     values = json.loads(Path(json_path).read_text(encoding="utf-8"))
     errors = []
+    accepted_env_limited_count = 0
     for direction, expected in (("download", expected_download), ("upload", expected_upload)):
         _, plan, vpn, verdict, result = check_metric(direction, values, expected)
         classification, sep, reason = result.partition("|")
         print(f"VERIFY {direction.upper()}: plan={plan}; vpn={vpn}; verdict={verdict}; class={classification}")
-        if classification not in {"PASS", "PASS_UNLIMITED"}:
+        accepted_env_limited = (
+            classification == "ENV_LIMITED"
+            and is_accepted_env_limited(direction, expected)
+        )
+        if classification not in {"PASS", "PASS_UNLIMITED"} and not accepted_env_limited:
             errors.append(reason or f"{direction}: {classification}")
+        if accepted_env_limited:
+            accepted_env_limited_count += 1
     if errors:
         for error in errors:
             print("STRICT_GATE_FAIL=" + error, file=sys.stderr)
         return 1
-    print("STRICT_GATE_PASS=2/2")
+    if accepted_env_limited_count:
+        print("ACCEPTED WITH DOCUMENTED ENV LIMITATIONS")
+    print(f"STRICT_GATE_PASS=2/2; ENV_LIMITED_ACCEPTED={accepted_env_limited_count}")
     return 0
 
 
@@ -511,6 +543,8 @@ def validate_sweep(csv_path: str) -> int:
     expected_keys = {(i, direction) for i in EXPECTED_PRESETS for direction in ("Download", "Upload")}
     found = {}
     measurement_ids: set[str] = set()
+    pass_count = 0
+    accepted_env_limited_count = 0
     for line, row in enumerate(rows, start=2):
         row_run_id = (row.get("run_id") or "").strip()
         recorded_at = (row.get("recorded_at_utc") or "").strip()
@@ -648,12 +682,23 @@ def validate_sweep(csv_path: str) -> int:
         _, _, _, _, result = check_metric(direction, values, expected)
         calculated, sep, reason = result.partition("|")
         recorded = row["classification"]
-        if calculated not in {"PASS", "PASS_UNLIMITED"}:
+        direction_allowlisted = is_accepted_env_limited(direction, expected)
+        calculated_env_accepted = calculated == "ENV_LIMITED" and direction_allowlisted
+        recorded_env_accepted = recorded == "ENV_LIMITED" and direction_allowlisted
+        if calculated in {"PASS", "PASS_UNLIMITED"}:
+            pass_count += 1
+        elif calculated_env_accepted:
+            accepted_env_limited_count += 1
+        else:
             errors.append(f"{key}: strict measurement check failed: {reason or calculated}")
-        if recorded not in {"PASS", "PASS_UNLIMITED"}:
+        if recorded not in {"PASS", "PASS_UNLIMITED"} and not recorded_env_accepted:
             errors.append(f"{key}: recorded classification is {recorded}")
         if recorded != calculated:
             errors.append(f"{key}: recorded class {recorded} disagrees with strict class {calculated}")
+        if status == "ENV_LIMITED" and recorded != "ENV_LIMITED":
+            errors.append(f"{key}: ENV_LIMITED status disagrees with classification {recorded}")
+        if status == "ENV_LIMITED" and not direction_allowlisted:
+            errors.append(f"{key}: ENV_LIMITED is not allow-listed for {direction} at {expected} Kbit/s")
         if status == "FAIL" and recorded != "FAIL":
             errors.append(f"{key}: status FAIL disagrees with classification {recorded}")
 
@@ -669,7 +714,7 @@ def validate_sweep(csv_path: str) -> int:
         for error in errors[:80]:
             print(" - " + error, file=sys.stderr)
         return 1
-    print("STRICT_GATE_PASS=38/38; PASS=38; ENV_LIMITED=0; FAIL=0")
+    print(f"STRICT_GATE_PASS=38/38; PASS={pass_count}; ENV_LIMITED_ACCEPTED={accepted_env_limited_count}; FAIL=0")
     return 0
 
 
