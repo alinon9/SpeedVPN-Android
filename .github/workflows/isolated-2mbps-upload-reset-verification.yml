@@ -163,13 +163,13 @@ jobs:
 
           # Qualify this exact runner before spending time on the two targeted
           # 2 MB/s attempts or the 19-preset regression sweep.
-          if SPEEDVPN_PREFLIGHT_ONLY=1 SPEEDVPN_RUN_DIR="baseline-preflight/initial" bash scripts/e2e/speed-limit-sweep.sh > baseline-preflight-initial.log 2>&1; then
+          if timeout --signal=TERM --kill-after=5s 160s env SPEEDVPN_PREFLIGHT_ONLY=1 SPEEDVPN_RUN_DIR="baseline-preflight/initial" bash scripts/e2e/speed-limit-sweep.sh > baseline-preflight-initial.log 2>&1; then
             cat baseline-preflight-initial.log
             echo "preflight_status=PASS" >> "$GITHUB_OUTPUT"
           else
             PREFLIGHT_RC=$?
             cat baseline-preflight-initial.log
-            if [ "$PREFLIGHT_RC" -eq 75 ] || grep -Fq "ENV_INSUFFICIENT — skipped sweep" baseline-preflight-initial.log; then
+            if [ "$PREFLIGHT_RC" -eq 75 ] || [ "$PREFLIGHT_RC" -eq 124 ] || grep -Fq "ENV_INSUFFICIENT — skipped sweep" baseline-preflight-initial.log; then
               echo "preflight_status=ENV_INSUFFICIENT" >> "$GITHUB_OUTPUT"
               echo "SPEEDVPN_TARGET_RUNNER_FAIL=1" >> "$GITHUB_ENV"
               echo "SPEEDVPN_REGRESSION_EXIT=1" >> "$GITHUB_ENV"
@@ -407,7 +407,7 @@ jobs:
           adb -s emulator-5554 shell settings put global animator_duration_scale 0
           adb -s emulator-5554 install -r retry-seed/speedvpn-debug-apk.apk
 
-          if SPEEDVPN_PREFLIGHT_ONLY=1 SPEEDVPN_RUN_DIR="retry-preflight" bash scripts/e2e/speed-limit-sweep.sh > retry-preflight.log 2>&1; then
+          if timeout --signal=TERM --kill-after=5s 160s env SPEEDVPN_PREFLIGHT_ONLY=1 SPEEDVPN_RUN_DIR="retry-preflight" bash scripts/e2e/speed-limit-sweep.sh > retry-preflight.log 2>&1; then
             cat retry-preflight.log
             echo "RETRY_PREFLIGHT_STATUS=PASS" | tee -a "$GITHUB_STEP_SUMMARY"
           else
