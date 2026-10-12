@@ -54,13 +54,15 @@ internal data class RelayReadBatch(val bytesRead: Int, val readCalls: Int)
  * that upload-write/half-close case, never for a dead VPN session or a download
  * write failure.
  */
-internal fun shouldPreserveReverseFlowAfterUploadHalfClose(
+internal fun shouldPreserveReverseFlowAfterUploadWriteFailure(
     isUploadDirection: Boolean,
     sessionActive: Boolean,
     destinationWriteBrokenPipe: Boolean,
+    destinationWriteConnectionReset: Boolean,
     halfCloseFailed: Boolean,
 ): Boolean =
-    isUploadDirection && sessionActive && (destinationWriteBrokenPipe || halfCloseFailed)
+    isUploadDirection && sessionActive &&
+        (destinationWriteBrokenPipe || destinationWriteConnectionReset || halfCloseFailed)
 
 internal fun readRelayBatch(
     source: InputStream,
@@ -648,13 +650,21 @@ class Socks5Server(
                     pipeError is SocketException &&
                     pipeError.message?.contains("broken pipe", ignoreCase = true) == true
 
+            val destinationWriteConnectionReset =
+                uploadDirection &&
+                    destinationWriteInProgress &&
+                    forwardedBytes > 0L &&
+                    pipeError is SocketException &&
+                    pipeError.message?.contains("connection reset", ignoreCase = true) == true
+
             if (eof && running) {
                 val halfCloseError = runCatching { destination.shutdownOutput() }.exceptionOrNull()
                 if (halfCloseError != null) {
-                    val preserveReverse = shouldPreserveReverseFlowAfterUploadHalfClose(
+                    val preserveReverse = shouldPreserveReverseFlowAfterUploadWriteFailure(
                         isUploadDirection = uploadDirection,
                         sessionActive = sessionActive,
                         destinationWriteBrokenPipe = false,
+                        destinationWriteConnectionReset = false,
                         halfCloseFailed = true,
                     )
                     if (preserveReverse) {
@@ -667,10 +677,11 @@ class Socks5Server(
                     }
                 }
             } else if (
-                shouldPreserveReverseFlowAfterUploadHalfClose(
+                shouldPreserveReverseFlowAfterUploadWriteFailure(
                     isUploadDirection = uploadDirection,
                     sessionActive = sessionActive,
                     destinationWriteBrokenPipe = destinationWriteBrokenPipe,
+                    destinationWriteConnectionReset = destinationWriteConnectionReset,
                     halfCloseFailed = false,
                 )
             ) {
