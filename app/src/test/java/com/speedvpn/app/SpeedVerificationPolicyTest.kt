@@ -76,6 +76,18 @@ class SpeedVerificationPolicyTest {
     }
 
     @Test
+    fun twoMbPerSecondPlanRetainsTheGenericTwelveTimesHeadroomFloor() {
+        val result = SpeedVerificationPolicy.evaluate(
+            planKbps = 16_000L,
+            baselineBps = 18_000_000L,
+            vpnBps = 16_000_000L,
+        )
+
+        assertEquals(SpeedVerificationStatus.NOT_VERIFIABLE, result.status)
+        assertEquals(null, result.accuracyPercent)
+    }
+
+    @Test
     fun baselineAtHeadroomFloorIsVerifiable() {
         val result = SpeedVerificationPolicy.evaluate(
             planKbps = 1_000L,
