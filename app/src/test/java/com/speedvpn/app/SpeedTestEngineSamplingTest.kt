@@ -336,7 +336,7 @@ class SpeedTestEngineSamplingTest {
         // Download behavior is intentionally unchanged. Upload connection teardown
         // is owned by its zero-idle per-request pool after the HTTP response is read.
         assertEquals("close", download.header("Connection"))
-        assertEquals(null, upload.header("Connection"))
+        assertTrue(upload.header("Connection") == null)
     }
 
     @Test
