@@ -70,7 +70,7 @@ class PreflightBaselineTests(unittest.TestCase):
                 places=2,
             )
             self.assertTrue(result["directions"]["download"]["passed"])
-            self.assertIn("ENV_NOTE", result["env_note"] or "ENV_NOTE")
+            self.assertIn("download raw spread 29.10%", result["env_note"])
             self.assertIn("10/11 MB/s upload verification", result["env_note"])
             self.assertIn("105.6 Mbps", result["env_note"])
 
