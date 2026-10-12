@@ -397,9 +397,10 @@ def check_metric(direction: str, values: dict[str, str], expected_kbps: int) -> 
         < target_bps * verification_headroom_multiplier(expected_kbps)
     )
     if baseline_limited:
+        headroom_multiplier = verification_headroom_multiplier(expected_kbps)
         reasons.append(
             f"{direction}: environment baseline {baseline_bps / 1000:.2f} Kbps "
-            f"is below the 1.2x verification floor for {expected_kbps} Kbps"
+            f"is below the {headroom_multiplier:.1f}x verification floor for {expected_kbps} Kbps"
         )
 
     # When the physical baseline misses the documented 1.2x headroom floor,
