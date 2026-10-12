@@ -58,7 +58,8 @@ class SpeedTestEngineSamplingTest {
             SpeedTestEngine.requestSizesFor(40_000L, verificationProfile = true),
         )
         assertArrayEquals(
-            longArrayOf(16_500_000L, 16_500_000L, 16_500_000L),
+            // Verification samples target 3 seconds and cap at 24 MB.
+            longArrayOf(24_000_000L, 24_000_000L, 24_000_000L),
             SpeedTestEngine.requestSizesFor(88_000L, verificationProfile = true),
         )
     }
