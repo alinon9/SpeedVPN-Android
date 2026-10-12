@@ -403,7 +403,7 @@ def check_metric(direction: str, values: dict[str, str], expected_kbps: int) -> 
             f"is below the {headroom_multiplier:.1f}x verification floor for {expected_kbps} Kbps"
         )
 
-    # When the physical baseline misses the documented 1.2x headroom floor,
+    # When the physical baseline misses the applicable headroom floor,
     # an under/over-target VPN result cannot independently prove an app defect.
     # Keep the strict gate red (ENV_LIMITED is never PASS), but classify it
     # separately from a verified rate-limiter failure. Structural failures such
