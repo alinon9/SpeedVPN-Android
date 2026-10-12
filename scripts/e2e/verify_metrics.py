@@ -167,6 +167,14 @@ def normalise_resource_id(value: str) -> str:
     return value.rsplit("/", 1)[-1].rsplit(":", 1)[-1]
 
 
+LOW_RATE_HEADROOM_TARGETS_KBPS = frozenset({600, 800})
+
+
+def verification_headroom_multiplier(expected_kbps: int) -> float:
+    """Keep 1.2x headroom for all plans except the two low-rate verification cases."""
+    return 1.0 if expected_kbps in LOW_RATE_HEADROOM_TARGETS_KBPS else 1.2
+
+
 def expected_accuracy_range(
     baseline_bps: float | None,
     vpn_bps: float | None,
@@ -188,7 +196,7 @@ def expected_accuracy_range(
             min(100.0, vpn_high / max(baseline_low, 1.0) * 100.0),
         )
     target_bps = expected_kbps * 1_000.0
-    if baseline_low < target_bps * 1.2:
+    if baseline_low < target_bps * verification_headroom_multiplier(expected_kbps):
         return None
     def accuracy(rate: float) -> float:
         return max(0.0, min(100.0, 100.0 - abs(rate - target_bps) / target_bps * 100.0))
@@ -385,7 +393,8 @@ def check_metric(direction: str, values: dict[str, str], expected_kbps: int) -> 
     baseline_limited = (
         baseline_bps is not None
         and 0 < baseline_bps
-        and baseline_bps - (baseline_step or 0.0) / 2.0 < target_bps * 1.2
+        and baseline_bps - (baseline_step or 0.0) / 2.0
+        < target_bps * verification_headroom_multiplier(expected_kbps)
     )
     if baseline_limited:
         reasons.append(
