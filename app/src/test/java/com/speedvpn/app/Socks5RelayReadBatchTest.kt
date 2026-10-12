@@ -147,6 +147,19 @@ class Socks5RelayReadBatchTest {
     }
 
     @Test
+    fun unclassifiedUploadWriteFailureDoesNotKeepReverseFlowAlive() {
+        assertTrue(
+            !shouldPreserveReverseFlowAfterUploadWriteFailure(
+                isUploadDirection = true,
+                sessionActive = true,
+                destinationWriteBrokenPipe = false,
+                destinationWriteConnectionReset = false,
+                halfCloseFailed = false,
+            ),
+        )
+    }
+
+    @Test
     fun oversizedRelayReadIsRejected() {
         val source = SingleReadInputStream(byteArrayOf(1), maxReadBytes = 1)
         assertThrows(IllegalArgumentException::class.java) {
