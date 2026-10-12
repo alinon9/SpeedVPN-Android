@@ -64,9 +64,14 @@ object SpeedVerificationPolicy {
 
         val headroomMultiplier = headroomMultiplierFor(planKbps)
         if (baselineBps.toDouble() < targetBps.toDouble() * headroomMultiplier) {
+            val headroomReason = if (headroomMultiplier == 1.0) {
+                "سرعة الشبكة الأصلية يجب أن تبلغ الخطة المحددة على الأقل."
+            } else {
+                "سرعة الشبكة الأصلية يجب أن تبلغ 1.2 مرة من الخطة على الأقل."
+            }
             return SpeedMetricVerification(
                 planKbps, baselineBps, vpnBps, SpeedVerificationStatus.NOT_VERIFIABLE, null,
-                "سرعة الشبكة الأصلية يجب أن تبلغ 1.2 مرة من الخطة على الأقل.",
+                headroomReason,
             )
         }
 
