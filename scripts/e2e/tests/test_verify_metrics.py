@@ -207,13 +207,22 @@ class DocumentedEnvironmentLimitationTests(unittest.TestCase):
         self.assertFalse(is_accepted_env_limited("upload", 64_000))   # 8 MB/s excluded
         self.assertFalse(is_accepted_env_limited("upload", 0))
 
+    def test_accuracy_inconsistency_is_not_hidden_by_allowlisted_env_limited(self):
+        result = check_metric(
+            "download",
+            values("download", "90.00 Mbps", "80.00 Mbps", "70.00 Mbps", STATUS_MISMATCH, "87.5%"),
+            80_000,
+        )
+        self.assertTrue(result[4].startswith("FAIL|"), result[4])
+        self.assertIn("accuracy should be unavailable", result[4])
+
     def test_parse_json_accepts_but_preserves_allowed_env_limited_rows(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             input_path = Path(temp_dir) / "metrics.json"
             output_path = Path(temp_dir) / "metrics.csv"
             metrics = {}
-            metrics.update(values("download", "90.00 Mbps", "80.00 Mbps", "70.00 Mbps", STATUS_MISMATCH, "87.5%"))
-            metrics.update(values("upload", "90.00 Mbps", "80.00 Mbps", "70.00 Mbps", STATUS_MISMATCH, "87.5%"))
+            metrics.update(values("download", "90.00 Mbps", "80.00 Mbps", "70.00 Mbps", STATUS_MISMATCH, "—"))
+            metrics.update(values("upload", "90.00 Mbps", "80.00 Mbps", "70.00 Mbps", STATUS_MISMATCH, "—"))
             input_path.write_text(json.dumps(metrics), encoding="utf-8")
             self.assertEqual(0, parse_json(str(input_path), "10 MB", 80_000, 17, str(output_path)))
             with output_path.open(newline="", encoding="utf-8") as handle:
@@ -226,8 +235,8 @@ class DocumentedEnvironmentLimitationTests(unittest.TestCase):
             input_path = Path(temp_dir) / "metrics.json"
             output_path = Path(temp_dir) / "metrics.csv"
             metrics = {}
-            metrics.update(values("download", "80.00 Mbps", "72.00 Mbps", "70.00 Mbps", STATUS_MISMATCH, "97.2%"))
-            metrics.update(values("upload", "80.00 Mbps", "72.00 Mbps", "70.00 Mbps", STATUS_MISMATCH, "97.2%"))
+            metrics.update(values("download", "80.00 Mbps", "72.00 Mbps", "70.00 Mbps", STATUS_MISMATCH, "—"))
+            metrics.update(values("upload", "80.00 Mbps", "72.00 Mbps", "70.00 Mbps", STATUS_MISMATCH, "—"))
             input_path.write_text(json.dumps(metrics), encoding="utf-8")
             self.assertEqual(2, parse_json(str(input_path), "9 MB", 72_000, 16, str(output_path)))
             with output_path.open(newline="", encoding="utf-8") as handle:

@@ -426,7 +426,7 @@ def check_metric(direction: str, values: dict[str, str], expected_kbps: int) -> 
     # an under/over-target VPN result cannot independently prove an app defect.
     # Preserve ENV_LIMITED as a distinct non-PASS classification. The final
     # sweep gate accepts it only for the explicit plan/direction allowlist;
-    # wrong plans, missing rates, and other structural failures remain FAIL.
+    # wrong plans, missing rates, unknown verdicts, and independent accuracy errors remain FAIL.
     valid_verdicts = {STATUS_PASS, STATUS_MISMATCH, STATUS_UNJUDGEABLE}
     if (
         baseline_limited
@@ -434,6 +434,7 @@ def check_metric(direction: str, values: dict[str, str], expected_kbps: int) -> 
         and vpn_bps is not None
         and vpn_bps > 0
         and verdict in valid_verdicts
+        and accuracy_error is None
     ):
         return baseline, plan, vpn, verdict, "ENV_LIMITED|" + "; ".join(reasons)
 
