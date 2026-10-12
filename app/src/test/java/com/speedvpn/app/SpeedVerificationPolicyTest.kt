@@ -123,6 +123,18 @@ class SpeedVerificationPolicyTest {
     }
 
     @Test
+    fun unlimitedUploadBelowEightyPercentRetentionRemainsMismatch() {
+        val result = SpeedVerificationPolicy.evaluate(
+            planKbps = null,
+            baselineBps = 84_520_000L,
+            vpnBps = 65_540_000L,
+        )
+
+        assertEquals(SpeedVerificationStatus.MISMATCH, result.status)
+        assertEquals(77.5, result.accuracyPercent!!, 0.1)
+    }
+
+    @Test
     fun zeroSentinelUsesUnlimitedBaselineComparison() {
         val nullPlan = SpeedVerificationPolicy.evaluate(
             planKbps = null,
