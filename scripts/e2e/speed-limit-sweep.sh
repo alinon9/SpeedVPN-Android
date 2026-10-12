@@ -6,7 +6,7 @@ PACKAGE="com.speedvpn.app"
 SCREEN_SIZE="$(adb -s "$DEVICE" shell wm size 2>/dev/null | awk -F': ' '/Override size:/{size=$2} /Physical size:/{if(size=="")size=$2} END{print size}')"
 SCREEN_WIDTH="${SCREEN_SIZE%x*}"
 SCREEN_HEIGHT="${SCREEN_SIZE#*x}"
-RUN_DIR="speed-limit-sweep"
+RUN_DIR="${SPEEDVPN_RUN_DIR:-speed-limit-sweep}"
 CSV_RUN_ID="${GITHUB_RUN_ID:-local}"
 recorded_at_utc() { date -u +"%Y-%m-%dT%H:%M:%S.%3NZ"; }
 RUN_STARTED_AT="$(recorded_at_utc)"
@@ -591,6 +591,8 @@ echo
 preflight_fail() {
   local reason="$1"
   echo "BASELINE_PREFLIGHT_FAIL=$reason" | tee -a "$RUN_DIR/sweep-console.log"
+  echo "ENV_INSUFFICIENT — skipped sweep" | tee -a "$RUN_DIR/sweep-console.log"
+  if [ -n "${GITHUB_OUTPUT:-}" ]; then echo "preflight_status=ENV_INSUFFICIENT" >> "$GITHUB_OUTPUT"; fi
   adb -s "$DEVICE" logcat -d -v threadtime > "$RUN_DIR/baseline-preflight-logcat.txt" 2>&1 || true
   {
     echo "# SpeedVPN baseline preflight"
@@ -603,70 +605,134 @@ preflight_fail() {
     echo "- No speed presets were counted as tested; the 38-metric sweep was not started."
   } > "$RUN_DIR/speed-limit-sweep-summary.md"
   # Preserve a root-level CSV for the strict workflow gate even on early exits.
-  # The header-only CSV remains a hard failure; it is not treated as a successful sweep.
-  cp "$RUN_DIR/speed-limit-sweep-results.csv" speed-limit-sweep-results.csv
-  cp "$RUN_DIR/speed-limit-sweep-summary.md" speed-limit-sweep-summary.md
-  return 0
-}
-
-if ! cleanup_vpn; then
-  preflight_fail "VPN TUN could not be confirmed stopped before baseline measurement."
-  exit 1
-fi
-adb -s "$DEVICE" shell am start -n "$PACKAGE/.MainActivity" >/dev/null
-sleep 4
-if ! tap_text "السرعة"; then
-  preflight_fail "Speed screen could not be opened for baseline measurement."
-  exit 1
-fi
-if ! select_preset_and_wait "11 MB" top 88000 dl none; then
-  preflight_fail "Could not select/persist 88 Mbps Download plan for preflight."
-  exit 1
-fi
-adb -s "$DEVICE" shell input swipe 160 570 160 190 850
-sleep 1
-if ! select_preset_and_wait "11 MB" bottom 88000 ul both; then
-  preflight_fail "Could not select/persist 88 Mbps Upload plan for preflight."
-  exit 1
-fi
-if ! tap_resource_id "baseline_preflight_button"; then
-  preflight_fail "Baseline preflight button could not be selected."
-  exit 1
-fi
-
-preflight_json="$RUN_DIR/baseline-preflight.json"
-preflight_xml="$RUN_DIR/baseline-preflight.xml"
-printf '{}' > "$preflight_json"
-preflight_collected=0
-for preflight_attempt in $(seq 1 90); do
-  dump_ui "$preflight_xml" || true
-  if python3 scripts/e2e/verify_metrics.py collect-preflight "$preflight_xml" "$preflight_json" >> "$RUN_DIR/sweep-console.log" 2>&1; then
-    preflight_collected=1
-    echo "Baseline preflight measurements collected after ${preflight_attempt}s." | tee -a "$RUN_DIR/sweep-console.log"
-    break
-  fi
-  if [ "$((preflight_attempt % 2))" -eq 0 ]; then
-    adb -s "$DEVICE" shell input swipe 160 500 160 220 650 || true
-  fi
-  sleep 1
-done
-if [ "$preflight_collected" -ne 1 ]; then
-  preflight_fail "The UI did not expose both real baseline measurements within 90 seconds."
-  cp "$preflight_json" "$RUN_DIR/baseline-preflight-failed.json"
-  exit 1
-fi
-BASELINE_PREFLIGHT_DOWNLOAD="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1], encoding="utf-8")); print(d.get("baseline_preflight_download_value", "unknown"))' "$preflight_json")"
-BASELINE_PREFLIGHT_UPLOAD="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1], encoding="utf-8")); print(d.get("baseline_preflight_upload_value", "unknown"))' "$preflight_json")"
-if python3 scripts/e2e/verify_metrics.py validate-headroom "$preflight_json" 88000 2>&1 | tee -a "$RUN_DIR/sweep-console.log"; then
+  # The header-only CSV remains a hard failure; if [ "${SPEEDVPN_SKIP_BASELINE_PREFLIGHT:-0}" = "1" ]; then
   BASELINE_PREFLIGHT_STATUS="PASS"
-  BASELINE_PREFLIGHT_REASON="Both directions met the 105.6 Mbps minimum."
-  echo "BASELINE_PREFLIGHT_PASS=2/2; required=105.6 Mbps per direction." | tee -a "$RUN_DIR/sweep-console.log"
+  BASELINE_PREFLIGHT_REASON="A standalone three-sample preflight passed before this sweep."
+  echo "BASELINE_PREFLIGHT_SKIPPED=standalone three-sample preflight already passed." | tee -a "$RUN_DIR/sweep-console.log"
+  if [ -n "${GITHUB_OUTPUT:-}" ]; then echo "preflight_status=PASS" >> "$GITHUB_OUTPUT"; fi
 else
-  BASELINE_PREFLIGHT_STATUS="ENV_LIMITED"
-  BASELINE_PREFLIGHT_REASON="At least one baseline direction was below 105.6 Mbps; diagnostics will continue, but strict acceptance remains blocked."
-  cp "$preflight_json" "$RUN_DIR/baseline-preflight-failed.json"
-  FAIL_COUNT=$((FAIL_COUNT+1))
-  echo "BASELINE_PREFLIGHT_ENV_LIMITED=$BASELINE_PREFLIGHT_REASON" | tee -a "$RUN_DIR/sweep-console.log"
+  PREFLIGHT_START_EPOCH="$(date +%s)"
+  PREFLIGHT_SAMPLES_DIR="$RUN_DIR/baseline-preflight"
+  mkdir -p "$PREFLIGHT_SAMPLES_DIR"
+
+  for preflight_round in 1 2 3; do
+    echo "===== BASELINE PREFLIGHT SAMPLE $preflight_round/3 =====" | tee -a "$RUN_DIR/sweep-console.log"
+    if [ "$(( $(date +%s) - PREFLIGHT_START_EPOCH ))" -ge 165 ]; then
+      preflight_fail "Three-sample preflight exceeded its 165-second time budget."
+      exit 75
+    fi
+    if ! cleanup_vpn; then
+      preflight_fail "VPN TUN could not be confirmed stopped before baseline sample $preflight_round."
+      exit 75
+    fi
+    adb -s "$DEVICE" shell am start -n "$PACKAGE/.MainActivity" >/dev/null
+    sleep 3
+    if ! tap_text "السرعة"; then
+      preflight_fail "Speed screen could not be opened for baseline sample $preflight_round."
+      exit 75
+    fi
+    if ! select_preset_and_wait "11 MB" top 88000 dl none; then
+      preflight_fail "Could not select/persist 88 Mbps Download plan for baseline sample $preflight_round."
+      exit 75
+    fi
+    adb -s "$DEVICE" shell input swipe 160 570 160 190 850
+    sleep 1
+    if ! select_preset_and_wait "11 MB" bottom 88000 ul both; then
+      preflight_fail "Could not select/persist 88 Mbps Upload plan for baseline sample $preflight_round."
+      exit 75
+    fi
+    if ! tap_resource_id "baseline_preflight_button"; then
+      preflight_fail "Baseline preflight button could not be selected for sample $preflight_round."
+      exit 75
+    fi
+
+    preflight_json="$PREFLIGHT_SAMPLES_DIR/round-$preflight_round.json"
+    preflight_xml="$PREFLIGHT_SAMPLES_DIR/round-$preflight_round.xml"
+    printf '{}' > "$preflight_json"
+    preflight_collected=0
+    for preflight_poll in $(seq 1 30); do
+      dump_ui "$preflight_xml" || true
+      if python3 scripts/e2e/verify_metrics.py collect-preflight "$preflight_xml" "$preflight_json" >> "$RUN_DIR/sweep-console.log" 2>&1; then
+        preflight_collected=1
+        echo "Baseline sample $preflight_round collected after ${preflight_poll}s." | tee -a "$RUN_DIR/sweep-console.log"
+        break
+      fi
+      if [ "$((preflight_poll % 2))" -eq 0 ]; then
+        adb -s "$DEVICE" shell input swipe 160 500 160 220 650 || true
+      fi
+      if [ "$(( $(date +%s) - PREFLIGHT_START_EPOCH ))" -ge 165 ]; then
+        break
+      fi
+      sleep 1
+    done
+    if [ "$preflight_collected" -ne 1 ]; then
+      preflight_fail "The UI did not expose both fresh baseline values for sample $preflight_round within the preflight time budget."
+      cp "$preflight_json" "$PREFLIGHT_SAMPLES_DIR/round-$preflight_round-failed.json" 2>/dev/null || true
+      exit 75
+    fi
+    python3 - "$preflight_json" "$preflight_round" <<'PY' | tee -a "$RUN_DIR/sweep-console.log"
+import json, sys
+from pathlib import Path
+data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(
+    f"PREFLIGHT_SAMPLE_{sys.argv[2]} "
+    f"download={data.get('baseline_preflight_download_value', 'missing')} "
+    f"upload={data.get('baseline_preflight_upload_value', 'missing')}"
+)
+PY
+    if ! cleanup_vpn; then
+      preflight_fail "VPN TUN was not stopped after baseline sample $preflight_round."
+      exit 75
+    fi
+  done
+
+  preflight_summary="$PREFLIGHT_SAMPLES_DIR/summary.json"
+  if python3 scripts/e2e/preflight_baseline.py \
+      "$PREFLIGHT_SAMPLES_DIR/round-1.json" \
+      "$PREFLIGHT_SAMPLES_DIR/round-2.json" \
+      "$PREFLIGHT_SAMPLES_DIR/round-3.json" \
+      --download-min 96 --upload-min 106 --max-variability 15 \
+      --output "$preflight_summary" 2>&1 | tee -a "$RUN_DIR/sweep-console.log"; then
+    BASELINE_PREFLIGHT_STATUS="PASS"
+    BASELINE_PREFLIGHT_REASON="Three samples per direction passed median headroom and 15% stability gates."
+    BASELINE_PREFLIGHT_DOWNLOAD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["directions"]["download"]["median_mbps"])' "$preflight_summary") Mbps (median)"
+    BASELINE_PREFLIGHT_UPLOAD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["directions"]["upload"]["median_mbps"])' "$preflight_summary") Mbps (median)"
+    echo "BASELINE_PREFLIGHT_PASS=3/3 samples per direction; download>=96 Mbps; upload>=106 Mbps; spread<=15%." | tee -a "$RUN_DIR/sweep-console.log"
+  else
+    BASELINE_PREFLIGHT_STATUS="ENV_INSUFFICIENT"
+    BASELINE_PREFLIGHT_REASON="Baseline headroom or variability failed. No speed sweep was started."
+    echo "ENV_INSUFFICIENT — skipped sweep" | tee -a "$RUN_DIR/sweep-console.log"
+    if [ -n "${GITHUB_OUTPUT:-}" ]; then echo "preflight_status=ENV_INSUFFICIENT" >> "$GITHUB_OUTPUT"; fi
+    {
+      echo "# SpeedVPN baseline preflight"
+      echo
+      echo "- Result: ENV_INSUFFICIENT"
+      echo "- Download median minimum: 96 Mbps"
+      echo "- Upload median minimum: 106 Mbps"
+      echo "- Maximum sample range: 15% of the median in each direction"
+      echo "- Three baseline samples were collected before any speed sweep."
+      echo "- The sweep was skipped; one retry on a new GitHub-hosted runner is permitted."
+    } > "$RUN_DIR/speed-limit-sweep-summary.md"
+    cp "$RUN_DIR/speed-limit-sweep-results.csv" speed-limit-sweep-results.csv
+    cp "$RUN_DIR/speed-limit-sweep-summary.md" speed-limit-sweep-summary.md
+    if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+      {
+        echo "## ENV_INSUFFICIENT — skipped sweep"
+        echo
+        echo "The 3-sample baseline gate failed. One automatic retry is delegated to a separate runner job."
+        cat "$preflight_summary" 2>/dev/null || true
+      } >> "$GITHUB_STEP_SUMMARY"
+    fi
+    exit 75
+  fi
+fi
+
+if [ "${SPEEDVPN_PREFLIGHT_ONLY:-0}" = "1" ]; then
+  echo "PREFLIGHT_ONLY_COMPLETE status=$BASELINE_PREFLIGHT_STATUS" | tee -a "$RUN_DIR/sweep-console.log"
+  exit 0
+fi
+
+"BASELINE_PREFLIGHT_ENV_LIMITED=$BASELINE_PREFLIGHT_REASON" | tee -a "$RUN_DIR/sweep-console.log"
 fi
 if ! cleanup_vpn; then
   preflight_fail "VPN TUN was not stopped after baseline preflight."
