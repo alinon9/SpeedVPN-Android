@@ -606,9 +606,33 @@ preflight_fail() {
   } > "$RUN_DIR/speed-limit-sweep-summary.md"
   # Preserve a root-level CSV for the strict workflow gate even on early exits.
   # The header-only CSV remains a hard failure; if [ "${SPEEDVPN_SKIP_BASELINE_PREFLIGHT:-0}" = "1" ]; then
+  PREFLIGHT_SUMMARY="${SPEEDVPN_PREFLIGHT_SUMMARY:-}"
+  if [ -z "$PREFLIGHT_SUMMARY" ] || [ ! -s "$PREFLIGHT_SUMMARY" ]; then
+    echo "ENV_INSUFFICIENT — skipped sweep" | tee -a "$RUN_DIR/sweep-console.log"
+    echo "ERROR: SPEEDVPN_SKIP_BASELINE_PREFLIGHT=1 requires a validated SPEEDVPN_PREFLIGHT_SUMMARY file."
+    if [ -n "${GITHUB_OUTPUT:-}" ]; then echo "preflight_status=ENV_INSUFFICIENT" >> "$GITHUB_OUTPUT"; fi
+    exit 75
+  fi
+  if ! python3 - "$PREFLIGHT_SUMMARY" <<'PY' | tee -a "$RUN_DIR/sweep-console.log"
+import json, sys
+from pathlib import Path
+payload=json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert payload.get("status") == "PASS", "preflight summary status is not PASS"
+for direction in ("download", "upload"):
+    item=payload["directions"][direction]
+    assert item.get("passed") is True, f"{direction} preflight did not pass"
+    print(f"REUSED_PREFLIGHT_{direction.upper()}_MEDIAN={item['median_mbps']} Mbps")
+PY
+  then
+    echo "ENV_INSUFFICIENT — skipped sweep" | tee -a "$RUN_DIR/sweep-console.log"
+    if [ -n "${GITHUB_OUTPUT:-}" ]; then echo "preflight_status=ENV_INSUFFICIENT" >> "$GITHUB_OUTPUT"; fi
+    exit 75
+  fi
   BASELINE_PREFLIGHT_STATUS="PASS"
-  BASELINE_PREFLIGHT_REASON="A standalone three-sample preflight passed before this sweep."
-  echo "BASELINE_PREFLIGHT_SKIPPED=standalone three-sample preflight already passed." | tee -a "$RUN_DIR/sweep-console.log"
+  BASELINE_PREFLIGHT_REASON="Reused validated three-sample preflight summary."
+  BASELINE_PREFLIGHT_DOWNLOAD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["directions"]["download"]["median_mbps"])' "$PREFLIGHT_SUMMARY") Mbps (median)"
+  BASELINE_PREFLIGHT_UPLOAD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["directions"]["upload"]["median_mbps"])' "$PREFLIGHT_SUMMARY") Mbps (median)"
+  echo "BASELINE_PREFLIGHT_SKIPPED=validated three-sample preflight reused." | tee -a "$RUN_DIR/sweep-console.log"
   if [ -n "${GITHUB_OUTPUT:-}" ]; then echo "preflight_status=PASS" >> "$GITHUB_OUTPUT"; fi
 else
   PREFLIGHT_START_EPOCH="$(date +%s)"
