@@ -600,7 +600,8 @@ preflight_fail() {
     echo "- GitHub run ID: $CSV_RUN_ID"
     echo "- Result: INFRASTRUCTURE_BLOCKED"
     echo "- Target: 88 Mbps"
-    echo "- Required baseline in each direction: 105.6 Mbps (1.2x)"
+    echo "- Required median baseline: Download >= 96 Mbps; Upload >= 106 Mbps"
+    echo "- Maximum sample spread: 15% of the median in each direction"
     echo "- Failure: $reason"
     echo "- No speed presets were counted as tested; the 38-metric sweep was not started."
   } > "$RUN_DIR/speed-limit-sweep-summary.md"
@@ -706,6 +707,10 @@ print(
 PY
     if ! cleanup_vpn; then
       preflight_fail "VPN TUN was not stopped after baseline sample $preflight_round."
+      exit 75
+    fi
+    if [ "$(( $(date +%s) - PREFLIGHT_START_EPOCH ))" -ge 165 ]; then
+      preflight_fail "Three-sample preflight exceeded its 165-second time budget."
       exit 75
     fi
   done
@@ -1033,7 +1038,7 @@ cat > "$RUN_DIR/speed-limit-sweep-summary.md" <<MD
 - Summary generated at (UTC): $SUMMARY_RECORDED_AT_UTC
 - Presets attempted: $TESTED_PRESET_COUNT/$TOTAL
 - Download/Upload metric results recorded: $METRIC_RESULT_COUNT/$EXPECTED_METRIC_RESULTS
-- 88 Mbps baseline preflight: $BASELINE_PREFLIGHT_STATUS (Download=$BASELINE_PREFLIGHT_DOWNLOAD; Upload=$BASELINE_PREFLIGHT_UPLOAD; minimum=105.6 Mbps each)
+- Three-sample baseline preflight: $BASELINE_PREFLIGHT_STATUS (Download median=$BASELINE_PREFLIGHT_DOWNLOAD; Upload median=$BASELINE_PREFLIGHT_UPLOAD; minimums=96/106 Mbps; max spread=15%)
 - Preflight detail: $BASELINE_PREFLIGHT_REASON
 - Metric PASS: $PASS_COUNT
 - Metric FAIL (validly collected but outside criteria, or invalid verification result): $METRIC_FAIL_COUNT
