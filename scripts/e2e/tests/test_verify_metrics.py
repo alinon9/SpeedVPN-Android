@@ -114,6 +114,30 @@ class VerifyMetricClassificationTests(unittest.TestCase):
         self.assertTrue(result[4].startswith("FAIL|"), result[4])
         self.assertIn("invalid/missing VPN measured rate", result[4])
 
+    def test_75_kbs_upload_is_judgeable_within_twenty_percent(self):
+        result = check_metric(
+            "upload",
+            values("upload", "650 Kbps", "600 Kbps", "555 Kbps", STATUS_PASS, "92.5%"),
+            600,
+        )
+        self.assertEqual("PASS", result[4], result[4])
+
+    def test_100_kbs_upload_is_judgeable_within_twenty_percent(self):
+        result = check_metric(
+            "upload",
+            values("upload", "850 Kbps", "800 Kbps", "710 Kbps", STATUS_PASS, "88.8%"),
+            800,
+        )
+        self.assertEqual("PASS", result[4], result[4])
+
+    def test_low_rate_upload_still_requires_baseline_at_least_the_plan(self):
+        result = check_metric(
+            "upload",
+            values("upload", "599 Kbps", "600 Kbps", "555 Kbps", STATUS_UNJUDGEABLE, "—"),
+            600,
+        )
+        self.assertTrue(result[4].startswith("ENV_LIMITED|"), result[4])
+
     def test_finite_plan_with_valid_measurement_passes(self):
         result = check_metric(
             "download",
