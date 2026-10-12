@@ -657,6 +657,7 @@ class Socks5Server(
             val destinationWriteConnectionReset =
                 uploadDirection &&
                     destinationWriteInProgress &&
+                    forwardedBytes > 0L &&
                     pipeError is SocketException &&
                     pipeError.message?.contains("connection reset", ignoreCase = true) == true
 
