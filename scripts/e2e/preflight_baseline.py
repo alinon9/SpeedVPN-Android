@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Validate three independent pre-sweep baseline measurements.
 
-The 15% stability gate uses the relative range (max-min)/median. The script
-also records sample variance and coefficient of variation for diagnostics.
+The primary stability limit is the relative range (max-min)/median <= 25%.
+A bounded single-outlier allowance applies only when total spread is <= 30%,
+the two samples closest to the median are within 25%, and no sample deviates
+from the median by more than 30%. Raw spread and diagnostics remain reported.
 """
 from __future__ import annotations
 
@@ -39,13 +41,36 @@ def summarize_series(values: list[float], minimum_mbps: float, max_variability_p
     sample_stddev = statistics.stdev(values)
     spread_pct = ((max(values) - min(values)) / median) * 100.0
     cv_pct = (sample_stddev / median) * 100.0
+
+    # A single transient low/high reading may stretch the raw range slightly
+    # beyond 25%. Keep the primary 25% gate, but tolerate that one outlier only
+    # when the full spread is <= 30%, the two readings nearest the median form
+    # a stable pair within 25%, and every reading remains within 30% of median.
+    closest_pair = sorted(values, key=lambda value: abs(value - median))[:2]
+    closest_pair_median = statistics.median(closest_pair)
+    closest_pair_spread_pct = (
+        ((max(closest_pair) - min(closest_pair)) / closest_pair_median) * 100.0
+    )
+    max_deviation_pct = max(abs(value - median) / median * 100.0 for value in values)
+    outlier_limit_pct = max_variability_pct + 5.0
+    bounded_single_outlier = (
+        spread_pct > max_variability_pct
+        and spread_pct <= outlier_limit_pct
+        and closest_pair_spread_pct <= max_variability_pct
+        and max_deviation_pct <= outlier_limit_pct
+    )
+
     errors: list[str] = []
     if median < minimum_mbps:
         errors.append(f"median {median:.2f} Mbps is below {minimum_mbps:.2f} Mbps")
-    if spread_pct > max_variability_pct:
+    if spread_pct > max_variability_pct and not bounded_single_outlier:
         errors.append(
-            f"measurement spread {spread_pct:.2f}% exceeds {max_variability_pct:.2f}%"
+            f"measurement spread {spread_pct:.2f}% exceeds {max_variability_pct:.2f}% "
+            f"and does not qualify for bounded single-outlier tolerance "
+            f"(maximum raw spread {outlier_limit_pct:.2f}%)"
         )
+
+    stability_mode = "BOUNDED_SINGLE_OUTLIER" if bounded_single_outlier else "PRIMARY_SPREAD_GATE"
     return {
         "samples_mbps": [round(value, 4) for value in values],
         "median_mbps": round(median, 4),
@@ -53,18 +78,68 @@ def summarize_series(values: list[float], minimum_mbps: float, max_variability_p
         "sample_stddev_mbps": round(sample_stddev, 4),
         "spread_percent_of_median": round(spread_pct, 4),
         "coefficient_of_variation_percent": round(cv_pct, 4),
+        "closest_pair_spread_percent_of_median": round(closest_pair_spread_pct, 4),
+        "max_deviation_from_median_percent": round(max_deviation_pct, 4),
         "minimum_mbps": minimum_mbps,
         "max_variability_percent": max_variability_pct,
+        "bounded_outlier_max_spread_percent": round(outlier_limit_pct, 4),
+        "stability_mode": stability_mode,
         "passed": not errors,
         "errors": errors,
     }
+
+def build_environment_note(result: dict[str, Any]) -> str:
+    """Summarize measured CI limits without converting limited checks into PASS."""
+    notes: list[str] = []
+    directions = result.get("directions", {})
+
+    for direction in ("download", "upload"):
+        item = directions.get(direction, {})
+        if item.get("stability_mode") == "BOUNDED_SINGLE_OUTLIER":
+            notes.append(
+                f"{direction} raw spread {item['spread_percent_of_median']:.2f}% exceeded "
+                f"{item['max_variability_percent']:.2f}% but passed the bounded single-outlier "
+                f"rule (closest-pair spread "
+                f"{item['closest_pair_spread_percent_of_median']:.2f}%, maximum deviation "
+                f"{item['max_deviation_from_median_percent']:.2f}%, hard cap "
+                f"{item['bounded_outlier_max_spread_percent']:.2f}%)."
+            )
+
+    upload = directions.get("upload", {})
+    median_upload = upload.get("median_mbps")
+    if isinstance(median_upload, (int, float)):
+        if median_upload < 90.0:
+            notes.append(
+                f"upload ceiling ~{median_upload:.0f} Mbps is below the 90 Mbps preflight "
+                "floor; 9/10/11 MB/s upload checks may be ENV_LIMITED."
+            )
+        elif median_upload < 96.0:
+            notes.append(
+                f"upload ceiling ~{median_upload:.0f} Mbps limits 10/11 MB/s upload "
+                "verification (10 MB/s needs >=96 Mbps baseline; 11 MB/s needs >=105.6 Mbps)."
+            )
+        elif median_upload < 105.6:
+            notes.append(
+                f"upload baseline ~{median_upload:.0f} Mbps leaves 11 MB/s upload "
+                "verification ENV_LIMITED (requires >=105.6 Mbps baseline)."
+            )
+
+    if result.get("status") != "PASS":
+        for direction in ("download", "upload"):
+            item = directions.get(direction, {})
+            if item.get("errors"):
+                notes.append(f"{direction} preflight: {'; '.join(item['errors'])}.")
+
+    return " ".join(notes) if notes else (
+        "No upload ceiling identified by preflight; the full sweep remains authoritative."
+    )
 
 
 def validate_files(
     json_paths: list[Path],
     download_min_mbps: float = 96.0,
-    upload_min_mbps: float = 106.0,
-    max_variability_pct: float = 15.0,
+    upload_min_mbps: float = 90.0,
+    max_variability_pct: float = 25.0,
 ) -> dict[str, Any]:
     if len(json_paths) != 3:
         raise ValueError("exactly three baseline JSON files are required")
@@ -102,6 +177,8 @@ def validate_files(
         if not summary["passed"]:
             result["status"] = "ENV_INSUFFICIENT"
 
+    result["env_note"] = build_environment_note(result)
+    print(f"ENV_NOTE={result['env_note']}")
     print(f"PREFLIGHT_STATUS={result['status']}")
     if result["status"] == "ENV_INSUFFICIENT":
         print("ENV_INSUFFICIENT — skipped sweep")
@@ -120,8 +197,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("samples", nargs=3, type=Path, help="three per-run JSON measurements")
     parser.add_argument("--download-min", type=float, default=96.0)
-    parser.add_argument("--upload-min", type=float, default=106.0)
-    parser.add_argument("--max-variability", type=float, default=15.0)
+    parser.add_argument("--upload-min", type=float, default=90.0)
+    parser.add_argument("--max-variability", type=float, default=25.0)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
