@@ -36,6 +36,17 @@ class MetricResultStatusTests(unittest.TestCase):
             xml = self.write_xml(directory, "فشل القياس", "800 Kbps", "فشل القياس", "⚠️ لا يمكن الحكم")
             self.assertTrue(has_terminal_metric_row(xml, 800))
 
+    def test_environment_limited_result_is_terminal_not_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            xml = self.write_xml(
+                directory,
+                "700 Kbps",
+                "800 Kbps",
+                "713 Kbps",
+                "⚠️ ENV_LIMITED — قيود بيئة القياس",
+            )
+            self.assertTrue(has_terminal_metric_row(xml, 800))
+
     def test_wrong_selected_plan_is_not_terminal_for_current_case(self):
         with tempfile.TemporaryDirectory() as directory:
             xml = self.write_xml(directory, "100 Mbps", "600 Kbps", "580 Kbps", "❌ السرعة غير متطابقة")
