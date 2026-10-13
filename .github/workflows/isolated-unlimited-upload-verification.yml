@@ -1,6 +1,12 @@
 name: Isolated Unlimited Upload Diagnostic — Run 179
 
 on:
+  push:
+    branches:
+      - validation/run179-unlimited-upload-trigger-20261013
+    paths:
+      - '.github/workflows/isolated-unlimited-upload-verification.yml'
+      - 'scripts/e2e/speed-limit-sweep.sh'
   pull_request:
     branches:
       - validation/run179-unlimited-upload-20261013
