@@ -1,11 +1,6 @@
 name: Isolated Unlimited Upload Diagnostic — Run 179
 
 on:
-  push:
-    branches:
-      - validation/run179-unlimited-upload-20261013
-    paths:
-      - '.github/workflows/isolated-unlimited-upload-verification.yml'
   pull_request:
     branches:
       - validation/run179-unlimited-upload-20261013
@@ -17,7 +12,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: isolated-unlimited-upload-run179
+  group: isolated-unlimited-upload-run179-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
