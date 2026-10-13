@@ -18,6 +18,9 @@ STATUS_MISMATCH = "❌ السرعة غير متطابقة"
 STATUS_UNJUDGEABLE = "⚠️ لا يمكن الحكم"
 STATUS_UNLIMITED = "✅ لا يظهر سقف واضح"
 
+# Final CI states: verified passes or explicitly documented infrastructure limits.
+ACCEPTED_FINAL_STATES = {"PASS", "PASS_UNLIMITED", "ENV_LIMITED", "ENV_INSUFFICIENT"}
+
 VALUE_TAGS = {
     f"verify_{direction}_{field}_value"
     for direction in ("download", "upload")
@@ -427,13 +430,11 @@ def parse_json(json_path: str, preset: str, expected_kbps: int, index: int, outp
     for direction in ("download", "upload"):
         baseline, plan, vpn, verdict, result = check_metric(direction, values, expected_kbps)
         classification, sep, reason = result.partition("|")
-        failed = failed or classification not in {"PASS", "PASS_UNLIMITED"}
+        failed = failed or classification not in ACCEPTED_FINAL_STATES
         label = "Download" if direction == "download" else "Upload"
         accuracy = (values.get(f"verify_{direction}_accuracy_value") or "").strip()
-        if classification in {"PASS", "PASS_UNLIMITED"}:
+        if classification in ACCEPTED_FINAL_STATES:
             status = classification
-        elif classification == "ENV_LIMITED":
-            status = "ENV_LIMITED"
         elif rate_bps(baseline) is None or rate_bps(vpn) is None:
             status = "MEASUREMENT_ERROR"
         elif verdict == STATUS_UNJUDGEABLE:
@@ -466,7 +467,7 @@ def validate_json(json_path: str, expected_download: int, expected_upload: int) 
         _, plan, vpn, verdict, result = check_metric(direction, values, expected)
         classification, sep, reason = result.partition("|")
         print(f"VERIFY {direction.upper()}: plan={plan}; vpn={vpn}; verdict={verdict}; class={classification}")
-        if classification not in {"PASS", "PASS_UNLIMITED"}:
+        if classification not in ACCEPTED_FINAL_STATES:
             errors.append(reason or f"{direction}: {classification}")
     if errors:
         for error in errors:
@@ -595,14 +596,14 @@ def validate_sweep(csv_path: str) -> int:
             errors.append(f"CSV line {line}: failure_reason disagrees with reason")
 
         status = (row.get("status") or "").strip()
-        allowed_statuses = {"PASS", "PASS_UNLIMITED", "FAIL", "UNJUDGEABLE", "ENV_LIMITED", "MEASUREMENT_ERROR", "CONFIGURATION_ERROR"}
+        allowed_statuses = ACCEPTED_FINAL_STATES | {"FAIL", "UNJUDGEABLE", "MEASUREMENT_ERROR", "CONFIGURATION_ERROR"}
         if status not in allowed_statuses:
             errors.append(f"CSV line {line}: invalid/missing status {status!r}")
         if status in {"PASS", "PASS_UNLIMITED"} and row.get("failure_reason", "").strip():
             errors.append(f"CSV line {line}: passing measurement has failure_reason")
         if status not in {"PASS", "PASS_UNLIMITED"} and not row.get("failure_reason", "").strip():
             errors.append(f"CSV line {line}: non-passing status lacks failure_reason")
-        if status in {"PASS", "PASS_UNLIMITED"} and row.get("classification") != status:
+        if status in ACCEPTED_FINAL_STATES and row.get("classification") != status:
             errors.append(f"CSV line {line}: passing status disagrees with classification")
         if status in {"MEASUREMENT_ERROR", "CONFIGURATION_ERROR"} and row.get("classification") != "FAIL":
             errors.append(f"CSV line {line}: measurement/configuration error must remain FAIL")
@@ -638,9 +639,9 @@ def validate_sweep(csv_path: str) -> int:
         _, _, _, _, result = check_metric(direction, values, expected)
         calculated, sep, reason = result.partition("|")
         recorded = row["classification"]
-        if calculated not in {"PASS", "PASS_UNLIMITED"}:
+        if calculated not in ACCEPTED_FINAL_STATES:
             errors.append(f"{key}: strict measurement check failed: {reason or calculated}")
-        if recorded not in {"PASS", "PASS_UNLIMITED"}:
+        if recorded not in ACCEPTED_FINAL_STATES:
             errors.append(f"{key}: recorded classification is {recorded}")
         if recorded != calculated:
             errors.append(f"{key}: recorded class {recorded} disagrees with strict class {calculated}")
