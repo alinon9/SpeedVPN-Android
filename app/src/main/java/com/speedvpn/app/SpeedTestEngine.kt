@@ -51,10 +51,7 @@ object SpeedTestEngine {
     private val uploadBodyEventListenerFactory: EventListener.Factory = EventListener.Factory { _ ->
         object : EventListener() {
             override fun requestBodyEnd(call: Call, byteCount: Long) {
-                call.request().tag(UploadBodyByteCounter::class.java)?.let { counter ->
-                    counter.bytesWritten.set(byteCount)
-                    Log.d(TAG, "OkHttp requestBodyEnd method=${call.request().method} payloadBytesWritten=$byteCount")
-                }
+                call.request().tag(UploadBodyByteCounter::class.java)?.bytesWritten?.set(byteCount)
             }
         }
     }
