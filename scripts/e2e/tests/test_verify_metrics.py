@@ -1,5 +1,8 @@
 import sys
 import unittest
+import csv
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -15,6 +18,7 @@ from verify_metrics import (
     baseline_headroom_errors,
     collect_preflight,
     check_metric,
+    parse_json,
 )
 
 
@@ -34,6 +38,27 @@ class VerifyMetricClassificationTests(unittest.TestCase):
             {"PASS", "PASS_UNLIMITED", "ENV_LIMITED", "ENV_INSUFFICIENT"},
             ACCEPTED_FINAL_STATES,
         )
+
+    def test_parse_json_reports_environment_limit_without_claiming_pass(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            metrics_path = Path(temp_dir) / "metrics.json"
+            results_path = Path(temp_dir) / "results.csv"
+            metric_values = {}
+            for direction in ("download", "upload"):
+                metric_values.update(
+                    values(direction, "79.20 Mbps", "72.00 Mbps", "72.00 Mbps", STATUS_PASS, "—")
+                )
+            metrics_path.write_text(json.dumps(metric_values), encoding="utf-8")
+            output = StringIO()
+            with redirect_stdout(output):
+                code = parse_json(str(metrics_path), "9 MB", 72_000, 16, str(results_path))
+            self.assertEqual(0, code)
+            self.assertIn("OVERALL|ENV_LIMITED", output.getvalue())
+            self.assertNotIn("OVERALL|PASS\\n", output.getvalue())
+            with results_path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(2, len(rows))
+            self.assertEqual({"ENV_LIMITED"}, {row["status"] for row in rows})
 
     def test_preflight_xml_collection_requires_both_tagged_real_metrics(self):
         with tempfile.TemporaryDirectory() as temp_dir:
