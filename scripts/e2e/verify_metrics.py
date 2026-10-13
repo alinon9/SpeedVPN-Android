@@ -252,7 +252,7 @@ def collect(xml_path: str, json_path: str) -> int:
 
 def _preflight_rate_from_node(node: ET.Element) -> str:
     """Find a real rate associated with a tagged preflight field, including nested UI nodes."""
-    rate_pattern = re.compile(r"(?<![A-Za-z0-9.])(?:[0-9]+(?:\\.[0-9]+)?)\\s?(?:Gbps|Mbps|Kbps|bps)(?![A-Za-z])")
+    rate_pattern = re.compile(r"(?<![A-Za-z0-9.])(?:[0-9]+(?:\.[0-9]+)?)\s?(?:Gbps|Mbps|Kbps|bps)(?![A-Za-z])")
     for candidate_node in node.iter("node"):
         for attribute in ("text", "content-desc", "contentDescription"):
             raw = (candidate_node.attrib.get(attribute, "") or "").strip()
