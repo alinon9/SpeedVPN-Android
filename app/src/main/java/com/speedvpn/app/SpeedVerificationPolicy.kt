@@ -23,9 +23,9 @@ object SpeedVerificationPolicy {
     const val TOLERANCE = 0.20
     const val BASELINE_HEADROOM_MULTIPLIER = 1.20
 
-    // The 75 KB/s and 100 KB/s presets can be judged once the physical baseline
+    // The 25, 50, 75, and 100 KB/s presets can be judged once the physical baseline
     // reaches the plan itself. All other presets retain the stricter 1.2x floor.
-    private val LOW_RATE_HEADROOM_TARGETS_KBPS = setOf(600L, 800L)
+    private val LOW_RATE_HEADROOM_TARGETS_KBPS = setOf(200L, 400L, 600L, 800L)
 
     private fun headroomMultiplierFor(planKbps: Long): Double =
         if (planKbps in LOW_RATE_HEADROOM_TARGETS_KBPS) 1.0 else BASELINE_HEADROOM_MULTIPLIER

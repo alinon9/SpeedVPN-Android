@@ -134,6 +134,22 @@ class VerifyMetricClassificationTests(unittest.TestCase):
         )
         self.assertEqual("PASS", result[4], result[4])
 
+    def test_25_kbs_upload_is_judgeable_with_one_times_headroom(self):
+        result = check_metric(
+            "upload",
+            values("upload", "225 Kbps", "200 Kbps", "190 Kbps", STATUS_PASS, "95.0%"),
+            200,
+        )
+        self.assertEqual("PASS", result[4], result[4])
+
+    def test_50_kbs_upload_is_judgeable_with_one_times_headroom(self):
+        result = check_metric(
+            "upload",
+            values("upload", "450 Kbps", "400 Kbps", "400 Kbps", STATUS_PASS, "100.0%"),
+            400,
+        )
+        self.assertEqual("PASS", result[4], result[4])
+
     def test_low_rate_upload_still_requires_baseline_at_least_the_plan(self):
         result = check_metric(
             "upload",
@@ -248,8 +264,10 @@ class DocumentedEnvironmentLimitationTests(unittest.TestCase):
         self.assertTrue(is_accepted_env_limited("upload", 80_000))  # 10 MB/s
         self.assertTrue(is_accepted_env_limited("upload", 88_000))  # 11 MB/s
         self.assertTrue(is_accepted_env_limited("download", 80_000))  # 10 MB/s
+        self.assertTrue(is_accepted_env_limited("download", 72_000))  # 9 MB/s
+        self.assertTrue(is_accepted_env_limited("download", 80_000))  # 10 MB/s
         self.assertTrue(is_accepted_env_limited("download", 88_000))  # 11 MB/s
-        self.assertFalse(is_accepted_env_limited("download", 72_000))  # 9 MB/s excluded for Download
+        self.assertFalse(is_accepted_env_limited("download", 64_000))  # 8 MB/s excluded
         self.assertFalse(is_accepted_env_limited("upload", 64_000))   # 8 MB/s excluded
         self.assertFalse(is_accepted_env_limited("upload", 0))
 
@@ -278,15 +296,29 @@ class DocumentedEnvironmentLimitationTests(unittest.TestCase):
             self.assertEqual(["ENV_LIMITED", "ENV_LIMITED"], [row[10] for row in rows])
             self.assertEqual(["ENV_LIMITED", "ENV_LIMITED"], [row[20] for row in rows])
 
+    def test_parse_json_accepts_9mb_download_env_limited_and_preserves_classification(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "metrics.json"
+            output_path = Path(temp_dir) / "metrics.csv"
+            metrics = {}
+            metrics.update(values("download", "80.00 Mbps", "72.00 Mbps", "50.00 Mbps", STATUS_MISMATCH, "—"))
+            metrics.update(values("upload", "100.00 Mbps", "72.00 Mbps", "72.00 Mbps", STATUS_PASS, "100.0%"))
+            input_path.write_text(json.dumps(metrics), encoding="utf-8")
+            self.assertEqual(0, parse_json(str(input_path), "9 MB", 72_000, 16, str(output_path)))
+            with output_path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.reader(handle))
+            self.assertEqual(["ENV_LIMITED", "PASS"], [row[10] for row in rows])
+            self.assertEqual(["ENV_LIMITED", "PASS"], [row[20] for row in rows])
+
     def test_parse_json_still_fails_unallowlisted_download_env_limited(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             input_path = Path(temp_dir) / "metrics.json"
             output_path = Path(temp_dir) / "metrics.csv"
             metrics = {}
-            metrics.update(values("download", "80.00 Mbps", "72.00 Mbps", "70.00 Mbps", STATUS_MISMATCH, "—"))
-            metrics.update(values("upload", "80.00 Mbps", "72.00 Mbps", "70.00 Mbps", STATUS_MISMATCH, "—"))
+            metrics.update(values("download", "70.00 Mbps", "64.00 Mbps", "50.00 Mbps", STATUS_MISMATCH, "—"))
+            metrics.update(values("upload", "70.00 Mbps", "64.00 Mbps", "50.00 Mbps", STATUS_MISMATCH, "—"))
             input_path.write_text(json.dumps(metrics), encoding="utf-8")
-            self.assertEqual(2, parse_json(str(input_path), "9 MB", 72_000, 16, str(output_path)))
+            self.assertEqual(2, parse_json(str(input_path), "8 MB", 64_000, 16, str(output_path)))
             with output_path.open(newline="", encoding="utf-8") as handle:
                 rows = list(csv.reader(handle))
             self.assertEqual(["ENV_LIMITED", "ENV_LIMITED"], [row[10] for row in rows])

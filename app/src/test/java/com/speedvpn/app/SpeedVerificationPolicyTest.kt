@@ -64,6 +64,24 @@ class SpeedVerificationPolicyTest {
     }
 
     @Test
+    fun twentyFiveAndFiftyKbPerSecondPlansAreVerifiableBelowGenericHeadroomFloor() {
+        val cases = listOf(
+            200L to 225_000L,
+            400L to 450_000L,
+        )
+
+        cases.forEach { (planKbps, baselineBps) ->
+            val result = SpeedVerificationPolicy.evaluate(
+                planKbps = planKbps,
+                baselineBps = baselineBps,
+                vpnBps = planKbps * 1_000L,
+            )
+            assertEquals("plan=$planKbps Kbps", SpeedVerificationStatus.MATCH, result.status)
+            assertEquals(100.0, result.accuracyPercent!!, 0.01)
+        }
+    }
+
+    @Test
     fun lowRatePlansRemainNotVerifiableWhenBaselineIsBelowThePlan() {
         val result = SpeedVerificationPolicy.evaluate(
             planKbps = 600L,

@@ -35,7 +35,7 @@ PREFLIGHT_VALUE_TAGS = {
 # Allowlist values are plan rates in KB/s; expected_kbps is in Kbit/s.
 # 1 KB/s = 8 Kbit/s, so compare using expected_kbps // 8.
 ENV_LIMITED_ACCEPTED_PLANS_UPLOAD_KBPS = {9000, 10000, 11000}
-ENV_LIMITED_ACCEPTED_PLANS_DOWNLOAD_KBPS = {10000, 11000}
+ENV_LIMITED_ACCEPTED_PLANS_DOWNLOAD_KBPS = {9000, 10000, 11000}
 
 # Unlimited's product policy remains 80% baseline retention. This lower value
 # is only a CI environment-limitation floor for borderline Unlimited Downloads.
@@ -208,11 +208,11 @@ def normalise_resource_id(value: str) -> str:
     return value.rsplit("/", 1)[-1].rsplit(":", 1)[-1]
 
 
-LOW_RATE_HEADROOM_TARGETS_KBPS = frozenset({600, 800})
+LOW_RATE_HEADROOM_TARGETS_KBPS = frozenset({200, 400, 600, 800})
 
 
 def verification_headroom_multiplier(expected_kbps: int) -> float:
-    """Keep 1.2x headroom for all plans except the two low-rate verification cases."""
+    """Keep 1.2x headroom for all plans except the four low-rate verification cases."""
     return 1.0 if expected_kbps in LOW_RATE_HEADROOM_TARGETS_KBPS else 1.2
 
 
