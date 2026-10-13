@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: isolated-unlimited-upload-run179
+  group: isolated-unlimited-upload-run179-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
