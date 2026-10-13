@@ -1,6 +1,7 @@
 name: Isolated 2 MB/s Upload Reset Verification
 
 on:
+  workflow_dispatch:
   pull_request:
     branches:
       - verify/2mbps-upload-reset-ci-base-20261012
