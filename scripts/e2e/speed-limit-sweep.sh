@@ -10,6 +10,7 @@ RUN_DIR="${SPEEDVPN_RUN_DIR:-speed-limit-sweep}"
 CSV_RUN_ID="${GITHUB_RUN_ID:-local}"
 recorded_at_utc() { date -u +"%Y-%m-%dT%H:%M:%S.%3NZ"; }
 RUN_STARTED_AT="$(recorded_at_utc)"
+SWEEP_SCRIPT_START_SECONDS=$SECONDS
 export SPEEDVPN_SWEEP_STARTED_AT="$RUN_STARTED_AT"
 if [ -n "${GITHUB_ENV:-}" ]; then
   printf 'SPEEDVPN_SWEEP_STARTED_AT=%s\n' "$RUN_STARTED_AT" >> "$GITHUB_ENV"
@@ -48,18 +49,65 @@ fi
 
 dump_ui() {
   local out="$1"
+  local deadline_seconds="${2:-}"
   local remote="/sdcard/speedvpn-sweep-ui.xml"
+  local attempt_started_ms dump_started_ms dump_finished_ms dump_elapsed_ms
+  local attempt_finished_ms attempt_elapsed_ms dump_status snapshot_reason remaining_seconds
+
   for attempt in 1 2 3 4 5; do
     rm -f "$out"
-    if adb -s "$DEVICE" shell uiautomator dump "$remote" >/dev/null 2>&1 &&
+    attempt_started_ms="$(date +%s%3N)"
+    dump_started_ms="$(date +%s%3N)"
+
+    if [ -n "$deadline_seconds" ]; then
+      remaining_seconds=$((deadline_seconds - SECONDS))
+      if [ "$remaining_seconds" -le 0 ]; then
+        echo "UIAUTOMATOR_DUMP status=deadline_reached duration_ms=0 attempt=$attempt/5 file=$out" | tee -a "$RUN_DIR/sweep-console.log"
+        return 1
+      fi
+      if timeout "${remaining_seconds}s" adb -s "$DEVICE" shell uiautomator dump "$remote" >/dev/null 2>&1; then
+        dump_status="success"
+      else
+        dump_status="failed"
+      fi
+    else
+      if adb -s "$DEVICE" shell uiautomator dump "$remote" >/dev/null 2>&1; then
+        dump_status="success"
+      else
+        dump_status="failed"
+      fi
+    fi
+
+    dump_finished_ms="$(date +%s%3N)"
+    dump_elapsed_ms=$((dump_finished_ms - dump_started_ms))
+    echo "UIAUTOMATOR_DUMP status=$dump_status duration_ms=$dump_elapsed_ms attempt=$attempt/5 run_elapsed_s=$((SECONDS - SWEEP_SCRIPT_START_SECONDS)) file=$out" | tee -a "$RUN_DIR/sweep-console.log"
+
+    if [ "$dump_status" = "success" ] &&
        adb -s "$DEVICE" exec-out cat "$remote" > "$out" 2>/dev/null &&
        [ -s "$out" ] &&
        python3 -c 'import sys, xml.etree.ElementTree as ET; ET.parse(sys.argv[1])' "$out" >/dev/null 2>&1; then
       adb -s "$DEVICE" shell rm -f "$remote" >/dev/null 2>&1 || true
+      attempt_finished_ms="$(date +%s%3N)"
+      attempt_elapsed_ms=$((attempt_finished_ms - attempt_started_ms))
+      echo "UI_SNAPSHOT_ATTEMPT status=success total_duration_ms=$attempt_elapsed_ms attempt=$attempt/5 run_elapsed_s=$((SECONDS - SWEEP_SCRIPT_START_SECONDS)) file=$out" | tee -a "$RUN_DIR/sweep-console.log"
       return 0
     fi
+
+    if [ "$dump_status" = "success" ]; then
+      snapshot_reason="read_or_xml_validation"
+    else
+      snapshot_reason="uiautomator_dump"
+    fi
+    attempt_finished_ms="$(date +%s%3N)"
+    attempt_elapsed_ms=$((attempt_finished_ms - attempt_started_ms))
+    echo "UI_SNAPSHOT_ATTEMPT status=retry reason=$snapshot_reason total_duration_ms=$attempt_elapsed_ms attempt=$attempt/5 run_elapsed_s=$((SECONDS - SWEEP_SCRIPT_START_SECONDS)) file=$out" | tee -a "$RUN_DIR/sweep-console.log"
+
     if [ -s "$out" ] && ! python3 -c 'import sys, xml.etree.ElementTree as ET; ET.parse(sys.argv[1])' "$out" >/dev/null 2>&1; then
-      echo "UI hierarchy XML is malformed (attempt ${attempt}/5); retrying."
+      echo "UI hierarchy XML is malformed (attempt ${attempt}/5); retrying." | tee -a "$RUN_DIR/sweep-console.log"
+    fi
+    if [ -n "$deadline_seconds" ] && [ "$SECONDS" -ge "$deadline_seconds" ]; then
+      echo "UI_SNAPSHOT deadline reached after attempt $attempt/5; returning to the real-time wait deadline." | tee -a "$RUN_DIR/sweep-console.log"
+      return 1
     fi
     sleep 1
   done
@@ -889,8 +937,23 @@ while IFS='|' read -r index preset expected <&3; do
   result_xml="$RUN_DIR/$slug-verify.xml"
   finished=0
   loading_seen=0
-  for second in $(seq 1 300); do
-    dump_ui "$result_xml" || true
+  verify_wait_timeout_seconds=300
+  verify_wait_started_seconds=$SECONDS
+  verify_wait_started_epoch_ms="$(date +%s%3N)"
+  verify_wait_deadline_seconds=$((verify_wait_started_seconds + verify_wait_timeout_seconds))
+  verify_wait_poll_count=0
+  echo "VERIFY_WAIT_START preset=$preset timeout_s=$verify_wait_timeout_seconds run_elapsed_s=$((SECONDS - SWEEP_SCRIPT_START_SECONDS))" | tee -a "$RUN_DIR/sweep-console.log"
+
+  while [ "$((SECONDS - verify_wait_started_seconds))" -lt "$verify_wait_timeout_seconds" ]; do
+    verify_wait_poll_count=$((verify_wait_poll_count + 1))
+    verify_wait_elapsed_before=$((SECONDS - verify_wait_started_seconds))
+    verify_wait_remaining_before=$((verify_wait_timeout_seconds - verify_wait_elapsed_before))
+    echo "VERIFY_WAIT_POLL_START preset=$preset poll=$verify_wait_poll_count elapsed_s=$verify_wait_elapsed_before remaining_s=$verify_wait_remaining_before" >> "$RUN_DIR/sweep-console.log"
+
+    dump_ui "$result_xml" "$verify_wait_deadline_seconds" || true
+    verify_wait_elapsed_after_dump=$((SECONDS - verify_wait_started_seconds))
+    echo "VERIFY_WAIT_POLL_END preset=$preset poll=$verify_wait_poll_count elapsed_s=$verify_wait_elapsed_after_dump remaining_s=$((verify_wait_timeout_seconds - verify_wait_elapsed_after_dump))" >> "$RUN_DIR/sweep-console.log"
+
     if grep -q "جاري التحقق من الخطة…" "$result_xml" 2>/dev/null; then
       loading_seen=1
     fi
@@ -901,17 +964,41 @@ while IFS='|' read -r index preset expected <&3; do
     if python3 scripts/e2e/metric_result_status.py "$result_xml" "$expected" >/dev/null 2>&1
     then
       finished=1
-      echo "Verify result exposed for $preset after ${second}s (loading_frame_seen=$loading_seen)." | tee -a "$RUN_DIR/sweep-console.log"
+      verify_wait_completed_seconds=$((SECONDS - verify_wait_started_seconds))
+      verify_wait_completed_epoch_ms="$(date +%s%3N)"
+      verify_wait_completed_wall_ms=$((verify_wait_completed_epoch_ms - verify_wait_started_epoch_ms))
+      echo "Verify result exposed for $preset after ${verify_wait_completed_seconds}s (wall_elapsed_ms=$verify_wait_completed_wall_ms, polls=$verify_wait_poll_count, loading_frame_seen=$loading_seen)." | tee -a "$RUN_DIR/sweep-console.log"
+      echo "VERIFY_WAIT_RESULT status=completed preset=$preset elapsed_s=$verify_wait_completed_seconds wall_elapsed_ms=$verify_wait_completed_wall_ms polls=$verify_wait_poll_count" | tee -a "$RUN_DIR/sweep-console.log"
       break
     fi
 
     # Keep scrolling toward the current result card. This handles the case
     # where the result is complete but below the UIAutomator viewport.
-    if [ "$((second % 3))" -eq 0 ]; then
-      adb -s "$DEVICE" shell input swipe 160 500 160 220 650 || true
+    if [ "$((verify_wait_poll_count % 3))" -eq 0 ]; then
+      verify_wait_remaining_for_swipe=$((verify_wait_deadline_seconds - SECONDS))
+      if [ "$verify_wait_remaining_for_swipe" -gt 0 ]; then
+        verify_wait_swipe_started_ms="$(date +%s%3N)"
+        timeout "${verify_wait_remaining_for_swipe}s" adb -s "$DEVICE" shell input swipe 160 500 160 220 650 || true
+        verify_wait_swipe_finished_ms="$(date +%s%3N)"
+        verify_wait_swipe_elapsed_ms=$((verify_wait_swipe_finished_ms - verify_wait_swipe_started_ms))
+        echo "VERIFY_WAIT_SWIPE preset=$preset poll=$verify_wait_poll_count duration_ms=$verify_wait_swipe_elapsed_ms elapsed_s=$((SECONDS - verify_wait_started_seconds))" | tee -a "$RUN_DIR/sweep-console.log"
+      fi
+    fi
+
+    if [ "$((SECONDS - verify_wait_started_seconds))" -ge "$verify_wait_timeout_seconds" ]; then
+      break
     fi
     sleep 1
   done
+
+  verify_wait_elapsed_seconds=$((SECONDS - verify_wait_started_seconds))
+  verify_wait_finished_epoch_ms="$(date +%s%3N)"
+  verify_wait_wall_elapsed_ms=$((verify_wait_finished_epoch_ms - verify_wait_started_epoch_ms))
+  if [ "$finished" -ne 1 ]; then
+    echo "VERIFY_WAIT_RESULT status=timeout preset=$preset timeout_s=$verify_wait_timeout_seconds elapsed_s=$verify_wait_elapsed_seconds wall_elapsed_ms=$verify_wait_wall_elapsed_ms polls=$verify_wait_poll_count loading_frame_seen=$loading_seen" | tee -a "$RUN_DIR/sweep-console.log"
+  else
+    echo "VERIFY_WAIT_END status=completed preset=$preset elapsed_s=$verify_wait_elapsed_seconds wall_elapsed_ms=$verify_wait_wall_elapsed_ms polls=$verify_wait_poll_count" | tee -a "$RUN_DIR/sweep-console.log"
+  fi
 
   adb -s "$DEVICE" logcat -d -t 3500 > "$RUN_DIR/$slug-logcat.txt" || true
 
