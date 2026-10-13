@@ -1,0 +1,343 @@
+name: Isolated Unlimited Upload Diagnostic — Run 179
+
+on:
+  push:
+    branches:
+      - validation/run179-unlimited-upload-20261013
+    paths:
+      - '.github/workflows/isolated-unlimited-upload-verification.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: isolated-unlimited-upload-run179
+  cancel-in-progress: false
+
+jobs:
+  isolated-2mbps-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 140
+    outputs:
+      preflight_status: ${{ steps.validation.outputs.preflight_status }}
+
+    steps:
+      - name: Checkout exact verification commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools platforms;android-36 build-tools;36.0.0 ndk;30.0.16248370'
+
+      - name: Prepare pinned native tunnel
+        run: |
+          set -euo pipefail
+          test -x ./gradlew
+          test -s gradle/wrapper/gradle-wrapper.jar.sha256
+          echo 'ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/30.0.16248370' >> "$GITHUB_ENV"
+          echo 'ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/30.0.16248370' >> "$GITHUB_ENV"
+          bash ./setup.sh
+          test "$(git -C app/src/main/jni/hev-socks5-tunnel rev-parse HEAD)" = 'd9dca26c7ad0e494492244f0309e80ee583e739e'
+          python3 scripts/e2e/patch_hev_tcp_buffers.py --check app/src/main/jni/hev-socks5-tunnel/third-part/lwip/src/ports/include/lwipopts.h
+
+      - name: Validate E2E test helpers
+        run: |
+          set -euo pipefail
+          bash -n scripts/e2e/speed-limit-sweep.sh
+          python3 -m py_compile scripts/e2e/preference_matches.py scripts/e2e/verify_metrics.py scripts/e2e/preflight_baseline.py scripts/e2e/local_speed_test_server.py scripts/e2e/metric_result_status.py scripts/e2e/patch_hev_tcp_buffers.py scripts/e2e/benchmark_local_speed_test_server.py scripts/e2e/tests/test_hev_tcp_buffer_patch.py scripts/e2e/tests/test_local_speed_test_server.py scripts/e2e/tests/test_metric_result_status.py scripts/e2e/tests/test_preflight_baseline.py
+          python3 -m unittest discover -s scripts/e2e/tests -v
+
+      - name: Build APK and verify 73/73 Android JVM unit tests
+        run: |
+          set -euo pipefail
+          ./gradlew :app:testDebugUnitTest :app:assembleDebug -PspeedTestBaseUrl=http://10.0.2.2:18765 --stacktrace --no-daemon
+          test -s app/build/outputs/apk/debug/app-debug.apk
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          report_dir = Path("app/build/test-results/testDebugUnitTest")
+          reports = sorted(report_dir.glob("TEST-*.xml"))
+          if not reports:
+              raise SystemExit("UNIT_TESTS_FAIL: Gradle JUnit XML reports are missing")
+          totals = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+          for report in reports:
+              root = ET.parse(report).getroot()
+              for key in totals:
+                  totals[key] += int(root.attrib.get(key, "0"))
+          print(
+              "UNIT_TESTS="
+              f"{totals['tests']}/{totals['tests']} "
+              f"failures={totals['failures']} errors={totals['errors']} skipped={totals['skipped']}"
+          )
+          if totals["tests"] != 73 or totals["failures"] or totals["errors"]:
+              raise SystemExit(f"UNIT_TESTS_FAIL: expected 73 passing tests, got {totals}")
+          PY
+          echo "verified_pr19_source_commit=d1f5f2ee6e15341b6778bb8777fd848feb7e0d52" | tee speedvpn-debug-apk-fingerprint.txt
+          echo "validation_workflow_commit=$(git rev-parse HEAD)" | tee -a speedvpn-debug-apk-fingerprint.txt
+          sha256sum app/build/outputs/apk/debug/app-debug.apk | tee -a speedvpn-debug-apk-fingerprint.txt
+          cp app/build/outputs/apk/debug/app-debug.apk speedvpn-debug-apk.apk
+
+      - name: Install Android Emulator
+        run: |
+          set -euo pipefail
+          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/platform-tools:$ANDROID_SDK_ROOT/emulator" >> "$GITHUB_PATH"
+          export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/platform-tools:$ANDROID_SDK_ROOT/emulator:$PATH"
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" --install emulator 'system-images;android-29;google_apis;x86_64'
+          test -x "$ANDROID_SDK_ROOT/emulator/emulator"
+
+      - name: Enable KVM
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y cpu-checker
+          sudo kvm-ok
+          sudo chmod 666 /dev/kvm
+          emulator -accel-check
+
+      - name: Configure controlled fixture TCP buffers and start server
+        run: |
+          set -euo pipefail
+          sudo sysctl -w net.core.rmem_max=16777216
+          sudo sysctl -w net.core.wmem_max=16777216
+          sudo sysctl -w net.ipv4.tcp_rmem='4096 131072 16777216'
+          sudo sysctl -w net.ipv4.tcp_wmem='4096 131072 16777216'
+          nohup python3 -u scripts/e2e/local_speed_test_server.py --host 0.0.0.0 --port 18765 < /dev/null > speed-test-server.log 2>&1 &
+          echo "$!" > speed-test-server.pid
+          python3 - <<'PY'
+          import json, time
+          from urllib.request import urlopen
+          minimum = 4 * 1024 * 1024
+          for attempt in range(60):
+              try:
+                  with urlopen("http://127.0.0.1:18765/healthz", timeout=1) as response:
+                      payload = json.loads(response.read())
+                      effective = int(payload.get("socket_receive_buffer_bytes", 0))
+                      print(f"FIXTURE_HEALTH={json.dumps(payload, sort_keys=True)}")
+                      if response.status == 200 and payload.get("status") == "ok":
+                          if effective < minimum:
+                              raise SystemExit(f"Fixture receive buffer too small: {effective} bytes")
+                          break
+              except Exception as error:
+                  print(f"FIXTURE_WAIT attempt={attempt + 1} error={type(error).__name__}: {error}")
+              time.sleep(0.5)
+          else:
+              raise SystemExit("Local speed-test fixture did not become ready")
+          PY
+
+      - name: Benchmark local fixture capacity
+        run: python3 scripts/e2e/benchmark_local_speed_test_server.py --base-url http://127.0.0.1:18765 --rounds 3 --streams 6 --bytes-per-stream 8000000 --min-mbps 211.2 --output fixture-throughput-benchmark.json
+
+      - name: Boot emulator and run one Unlimited-plan diagnostic
+        id: validation
+        shell: bash
+        run: |
+          set -uo pipefail
+          export ANDROID_AVD_HOME="${RUNNER_TEMP}/android-avd"
+          mkdir -p "$ANDROID_AVD_HOME" isolated-unlimited-upload baseline-preflight
+          echo no | avdmanager create avd -n speedvpn-unlimited -k 'system-images;android-29;google_apis;x86_64' --force
+          adb kill-server >/dev/null 2>&1 || true
+          adb start-server
+          nohup emulator -avd speedvpn-unlimited -no-window -no-audio -no-boot-anim -no-snapshot -no-snapshot-save -no-metrics -gpu swiftshader_indirect -accel on -cores 4 -memory 4096 -partition-size 2048 -netdelay none -netspeed full -dns-server 8.8.8.8,1.1.1.1 > emulator-console.log 2>&1 &
+          EMULATOR_PID=$!
+
+          cleanup() {
+            adb -s emulator-5554 logcat -d -v threadtime > final-logcat.txt 2>&1 || true
+            adb -s emulator-5554 emu kill >/dev/null 2>&1 || true
+            kill "$EMULATOR_PID" >/dev/null 2>&1 || true
+            wait "$EMULATOR_PID" >/dev/null 2>&1 || true
+            if [ -f speed-test-server.pid ]; then
+              kill "$(cat speed-test-server.pid)" >/dev/null 2>&1 || true
+            fi
+          }
+          trap cleanup EXIT
+
+          diagnostics() {
+            adb devices -l || true
+            adb -s emulator-5554 shell ip route || true
+            adb -s emulator-5554 shell dumpsys connectivity | head -n 180 || true
+            cat emulator-console.log || true
+          }
+          for i in $(seq 1 180); do
+            adb -s emulator-5554 get-state >/dev/null 2>&1 && break
+            kill -0 "$EMULATOR_PID" >/dev/null 2>&1 || { diagnostics; exit 1; }
+            sleep 1
+          done
+          adb -s emulator-5554 wait-for-device
+          for i in $(seq 1 180); do
+            adb -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' | grep -q '^1$' && break
+            kill -0 "$EMULATOR_PID" >/dev/null 2>&1 || { diagnostics; exit 1; }
+            sleep 1
+          done
+          adb -s emulator-5554 shell settings put global window_animation_scale 0
+          adb -s emulator-5554 shell settings put global transition_animation_scale 0
+          adb -s emulator-5554 shell settings put global animator_duration_scale 0
+          adb -s emulator-5554 install -r app/build/outputs/apk/debug/app-debug.apk
+
+          # Reuse the same strict three-sample baseline qualification used by the
+          # exhaustive sweep. Do not run the Unlimited diagnostic if headroom fails.
+          if timeout --signal=TERM --kill-after=5s 160s env SPEEDVPN_PREFLIGHT_ONLY=1 SPEEDVPN_RUN_DIR="baseline-preflight/initial" bash scripts/e2e/speed-limit-sweep.sh > baseline-preflight-initial.log 2>&1; then
+            cat baseline-preflight-initial.log
+            echo "preflight_status=PASS" >> "$GITHUB_OUTPUT"
+          else
+            PREFLIGHT_RC=$?
+            cat baseline-preflight-initial.log
+            if [ "$PREFLIGHT_RC" -eq 75 ] || [ "$PREFLIGHT_RC" -eq 124 ] || grep -Fq "ENV_INSUFFICIENT — skipped sweep" baseline-preflight-initial.log; then
+              echo "preflight_status=ENV_INSUFFICIENT" >> "$GITHUB_OUTPUT"
+              echo "ENV_INSUFFICIENT: baseline did not qualify; Unlimited Upload test was not run." | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "preflight_status=ERROR" >> "$GITHUB_OUTPUT"
+            exit "$PREFLIGHT_RC"
+          fi
+
+          out="isolated-unlimited-upload"
+          adb -s emulator-5554 shell am force-stop com.speedvpn.app >/dev/null 2>&1 || true
+          sleep 2
+          adb -s emulator-5554 logcat -c || true
+          echo "===== ISOLATED UNLIMITED UPLOAD DIAGNOSTIC =====" | tee "$out/driver-console.log"
+
+          # The app's Verify Speed flow measures both directions. This run selects
+          # only preset 19 (Unlimited); the acceptance/reporting step gates solely
+          # on its Upload row and its three completed upload samples.
+          if env \
+              SPEEDVPN_DIAGNOSTIC_ONLY=1 \
+              SPEEDVPN_SKIP_BASELINE_PREFLIGHT=1 \
+              SPEEDVPN_PREFLIGHT_SUMMARY="baseline-preflight/initial/baseline-preflight/summary.json" \
+              SPEEDVPN_TOTAL_PRESETS=1 \
+              SPEEDVPN_CASES_OVERRIDE='19|بدون حد|0' \
+              SPEEDVPN_RUN_DIR="$out" \
+              bash scripts/e2e/speed-limit-sweep.sh 2>&1 | tee -a "$out/driver-console.log"; then
+            DRIVER_RC=0
+          else
+            DRIVER_RC=$?
+          fi
+          echo "DIAGNOSTIC_DRIVER_EXIT=$DRIVER_RC" | tee -a "$out/driver-console.log"
+          echo "driver_exit=$DRIVER_RC" >> "$GITHUB_OUTPUT"
+          adb -s emulator-5554 logcat -d -v threadtime > "$out/logcat-after-attempt.txt" 2>&1 || true
+
+      - name: Validate Unlimited Upload samples, error handling, and real elapsed time
+        if: always() && steps.validation.conclusion == 'success'
+        env:
+          PREFLIGHT_STATUS: ${{ steps.validation.outputs.preflight_status }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$PREFLIGHT_STATUS" != "PASS" ]; then
+            echo "ISOLATED_UNLIMITED_UPLOAD_NOT_RUN: preflight status=$PREFLIGHT_STATUS"
+            exit 1
+          fi
+          python3 - <<'PY'
+          import csv
+          import re
+          import sys
+          from pathlib import Path
+
+          run_dir = Path("isolated-unlimited-upload")
+          results_path = run_dir / "speed-limit-sweep-results.csv"
+          if not results_path.is_file():
+              raise SystemExit(f"FAIL: missing result CSV {results_path}")
+          with results_path.open(newline="", encoding="utf-8-sig") as handle:
+              rows = list(csv.DictReader(handle))
+          upload_rows = [row for row in rows if row.get("direction") == "Upload"]
+          if len(upload_rows) != 1:
+              raise SystemExit(f"FAIL: expected exactly one Upload row, found {len(upload_rows)}")
+          row = upload_rows[0]
+          if row.get("index") != "19" or row.get("preset") != "بدون حد" or row.get("expected_kbps") != "0":
+              raise SystemExit(f"FAIL: wrong Unlimited selection/plan: {row}")
+          classification = (row.get("classification") or "").strip()
+          allowed_classes = {"PASS_UNLIMITED", "FAIL", "ENV_LIMITED", "ENV_INSUFFICIENT"}
+          if classification not in allowed_classes:
+              raise SystemExit(f"FAIL: missing/unknown Upload classification {classification!r}")
+          print(
+              "UNLIMITED_UPLOAD_RESULT "
+              f"classification={classification} "
+              f"baseline_mbps={row.get('original_speed_mbps')} "
+              f"vpn_mbps={row.get('vpn_speed_mbps')} "
+              f"verdict={row.get('verdict')} "
+              f"reason={row.get('failure_reason') or row.get('reason')}"
+          )
+
+          console_path = run_dir / "sweep-console.log"
+          console = console_path.read_text(encoding="utf-8", errors="replace") if console_path.exists() else ""
+          timeout_records = re.findall(r"VERIFY_WAIT_RESULT status=timeout[^\n]*", console)
+          complete_records = re.findall(
+              r"VERIFY_WAIT_RESULT status=completed preset=بدون حد elapsed_s=(\d+) wall_elapsed_ms=(\d+)",
+              console,
+          )
+          if timeout_records:
+              print("TIMEOUT_RECORDS=" + " || ".join(timeout_records))
+              raise SystemExit("FAIL: Verify Speed ended by timeout")
+          if not complete_records:
+              raise SystemExit("FAIL: no completed Verify Speed record with real elapsed time was written")
+          elapsed_s, wall_ms = map(int, complete_records[-1])
+          print(f"VERIFY_WAIT_COMPLETED elapsed_s={elapsed_s} wall_elapsed_ms={wall_ms}")
+          if elapsed_s > 300 or wall_ms > 300000:
+              raise SystemExit("FAIL: Verify Speed exceeded the 300-second real-time deadline")
+
+          log_paths = [run_dir / "logcat-after-attempt.txt", Path("final-logcat.txt")]
+          log_paths.extend(run_dir.glob("*logcat.txt"))
+          logs = "\n".join(
+              path.read_text(encoding="utf-8", errors="replace")
+              for path in log_paths if path.exists()
+          )
+          upload_sample_lines = [
+              line for line in logs.splitlines()
+              if "Phase complete direction=upload" in line and "validSamples=3/3" in line
+          ]
+          if not upload_sample_lines:
+              likely = [line for line in logs.splitlines() if "validSamples=" in line or "Upload failed:" in line]
+              print("UPLOAD_SAMPLE_DIAGNOSTICS=" + " || ".join(likely[-30:]))
+              raise SystemExit("FAIL: did not observe upload validSamples=3/3 in logcat")
+          print(f"UPLOAD_VALID_SAMPLES_3_OF_3={len(upload_sample_lines)}")
+          for line in upload_sample_lines:
+              print("UPLOAD_SAMPLE_LOG=" + line[-600:])
+
+          # A final-flush peer-close may be logged as a recovered warning with its
+          # stack trace. Fail only an unhandled upload request/sample failure, not
+          # the explicitly recovered path or the SOCKS handler that preserves the
+          # reverse response flow.
+          unhandled = [
+              line for line in logs.splitlines()
+              if re.search(r"(Upload failed:|Unable to collect enough upload samples|HTTP upload request failed).*(Broken pipe|Connection reset)", line, re.I)
+          ]
+          if unhandled:
+              print("UNHANDLED_UPLOAD_SOCKET_ERRORS=" + " || ".join(unhandled))
+              raise SystemExit("FAIL: unhandled Broken pipe/Connection reset still fails upload")
+          recovered = any("Upload payload fully emitted; final flush saw peer-close race" in line for line in logs.splitlines())
+          socks_handled = any("SOCKS upload destination write failed (Broken pipe/Connection reset); preserving reverse response" in line for line in logs.splitlines())
+          print(f"RECOVERED_FINAL_FLUSH_RACE={int(recovered)}")
+          print(f"SOCKS_REVERSE_FLOW_PRESERVED={int(socks_handled)}")
+          print("UNLIMITED_UPLOAD_DIAGNOSTIC_COMPLETE")
+          PY
+
+      - name: Upload Unlimited Upload diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: speedvpn-isolated-unlimited-upload-run179
+          path: |
+            isolated-unlimited-upload/**
+            baseline-preflight/**
+            baseline-preflight-initial.log
+            speedvpn-debug-apk.apk
+            speedvpn-debug-apk-fingerprint.txt
+            speed-test-server.log
+            emulator-console.log
+            final-logcat.txt
+            fixture-throughput-benchmark.json
+          if-no-files-found: warn
+          compression-level: 6
+
