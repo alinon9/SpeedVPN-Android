@@ -8,6 +8,7 @@ import json
 import tempfile
 
 from verify_metrics import (
+    STATUS_ENV_LIMITED,
     STATUS_MISMATCH,
     STATUS_PASS,
     STATUS_UNJUDGEABLE,
