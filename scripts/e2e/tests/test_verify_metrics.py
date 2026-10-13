@@ -7,6 +7,7 @@ import json
 import tempfile
 
 from verify_metrics import (
+    ACCEPTED_FINAL_STATES,
     STATUS_MISMATCH,
     STATUS_PASS,
     STATUS_UNJUDGEABLE,
@@ -28,6 +29,12 @@ def values(direction, baseline, plan, vpn, verdict, accuracy="—"):
 
 
 class VerifyMetricClassificationTests(unittest.TestCase):
+    def test_accepted_final_states_are_explicit_and_documented(self):
+        self.assertEqual(
+            {"PASS", "PASS_UNLIMITED", "ENV_LIMITED", "ENV_INSUFFICIENT"},
+            ACCEPTED_FINAL_STATES,
+        )
+
     def test_preflight_xml_collection_requires_both_tagged_real_metrics(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             xml_path = Path(temp_dir) / "ui.xml"
