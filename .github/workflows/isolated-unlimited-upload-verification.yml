@@ -188,8 +188,11 @@ jobs:
           adb -s emulator-5554 shell settings put global animator_duration_scale 0
           adb -s emulator-5554 install -r app/build/outputs/apk/debug/app-debug.apk
 
-          # Reuse the same strict three-sample baseline qualification used by the
-          # exhaustive sweep. Do not run the Unlimited diagnostic if headroom fails.
+          # Run the standard three-sample runner preflight first. A failed global
+          # preflight blocks the exhaustive sweep, but this workflow tests ONLY
+          # Unlimited and can continue as a diagnostic with the real failed summary.
+          # It does not change the app's 80% Unlimited retention rule or qualify
+          # any finite preset for acceptance.
           if timeout --signal=TERM --kill-after=5s 160s env SPEEDVPN_PREFLIGHT_ONLY=1 SPEEDVPN_RUN_DIR="baseline-preflight/initial" bash scripts/e2e/speed-limit-sweep.sh > baseline-preflight-initial.log 2>&1; then
             cat baseline-preflight-initial.log
             echo "preflight_status=PASS" >> "$GITHUB_OUTPUT"
@@ -197,9 +200,13 @@ jobs:
             PREFLIGHT_RC=$?
             cat baseline-preflight-initial.log
             if [ "$PREFLIGHT_RC" -eq 75 ] || [ "$PREFLIGHT_RC" -eq 124 ] || grep -Fq "ENV_INSUFFICIENT — skipped sweep" baseline-preflight-initial.log; then
+              test -s "baseline-preflight/initial/baseline-preflight/summary.json" || {
+                echo "ERROR: strict preflight failed before writing its real diagnostic summary."
+                echo "preflight_status=ERROR" >> "$GITHUB_OUTPUT"
+                exit 1
+              }
               echo "preflight_status=ENV_INSUFFICIENT" >> "$GITHUB_OUTPUT"
-              echo "ENV_INSUFFICIENT: baseline did not qualify; Unlimited Upload test was not run." | tee -a "$GITHUB_STEP_SUMMARY"
-              exit 0
+              echo "ENV_INSUFFICIENT: strict all-plan preflight failed; continuing ONLY the isolated Unlimited Upload diagnostic. This is not acceptance evidence for finite plans." | tee -a "$GITHUB_STEP_SUMMARY"
             fi
             echo "preflight_status=ERROR" >> "$GITHUB_OUTPUT"
             exit "$PREFLIGHT_RC"
@@ -237,9 +244,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ "$PREFLIGHT_STATUS" != "PASS" ]; then
+          if [ "$PREFLIGHT_STATUS" != "PASS" ] && [ "$PREFLIGHT_STATUS" != "ENV_INSUFFICIENT" ]; then
             echo "ISOLATED_UNLIMITED_UPLOAD_NOT_RUN: preflight status=$PREFLIGHT_STATUS"
             exit 1
+          fi
+          if [ "$PREFLIGHT_STATUS" = "ENV_INSUFFICIENT" ]; then
+            echo "DIAGNOSTIC_ONLY: runner baseline was unstable/insufficient; report the observed Unlimited Upload classification, but do not claim strict-runner qualification or full-sweep acceptance."
           fi
           python3 - <<'PY'
           import csv
