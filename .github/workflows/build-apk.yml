@@ -3,7 +3,7 @@ name: Build SpeedVPN APK
 on:
   workflow_dispatch:
   push:
-    branches: [ main, master ]
+    branches: [ main, master, fix/100kb-upload-body-accounting-20261013 ]
   pull_request:
     branches: [ main ]
 
