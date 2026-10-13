@@ -36,7 +36,23 @@ jobs:
           test "$(git -C app/src/main/jni/hev-socks5-tunnel rev-parse HEAD)" = 'd9dca26c7ad0e494492244f0309e80ee583e739e'
 
       - name: Run full unit-test suite including 512 KiB upload accounting regression
-        run: ./gradlew :app:testDebugUnitTest --stacktrace --no-daemon
+        run: |
+          set +e
+          ./gradlew :app:testDebugUnitTest --stacktrace --no-daemon
+          test_status=$?
+          echo "===== UploadByteAccountingTest JUnit report ====="
+          if [ -f app/build/test-results/testDebugUnitTest/TEST-com.speedvpn.app.UploadByteAccountingTest.xml ]; then
+            cat app/build/test-results/testDebugUnitTest/TEST-com.speedvpn.app.UploadByteAccountingTest.xml
+          fi
+          exit "$test_status"
+
+      - name: Upload JUnit test reports for diagnosis
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: upload-byte-accounting-junit-reports
+          path: app/build/test-results/testDebugUnitTest/*.xml
+          if-no-files-found: warn
 
       - name: Build debug APK
         run: ./gradlew :app:assembleDebug --stacktrace --no-daemon
