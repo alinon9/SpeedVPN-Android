@@ -49,18 +49,20 @@ import kotlin.concurrent.thread
 internal data class RelayReadBatch(val bytesRead: Int, val readCalls: Int)
 
 /**
- * An upstream peer may finish its HTTP request and close its receive half while
- * the reverse response is still in flight. Preserve the reverse pipe only for
- * that upload-write/half-close case, never for a dead VPN session or a download
- * write failure.
+ * An upstream peer may finish its HTTP request while the reverse response is
+ * still in flight. Preserve the reverse pipe for a Broken pipe/Connection reset
+ * during an active upload write or a failed upload half-close, never for a dead
+ * VPN session or a download write failure.
  */
-internal fun shouldPreserveReverseFlowAfterUploadHalfClose(
+internal fun shouldPreserveReverseFlowAfterUploadWriteFailure(
     isUploadDirection: Boolean,
     sessionActive: Boolean,
     destinationWriteBrokenPipe: Boolean,
+    destinationWriteConnectionReset: Boolean,
     halfCloseFailed: Boolean,
 ): Boolean =
-    isUploadDirection && sessionActive && (destinationWriteBrokenPipe || halfCloseFailed)
+    isUploadDirection && sessionActive &&
+        (destinationWriteBrokenPipe || destinationWriteConnectionReset || halfCloseFailed)
 
 internal fun readRelayBatch(
     source: InputStream,
@@ -648,13 +650,21 @@ class Socks5Server(
                     pipeError is SocketException &&
                     pipeError.message?.contains("broken pipe", ignoreCase = true) == true
 
+            val destinationWriteConnectionReset =
+                uploadDirection &&
+                    destinationWriteInProgress &&
+                    forwardedBytes > 0L &&
+                    pipeError is SocketException &&
+                    pipeError.message?.contains("connection reset", ignoreCase = true) == true
+
             if (eof && running) {
                 val halfCloseError = runCatching { destination.shutdownOutput() }.exceptionOrNull()
                 if (halfCloseError != null) {
-                    val preserveReverse = shouldPreserveReverseFlowAfterUploadHalfClose(
+                    val preserveReverse = shouldPreserveReverseFlowAfterUploadWriteFailure(
                         isUploadDirection = uploadDirection,
                         sessionActive = sessionActive,
                         destinationWriteBrokenPipe = false,
+                        destinationWriteConnectionReset = false,
                         halfCloseFailed = true,
                     )
                     if (preserveReverse) {
@@ -667,10 +677,11 @@ class Socks5Server(
                     }
                 }
             } else if (
-                shouldPreserveReverseFlowAfterUploadHalfClose(
+                shouldPreserveReverseFlowAfterUploadWriteFailure(
                     isUploadDirection = uploadDirection,
                     sessionActive = sessionActive,
                     destinationWriteBrokenPipe = destinationWriteBrokenPipe,
+                    destinationWriteConnectionReset = destinationWriteConnectionReset,
                     halfCloseFailed = false,
                 )
             ) {
@@ -679,7 +690,7 @@ class Socks5Server(
                 // here: drain the server's response on the sibling download pipe.
                 runCatching { destination.shutdownOutput() }
                 log(
-                    "SOCKS upload destination Broken pipe; preserving reverse response flowId=$flowId " +
+                    "SOCKS upload destination write failed (Broken pipe/Connection reset); preserving reverse response flowId=$flowId " +
                         "bytesForwarded=$forwardedBytes",
                 )
             } else {
