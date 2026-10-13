@@ -6,6 +6,11 @@ on:
       - validation/run179-unlimited-upload-20261013
     paths:
       - '.github/workflows/isolated-unlimited-upload-verification.yml'
+  pull_request:
+    branches:
+      - validation/run179-unlimited-upload-20261013
+    paths:
+      - '.github/workflows/isolated-unlimited-upload-verification.yml'
   workflow_dispatch:
 
 permissions:
