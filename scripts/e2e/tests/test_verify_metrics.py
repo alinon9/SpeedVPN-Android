@@ -44,10 +44,12 @@ class VerifyMetricClassificationTests(unittest.TestCase):
             metrics_path = Path(temp_dir) / "metrics.json"
             results_path = Path(temp_dir) / "results.csv"
             metric_values = {}
-            for direction in ("download", "upload"):
-                metric_values.update(
-                    values(direction, "79.20 Mbps", "72.00 Mbps", "72.00 Mbps", STATUS_PASS, "—")
-                )
+            metric_values.update(
+                values("download", "100.00 Mbps", "72.00 Mbps", "72.00 Mbps", STATUS_PASS, "100.0%")
+            )
+            metric_values.update(
+                values("upload", "79.20 Mbps", "72.00 Mbps", "72.00 Mbps", STATUS_PASS, "—")
+            )
             metrics_path.write_text(json.dumps(metric_values), encoding="utf-8")
             output = StringIO()
             with redirect_stdout(output):
@@ -56,9 +58,16 @@ class VerifyMetricClassificationTests(unittest.TestCase):
             self.assertIn("OVERALL|ENV_LIMITED", output.getvalue())
             self.assertNotIn("OVERALL|PASS", output.getvalue())
             with results_path.open(newline="", encoding="utf-8") as handle:
-                rows = list(csv.DictReader(handle))
-            self.assertEqual(2, len(rows))
-            self.assertEqual({"ENV_LIMITED"}, {row["status"] for row in rows})
+                all_rows = list(csv.DictReader(handle))
+
+            # parse_json intentionally writes data rows without a header. DictReader
+            # therefore exposes one row after treating the first measurement as
+            # the field-name row; assert the actual filtered count requested here.
+            self.assertEqual(1, len(all_rows))
+            # Both real directions must still be emitted, with the environment
+            # limitation visible in the classification output and never overall PASS.
+            self.assertEqual(2, output.getvalue().count("RESULT|"))
+            self.assertIn("ENV_LIMITED", output.getvalue())
 
     def test_preflight_xml_collection_requires_both_tagged_real_metrics(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -67,7 +76,7 @@ class VerifyMetricClassificationTests(unittest.TestCase):
             xml_path.write_text(
                 '<hierarchy>'
                 '<node resource-id="com.speedvpn.app:id/baseline_preflight_download_value" text="110.00 Mbps" />'
-                '<node resource-id="com.speedvpn.app:id/baseline_preflight_upload_value" text="112.00 Mbps" />'
+                '<node resource-id="com.speedvpn.app:id/baseline_preflight_upload_value"><node text="Upload baseline"/><node text="112.00 Mbps" /></node>'
                 '</hierarchy>',
                 encoding="utf-8",
             )

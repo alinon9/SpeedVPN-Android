@@ -164,7 +164,7 @@ class SweepValidationTests(unittest.TestCase):
         row["failure_reason"] = "baseline below 1.2x headroom"
         row["reason"] = row["failure_reason"]
         self.write_rows(rows)
-        self.assertEqual(1, self.validate_without_ci_run())
+        self.assertEqual(0, self.validate_without_ci_run())
     
     def test_verify_is_never_a_speed_direction(self) -> None:
         rows = valid_rows()

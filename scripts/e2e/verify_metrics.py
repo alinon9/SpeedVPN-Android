@@ -250,8 +250,26 @@ def collect(xml_path: str, json_path: str) -> int:
     return 0
 
 
+def _preflight_rate_from_node(node: ET.Element) -> str:
+    """Find a real rate associated with a tagged preflight field, including nested UI nodes."""
+    rate_pattern = re.compile(r"(?<![A-Za-z0-9.])(?:[0-9]+(?:\.[0-9]+)?)\s?(?:Gbps|Mbps|Kbps|bps)(?![A-Za-z])")
+    for candidate_node in node.iter("node"):
+        for attribute in ("text", "content-desc", "contentDescription"):
+            raw = (candidate_node.attrib.get(attribute, "") or "").strip()
+            if not raw:
+                continue
+            candidate = raw if RATE_RE.fullmatch(raw) else ""
+            if not candidate:
+                match = rate_pattern.search(raw)
+                candidate = match.group(0) if match else ""
+            parsed = rate_bps(candidate)
+            if parsed is not None and parsed > 0:
+                return candidate
+    return ""
+
+
 def collect_preflight(xml_path: str, json_path: str) -> int:
-    """Accumulate only the real baseline measurements rendered by the debug UI."""
+    """Accumulate real Download/Upload baselines even when values are nested in UIAutomator XML."""
     output = Path(json_path)
     try:
         state = json.loads(output.read_text(encoding="utf-8"))
@@ -261,10 +279,16 @@ def collect_preflight(xml_path: str, json_path: str) -> int:
         state = {}
     root = ET.parse(xml_path).getroot()
     for node in root.iter("node"):
-        tag = normalise_resource_id(node.attrib.get("resource-id", ""))
-        value = (node.attrib.get("text", "") or "").strip()
-        if tag in PREFLIGHT_VALUE_TAGS and value:
-            state[tag] = value
+        tag = ""
+        for attribute in ("resource-id", "resourceId", "content-desc", "contentDescription"):
+            candidate_tag = normalise_resource_id(node.attrib.get(attribute, ""))
+            if candidate_tag in PREFLIGHT_VALUE_TAGS:
+                tag = candidate_tag
+                break
+        if tag:
+            value = _preflight_rate_from_node(node)
+            if value:
+                state[tag] = value
     output.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     missing = sorted(PREFLIGHT_VALUE_TAGS - {key for key, value in state.items() if str(value).strip()})
     print(f"PREFLIGHT_FIELDS_CAPTURED={len(PREFLIGHT_VALUE_TAGS) - len(missing)}/2")
