@@ -54,7 +54,7 @@ class VerifyMetricClassificationTests(unittest.TestCase):
                 code = parse_json(str(metrics_path), "9 MB", 72_000, 16, str(results_path))
             self.assertEqual(0, code)
             self.assertIn("OVERALL|ENV_LIMITED", output.getvalue())
-            self.assertNotIn("OVERALL|PASS\\n", output.getvalue())
+            self.assertNotIn("OVERALL|PASS", output.getvalue())
             with results_path.open(newline="", encoding="utf-8") as handle:
                 rows = list(csv.DictReader(handle))
             self.assertEqual(2, len(rows))
