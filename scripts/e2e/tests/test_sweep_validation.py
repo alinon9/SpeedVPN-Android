@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from verify_metrics import CSV_FIELDS, EXPECTED_PRESETS, STATUS_PASS, STATUS_UNLIMITED, validate_sweep  # noqa: E402
+from verify_metrics import CSV_FIELDS, EXPECTED_PRESETS, STATUS_MISMATCH, STATUS_PASS, STATUS_UNLIMITED, validate_sweep  # noqa: E402
 
 
 def rate_label(bps: float) -> str:
@@ -94,12 +94,32 @@ class SweepValidationTests(unittest.TestCase):
         self.write_rows(rows)
         self.assertEqual(1, self.validate_without_ci_run())
 
-    def test_environment_limited_is_never_counted_as_pass(self) -> None:
+    def test_documented_environment_limited_row_is_an_accepted_final_state(self) -> None:
         rows = valid_rows()
         row = next(r for r in rows if r["index"] == "16" and r["direction"] == "Download")
         target = EXPECTED_PRESETS[16][1] * 1_000.0
         row["baseline_raw"] = rate_label(target * 1.1)
+        row["original_speed_mbps"] = f"{target * 1.1 / 1_000_000:.6f}"
+        row["accuracy_raw"] = "—"
         row["classification"] = "ENV_LIMITED"
+        row["status"] = "ENV_LIMITED"
+        row["reason"] = "environment baseline below documented 1.2x headroom floor"
+        row["failure_reason"] = row["reason"]
+        self.write_rows(rows)
+        self.assertEqual(0, self.validate_without_ci_run())
+
+    def test_measured_out_of_range_result_with_sufficient_headroom_still_fails(self) -> None:
+        rows = valid_rows()
+        row = next(r for r in rows if r["index"] == "18" and r["direction"] == "Upload")
+        target_bps = EXPECTED_PRESETS[18][1] * 1_000.0
+        row["vpn_raw"] = rate_label(target_bps * 0.6)
+        row["vpn_speed_mbps"] = f"{target_bps * 0.6 / 1_000_000:.6f}"
+        row["accuracy_raw"] = "60.0%"
+        row["verdict"] = STATUS_MISMATCH
+        row["classification"] = "FAIL"
+        row["status"] = "FAIL"
+        row["reason"] = "measured upload is outside strict ±20% acceptance range"
+        row["failure_reason"] = row["reason"]
         self.write_rows(rows)
         self.assertEqual(1, self.validate_without_ci_run())
 
