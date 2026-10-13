@@ -398,9 +398,9 @@ def check_metric(direction: str, values: dict[str, str], expected_kbps: int) -> 
 
     # When the physical baseline misses the documented 1.2x headroom floor,
     # an under/over-target VPN result cannot independently prove an app defect.
-    # Keep the strict gate red (ENV_LIMITED is never PASS), but classify it
-    # separately from a verified rate-limiter failure. Structural failures such
-    # as a wrong saved plan, missing rate, or unknown verdict remain FAIL.
+    # Do not relabel it as PASS: record ENV_LIMITED separately from both a
+    # verified pass and a true limiter failure. Structural failures such as a
+    # wrong saved plan, missing rate, or unknown verdict remain FAIL.
     valid_verdicts = {STATUS_PASS, STATUS_MISMATCH, STATUS_UNJUDGEABLE}
     if (
         baseline_limited
@@ -420,6 +420,7 @@ def parse_json(json_path: str, preset: str, expected_kbps: int, index: int, outp
     values = json.loads(Path(json_path).read_text(encoding="utf-8"))
     rows: list[dict[str, str]] = []
     failed = False
+    final_states: set[str] = set()
     run_id = (os.environ.get("GITHUB_RUN_ID") or "local").strip()
     recorded_at_utc = utc_now()
     started_at = (os.environ.get("SPEEDVPN_CASE_STARTED_AT") or "").strip() or recorded_at_utc
@@ -430,6 +431,7 @@ def parse_json(json_path: str, preset: str, expected_kbps: int, index: int, outp
     for direction in ("download", "upload"):
         baseline, plan, vpn, verdict, result = check_metric(direction, values, expected_kbps)
         classification, sep, reason = result.partition("|")
+        final_states.add(classification)
         failed = failed or classification not in ACCEPTED_FINAL_STATES
         label = "Download" if direction == "download" else "Upload"
         accuracy = (values.get(f"verify_{direction}_accuracy_value") or "").strip()
@@ -456,16 +458,28 @@ def parse_json(json_path: str, preset: str, expected_kbps: int, index: int, outp
         csv.DictWriter(handle, fieldnames=CSV_FIELDS).writerows(rows)
     for row in rows:
         print("RESULT|" + "|".join(str(row.get(field, "")) for field in CSV_FIELDS[:13]))
-    print("OVERALL|" + ("FAIL" if failed else "PASS"))
+    if failed:
+        overall = "FAIL"
+    elif "ENV_INSUFFICIENT" in final_states:
+        overall = "ENV_INSUFFICIENT"
+    elif "ENV_LIMITED" in final_states:
+        overall = "ENV_LIMITED"
+    elif "PASS_UNLIMITED" in final_states:
+        overall = "PASS_UNLIMITED"
+    else:
+        overall = "PASS"
+    print("OVERALL|" + overall)
     return 2 if failed else 0
 
 
 def validate_json(json_path: str, expected_download: int, expected_upload: int) -> int:
     values = json.loads(Path(json_path).read_text(encoding="utf-8"))
     errors = []
+    final_states: list[str] = []
     for direction, expected in (("download", expected_download), ("upload", expected_upload)):
         _, plan, vpn, verdict, result = check_metric(direction, values, expected)
         classification, sep, reason = result.partition("|")
+        final_states.append(classification)
         print(f"VERIFY {direction.upper()}: plan={plan}; vpn={vpn}; verdict={verdict}; class={classification}")
         if classification not in ACCEPTED_FINAL_STATES:
             errors.append(reason or f"{direction}: {classification}")
@@ -473,7 +487,14 @@ def validate_json(json_path: str, expected_download: int, expected_upload: int) 
         for error in errors:
             print("STRICT_GATE_FAIL=" + error, file=sys.stderr)
         return 1
-    print("STRICT_GATE_PASS=2/2")
+    if "ENV_INSUFFICIENT" in final_states:
+        print("ACCEPTED_ENVIRONMENT_STATE=ENV_INSUFFICIENT")
+    elif "ENV_LIMITED" in final_states:
+        print(f"ACCEPTED_ENVIRONMENT_STATE=ENV_LIMITED; ENV_LIMITED={final_states.count('ENV_LIMITED')}/{len(final_states)}")
+    elif final_states and all(state == "PASS_UNLIMITED" for state in final_states):
+        print(f"STRICT_GATE_PASS_UNLIMITED={len(final_states)}/{len(final_states)}")
+    else:
+        print(f"STRICT_GATE_PASS={len(final_states)}/{len(final_states)}")
     return 0
 
 
@@ -660,7 +681,18 @@ def validate_sweep(csv_path: str) -> int:
         for error in errors[:80]:
             print(" - " + error, file=sys.stderr)
         return 1
-    print("STRICT_GATE_PASS=38/38; PASS=38; ENV_LIMITED=0; FAIL=0")
+    state_counts = {
+        state: sum(1 for row in rows if (row.get("status") or "").strip() == state)
+        for state in ("PASS", "PASS_UNLIMITED", "ENV_LIMITED", "ENV_INSUFFICIENT", "FAIL")
+    }
+    print(
+        "STRICT_GATE_ACCEPTED=38/38; "
+        f"PASS={state_counts['PASS']}; "
+        f"PASS_UNLIMITED={state_counts['PASS_UNLIMITED']}; "
+        f"ENV_LIMITED={state_counts['ENV_LIMITED']}; "
+        f"ENV_INSUFFICIENT={state_counts['ENV_INSUFFICIENT']}; "
+        f"FAIL={state_counts['FAIL']}"
+    )
     return 0
 
 
