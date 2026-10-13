@@ -125,15 +125,42 @@ object SpeedVerificationEngine {
 
                         val relayDownloadBytes =
                             (SpeedLimiter.download.total.get() - relayDownloadBefore).coerceAtLeast(0L)
-                        val relayUploadBytes =
+                        var relayUploadBytes =
                             (SpeedLimiter.upload.total.get() - relayUploadBefore).coerceAtLeast(0L)
                         val minimumDownloadBytes =
                             SpeedTestEngine.minimumRequiredSampleBytes(planDownloadKbps, verificationProfile = true)
                         val minimumUploadBytes =
                             SpeedTestEngine.minimumRequiredSampleBytes(planUploadKbps, verificationProfile = true)
                         val uploadPayloadBytesWritten = vpn.uploadPayloadBytesWritten
+                        // The relay records each successful socket write immediately after write() returns.
+                        // OkHttp can receive a very fast server response before the last relay worker has
+                        // published that final write to the aggregate counter. Give bookkeeping a bounded
+                        // drain window; keep the existing byte threshold strict and never turn a short
+                        // relay count into PASS merely because the request body callback completed.
+                        if (uploadPayloadBytesWritten >= minimumUploadBytes &&
+                            relayUploadBytes < minimumUploadBytes
+                        ) {
+                            val drainStartedNs = System.nanoTime()
+                            val drainBudgetNs = 1_000_000_000L
+                            while (
+                                relayUploadBytes < minimumUploadBytes &&
+                                System.nanoTime() - drainStartedNs < drainBudgetNs
+                            ) {
+                                delay(10L)
+                                relayUploadBytes =
+                                    (SpeedLimiter.upload.total.get() - relayUploadBefore).coerceAtLeast(0L)
+                            }
+                            Log.i(
+                                TAG,
+                                "Upload relay counter drain waitedMs=" +
+                                    ((System.nanoTime() - drainStartedNs) / 1_000_000L) +
+                                    " relayBytes=$relayUploadBytes requiredBytes=$minimumUploadBytes " +
+                                    "payloadBytesWritten=$uploadPayloadBytesWritten",
+                            )
+                        }
                         val uploadEvidence =
-                            uploadPayloadBytesWritten >= minimumUploadBytes && relayUploadBytes > 0L
+                            uploadPayloadBytesWritten >= minimumUploadBytes &&
+                                relayUploadBytes >= minimumUploadBytes
                         Log.i(
                             TAG,
                             "Tunnel byte evidence download=" + relayDownloadBytes + "/" + minimumDownloadBytes +
@@ -181,11 +208,13 @@ object SpeedVerificationEngine {
                                         reason = "لم تكتمل كتابة حمولة Upload عبر OkHttp: " +
                                             uploadPayloadBytesWritten + "/" + minimumUploadBytes + " بايت.",
                                     )
-                                vpn.uploadBps != null && relayUploadBytes <= 0L ->
+                                vpn.uploadBps != null && relayUploadBytes < minimumUploadBytes ->
                                     uploadEvaluation.copy(
                                         status = SpeedVerificationStatus.NOT_VERIFIABLE,
                                         accuracyPercent = null,
-                                        reason = "لم تُرصد بايتات Upload عبر مرحّل VPN (relay=0).",
+                                        reason = "لم يكتمل دليل مرور بيانات Upload عبر مرحّل VPN بعد انتظار تحديث العداد: " +
+                                            relayUploadBytes + "/" + minimumUploadBytes + " بايت؛ " +
+                                            "حمولة OkHttp المكتملة=" + uploadPayloadBytesWritten + " بايت.",
                                     )
                                 else -> uploadEvaluation
                             }
