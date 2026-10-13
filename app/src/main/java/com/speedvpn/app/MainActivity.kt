@@ -1251,13 +1251,14 @@ class MainActivity : ComponentActivity() {
         SpeedVerificationStatus.MATCH -> "✅ السرعة متطابقة"
         SpeedVerificationStatus.MISMATCH -> "❌ السرعة غير متطابقة"
         SpeedVerificationStatus.NOT_VERIFIABLE -> "⚠️ لا يمكن الحكم"
+        SpeedVerificationStatus.ENV_LIMITED -> "⚠️ ENV_LIMITED — قيود بيئة القياس"
         SpeedVerificationStatus.UNLIMITED_OK -> "✅ لا يظهر سقف واضح"
     }
 
     private fun speedStatusColor(status: SpeedVerificationStatus): Color = when (status) {
         SpeedVerificationStatus.MATCH, SpeedVerificationStatus.UNLIMITED_OK -> Green
         SpeedVerificationStatus.MISMATCH -> Color(0xFFFF7D88)
-        SpeedVerificationStatus.NOT_VERIFIABLE -> Amber
+        SpeedVerificationStatus.NOT_VERIFIABLE, SpeedVerificationStatus.ENV_LIMITED -> Amber
     }
 
     @Composable

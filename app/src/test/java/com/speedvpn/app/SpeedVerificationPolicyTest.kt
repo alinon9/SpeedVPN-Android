@@ -64,6 +64,27 @@ class SpeedVerificationPolicyTest {
     }
 
     @Test
+    fun hundredKbPerSecondUploadWithBaselineBelowPlanIsEnvironmentLimitedNotPass() {
+        val envLimited = SpeedVerificationPolicy.evaluate(
+            planKbps = 800L,
+            baselineBps = 799_000L,
+            vpnBps = 713_000L,
+        )
+
+        assertEquals(SpeedVerificationStatus.ENV_LIMITED, envLimited.status)
+        assertEquals(null, envLimited.accuracyPercent)
+        val matchingDownload = SpeedVerificationPolicy.evaluate(
+            planKbps = 800L,
+            baselineBps = 2_000_000L,
+            vpnBps = 800_000L,
+        )
+        assertEquals(
+            SpeedVerificationStatus.ENV_LIMITED,
+            SpeedVerificationPolicy.overall(matchingDownload, envLimited),
+        )
+    }
+
+    @Test
     fun twentyFiveAndFiftyKbPerSecondPlansAreVerifiableBelowGenericHeadroomFloor() {
         val cases = listOf(
             200L to 225_000L,

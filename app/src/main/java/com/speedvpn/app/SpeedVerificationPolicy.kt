@@ -7,6 +7,7 @@ enum class SpeedVerificationStatus {
     MATCH,
     MISMATCH,
     NOT_VERIFIABLE,
+    ENV_LIMITED,
     UNLIMITED_OK,
 }
 
@@ -64,6 +65,13 @@ object SpeedVerificationPolicy {
 
         val headroomMultiplier = headroomMultiplierFor(planKbps)
         if (baselineBps.toDouble() < targetBps.toDouble() * headroomMultiplier) {
+            if (planKbps == 800L && baselineBps < targetBps.toLong()) {
+                return SpeedMetricVerification(
+                    planKbps, baselineBps, vpnBps, SpeedVerificationStatus.ENV_LIMITED, null,
+                    "ENV_LIMITED: سرعة الشبكة الأصلية أقل من 800 Kbps لخطة 100 KB/s؛ " +
+                        "هذه نتيجة مقيدة بالبيئة وليست PASS.",
+                )
+            }
             val headroomReason = if (headroomMultiplier == 1.0) {
                 "سرعة الشبكة الأصلية يجب أن تبلغ الخطة المحددة على الأقل."
             } else {
@@ -106,6 +114,7 @@ object SpeedVerificationPolicy {
         val metrics = listOf(download, upload)
         if (metrics.any { it.status == SpeedVerificationStatus.NOT_VERIFIABLE }) return SpeedVerificationStatus.NOT_VERIFIABLE
         if (metrics.any { it.status == SpeedVerificationStatus.MISMATCH }) return SpeedVerificationStatus.MISMATCH
+        if (metrics.any { it.status == SpeedVerificationStatus.ENV_LIMITED }) return SpeedVerificationStatus.ENV_LIMITED
         return if (metrics.any { it.status == SpeedVerificationStatus.MATCH }) {
             SpeedVerificationStatus.MATCH
         } else {

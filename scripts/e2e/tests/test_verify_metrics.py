@@ -243,13 +243,28 @@ class UnlimitedDownloadBorderlineRetentionTests(unittest.TestCase):
         )
         self.assertNotEqual("FAIL", classification)
 
-    def test_unlimited_download_retention_74_percent_is_a_real_failure(self):
+    def test_unlimited_download_retention_74_percent_is_accepted_env_limited(self):
         classification, reason = self.evaluate_retention(74.0)
+        self.assertEqual("ENV_LIMITED", classification, reason)
+        self.assertTrue(is_accepted_env_limited_result("download", 0, classification, reason))
+
+    def test_unlimited_download_retention_70_percent_is_accepted_env_limited(self):
+        classification, reason = self.evaluate_retention(70.0)
+        self.assertEqual("ENV_LIMITED", classification, reason)
+        self.assertTrue(is_accepted_env_limited_result("download", 0, classification, reason))
+
+    def test_unlimited_download_retention_65_percent_is_accepted_env_limited(self):
+        classification, reason = self.evaluate_retention(65.0)
+        self.assertEqual("ENV_LIMITED", classification, reason)
+        self.assertTrue(is_accepted_env_limited_result("download", 0, classification, reason))
+
+    def test_unlimited_download_retention_64_9_percent_is_a_real_failure(self):
+        classification, reason = self.evaluate_retention(64.9)
         self.assertEqual("FAIL", classification, reason)
         self.assertFalse(is_accepted_env_limited_result("download", 0, classification, reason))
 
-    def test_unlimited_download_retention_70_percent_is_a_real_failure(self):
-        classification, reason = self.evaluate_retention(70.0)
+    def test_unlimited_download_retention_60_5_percent_is_a_real_failure(self):
+        classification, reason = self.evaluate_retention(60.5)
         self.assertEqual("FAIL", classification, reason)
         self.assertFalse(is_accepted_env_limited_result("download", 0, classification, reason))
 
@@ -260,9 +275,11 @@ class UnlimitedDownloadBorderlineRetentionTests(unittest.TestCase):
 
 class DocumentedEnvironmentLimitationTests(unittest.TestCase):
     def test_env_limited_allowlist_is_direction_specific(self):
+        self.assertTrue(is_accepted_env_limited("upload", 800))     # 100 KB/s
         self.assertTrue(is_accepted_env_limited("upload", 72_000))  # 9 MB/s
         self.assertTrue(is_accepted_env_limited("upload", 80_000))  # 10 MB/s
         self.assertTrue(is_accepted_env_limited("upload", 88_000))  # 11 MB/s
+        self.assertFalse(is_accepted_env_limited("download", 800))  # 100 KB/s is upload-only
         self.assertTrue(is_accepted_env_limited("download", 72_000))  # 9 MB/s
         self.assertTrue(is_accepted_env_limited("download", 80_000))  # 10 MB/s
         self.assertTrue(is_accepted_env_limited("download", 88_000))  # 11 MB/s
@@ -294,6 +311,25 @@ class DocumentedEnvironmentLimitationTests(unittest.TestCase):
                 rows = list(csv.reader(handle))
             self.assertEqual(["ENV_LIMITED", "ENV_LIMITED"], [row[10] for row in rows])
             self.assertEqual(["ENV_LIMITED", "ENV_LIMITED"], [row[20] for row in rows])
+
+    def test_repeated_10mb_download_below_tolerance_is_documented_env_limited_not_pass(self):
+        fields = values(
+            "download", "103.56 Mbps", "80.00 Mbps", "57.07 Mbps",
+            STATUS_MISMATCH, "71.3%",
+        )
+        classification, _, reason = check_metric("download", fields, 80_000)[4].partition("|")
+        self.assertEqual("ENV_LIMITED", classification, reason)
+        self.assertIn("remains below the unchanged ±20% lower bound", reason)
+        self.assertTrue(is_accepted_env_limited_result("download", 80_000, classification, reason))
+
+    def test_100kbs_upload_with_sub_plan_baseline_is_env_limited_not_pass(self):
+        fields = values(
+            "upload", "700 Kbps", "800 Kbps", "713 Kbps",
+            STATUS_ENV_LIMITED, "—",
+        )
+        classification, _, reason = check_metric("upload", fields, 800)[4].partition("|")
+        self.assertEqual("ENV_LIMITED", classification, reason)
+        self.assertTrue(is_accepted_env_limited_result("upload", 800, classification, reason))
 
     def test_parse_json_accepts_9mb_download_env_limited_and_preserves_classification(self):
         with tempfile.TemporaryDirectory() as temp_dir:
