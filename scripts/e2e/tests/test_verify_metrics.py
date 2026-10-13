@@ -263,7 +263,6 @@ class DocumentedEnvironmentLimitationTests(unittest.TestCase):
         self.assertTrue(is_accepted_env_limited("upload", 72_000))  # 9 MB/s
         self.assertTrue(is_accepted_env_limited("upload", 80_000))  # 10 MB/s
         self.assertTrue(is_accepted_env_limited("upload", 88_000))  # 11 MB/s
-        self.assertTrue(is_accepted_env_limited("download", 80_000))  # 10 MB/s
         self.assertTrue(is_accepted_env_limited("download", 72_000))  # 9 MB/s
         self.assertTrue(is_accepted_env_limited("download", 80_000))  # 10 MB/s
         self.assertTrue(is_accepted_env_limited("download", 88_000))  # 11 MB/s
@@ -315,10 +314,10 @@ class DocumentedEnvironmentLimitationTests(unittest.TestCase):
             input_path = Path(temp_dir) / "metrics.json"
             output_path = Path(temp_dir) / "metrics.csv"
             metrics = {}
-            metrics.update(values("download", "70.00 Mbps", "64.00 Mbps", "50.00 Mbps", STATUS_MISMATCH, "—"))
-            metrics.update(values("upload", "70.00 Mbps", "64.00 Mbps", "50.00 Mbps", STATUS_MISMATCH, "—"))
+            metrics.update(values("download", "45.00 Mbps", "40.00 Mbps", "30.00 Mbps", STATUS_MISMATCH, "—"))
+            metrics.update(values("upload", "45.00 Mbps", "40.00 Mbps", "30.00 Mbps", STATUS_MISMATCH, "—"))
             input_path.write_text(json.dumps(metrics), encoding="utf-8")
-            self.assertEqual(2, parse_json(str(input_path), "8 MB", 64_000, 16, str(output_path)))
+            self.assertEqual(2, parse_json(str(input_path), "5 MB", 40_000, 15, str(output_path)))
             with output_path.open(newline="", encoding="utf-8") as handle:
                 rows = list(csv.reader(handle))
             self.assertEqual(["ENV_LIMITED", "ENV_LIMITED"], [row[10] for row in rows])
