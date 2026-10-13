@@ -670,33 +670,60 @@ preflight_fail() {
 
 if [ "${SPEEDVPN_SKIP_BASELINE_PREFLIGHT:-0}" = "1" ]; then
   PREFLIGHT_SUMMARY="${SPEEDVPN_PREFLIGHT_SUMMARY:-}"
+  DIAGNOSTIC_UNLIMITED_ONLY=0
+  if [ "${SPEEDVPN_DIAGNOSTIC_ONLY:-0}" = "1" ] &&
+     [ "${SPEEDVPN_TOTAL_PRESETS:-19}" = "1" ] &&
+     [ "${SPEEDVPN_CASES_OVERRIDE:-}" = "19|بدون حد|0" ]; then
+    DIAGNOSTIC_UNLIMITED_ONLY=1
+  fi
   if [ -z "$PREFLIGHT_SUMMARY" ] || [ ! -s "$PREFLIGHT_SUMMARY" ]; then
-    preflight_fail "SPEEDVPN_SKIP_BASELINE_PREFLIGHT was requested without a validated summary."
+    preflight_fail "SPEEDVPN_SKIP_BASELINE_PREFLIGHT was requested without a real preflight summary."
     exit 75
   fi
-  if ! python3 - "$PREFLIGHT_SUMMARY" <<'PY' | tee -a "$RUN_DIR/sweep-console.log"
-import json, sys
+  PREFLIGHT_SUMMARY_STATUS="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("status", "MISSING"))' "$PREFLIGHT_SUMMARY")"
+  if [ "$PREFLIGHT_SUMMARY_STATUS" != "PASS" ] && [ "$DIAGNOSTIC_UNLIMITED_ONLY" -ne 1 ]; then
+    preflight_fail "Non-PASS preflight summaries are allowed only for the isolated Unlimited diagnostic."
+    exit 75
+  fi
+  if ! python3 - "$PREFLIGHT_SUMMARY" "$DIAGNOSTIC_UNLIMITED_ONLY" <<'PY' | tee -a "$RUN_DIR/sweep-console.log"
+import json, math, sys
 from pathlib import Path
 payload=json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-assert payload.get("status") == "PASS", "preflight summary status is not PASS"
+diagnostic_only = sys.argv[2] == "1"
+status = payload.get("status")
+assert status == "PASS" or diagnostic_only, f"preflight summary status {status!r} is not PASS"
 for direction in ("download", "upload"):
     item=payload["directions"][direction]
-    assert item.get("passed") is True, f"{direction} preflight did not pass"
-    print(f"REUSED_PREFLIGHT_{direction.upper()}_MEDIAN={item['median_mbps']} Mbps")
-print(f"ENV_NOTE={payload.get('env_note', 'No upload ceiling identified by preflight; the full sweep remains authoritative.')}")
+    median=item.get("median_mbps")
+    assert isinstance(median, (int, float)) and math.isfinite(median) and median > 0, f"{direction} preflight median is missing/invalid"
+    if status == "PASS":
+        assert item.get("passed") is True, f"{direction} preflight did not pass"
+    print(f"REUSED_PREFLIGHT_{direction.upper()}_MEDIAN={median} Mbps")
+print(f"PREFLIGHT_SUMMARY_STATUS={status}")
+if diagnostic_only and status != "PASS":
+    print("DIAGNOSTIC_ONLY_PREFLIGHT_BYPASS=1; only Unlimited is run; this is not full-sweep acceptance.")
+print(f"ENV_NOTE={payload.get('env_note', 'No upload ceiling identified by preflight; measurement remains authoritative.')}")
 PY
   then
-    preflight_fail "The validated preflight summary could not be verified."
+    preflight_fail "The preflight summary could not be read or its numeric medians were missing."
     exit 75
   fi
-  BASELINE_PREFLIGHT_STATUS="PASS"
-  BASELINE_PREFLIGHT_REASON="Reused validated three-sample preflight summary."
-  ENV_NOTE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("env_note", "No upload ceiling identified by preflight; the full sweep remains authoritative."))' "$PREFLIGHT_SUMMARY")"
+  ENV_NOTE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("env_note", "No upload ceiling identified by preflight; measurement remains authoritative."))' "$PREFLIGHT_SUMMARY")"
   echo "ENV_NOTE=$ENV_NOTE" | tee -a "$RUN_DIR/sweep-console.log"
   BASELINE_PREFLIGHT_DOWNLOAD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["directions"]["download"]["median_mbps"])' "$PREFLIGHT_SUMMARY") Mbps (median)"
   BASELINE_PREFLIGHT_UPLOAD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["directions"]["upload"]["median_mbps"])' "$PREFLIGHT_SUMMARY") Mbps (median)"
-  echo "BASELINE_PREFLIGHT_SKIPPED=validated three-sample preflight reused." | tee -a "$RUN_DIR/sweep-console.log"
-  if [ -n "${GITHUB_OUTPUT:-}" ]; then echo "preflight_status=PASS" >> "$GITHUB_OUTPUT"; fi
+  if [ "$PREFLIGHT_SUMMARY_STATUS" = "PASS" ]; then
+    BASELINE_PREFLIGHT_STATUS="PASS"
+    BASELINE_PREFLIGHT_REASON="Reused validated three-sample preflight summary."
+    echo "BASELINE_PREFLIGHT_SKIPPED=validated three-sample preflight reused." | tee -a "$RUN_DIR/sweep-console.log"
+    if [ -n "${GITHUB_OUTPUT:-}" ]; then echo "preflight_status=PASS" >> "$GITHUB_OUTPUT"; fi
+  else
+    BASELINE_PREFLIGHT_STATUS="ENV_INSUFFICIENT"
+    BASELINE_PREFLIGHT_REASON="The strict all-plan runner preflight failed; only an isolated Unlimited diagnostic is running. No finite-plan acceptance is claimed and the Unlimited retention policy is unchanged."
+    echo "BASELINE_PREFLIGHT_STATUS=ENV_INSUFFICIENT" | tee -a "$RUN_DIR/sweep-console.log"
+    echo "UNLIMITED_DIAGNOSTIC_ONLY=1; strict Unlimited verification result remains authoritative for the 80% retention policy." | tee -a "$RUN_DIR/sweep-console.log"
+    if [ -n "${GITHUB_OUTPUT:-}" ]; then echo "preflight_status=ENV_INSUFFICIENT" >> "$GITHUB_OUTPUT"; fi
+  fi
 else
   PREFLIGHT_START_EPOCH="$(date +%s)"
   PREFLIGHT_SAMPLES_DIR="$RUN_DIR/baseline-preflight"
