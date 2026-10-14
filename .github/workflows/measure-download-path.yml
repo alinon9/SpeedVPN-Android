@@ -88,21 +88,30 @@ jobs:
       - name: Build debug APK
         run: ./gradlew :app:assembleDebug --stacktrace --no-daemon
 
+      - name: Create AVD
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          export ANDROID_AVD_HOME="${RUNNER_TEMP}/android-avd"
+          echo "ANDROID_AVD_HOME=$ANDROID_AVD_HOME" >> "$GITHUB_ENV"
+          mkdir -p "${ANDROID_AVD_HOME}"
+          export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/platform-tools:$ANDROID_SDK_ROOT/emulator:$PATH"
+          echo "Checking emulator system image..."
+          test -f "${ANDROID_SDK_ROOT}/system-images/android-29/google_apis/x86_64/package.xml"
+          test -f "${ANDROID_SDK_ROOT}/system-images/android-29/google_apis/x86_64/system.img"
+          echo "Creating AVD..."
+          timeout 120s bash -c 'echo no | avdmanager create avd -n measure-download -k "system-images;android-29;google_apis;x86_64" --force'
+          test -f "${ANDROID_AVD_HOME}/measure-download.avd/config.ini"
+
       - name: Create and boot Android emulator
         shell: bash
         run: |
           set -Eeuo pipefail
           mkdir -p artifacts/download-path
           SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
-          AVDMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/avdmanager"
           export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/platform-tools:$ANDROID_SDK_ROOT/emulator:$PATH"
           if [ -e /dev/kvm ]; then sudo chmod 666 /dev/kvm; fi
           emulator -accel-check || true
-          echo "no" | "$AVDMANAGER" create avd \
-            --name measure-download \
-            --package "system-images;android-29;google_apis;x86_64" \
-            --device pixel_2 \
-            --force
           nohup emulator -avd measure-download \
             -no-window -no-audio -no-boot-anim -no-snapshot -no-snapshot-save \
             -no-metrics -gpu swiftshader_indirect -accel on \
