@@ -153,10 +153,12 @@ class SpeedVpnService : VpnService() {
 
     override fun onCreate() {
         super.onCreate()
+        UidPocDiagnostics.log(this, "SpeedVpnService.onCreate")
         registerPhysicalNetworkCallback()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        UidPocDiagnostics.log(this, "SpeedVpnService.onStartCommand action=${intent?.action ?: "null"} startId=$startId")
         if (destroying.get()) return START_NOT_STICKY
 
         when (intent?.action) {
@@ -1021,15 +1023,22 @@ class SpeedVpnService : VpnService() {
         }
         val started = runCatching {
             if (BuildConfig.DEBUG) {
+                UidPocDiagnostics.log(this, "JNI_HOOK_REGISTER_BEGIN generation=$newGeneration")
                 val diagnostic = uidDetectionPoc ?: UidDetectionPoc(this).also {
                     uidDetectionPoc = it
                 }
-                check(TProxyService.TProxySetUidPocCallback(diagnostic)) {
+                val callbackRegistered = TProxyService.TProxySetUidPocCallback(diagnostic)
+                UidPocDiagnostics.log(this, "JNI_HOOK_REGISTER_RETURN registered=$callbackRegistered")
+                check(callbackRegistered) {
                     "Unable to register temporary UID detection callback"
                 }
             }
-            TProxyService.TProxyStartService(configPath, expectedTun.fd)
+            UidPocDiagnostics.log(this, "JNI_NATIVE_START_BEGIN generation=$newGeneration fd=${expectedTun.fd}")
+            val nativeStarted = TProxyService.TProxyStartService(configPath, expectedTun.fd)
+            UidPocDiagnostics.log(this, "JNI_NATIVE_START_RETURN started=$nativeStarted")
+            nativeStarted
         }.getOrElse {
+            UidPocDiagnostics.error(this, "JNI/native startup raised a throwable", it)
             logE("Native start threw an exception", it)
             false
         }

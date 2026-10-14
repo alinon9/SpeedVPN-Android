@@ -156,6 +156,7 @@ internal class UidDetectionPoc(
 
     init {
         Log.i(TAG, "START Android API=${Build.VERSION.SDK_INT}; package=${service.packageName}")
+        UidPocDiagnostics.log(service, "UidDetectionPoc.init; API=${Build.VERSION.SDK_INT}; package=${service.packageName}")
         targets.forEach { pkg ->
             val expected = runCatching { packageManager.getApplicationInfo(pkg, 0).uid }
                 .getOrNull()
@@ -163,10 +164,25 @@ internal class UidDetectionPoc(
         }
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
             Log.w(TAG, "UNSUPPORTED getConnectionOwnerUid requires Android 10 / API 29+")
+            UidPocDiagnostics.log(service, "UNSUPPORTED: getConnectionOwnerUid requires API 29+")
         }
     }
 
     override fun onTunPacket(
+        protocol: Int,
+        srcAddress: ByteArray,
+        srcPort: Int,
+        dstAddress: ByteArray,
+        dstPort: Int,
+    ) {
+        try {
+            handleTunPacket(protocol, srcAddress, srcPort, dstAddress, dstPort)
+        } catch (t: Throwable) {
+            UidPocDiagnostics.error(service, "Unhandled error inside native UID callback", t)
+        }
+    }
+
+    private fun handleTunPacket(
         protocol: Int,
         srcAddress: ByteArray,
         srcPort: Int,
@@ -198,6 +214,7 @@ internal class UidDetectionPoc(
                 try {
                     val local = InetSocketAddress(InetAddress.getByAddress(srcAddress), srcPort)
                     val remote = InetSocketAddress(InetAddress.getByAddress(dstAddress), dstPort)
+                    UidPocDiagnostics.log(service, "OWNER_UID_QUERY_BEGIN tuple=$tuple attempt=$attempt")
                     val uid = connectivity.getConnectionOwnerUid(protocol, local, remote)
                     val packages = if (uid == Process.INVALID_UID) {
                         emptyList()
@@ -228,6 +245,8 @@ internal class UidDetectionPoc(
                     reportException(protocol, src, srcPort, dst, dstPort, attempt, e)
                 } catch (e: Exception) {
                     reportException(protocol, src, srcPort, dst, dstPort, attempt, e)
+                } catch (t: Throwable) {
+                    reportException(protocol, src, srcPort, dst, dstPort, attempt, t)
                 }
             }
         }.onFailure {
@@ -246,7 +265,7 @@ internal class UidDetectionPoc(
         dst: String,
         dstPort: Int,
         attempt: Int,
-        error: Exception,
+        error: Throwable,
     ) {
         val details = "${error.javaClass.simpleName}: ${error.message.orEmpty()}"
         UidDetectionPocResultStore.add(
@@ -254,6 +273,7 @@ internal class UidDetectionPoc(
             "attempt=$attempt; $details",
         )
         Log.e(TAG, "RESULT verdict=EXCEPTION tuple=${protocol}|$src|$srcPort|$dst|$dstPort attempt=$attempt details=$details", error)
+        UidPocDiagnostics.error(service, "OWNER_UID_QUERY_EXCEPTION tuple=${protocol}|$src|$srcPort|$dst|$dstPort attempt=$attempt", error)
     }
 
     override fun close() {
