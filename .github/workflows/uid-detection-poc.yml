@@ -34,7 +34,7 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
 
-      - name: Install SDK, NDK and Google Play emulator image
+      - name: Install SDK, NDK and Android 12 Google APIs emulator image
         shell: bash
         run: |
           set -euo pipefail
@@ -46,7 +46,7 @@ jobs:
             "build-tools;36.0.0" \
             "ndk;30.0.16248370" \
             "emulator" \
-            "system-images;android-35;google_apis_playstore;x86_64"
+            "system-images;android-31;google_apis;x86_64"
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/30.0.16248370" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/30.0.16248370" >> "$GITHUB_ENV"
           echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/platform-tools:$ANDROID_SDK_ROOT/emulator" >> "$GITHUB_PATH"
@@ -79,17 +79,18 @@ jobs:
           sudo chmod 666 /dev/kvm
           "$ANDROID_SDK_ROOT/emulator/emulator" -accel-check
 
-      - name: Create and boot Android 15 Google Play emulator
+      - name: Create and boot Android 12 (API 31) Google APIs emulator
+        timeout-minutes: 20
         shell: bash
         run: |
           set -euo pipefail
-          IMAGE="system-images;android-35;google_apis_playstore;x86_64"
+          IMAGE="system-images;android-31;google_apis;x86_64"
           echo "no" | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/avdmanager" create avd \
-            --name uid-detection-api35 --package "$IMAGE" --device pixel_2 --force
+            --name uid-detection-api31 --package "$IMAGE" --device pixel_2 --force
           nohup "$ANDROID_SDK_ROOT/emulator/emulator" \
-            -avd uid-detection-api35 \
+            -avd uid-detection-api31 \
             -no-window -no-audio -no-boot-anim -no-snapshot -wipe-data \
-            -gpu swiftshader_indirect -accel on -memory 4096 \
+            -gpu swiftshader_indirect -accel on -memory 2048 \
             > emulator.log 2>&1 &
           echo $! > emulator.pid
           adb wait-for-device
