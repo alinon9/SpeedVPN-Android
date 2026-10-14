@@ -14,6 +14,15 @@ public final class TProxyService {
 
     public static native boolean TProxyIsRunning();
 
+    /** Temporary POC callback for outbound packets observed at the native TUN read point. */
+    public interface UidPocCallback {
+        void onTunPacket(int protocol, byte[] srcAddress, int srcPort,
+                         byte[] dstAddress, int dstPort);
+    }
+
+    /** Temporary POC JNI hook. Present only on poc/uid-detection-test. */
+    public static native boolean TProxySetUidPocCallback(Object callback);
+
     /** [txPackets, txBytes, rxPackets, rxBytes] */
     public static native long[] TProxyGetStats();
 }
