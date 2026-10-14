@@ -295,7 +295,7 @@ class SpeedVpnService : VpnService() {
             UidPocDiagnostics.log(this, "TUN_ADD_ROUTE_V4_RETURN")
                 // Feed Android the actual DNS servers from the current physical link.
                 // No public resolver is hard-coded.
-                .apply { dnsServers.forEach { addDnsServer(it) } }
+            builder.apply { dnsServers.forEach { addDnsServer(it) } }
                 .apply {
                     if (compatibility.ipv6Enabled) {
                         UidPocDiagnostics.log(this@SpeedVpnService, "TUN_ADD_ADDRESS_V6_BEGIN address=$TUN_V6")
