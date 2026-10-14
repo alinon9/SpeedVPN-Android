@@ -28,8 +28,8 @@ internal object UidPocDiagnostics {
 
     fun error(context: Context, message: String, throwable: Throwable? = null) {
         Log.e(TAG, message, throwable)
-        val details = if (throwable == null) "" else "\n\${throwable.stackTraceToString()}"
-        appendLog(context, "\${timestamp()} E/$TAG: $message$details\n")
+        val details = if (throwable == null) "" else "\n${throwable.stackTraceToString()}"
+        appendLog(context, "${timestamp()} E/$TAG: $message$details\n")
     }
 
     fun logFile(context: Context): File = File(directory(context), "SpeedVPN-POC-Log.txt")
@@ -40,23 +40,23 @@ internal object UidPocDiagnostics {
 
     fun readLog(context: Context): String =
         runCatching { logFile(context).takeIf { it.isFile }?.readText(Charsets.UTF_8).orEmpty() }
-            .getOrDefault("تعذر قراءة ملف السجل: \${logFile(context).absolutePath}")
+            .getOrDefault("تعذر قراءة ملف السجل: ${logFile(context).absolutePath}")
 
     fun readCrash(context: Context): String =
         runCatching { crashFile(context).takeIf { it.isFile }?.readText(Charsets.UTF_8).orEmpty() }
-            .getOrDefault("تعذر قراءة ملف الانهيار: \${crashFile(context).absolutePath}")
+            .getOrDefault("تعذر قراءة ملف الانهيار: ${crashFile(context).absolutePath}")
 
     fun pathsText(context: Context): String =
-        "ملف السجل: \${logFile(context).absolutePath}\nملف الانهيار: \${crashFile(context).absolutePath}"
+        "ملف السجل: ${logFile(context).absolutePath}\nملف الانهيار: ${crashFile(context).absolutePath}"
 
     fun recordCrash(context: Context, thread: Thread, throwable: Throwable) {
         val stack = buildString {
             appendLine("SpeedVPN UID Detection POC — uncaught exception")
-            appendLine("Time: \${timestamp()}")
-            appendLine("Thread: \${thread.name}")
-            appendLine("Android API: \${Build.VERSION.SDK_INT}")
-            appendLine("Device: \${Build.MANUFACTURER} \${Build.MODEL}")
-            appendLine("Package: \${context.packageName}")
+            appendLine("Time: ${timestamp()}")
+            appendLine("Thread: ${thread.name}")
+            appendLine("Android API: ${Build.VERSION.SDK_INT}")
+            appendLine("Device: ${Build.MANUFACTURER} ${Build.MODEL}")
+            appendLine("Package: ${context.packageName}")
             appendLine()
             append(throwable.stackTraceToString())
             appendLine()
@@ -70,12 +70,12 @@ internal object UidPocDiagnostics {
             runCatching {
                 logFile(context).parentFile?.mkdirs()
                 logFile(context).appendText(
-                    "\${timestamp()} FATAL: uncaught exception on \${thread.name}; crashFile=\${crashPath.absolutePath}\n$stack\n",
+                    "${timestamp()} FATAL: uncaught exception on ${thread.name}; crashFile=${crashPath.absolutePath}\n$stack\n",
                     Charsets.UTF_8,
                 )
             }
         }
-        Log.e(TAG, "Uncaught exception saved to \${crashPath.absolutePath}", throwable)
+        Log.e(TAG, "Uncaught exception saved to ${crashPath.absolutePath}", throwable)
         postCrashNotification(context, crashPath.absolutePath, logFile(context).absolutePath)
     }
 
@@ -85,7 +85,7 @@ internal object UidPocDiagnostics {
                 logFile(context).parentFile?.mkdirs()
                 logFile(context).appendText(line, Charsets.UTF_8)
             }.onFailure {
-                Log.e(TAG, "Could not persist diagnostic log; internal fallback=\${File(context.filesDir, "uid-poc-diagnostics/SpeedVPN-POC-Log.txt").absolutePath}", it)
+                Log.e(TAG, "Could not persist diagnostic log; internal fallback=${File(context.filesDir, "uid-poc-diagnostics/SpeedVPN-POC-Log.txt").absolutePath}", it)
                 runCatching {
                     val fallback = File(context.filesDir, "uid-poc-diagnostics/SpeedVPN-POC-Log.txt")
                     fallback.parentFile?.mkdirs()
@@ -133,7 +133,7 @@ internal object UidPocDiagnostics {
             manager.notify(NOTIFICATION_ID, notification)
         }.onFailure {
             Log.e(TAG, "Unable to post crash-path notification", it)
-            appendLog(context, "\${timestamp()} W/$TAG: Notification unavailable: \${it.javaClass.simpleName}: \${it.message}\n")
+            appendLog(context, "${timestamp()} W/$TAG: Notification unavailable: ${it.javaClass.simpleName}: ${it.message}\n")
         }
     }
 

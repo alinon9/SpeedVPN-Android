@@ -47,7 +47,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /** Launcher activity used only by the isolated UID diagnostic APK on this POC branch. */
-/** Launcher activity used only by the isolated UID diagnostic APK on this POC branch. */
 class UidDetectionPocActivity : ComponentActivity() {
     private var vpnStartRequested = false
     private val startupError = mutableStateOf<String?>(null)
@@ -69,7 +68,7 @@ class UidDetectionPocActivity : ComponentActivity() {
     private val vpnConsent = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
     ) {
-        UidPocDiagnostics.log(this, "VPN consent activity returned; API=\${Build.VERSION.SDK_INT}")
+        UidPocDiagnostics.log(this, "VPN consent activity returned; API=${Build.VERSION.SDK_INT}")
         runCatching {
             if (VpnService.prepare(this) == null) {
                 startVpn()
@@ -80,7 +79,7 @@ class UidDetectionPocActivity : ComponentActivity() {
             }
         }.onFailure {
             vpnStartRequested = false
-            startupError.value = "تعذر فحص إذن VPN: \${it.javaClass.simpleName}: \${it.message.orEmpty()}"
+            startupError.value = "تعذر فحص إذن VPN: ${it.javaClass.simpleName}: ${it.message.orEmpty()}"
             UidPocDiagnostics.error(this, "VPN consent result handling failed", it)
         }
     }
@@ -100,10 +99,10 @@ class UidDetectionPocActivity : ComponentActivity() {
                 }
                 Toast.makeText(
                     this@UidDetectionPocActivity,
-                    if (exportError == null) "تم تصدير سجل UID بنجاح" else "فشل التصدير: \${exportError.message}",
+                    if (exportError == null) "تم تصدير سجل UID بنجاح" else "فشل التصدير: ${exportError.message}",
                     Toast.LENGTH_LONG,
                 ).show()
-                UidPocDiagnostics.log(this@UidDetectionPocActivity, "CSV export succeeded=\${exportError == null}")
+                UidPocDiagnostics.log(this@UidDetectionPocActivity, "CSV export succeeded=${exportError == null}")
             }
         }
     }
@@ -112,9 +111,9 @@ class UidDetectionPocActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         UidPocDiagnostics.log(
             this,
-            "UidDetectionPocActivity.onCreate; API=\${Build.VERSION.SDK_INT}; " +
-                "supported=\${Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q}; " +
-                "abi=\${Build.SUPPORTED_ABIS.joinToString(",")}",
+            "UidDetectionPocActivity.onCreate; API=${Build.VERSION.SDK_INT}; " +
+                "supported=${Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q}; " +
+                "abi=${Build.SUPPORTED_ABIS.joinToString(",")}",
         )
         setContent {
             val records by UidDetectionPocResultStore.records.collectAsStateWithLifecycle()
@@ -169,7 +168,7 @@ class UidDetectionPocActivity : ComponentActivity() {
         super.onResume()
         UidPocDiagnostics.log(
             this,
-            "UidDetectionPocActivity.onResume; API=\${Build.VERSION.SDK_INT}; vpn=\${VpnRuntime.state.value.status}",
+            "UidDetectionPocActivity.onResume; API=${Build.VERSION.SDK_INT}; vpn=${VpnRuntime.state.value.status}",
         )
     }
 
@@ -196,7 +195,7 @@ class UidDetectionPocActivity : ComponentActivity() {
             }
         }.onFailure {
             vpnStartRequested = false
-            startupError.value = "فشل تجهيز VPN: \${it.javaClass.simpleName}: \${it.message.orEmpty()}"
+            startupError.value = "فشل تجهيز VPN: ${it.javaClass.simpleName}: ${it.message.orEmpty()}"
             UidPocDiagnostics.error(this, "ensureVpnConnected failed before native startup", it)
         }
     }
@@ -210,7 +209,7 @@ class UidDetectionPocActivity : ComponentActivity() {
             }
             .onFailure {
                 vpnStartRequested = false
-                startupError.value = "تعذر تشغيل خدمة VPN: \${it.javaClass.simpleName}: \${it.message.orEmpty()}"
+                startupError.value = "تعذر تشغيل خدمة VPN: ${it.javaClass.simpleName}: ${it.message.orEmpty()}"
                 UidPocDiagnostics.error(this, "SpeedVpnService.start threw before service startup", it)
             }
     }
@@ -235,13 +234,13 @@ class UidDetectionPocActivity : ComponentActivity() {
                 this@UidDetectionPocActivity,
                 when {
                     exportError == null -> "تم تصدير الملف. أرفقه في المحادثة لإرساله."
-                    else -> "فشل التصدير: \${exportError.message.orEmpty()}"
+                    else -> "فشل التصدير: ${exportError.message.orEmpty()}"
                 },
                 Toast.LENGTH_LONG,
             ).show()
             UidPocDiagnostics.log(
                 this@UidDetectionPocActivity,
-                "Diagnostic export requested; crash=$crash; succeeded=\${exportError == null}",
+                "Diagnostic export requested; crash=$crash; succeeded=${exportError == null}",
             )
         }
     }
