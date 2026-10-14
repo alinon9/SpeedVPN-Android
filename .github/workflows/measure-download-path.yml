@@ -78,6 +78,13 @@ jobs:
           git diff --exit-code -- app/src/main/java/com/speedvpn/app/SpeedTestEngine.kt
           git diff --exit-code -- app/src/main/java/com/speedvpn/app/Socks5Server.kt
 
+      - name: Fetch pinned native tunnel
+        run: bash ./setup.sh
+
+      - name: Verify native pin
+        run: |
+          test "$(git -C app/src/main/jni/hev-socks5-tunnel rev-parse HEAD)" = "d9dca26c7ad0e494492244f0309e80ee583e739e"
+
       - name: Build debug APK
         run: ./gradlew :app:assembleDebug --stacktrace --no-daemon
 
