@@ -14,7 +14,7 @@
 6. افتح Chrome وWhatsApp وYouTube ونفّذ نشاطًا يولّد حركة مرور في كل تطبيق.
 7. ارجع إلى التطبيق. كل بطاقة تعرض `packageName`، البروتوكول TCP/UDP، `srcIp:srcPort → dstIp:dstPort`، UID والحالة.
 8. اضغط **تصدير النتائج** واحفظ CSV ثم أرسله للفحص. زر **مسح السجل** يحذف النتائج المعروضة.
-9. إذا انهار التطبيق، افتحه مجددًا واختر **تصدير Log** و**تصدير Crash** (إذا توفر الملف)، ثم أرفق الملفين في المحادثة. يمكن أيضًا العثور على المسار الظاهر أعلى الشاشة داخل مجلد التطبيق `Android/data/com.speedvpn.app/files/uid-poc-diagnostics` متى أتاح مدير الملفات الوصول إليه.
+9. إذا انهار التطبيق، افتحه مجددًا واختر **تصدير Log** و**تصدير Crash** (إذا توفر الملف)، ثم أرفق الملفين في المحادثة. يمكن أيضًا العثور على المسار الظاهر أعلى الشاشة داخل مجلد التطبيق `Android/data/com.speedvpn.app.uidpoc/files/uid-poc-diagnostics` متى أتاح مدير الملفات الوصول إليه.
 10. على Android 13+ اسمح بالإشعارات كي يظهر إشعار بمسار ملف الانهيار. تصدير الملفات من داخل الشاشة لا يعتمد على إذن الإشعارات.
 
 ## تفسير الحالات
@@ -61,7 +61,7 @@
 
 ## Native crash isolation — A/B builds on a physical device
 
-The isolated workflow `.github/workflows/uid-detection-poc.yml` builds two APKs from this branch and uploads them as `SpeedVPN-UID-POC-Crash-AB`:
+The isolated workflow `.github/workflows/uid-detection-poc.yml` builds two APKs from this branch and uploads them as `SpeedVPN-UID-POC-Crash-AB`: Both debug APKs use application ID `com.speedvpn.app.uidpoc`, keeping them isolated from the production package `com.speedvpn.app`.
 
 - `uid-poc-no-jni-hook.apk`: starts the same VPN/native tunnel, but does not register or invoke the Java packet callback.
 - `uid-poc-with-jni-hook.apk`: registers the temporary callback and calls `ConnectivityManager.getConnectionOwnerUid()` for eligible TCP/UDP tuples.
