@@ -1,4 +1,4 @@
-name: UID Detection POC
+name: UID Detection POC (Android Emulator)
 
 on:
   push:
@@ -9,22 +9,144 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: uid-detection-poc-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build-poc:
+  emulator-poc:
+    name: Build, run VPN and capture UID lookups
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - name: Checkout isolated POC branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
-      - name: Fetch pinned native source and apply diagnostic hook
-        run: ./setup.sh
-      - name: Compile and run JVM tests
-        run: ./gradlew --no-daemon testDebugUnitTest assembleDebug
-      - name: Upload diagnostic APK
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install SDK, NDK and Google Play emulator image
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" --install \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;30.0.16248370" \
+            "emulator" \
+            "system-images;android-35;google_apis_playstore;x86_64"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/30.0.16248370" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/30.0.16248370" >> "$GITHUB_ENV"
+          echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/platform-tools:$ANDROID_SDK_ROOT/emulator" >> "$GITHUB_PATH"
+
+      - name: Prepare pinned native tunnel and apply POC-only hook
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x ./gradlew
+          bash ./setup.sh
+          test "$(git -C app/src/main/jni/hev-socks5-tunnel rev-parse HEAD)" = 'd9dca26c7ad0e494492244f0309e80ee583e739e'
+          python3 scripts/poc/uid_detection/patch_hev_uid_detection_poc.py --help >/dev/null 2>&1 || true
+          python3 -m py_compile scripts/poc/uid_detection/run_emulator_poc.py
+
+      - name: Build diagnostic APK and run JVM tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon --stacktrace :app:testDebugUnitTest :app:assembleDebug
+          test -s app/build/outputs/apk/debug/app-debug.apk
+          sha256sum app/build/outputs/apk/debug/app-debug.apk | tee apk-sha256.txt
+
+      - name: Enable emulator acceleration
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y cpu-checker
+          sudo kvm-ok
+          sudo chmod 666 /dev/kvm
+          "$ANDROID_SDK_ROOT/emulator/emulator" -accel-check
+
+      - name: Create and boot Android 15 Google Play emulator
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="system-images;android-35;google_apis_playstore;x86_64"
+          echo "no" | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/avdmanager" create avd \
+            --name uid-detection-api35 --package "$IMAGE" --device pixel_2 --force
+          nohup "$ANDROID_SDK_ROOT/emulator/emulator" \
+            -avd uid-detection-api35 \
+            -no-window -no-audio -no-boot-anim -no-snapshot -wipe-data \
+            -gpu swiftshader_indirect -accel on -memory 4096 \
+            > emulator.log 2>&1 &
+          echo $! > emulator.pid
+          adb wait-for-device
+          for attempt in $(seq 1 120); do
+            if [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ]; then
+              break
+            fi
+            if [ "$attempt" -eq 120 ]; then
+              echo "Emulator did not complete boot in time." >&2
+              tail -n 160 emulator.log || true
+              exit 1
+            fi
+            sleep 5
+          done
+          adb shell input keyevent 82 || true
+          adb shell settings put global window_animation_scale 0
+          adb shell settings put global transition_animation_scale 0
+          adb shell settings put global animator_duration_scale 0
+          sleep 25
+          adb shell getprop ro.build.version.sdk | tee emulator-api.txt
+          test "$(adb shell getprop ro.build.version.sdk | tr -d '\r')" -ge 30
+
+      - name: Install diagnostic APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          adb install -r app/build/outputs/apk/debug/app-debug.apk
+          adb shell pm path com.speedvpn.app
+
+      - name: Run UID Detection POC with VPN and three apps
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          python3 scripts/poc/uid_detection/run_emulator_poc.py
+
+      - name: Collect Logcat and emulator diagnostics
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          adb logcat -d -v threadtime > artifacts/logcat-full-final.txt 2>&1 || true
+          adb logcat -d -v threadtime -s UidDetectionPOC:I > artifacts/logcat-uid-detection-final.txt 2>&1 || true
+          adb shell dumpsys activity services com.speedvpn.app > artifacts/speedvpn-services.txt 2>&1 || true
+          adb shell pm list packages > artifacts/installed-packages.txt 2>&1 || true
+          cp emulator.log artifacts/emulator.log 2>/dev/null || true
+          cp apk-sha256.txt artifacts/apk-sha256.txt 2>/dev/null || true
+          cp emulator-api.txt artifacts/emulator-api.txt 2>/dev/null || true
+          adb shell am force-stop com.speedvpn.app 2>/dev/null || true
+
+      - name: Upload APK and UID diagnostics
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: SpeedVPN-UID-Detection-POC
-          path: app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
+          path: |
+            app/build/outputs/apk/debug/app-debug.apk
+            artifacts/
+          if-no-files-found: warn
+          retention-days: 14
