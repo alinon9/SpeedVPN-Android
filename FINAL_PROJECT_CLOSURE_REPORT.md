@@ -4,7 +4,7 @@
 **Date:** 2026-10-14  
 **Repository:** [alinon9/SpeedVPN-Android](https://github.com/alinon9/SpeedVPN-Android)  
 **Final feature merge:** PR [#22](https://github.com/alinon9/SpeedVPN-Android/pull/22), merge commit [`a41c4dc35db21ac06d60ce2a4efbe9232df7980f`](https://github.com/alinon9/SpeedVPN-Android/commit/a41c4dc35db21ac06d60ce2a4efbe9232df7980f)  
-**Main HEAD at closeout audit:** [`034e58898a7db2b6ebace0d14835da75d5e40de5`](https://github.com/alinon9/SpeedVPN-Android/commit/034e58898a7db2b6ebace0d14835da75d5e40de5)
+**Final main-branch validation target (E2E #203):** [`034e58898a7db2b6ebace0d14835da75d5e40de5`](https://github.com/alinon9/SpeedVPN-Android/commit/034e58898a7db2b6ebace0d14835da75d5e40de5)
 
 ## Executive closure summary
 
