@@ -57,7 +57,7 @@ def main() -> None:
 #define UID_POC_NATIVE_FRAMES 32
 
 static char uid_poc_diag_dir[PATH_MAX] =
-    "/data/data/com.speedvpn.app/files/uid-poc-diagnostics";
+    "/data/data/com.speedvpn.app.uidpoc/files/uid-poc-diagnostics";
 static char uid_poc_stage_path[PATH_MAX];
 static char uid_poc_last_stage_path[PATH_MAX];
 static char uid_poc_crash_path[PATH_MAX];
@@ -300,7 +300,7 @@ static int
 uid_poc_open_diagnostics (const char *directory, int reset_trace)
 {
     if (!directory || !directory[0])
-        directory = "/data/data/com.speedvpn.app/files/uid-poc-diagnostics";
+        directory = "/data/data/com.speedvpn.app.uidpoc/files/uid-poc-diagnostics";
 
     if (snprintf (uid_poc_diag_dir, sizeof (uid_poc_diag_dir), "%s", directory) >=
         (int) sizeof (uid_poc_diag_dir))
