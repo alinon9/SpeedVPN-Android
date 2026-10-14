@@ -1,0 +1,30 @@
+name: UID Detection POC
+
+on:
+  push:
+    branches:
+      - poc/uid-detection-test
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-poc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Fetch pinned native source and apply diagnostic hook
+        run: ./setup.sh
+      - name: Compile and run JVM tests
+        run: ./gradlew --no-daemon testDebugUnitTest assembleDebug
+      - name: Upload diagnostic APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpeedVPN-UID-Detection-POC
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
