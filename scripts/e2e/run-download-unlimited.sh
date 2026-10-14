@@ -118,34 +118,26 @@ printf '%s\n' "$limits" | python3 scripts/e2e/preference_matches.py ul 0 both ||
 
 echo "PLAN_VERIFIED download=Unlimited upload=Unlimited" | tee -a "$RUN_DIR/runner-status.txt"
 
-# Monitor live SpeedTestEngine logs before tapping Verify. SpeedVerificationEngine
-# runs a baseline Download first, then a Download while the VPN is active.
-# The second completed Download phase is the target. Stop the app immediately
-# at that log boundary to minimize the subsequent Upload phase (the current
-# production engine sequences Upload after Download, so a small scheduling race
-# cannot be eliminated without changing app code).
-rm -f "$RUN_DIR/download-phase-captured.txt"
-(
-  adb -s "$DEVICE" logcat -v brief -s SpeedTestEngine:I |
-  while IFS= read -r line; do
-    printf '%s\n' "$line" >> "$RUN_DIR/phase-monitor.log"
-    if [[ "$line" == *"Phase complete direction=download"* ]]; then
-      count="$(grep -c 'Phase complete direction=download' "$RUN_DIR/phase-monitor.log" || true)"
-      if [ "${count:-0}" -ge 2 ]; then
-        printf '%s\n' "$line" > "$RUN_DIR/download-phase-captured.txt"
-        echo "VPN_DOWNLOAD_PHASE_CAPTURED: ${line}" >> "$RUN_DIR/runner-status.txt"
-        adb -s "$DEVICE" shell am force-stop "$PACKAGE" >/dev/null 2>&1 || true
-        break
-      fi
-    fi
-  done
-) &
+# Monitor SpeedTestEngine using a directly-owned adb logcat process.
+# The old "adb logcat | while read" pipeline could leave its logcat producer alive
+# after the reader broke, so EXIT cleanup could wait on a process that never exited.
+# A direct PID lets cleanup terminate and reap the monitor deterministically.
+MONITOR_LOG="$RUN_DIR/phase-monitor.log"
+rm -f "$RUN_DIR/download-phase-captured.txt" "$MONITOR_LOG"
+: > "$MONITOR_LOG"
+adb -s "$DEVICE" logcat -v brief -s SpeedTestEngine:I > "$MONITOR_LOG" 2>&1 &
 MONITOR_PID=$!
 cleanup_monitor() {
-  kill "$MONITOR_PID" 2>/dev/null || true
-  wait "$MONITOR_PID" 2>/dev/null || true
+  set +e
+  if [[ -n "${MONITOR_PID:-}" ]]; then
+    kill "$MONITOR_PID" 2>/dev/null || true
+    wait "$MONITOR_PID" 2>/dev/null || true
+    MONITOR_PID=""
+  fi
 }
-trap cleanup_monitor EXIT INT TERM
+trap cleanup_monitor EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 sleep 1
 
 # Verify Speed establishes the app VPN and routes its probe through the limiter.
@@ -177,16 +169,34 @@ elif ui_has_text "OK" || ui_has_text "Allow" || ui_has_text "السماح"; then
   tap_text "✅ تحقق من السرعة" || tap_text "تحقق من السرعة" || fail "Could not restart Verify Speed after VPN approval"
 fi
 
-# Wait for the second completed Download phase. The wrapper has its own timeout
-# and gathers all final logs/snapshots even if this step fails.
-for _ in $(seq 1 900); do
-  if [ -s "$RUN_DIR/download-phase-captured.txt" ]; then
-    echo "DOWNLOAD_DIAGNOSTIC_COMPLETE" | tee -a "$RUN_DIR/runner-status.txt"
+# Hard cap this runner's measurement wait at 15 minutes, independent of caller
+# input. The outer wrapper also enforces its configured timeout.
+RUNNER_TIMEOUT_SECONDS="${RUNNER_TIMEOUT_SECONDS:-900}"
+if ! [[ "$RUNNER_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
+  fail "RUNNER_TIMEOUT_SECONDS must be a positive integer"
+fi
+if (( RUNNER_TIMEOUT_SECONDS > 900 )); then
+  echo "RUNNER_TIMEOUT_CLAMPED requested=$RUNNER_TIMEOUT_SECONDS cap=900" | tee -a "$RUN_DIR/runner-status.txt"
+  RUNNER_TIMEOUT_SECONDS=900
+fi
+
+for ((elapsed=0; elapsed<RUNNER_TIMEOUT_SECONDS; elapsed++)); do
+  count="$(grep -cF 'Phase complete direction=download' "$MONITOR_LOG" 2>/dev/null || true)"
+  count="${count:-0}"
+  if (( count >= 2 )); then
+    grep -F 'Phase complete direction=download' "$MONITOR_LOG" | tail -n 1 > "$RUN_DIR/download-phase-captured.txt"
+    line="$(cat "$RUN_DIR/download-phase-captured.txt")"
+    echo "VPN_DOWNLOAD_PHASE_CAPTURED: $line" | tee -a "$RUN_DIR/runner-status.txt"
+    adb -s "$DEVICE" shell am force-stop "$PACKAGE" >/dev/null 2>&1 || true
+    # Explicitly stop and reap adb logcat before printing the completion marker.
+    cleanup_monitor
     adb -s "$DEVICE" logcat -d -v threadtime > "$RUN_DIR/logcat-at-download-capture.txt" 2>&1 || true
+    echo "DOWNLOAD_DIAGNOSTIC_COMPLETE" | tee -a "$RUN_DIR/runner-status.txt"
     exit 0
   fi
   sleep 1
 done
 
+cleanup_monitor
 adb -s "$DEVICE" logcat -d -v threadtime > "$RUN_DIR/logcat-runner-timeout.txt" 2>&1 || true
-fail "Timed out waiting for baseline + VPN Download phase completion"
+fail "Timed out waiting for baseline + VPN Download phase completion after ${RUNNER_TIMEOUT_SECONDS}s"
