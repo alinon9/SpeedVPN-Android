@@ -1,13 +1,18 @@
 name: Measure Download Path
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - scripts/e2e/run-download-unlimited.sh
   workflow_dispatch:
     inputs:
       measurement_timeout_seconds:
         description: Maximum time for the measurement runner
         required: true
         type: choice
-        default: "600"
+        default: "900"
         options:
           - "300"
           - "600"
@@ -112,6 +117,7 @@ jobs:
           export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/platform-tools:$ANDROID_SDK_ROOT/emulator:$PATH"
           if [ -e /dev/kvm ]; then sudo chmod 666 /dev/kvm; fi
           emulator -accel-check || true
+          AVD_START_EPOCH="$(date +%s)"
           nohup emulator -avd measure-download \
             -no-window -no-audio -no-boot-anim -no-snapshot -no-snapshot-save \
             -no-metrics -gpu swiftshader_indirect -accel on \
@@ -154,6 +160,8 @@ jobs:
           adb -s emulator-5554 shell settings put global master_sync_enabled 0
           adb -s emulator-5554 shell ip route > artifacts/download-path/routes-before.txt 2>&1 || true
           adb -s emulator-5554 shell dumpsys connectivity > artifacts/download-path/connectivity-booted.txt 2>&1 || true
+          AVD_STARTUP_SECONDS="$(( $(date +%s) - AVD_START_EPOCH ))"
+          printf "AVD_STARTUP_SECONDS=%s\n" "$AVD_STARTUP_SECONDS" | tee artifacts/download-path/avd-startup-time.txt
           echo "Emulator booted and ready."
 
       - name: Run Download Unlimited diagnostic
