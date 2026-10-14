@@ -1,6 +1,10 @@
 name: Measure Download Path
 
 on:
+  # A push to the isolated acceptance branch launches the next diagnostics-only run.
+  push:
+    branches:
+      - download-path-acceptance-20261014
   workflow_dispatch:
     inputs:
       measurement_timeout_seconds:
@@ -67,11 +71,19 @@ jobs:
           test -x "$SDKMANAGER"
           test -x "$AVDMANAGER"
 
+      - name: Install tcpdump for upstream TCP RTT
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y tcpdump
+          tcpdump --version
+
       - name: Validate diagnostic scripts
         run: |
           set -Eeuo pipefail
           bash -n scripts/e2e/measure_download_path.sh
           bash -n scripts/e2e/run-download-unlimited.sh
+          python3 -m py_compile scripts/e2e/analyze_tcp_handshake_rtt.py
           test -s app/build.gradle.kts
           grep -Eq 'applicationId = "com\.speedvpn\.app"' app/build.gradle.kts
           echo "Verified actual applicationId=com.speedvpn.app from app/build.gradle.kts."
