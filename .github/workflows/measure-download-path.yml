@@ -1,10 +1,6 @@
 name: Measure Download Path
 
 on:
-  # A push to the isolated acceptance branch launches the next diagnostics-only run.
-  push:
-    branches:
-      - download-path-acceptance-20261014
   workflow_dispatch:
     inputs:
       measurement_timeout_seconds:
