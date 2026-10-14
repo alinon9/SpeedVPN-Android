@@ -31,7 +31,8 @@ internal class UidDetectionPoc(
         val dstPort: Int,
     ) {
         override fun toString(): String =
-            "${protocolName(protocol)}|$src|$srcPort|$dst|$dstPort"
+            "${when (protocol) { IPPROTO_TCP -> "TCP"; IPPROTO_UDP -> "UDP"; else -> protocol.toString() }}|" +
+                "$src|$srcPort|$dst|$dstPort"
     }
 
     private val connectivity = service.getSystemService(ConnectivityManager::class.java)
@@ -92,8 +93,9 @@ internal class UidDetectionPoc(
         val previous = lastQueuedAt.put(tuple, now)
         if (previous != null && now - previous < RETRY_INTERVAL_MS) return
 
-        val attempt = attempts.computeIfAbsent(tuple) { AtomicInteger() }.incrementAndGet()
-        if (attempt > MAX_ATTEMPTS) return
+        val attemptCounter = attempts.computeIfAbsent(tuple) { AtomicInteger() }
+        if (attemptCounter.get() >= MAX_ATTEMPTS) return
+        val attempt = attemptCounter.incrementAndGet()
 
         // Never perform the Binder-backed Android UID lookup on the TUN engine thread.
         runCatching {
@@ -145,10 +147,5 @@ internal class UidDetectionPoc(
         const val RETRY_INTERVAL_MS = 750L
         const val MAX_ATTEMPTS = 4
 
-        fun protocolName(protocol: Int): String = when (protocol) {
-            IPPROTO_TCP -> "TCP"
-            IPPROTO_UDP -> "UDP"
-            else -> protocol.toString()
-        }
     }
 }
