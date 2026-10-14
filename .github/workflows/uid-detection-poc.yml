@@ -58,8 +58,8 @@ jobs:
           test -x ./gradlew
           bash ./setup.sh
           test "$(git -C app/src/main/jni/hev-socks5-tunnel rev-parse HEAD)" = 'd9dca26c7ad0e494492244f0309e80ee583e739e'
-          python3 scripts/poc/uid_detection/patch_hev_uid_detection_poc.py --help >/dev/null 2>&1 || true
           python3 -m py_compile scripts/poc/uid_detection/run_emulator_poc.py
+          bash -n setup.sh
 
       - name: Build diagnostic APK and run JVM tests
         shell: bash
