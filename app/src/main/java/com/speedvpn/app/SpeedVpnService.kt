@@ -1039,6 +1039,12 @@ class SpeedVpnService : VpnService() {
             nativeOwnerGeneration.set(newGeneration)
             engineRunning = true
         } else {
+            if (BuildConfig.DEBUG) {
+                runCatching { TProxyService.TProxySetUidPocCallback(null) }
+                    .onFailure { logE("Unable to clear failed-start UID POC callback", it) }
+                uidDetectionPoc?.close()
+                uidDetectionPoc = null
+            }
             SpeedLimiter.endSession(newGeneration)
         }
         started
