@@ -95,7 +95,8 @@ def main() -> int:
                 continue
             started, _ = prior
             rtt_ms = (timestamp - started).total_seconds() * 1000.0
-            remote_ip = dst
+            # The SYN/ACK direction is remote -> local; retain local -> remote for reporting.
+            remote_ip = src
             if remote_ip not in target_ips:
                 continue
             phase = "outside"
@@ -103,7 +104,7 @@ def main() -> int:
                 if start <= started <= end:
                     phase = label
                     break
-            matches.append((started, phase, src, sport, dst, dport, rtt_ms))
+            matches.append((started, phase, dst, dport, src, sport, rtt_ms))
 
     print("TCP SYN-to-SYN/ACK RTT diagnostic (metadata only; no payload captured)")
     print(f"Capture file: {capture_path}")
