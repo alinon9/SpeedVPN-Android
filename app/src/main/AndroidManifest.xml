@@ -32,7 +32,13 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:launchMode="singleTop">
+            android:launchMode="singleTop" />
+
+        <!-- POC-only launcher: keeps the production UI source untouched on this isolated branch. -->
+        <activity
+            android:name=".UidDetectionPocActivity"
+            android:exported="true"
+            android:label="فحص UID (POC)">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

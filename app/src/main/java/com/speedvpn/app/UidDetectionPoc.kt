@@ -8,16 +8,110 @@ import android.util.Log
 import hev.htproxy.TProxyService
 import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+
+internal data class UidDetectionRecord(
+    val id: Long,
+    val timestampMillis: Long,
+    val packageName: String,
+    val protocol: String,
+    val srcIp: String,
+    val srcPort: Int,
+    val dstIp: String,
+    val dstPort: Int,
+    val uid: Int?,
+    val status: String,
+    val details: String = "",
+)
+
+/** In-process POC UI model. No packet is blocked or modified by these diagnostics. */
+internal object UidDetectionPocResultStore {
+    private const val MAX_RECORDS = 1000
+    private val nextId = AtomicLong(0L)
+    private val _recording = MutableStateFlow(false)
+    private val _records = MutableStateFlow<List<UidDetectionRecord>>(emptyList())
+
+    val recording: StateFlow<Boolean> = _recording.asStateFlow()
+    val records: StateFlow<List<UidDetectionRecord>> = _records.asStateFlow()
+    val isRecording: Boolean get() = _recording.value
+
+    fun startRecording() { _recording.value = true }
+    fun stopRecording() { _recording.value = false }
+    fun clear() { _records.value = emptyList() }
+
+    fun add(
+        protocol: Int,
+        srcIp: String,
+        srcPort: Int,
+        dstIp: String,
+        dstPort: Int,
+        uid: Int?,
+        packages: List<String>,
+        status: String,
+        details: String = "",
+    ) {
+        if (!_recording.value) return
+        val packageLabel = when {
+            packages.isNotEmpty() -> packages.sorted().distinct().joinToString(", ")
+            uid != null && uid != Process.INVALID_UID -> "UID:$uid (package name unavailable)"
+            else -> "—"
+        }
+        val record = UidDetectionRecord(
+            id = nextId.incrementAndGet(),
+            timestampMillis = System.currentTimeMillis(),
+            packageName = packageLabel,
+            protocol = when (protocol) { 6 -> "TCP"; 17 -> "UDP"; else -> protocol.toString() },
+            srcIp = srcIp,
+            srcPort = srcPort,
+            dstIp = dstIp,
+            dstPort = dstPort,
+            uid = uid,
+            status = status,
+            details = details,
+        )
+        _records.update { (it + record).takeLast(MAX_RECORDS) }
+    }
+
+    fun exportCsv(): String {
+        fun cell(value: String): String = "\"" + value.replace("\"", "\"\"") + "\""
+        val header = listOf(
+            "timestamp", "packageName", "protocol", "srcIp", "srcPort",
+            "dstIp", "dstPort", "uid", "status", "details",
+        ).joinToString(",")
+        val rows = _records.value.map { r ->
+            listOf(
+                cell(SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(Date(r.timestampMillis))),
+                cell(r.packageName),
+                cell(r.protocol),
+                cell(r.srcIp),
+                r.srcPort.toString(),
+                cell(r.dstIp),
+                r.dstPort.toString(),
+                r.uid?.toString() ?: "",
+                cell(r.status),
+                cell(r.details),
+            ).joinToString(",")
+        }
+        return (listOf(header) + rows).joinToString("\n", postfix = "\n")
+    }
+}
 
 /**
- * Temporary diagnostic only. This class observes tuples reported at the native TUN read
- * point and asks Android which UID owns each tuple. Results are logged under
- * UidDetectionPOC and never affect packet forwarding.
+ * Temporary diagnostic only. It observes tuples reported at the native TUN read point and
+ * asks Android which UID owns each tuple. The records are shown in the POC screen and are
+ * never used to change packet forwarding or enforce a firewall.
  */
 internal class UidDetectionPoc(
     private val service: SpeedVpnService,
@@ -36,10 +130,9 @@ internal class UidDetectionPoc(
 
     private val connectivity = service.getSystemService(ConnectivityManager::class.java)
     private val packageManager = service.packageManager
-    // These are present in the Google Play emulator image used by the POC workflow.
-    // The workflow launches each app while the local VPN is active to generate distinct UID traffic.
     private val targets = listOf(
         "com.android.chrome",
+        "com.whatsapp",
         "com.google.android.youtube",
         "com.android.vending",
     )
@@ -80,6 +173,7 @@ internal class UidDetectionPoc(
         dstAddress: ByteArray,
         dstPort: Int,
     ) {
+        if (!UidDetectionPocResultStore.isRecording) return
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
         if (protocol != IPPROTO_TCP && protocol != IPPROTO_UDP) return
         if (srcPort !in 0..65535 || dstPort !in 0..65535) return
@@ -116,6 +210,11 @@ internal class UidDetectionPoc(
                         targetMatch != "-" -> "MATCH_TARGET"
                         else -> "UID_FOUND_OTHER_OR_UNLISTED"
                     }
+                    UidDetectionPocResultStore.add(
+                        protocol, src, srcPort, dst, dstPort, uid, packages,
+                        if (uid == Process.INVALID_UID) "INVALID" else "MATCH",
+                        "attempt=$attempt; targetMatch=$targetMatch",
+                    )
                     Log.i(
                         TAG,
                         "RESULT verdict=$verdict tuple=$tuple uid=$uid " +
@@ -124,16 +223,37 @@ internal class UidDetectionPoc(
                     )
                     if (uid != Process.INVALID_UID) resolved.add(tuple)
                 } catch (e: SecurityException) {
-                    Log.e(TAG, "RESULT verdict=SECURITY_EXCEPTION tuple=$tuple attempt=$attempt", e)
+                    reportException(protocol, src, srcPort, dst, dstPort, attempt, e)
                 } catch (e: IllegalArgumentException) {
-                    Log.e(TAG, "RESULT verdict=BAD_ARGUMENT tuple=$tuple attempt=$attempt", e)
+                    reportException(protocol, src, srcPort, dst, dstPort, attempt, e)
                 } catch (e: Exception) {
-                    Log.e(TAG, "RESULT verdict=ERROR tuple=$tuple attempt=$attempt", e)
+                    reportException(protocol, src, srcPort, dst, dstPort, attempt, e)
                 }
             }
         }.onFailure {
+            UidDetectionPocResultStore.add(
+                protocol, src, srcPort, dst, dstPort, null, emptyList(), "EXCEPTION",
+                "Queue error: ${it.javaClass.simpleName}: ${it.message.orEmpty()}",
+            )
             Log.w(TAG, "QUEUE_DROP tuple=$tuple reason=${it.javaClass.simpleName}")
         }
+    }
+
+    private fun reportException(
+        protocol: Int,
+        src: String,
+        srcPort: Int,
+        dst: String,
+        dstPort: Int,
+        attempt: Int,
+        error: Exception,
+    ) {
+        val details = "${error.javaClass.simpleName}: ${error.message.orEmpty()}"
+        UidDetectionPocResultStore.add(
+            protocol, src, srcPort, dst, dstPort, null, emptyList(), "EXCEPTION",
+            "attempt=$attempt; $details",
+        )
+        Log.e(TAG, "RESULT verdict=EXCEPTION tuple=${protocol}|$src|$srcPort|$dst|$dstPort attempt=$attempt details=$details", error)
     }
 
     override fun close() {
@@ -147,6 +267,5 @@ internal class UidDetectionPoc(
         const val IPPROTO_UDP = 17
         const val RETRY_INTERVAL_MS = 750L
         const val MAX_ATTEMPTS = 4
-
     }
 }

@@ -2,6 +2,20 @@
 
 Current version: **v1.1.1** (versionCode 30)
 
+## اختبار UID على جهاز Android حقيقي (POC — فرع معزول)
+
+هذا الاختبار تشخيصي فقط؛ لا يفعّل حظر التطبيقات ولا يغيّر تمرير الحزم. ملف APK مخصص للتجربة على جهاز فعلي ولا يمثل إصدارًا إنتاجيًا.
+
+1. افتح **Actions** في المستودع، واختر **UID Detection POC (Real Device APK)** وشغّل workflow على الفرع `poc/uid-detection-test`. أو ادفع تحديثًا إلى هذا الفرع ليبدأ البناء تلقائيًا.
+2. بعد اكتمال التشغيل، افتح **Artifacts** ونزّل `SpeedVPN-UID-Detection-POC`، ثم فك ملف ZIP للحصول على `app-debug.apk`.
+3. ثبّت APK على جهاز Android 10 أو أحدث. وافق على نافذة إذن VPN من Android؛ بعد الموافقة يحاول التطبيق تشغيل SpeedVPN تلقائيًا.
+4. في شاشة **UID Detection POC** انتظر حالة VPN، ثم اضغط **ابدأ التسجيل**.
+5. افتح Chrome وWhatsApp وYouTube واستخدم كل تطبيق قليلًا لإنشاء اتصالات TCP وUDP.
+6. عُد إلى شاشة POC لمشاهدة اسم الحزمة، والبروتوكول، وعناوين/منافذ المصدر والوجهة، وUID والحالة لكل تدفق.
+7. اضغط **تصدير النتائج** واحفظ ملف CSV، ثم أرسله للمراجعة. استخدم **مسح السجل** لبدء جلسة نظيفة.
+
+إذا لم تظهر تدفقات، تأكد من اتصال VPN ومن إنشاء حركة مرور فعلية، ثم جرّب إيقاف التسجيل وتشغيله. سجلات `MATCH` و`INVALID` و`EXCEPTION` جميعها مفيدة؛ لا تعتبر نجاح البناء وحده دليلًا على نجاح اكتشاف UID. مدة البناء المتوقعة نحو 8–10 دقائق، وقد تتغير حسب ذاكرة التخزين المؤقت وحالة runner.
+
 ## Overview
 
 SpeedVPN is a local Android `VpnService` that routes device traffic through a local TUN/tun2socks path for upload/download shaping and traffic accounting. Remote dashboard control is optional.
