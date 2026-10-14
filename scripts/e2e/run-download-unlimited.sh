@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Download-path CI probe. UI-only harness; does not modify application source.
 # Acceptance run A trigger; no runtime behavior change.
+# Acceptance run B trigger; no runtime behavior change.
 set -Eeuo pipefail
 
 DEVICE="${ANDROID_SERIAL:-emulator-5554}"
