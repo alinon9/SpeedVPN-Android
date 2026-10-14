@@ -10,7 +10,7 @@ END = "/* SPEEDVPN_UID_POC_END */"
 
 def replace_once(path: Path, old: str, new: str) -> None:
     text = path.read_text()
-    if BEGIN in text:
+    if new in text:
         return
     count = text.count(old)
     if count != 1:
