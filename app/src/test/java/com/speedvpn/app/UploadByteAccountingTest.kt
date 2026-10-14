@@ -13,7 +13,10 @@ import okhttp3.Request
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
 
+@RunWith(RobolectricTestRunner::class)
 class UploadByteAccountingTest {
     @Test
     fun okHttpRequestBodyEndCounterMatchesServerReceivedBytesFor512KiBBody() {
