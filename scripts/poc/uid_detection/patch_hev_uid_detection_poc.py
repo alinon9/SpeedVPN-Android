@@ -124,6 +124,7 @@ task_io_yielder (HevTaskYieldType type, void *data)
             + "static pthread_mutex_t uid_poc_mutex = PTHREAD_MUTEX_INITIALIZER;\n"
             + "static jobject uid_poc_callback;\n"
             + "static jmethodID uid_poc_method;\n"
+            + "static atomic_int uid_poc_enabled;\n"
             + END + "\n",
             1,
         )
@@ -172,6 +173,7 @@ native_set_uid_poc_callback (JNIEnv *env, jobject thiz, jobject callback)
     previous = uid_poc_callback;
     uid_poc_callback = replacement;
     uid_poc_method = method;
+    atomic_store_explicit (&uid_poc_enabled, replacement ? 1 : 0, memory_order_release);
     pthread_mutex_unlock (&uid_poc_mutex);
 
     if (previous)
@@ -191,6 +193,8 @@ hev_jni_uid_poc_packet (int protocol,
     jbyteArray src_array = NULL, dst_array = NULL;
     jint status;
 
+    if (!atomic_load_explicit (&uid_poc_enabled, memory_order_acquire))
+        return;
     if (!java_vm)
         return;
     status = (*java_vm)->GetEnv (java_vm, (void **) &env, JNI_VERSION_1_4);
