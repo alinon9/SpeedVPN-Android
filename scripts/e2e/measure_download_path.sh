@@ -56,13 +56,45 @@ echo "Observation-only diagnostic; no application source or speed plans are modi
 "${ADB[@]}" logcat -v threadtime > "$OUT_DIR/logcat-full.txt" 2>&1 &
 LOGCAT_PID=$!
 SAMPLER_PID=""
+TCPDUMP_PID=""
+stop_tcpdump() {
+  set +e
+  if [[ -n "${TCPDUMP_PID:-}" ]]; then
+    # This runner owns this dedicated capture; signal tcpdump itself, then reap sudo.
+    sudo pkill -INT -x tcpdump >/dev/null 2>&1 || true
+    wait "$TCPDUMP_PID" 2>/dev/null || true
+    TCPDUMP_PID=""
+  fi
+}
 cleanup() {
   set +e
+  stop_tcpdump
   [[ -n "${SAMPLER_PID:-}" ]] && kill "$SAMPLER_PID" 2>/dev/null
   [[ -n "${LOGCAT_PID:-}" ]] && kill "$LOGCAT_PID" 2>/dev/null
-  wait "$LOGCAT_PID" 2>/dev/null
+  [[ -n "${LOGCAT_PID:-}" ]] && wait "$LOGCAT_PID" 2>/dev/null
 }
 trap cleanup EXIT INT TERM
+
+# Capture TCP SYN/SYN-ACK packets only: no HTTP bodies, TLS records, or credentials.
+# This measures upstream TCP handshake RTT at the runner/NAT boundary; it is not
+# Android guest TCP_INFO, but it is an actual RTT for TCP connections used by the relay.
+CAPTURE_FILE="$OUT_DIR/tcp-syn-capture.txt"
+if command -v tcpdump >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+  : > "$CAPTURE_FILE"
+  sudo tcpdump -i any -nn -tttt -vvv -l -s 128 \
+    'tcp port 443 and (tcp[tcpflags] & tcp-syn != 0)' \
+    > "$CAPTURE_FILE" 2>&1 &
+  TCPDUMP_PID=$!
+  sleep 1
+  if ! kill -0 "$TCPDUMP_PID" 2>/dev/null; then
+    echo "WARNING: tcpdump exited before measurement began." >> "$CAPTURE_FILE"
+    TCPDUMP_PID=""
+  else
+    echo "TCP_SYN_CAPTURE_STARTED=1" | tee "$OUT_DIR/tcp-capture-status.txt"
+  fi
+else
+  echo "tcpdump unavailable or sudo unavailable; no TCP RTT measurement captured." | tee "$CAPTURE_FILE" "$OUT_DIR/tcp-capture-status.txt"
+fi
 
 (
   while :; do
@@ -95,6 +127,8 @@ timeout --signal=INT --kill-after=10 "$DURATION" "${TEST_CMD[@]}" 2>&1 | tee "$O
 TEST_STATUS=${PIPESTATUS[0]}
 set -e
 echo "$TEST_STATUS" > "$OUT_DIR/test-exit-code.txt"
+stop_tcpdump
+echo "TCP_SYN_CAPTURE_STOPPED=1" >> "$OUT_DIR/tcp-capture-status.txt"
 
 "${ADB[@]}" shell cat /proc/net/tcp /proc/net/tcp6 > "$OUT_DIR/proc-net-tcp-after.txt" 2>&1 || true
 "${ADB[@]}" shell 'command -v ss >/dev/null 2>&1 && ss -tinm || echo "ss unavailable or restricted"' > "$OUT_DIR/ss-after.txt" 2>&1 || true
@@ -107,6 +141,10 @@ kill "$SAMPLER_PID" 2>/dev/null || true
 SAMPLER_PID=""
 kill "$LOGCAT_PID" 2>/dev/null || true
 wait "$LOGCAT_PID" 2>/dev/null || true
+LOGCAT_PID=""
+python3 scripts/e2e/analyze_tcp_handshake_rtt.py \
+  --capture "$CAPTURE_FILE" --logcat "$OUT_DIR/logcat-full.txt" \
+  > "$OUT_DIR/tcp-rtt-summary.txt" 2>&1 || true
 trap - EXIT INT TERM
 
 grep -Ein 'ERR_MEM|mem err|tcp_sndbuf|snd_buf|rcv_buf|chunk|socks5|download|upload|rtt|round.trip|broken pipe|connection reset|Phase complete direction=download|Phase start direction=upload|Unlimited|unlimited' \
@@ -124,12 +162,14 @@ Files:
 - samples.txt: repeated /proc/net/tcp, ss -tinm, CPU, RAM/load, app memory and debugfs snapshots.
 - logcat-full.txt / relevant-log-lines.txt: full logs and filtered SOCKS5, chunk, ERR_MEM, Download/Upload and RTT-like lines.
 - proc-net-tcp-*.txt / ss-*.txt: before/after socket snapshots.
-- ping.txt: host-runner ping RTT; not proof of TCP RTT inside the VPN path.
+- tcp-syn-capture.txt / tcp-rtt-summary.txt: SYN-to-SYN/ACK RTT for TCP/443 remote IPs seen in SOCKS relay flow IDs; only packet metadata is captured.
+- ping.txt: host-runner ICMP diagnostic; it is not used as a substitute for TCP RTT.
 - runner-status.txt, phase-monitor.log and *download*capture*.txt are emitted by the UI runner.
 - test-command.log and test-exit-code.txt: runner output and return code.
 
 Limitations:
 - /proc/net/tcp alone does not expose TCP send/receive buffers or RTT.
+- TCP handshake RTT is measured at the Linux runner's capture interface, through the emulator NAT boundary, not from Android guest TCP_INFO. A missing/empty capture is reported explicitly.
 - ss may be absent or restricted; tcp_info availability varies by emulator image.
 - lwIP ERR_MEM counters require the build/device to expose the probed debugfs paths.
 - Current log output determines whether SOCKS5 chunk sizes are visible; absent log lines do not prove absent chunks.
@@ -145,7 +185,7 @@ exit "$TEST_STATUS"
 #
 # GitHub Actions use: the measure-download-path.yml workflow provisions the emulator,
 # builds/installs the APK, calls this script, and uploads artifacts/download-path/.
-# Expected output includes socket snapshots, RTT/ping samples, CPU/RAM, full logcat,
+# Expected output includes socket snapshots, SYN-only TCP handshake RTT, ping samples, CPU/RAM, full logcat,
 # ERR_MEM/chunk/SOCKS5 matches when emitted, and runner status. Missing ss/debugfs
 # or absent chunk logs are limitations, not proof that the target data does not exist.
 # Send the uploaded Actions artifact ZIP back here for diagnosis.
