@@ -303,7 +303,7 @@ static void
 uid_poc_install_crash_handlers (void)
 {
     struct sigaction action;
-    (void) uid_poc_open_diagnostics (uid_poc_diag_dir, 1);
+    (void) uid_poc_open_diagnostics (NULL, 1);
     memset (&action, 0, sizeof (action));
     sigemptyset (&action.sa_mask);
     action.sa_sigaction = uid_poc_native_signal_handler;
