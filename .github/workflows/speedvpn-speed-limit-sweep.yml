@@ -1,4 +1,5 @@
 name: SpeedVPN Exhaustive Speed Limit Sweep
+# Post-merge acceptance trigger for PR #22; comment-only, no behavior or threshold changes.
 
 on:
   push:
