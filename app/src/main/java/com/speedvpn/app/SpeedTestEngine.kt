@@ -21,10 +21,33 @@ import okhttp3.RequestBody
 import okhttp3.Response
 import okio.BufferedSink
 import java.io.IOException
+import java.net.SocketException
 import java.util.concurrent.TimeUnit
 import kotlin.math.min
 
 enum class SpeedTestPhase { DOWNLOAD, UPLOAD }
+
+/**
+ * A peer may close its upload half immediately after consuming the declared
+ * Content-Length. Treat only a late Broken pipe/Connection reset during the
+ * final flush as recoverable when every body byte has been emitted and no
+ * bytes remain buffered. The caller must still receive a successful HTTP
+ * response before it accepts this request as a measurement sample.
+ */
+internal fun isRecoverableCompletedUploadFlushFailure(
+    writtenBytes: Long,
+    expectedBytes: Long,
+    bufferedBytes: Long,
+    error: Throwable,
+): Boolean {
+    if (expectedBytes <= 0L || writtenBytes != expectedBytes || bufferedBytes != 0L) return false
+    val socketError = generateSequence(error) { it.cause }
+        .filterIsInstance<SocketException>()
+        .firstOrNull() ?: return false
+    val message = socketError.message.orEmpty()
+    return message.contains("broken pipe", ignoreCase = true) ||
+        message.contains("connection reset", ignoreCase = true)
+}
 
 data class SpeedTestResult(
     val downloadBps: Long?,
@@ -929,7 +952,25 @@ object SpeedTestEngine {
                 sink.write(chunk, 0, count)
                 written += count
             }
-            sink.flush()
+            try {
+                sink.flush()
+            } catch (error: IOException) {
+                if (!isRecoverableCompletedUploadFlushFailure(
+                        writtenBytes = written,
+                        expectedBytes = sizeBytes,
+                        bufferedBytes = sink.buffer.size,
+                        error = error,
+                    )
+                ) {
+                    throw error
+                }
+                Log.w(
+                    TAG,
+                    "Upload payload fully emitted; final flush saw peer-close race; " +
+                        "awaiting successful HTTP response before accepting sample",
+                    error,
+                )
+            }
         }
     }
 }
