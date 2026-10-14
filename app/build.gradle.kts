@@ -4,6 +4,11 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+val uidPocJniHook = providers.gradleProperty("uidPocJniHook")
+    .orNull
+    ?.toBooleanStrictOrNull()
+    ?: false
+
 val configuredSpeedTestBaseUrl = providers.gradleProperty("speedTestBaseUrl")
     .orNull
     ?.trim()
@@ -26,6 +31,9 @@ android {
         targetSdk = 36
         versionCode = 30
         versionName = "1.1.1"
+
+        // Isolated UID POC switch; false is the native-startup baseline build.
+        buildConfigField("boolean", "UID_POC_JNI_HOOK", uidPocJniHook.toString())
 
         // Public values only (same ones the website uses). No secrets here.
         buildConfigField("String", "API_BASE", "\"${System.getenv("SPEEDVPN_API_BASE") ?: "https://read-fix-build-magic.lovable.app/api/public/vpn"}\"")
@@ -63,6 +71,8 @@ android {
 
     buildTypes {
         debug {
+            // Keep POC APKs isolated from the production SpeedVPN package.
+            applicationIdSuffix = ".uidpoc"
             // Only the CI Debug APK can target the runner-local deterministic fixture.
             buildConfigField("String", "SPEED_TEST_BASE_URL", "\"$configuredSpeedTestBaseUrl\"")
         }

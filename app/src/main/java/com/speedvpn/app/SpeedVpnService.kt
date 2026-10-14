@@ -57,6 +57,8 @@ class SpeedVpnService : VpnService() {
         private const val EXTRA_EXPECTED_GENERATION = "expected_generation"
         private const val EXTRA_START_REQUEST_ID = "start_request_id"
         private const val NOTIF_ID = 1
+        // Diagnostic isolation: keep the JNI UID callback disabled until native startup is proven stable.
+        private val ENABLE_UID_POC_JNI_HOOK = BuildConfig.DEBUG && BuildConfig.UID_POC_JNI_HOOK
         private const val HEALTH_INTERVAL_MS = 30_000L
         private const val UPSTREAM_PROBE_TIMEOUT_MS = 3_000
         private const val UPSTREAM_PROBE_IP_1 = "1.1.1.1"
@@ -153,8 +155,11 @@ class SpeedVpnService : VpnService() {
 
     override fun onCreate() {
         super.onCreate()
+        UidPocDiagnostics.stage(this, "service.onCreate.enter")
         UidPocDiagnostics.log(this, "SpeedVpnService.onCreate")
+        UidPocDiagnostics.stage(this, "service.onCreate.before_register_network_callback")
         registerPhysicalNetworkCallback()
+        UidPocDiagnostics.stage(this, "service.onCreate.return")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -208,13 +213,16 @@ class SpeedVpnService : VpnService() {
             .setOngoing(true)
             .setContentIntent(open)
             .build()
+        UidPocDiagnostics.stage(this, "foreground.startForeground.begin api=${Build.VERSION.SDK_INT}")
         ServiceCompat.startForeground(
             this, NOTIF_ID, notification,
             if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0,
         )
+        UidPocDiagnostics.stage(this, "foreground.startForeground.return")
     }
 
     private suspend fun connect() = stateMutex.withLock {
+        UidPocDiagnostics.stage(this, "connect.enter")
         if (destroying.get()) return@withLock
 
         val currentStatus = VpnRuntime.state.value.status
@@ -278,23 +286,35 @@ class SpeedVpnService : VpnService() {
         // trigger a VPN generation rebuild because the VPN-facing resolver is fixed.
         val dnsServers = listOf(InetAddress.getByName(MAP_DNS_V4))
 
+        UidPocDiagnostics.stage(this, "TUN.Builder.begin session=$mySession mtu=${compatibility.mtu}")
         val pfd = try {
             val builder = Builder()
-                .setSession("SpeedVPN")
+            UidPocDiagnostics.stage(this, "TUN.Builder.created session=$mySession")
+            builder.setSession("SpeedVPN")
                 .setMtu(compatibility.mtu)
                 .setUnderlyingNetworks(physicalNetwork?.let { arrayOf(it) } ?: emptyArray())
-                .addAddress(TUN_V4, 32)
-                .addRoute("0.0.0.0", 0)
+            UidPocDiagnostics.stage(this, "TUN.addAddress.v4.begin address=$TUN_V4")
+            builder.addAddress(TUN_V4, 32)
+            UidPocDiagnostics.stage(this, "TUN.addAddress.v4.return")
+            UidPocDiagnostics.stage(this, "TUN.addRoute.v4.begin route=0.0.0.0/0")
+            builder.addRoute("0.0.0.0", 0)
+            UidPocDiagnostics.stage(this, "TUN.addRoute.v4.return")
                 // Feed Android the actual DNS servers from the current physical link.
                 // No public resolver is hard-coded.
-                .apply { dnsServers.forEach { addDnsServer(it) } }
-                .apply {
+            UidPocDiagnostics.stage(this, "TUN.addDnsServer.begin count=${dnsServers.size}")
+            builder.apply { dnsServers.forEach { addDnsServer(it) } }
+            UidPocDiagnostics.stage(this, "TUN.addDnsServer.return")
+            builder.apply {
                     if (compatibility.ipv6Enabled) {
+                        UidPocDiagnostics.stage(this@SpeedVpnService, "TUN.addAddress.v6.begin address=$TUN_V6")
                         addAddress(TUN_V6, 128)
+                        UidPocDiagnostics.stage(this@SpeedVpnService, "TUN.addAddress.v6.return")
+                        UidPocDiagnostics.stage(this@SpeedVpnService, "TUN.addRoute.v6.begin route=::/0")
                         addRoute("::", 0)
+                        UidPocDiagnostics.stage(this@SpeedVpnService, "TUN.addRoute.v6.return")
                     }
                 }
-                .apply {
+            builder.apply {
                     // Quota-blocked apps are enforced independently from the manual App Firewall.
                     val quotaBlocked = VpnAppControl.quotaBlockedPackages(this@SpeedVpnService)
                     val manualBlocked = if (firewall.firewallEnabled) {
@@ -379,7 +399,8 @@ class SpeedVpnService : VpnService() {
                     // continues to exclude SpeedVPN itself.
                 }
 
-            builder.establish()
+            UidPocDiagnostics.stage(this, "TUN.establish.begin session=$mySession")
+            builder.establish().also { UidPocDiagnostics.stage(this, "TUN.establish.return session=$mySession success=${it != null}") }
         } catch (e: IllegalStateException) {
             failLocked(e.message ?: "Unable to establish VPN interface", e)
             return@withLock
@@ -417,8 +438,10 @@ class SpeedVpnService : VpnService() {
         SpeedLimitStore.applyToLimiter(this)
         log("Restored local speed limits before native data plane start")
 
+        UidPocDiagnostics.stage(this, "tunnel.startNativeIfCurrent.begin session=$mySession config=${conf.absolutePath}")
         log("Starting hev tunnel")
         val started = startNativeIfCurrent(mySession, pfd, conf.absolutePath)
+        UidPocDiagnostics.stage(this, "tunnel.startNativeIfCurrent.return session=$mySession started=$started")
         if (!started) {
             // A stale session must not be turned into a new global error. Clean only
             // this instance's detached resources; owner-aware native cleanup will not
@@ -1022,20 +1045,27 @@ class SpeedVpnService : VpnService() {
             SpeedLimiter.beginSession(newGeneration)
         }
         val started = runCatching {
-            if (BuildConfig.DEBUG) {
-                UidPocDiagnostics.log(this, "JNI_HOOK_REGISTER_BEGIN generation=$newGeneration")
+            UidPocDiagnostics.stage(this, "JNI.setup.begin generation=$newGeneration hookEnabled=$ENABLE_UID_POC_JNI_HOOK fd=${expectedTun.fd}")
+            UidPocDiagnostics.stage(this, "JNI.diagnosticPath.set.begin")
+            val diagnosticPathSet = TProxyService.TProxySetDiagnosticPath(UidPocDiagnostics.nativeDirectoryPath(this))
+            UidPocDiagnostics.stage(this, "JNI.diagnosticPath.set.return success=$diagnosticPathSet")
+            check(diagnosticPathSet) { "Unable to configure native POC diagnostic path" }
+            if (BuildConfig.DEBUG && ENABLE_UID_POC_JNI_HOOK) {
+                UidPocDiagnostics.stage(this, "JNI.hook.register.begin generation=$newGeneration")
                 val diagnostic = uidDetectionPoc ?: UidDetectionPoc(this).also {
                     uidDetectionPoc = it
                 }
                 val callbackRegistered = TProxyService.TProxySetUidPocCallback(diagnostic)
-                UidPocDiagnostics.log(this, "JNI_HOOK_REGISTER_RETURN registered=$callbackRegistered")
+                UidPocDiagnostics.stage(this, "JNI.hook.register.return registered=$callbackRegistered")
                 check(callbackRegistered) {
                     "Unable to register temporary UID detection callback"
                 }
             }
-            UidPocDiagnostics.log(this, "JNI_NATIVE_START_BEGIN generation=$newGeneration fd=${expectedTun.fd}")
+            UidPocDiagnostics.stage(this, "JNI.nativeStart.begin generation=$newGeneration fd=${expectedTun.fd}")
+            UidPocDiagnostics.stage(this, "JNI.TProxyStartService.begin generation=$newGeneration config=$configPath fd=${expectedTun.fd}")
             val nativeStarted = TProxyService.TProxyStartService(configPath, expectedTun.fd)
-            UidPocDiagnostics.log(this, "JNI_NATIVE_START_RETURN started=$nativeStarted")
+            UidPocDiagnostics.stage(this, "JNI.TProxyStartService.return started=$nativeStarted")
+            UidPocDiagnostics.stage(this, "JNI.nativeStart.return generation=$newGeneration started=$nativeStarted")
             nativeStarted
         }.getOrElse {
             UidPocDiagnostics.error(this, "JNI/native startup raised a throwable", it)

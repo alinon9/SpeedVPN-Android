@@ -14,7 +14,7 @@
 6. افتح Chrome وWhatsApp وYouTube ونفّذ نشاطًا يولّد حركة مرور في كل تطبيق.
 7. ارجع إلى التطبيق. كل بطاقة تعرض `packageName`، البروتوكول TCP/UDP، `srcIp:srcPort → dstIp:dstPort`، UID والحالة.
 8. اضغط **تصدير النتائج** واحفظ CSV ثم أرسله للفحص. زر **مسح السجل** يحذف النتائج المعروضة.
-9. إذا انهار التطبيق، افتحه مجددًا واختر **تصدير Log** و**تصدير Crash** (إذا توفر الملف)، ثم أرفق الملفين في المحادثة. يمكن أيضًا العثور على المسار الظاهر أعلى الشاشة داخل مجلد التطبيق `Android/data/com.speedvpn.app/files/uid-poc-diagnostics` متى أتاح مدير الملفات الوصول إليه.
+9. إذا انهار التطبيق، افتحه مجددًا واختر **تصدير Log** و**تصدير Crash** (إذا توفر الملف)، ثم أرفق الملفين في المحادثة. يمكن أيضًا العثور على المسار الظاهر أعلى الشاشة داخل مجلد التطبيق `Android/data/com.speedvpn.app.uidpoc/files/uid-poc-diagnostics` متى أتاح مدير الملفات الوصول إليه.
 10. على Android 13+ اسمح بالإشعارات كي يظهر إشعار بمسار ملف الانهيار. تصدير الملفات من داخل الشاشة لا يعتمد على إذن الإشعارات.
 
 ## تفسير الحالات
@@ -58,3 +58,25 @@
 - الملفات في مساحة تخزين خاصة بالتطبيق حتى لا يحتاج POC إلى صلاحية تخزين واسعة. استخدم زري التصدير لاختيار مكان واضح مثل Downloads.
 - `Thread.setDefaultUncaughtExceptionHandler` لا يستطيع اعتراض انهيار native قاتل مثل `SIGSEGV`؛ في هذه الحالة قد لا يتولد ملف Crash منفصل، لكن آخر علامات Log المحفوظة قبل نداء JNI/native ستبقى في ملف Log.
 - إذا انهار التطبيق قبل ظهور الشاشة، ثبّت APK الجديد من أحدث تشغيل للـ workflow ثم افتحه مجددًا لتصدير سجل المحاولة الجديدة أو السابقة.
+
+## Native crash isolation — A/B builds on a physical device
+
+The isolated workflow `.github/workflows/uid-detection-poc.yml` builds two APKs from this branch and uploads them as `SpeedVPN-UID-POC-Crash-AB`: Both debug APKs use application ID `com.speedvpn.app.uidpoc`, keeping them isolated from the production package `com.speedvpn.app`.
+
+- `uid-poc-no-jni-hook.apk`: starts the same VPN/native tunnel, but does not register or invoke the Java packet callback.
+- `uid-poc-with-jni-hook.apk`: registers the temporary callback and calls `ConnectivityManager.getConnectionOwnerUid()` for eligible TCP/UDP tuples.
+
+Install and test **one APK at a time** on the same device and network. Export the diagnostic log before uninstalling the first APK, then install the second APK and repeat the exact same steps. Both builds share the same package ID, so they replace each other rather than installing side-by-side.
+
+The POC now records synchronous Kotlin lifecycle markers before/after foreground startup, `Builder`, IPv4/IPv6 `addAddress` / `addRoute`, DNS setup, `establish()`, JNI diagnostic setup, callback registration, and `TProxyStartService`. The native side maintains a stage trace and a last-stage file before key tunnel initialization phases.
+
+Files are accessible with **Export Log** and **Export Crash** in the diagnostic screen:
+- `SpeedVPN-POC-Log.txt` — Kotlin/Java timeline and attached native-stage excerpts.
+- `SpeedVPN-POC-Crash.txt` — uncaught Java/Kotlin exception, if any.
+- `SpeedVPN-POC-Native-Crash.txt` — signal, fault address, PC/LR/SP where supported, best-effort native address backtrace, and last C phase.
+- `SpeedVPN-POC-Last-Stage.txt` — most recent Kotlin stage persisted before the operation.
+- `SpeedVPN-POC-Native-Stage.txt` and `SpeedVPN-POC-Native-Last-Stage.txt` — native phase history and last native phase.
+
+The signal handler attempts to chain the Android-installed fatal-signal handler so Android can still produce its system tombstone. The native text trace is supplementary; collect `adb logcat -b crash -d` / the device tombstone too when available.
+
+**Acceptance is runtime-based, not build-based:** (A) with hook disabled, the VPN must establish/start the native engine without crashing; (B) with hook enabled, the VPN must remain alive and a traffic test must produce at least one non-negative UID from `getConnectionOwnerUid()`. A crash log without a valid UID is diagnostic progress, not proof that UID detection works.

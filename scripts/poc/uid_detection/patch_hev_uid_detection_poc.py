@@ -36,6 +36,8 @@ extern void hev_jni_uid_poc_packet (int protocol,
                                      int src_port,
                                      const unsigned char *dst, int dst_len,
                                      int dst_port);
+extern void hev_jni_uid_poc_stage (const char *stage);
+static atomic_int uid_poc_first_packet_seen;
 
 /* Diagnostic parser only: outgoing IP packets as they enter lwIP from Android TUN.
  * IPv6 extension headers and non-initial IPv4 fragments are deliberately skipped. */
@@ -92,6 +94,8 @@ uid_poc_report_packet (const struct pbuf *buf)
 
     src_port = ((unsigned int) l4[0] << 8) | l4[1];
     dst_port = ((unsigned int) l4[2] << 8) | l4[3];
+    if (!atomic_exchange_explicit (&uid_poc_first_packet_seen, 1, memory_order_relaxed))
+        hev_jni_uid_poc_stage ("hev.uid_poc.first_packet_callback");
     hev_jni_uid_poc_packet (protocol, src, src_len, src_port,
                             dst, src_len, dst_port);
 }
@@ -124,6 +128,7 @@ task_io_yielder (HevTaskYieldType type, void *data)
             + "static pthread_mutex_t uid_poc_mutex = PTHREAD_MUTEX_INITIALIZER;\n"
             + "static jobject uid_poc_callback;\n"
             + "static jmethodID uid_poc_method;\n"
+            + "static atomic_int uid_poc_enabled;\n"
             + END + "\n",
             1,
         )
@@ -172,6 +177,7 @@ native_set_uid_poc_callback (JNIEnv *env, jobject thiz, jobject callback)
     previous = uid_poc_callback;
     uid_poc_callback = replacement;
     uid_poc_method = method;
+    atomic_store_explicit (&uid_poc_enabled, replacement ? 1 : 0, memory_order_release);
     pthread_mutex_unlock (&uid_poc_mutex);
 
     if (previous)
@@ -191,6 +197,8 @@ hev_jni_uid_poc_packet (int protocol,
     jbyteArray src_array = NULL, dst_array = NULL;
     jint status;
 
+    if (!atomic_load_explicit (&uid_poc_enabled, memory_order_acquire))
+        return;
     if (!java_vm)
         return;
     status = (*java_vm)->GetEnv (java_vm, (void **) &env, JNI_VERSION_1_4);
