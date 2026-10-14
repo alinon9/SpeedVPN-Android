@@ -57,6 +57,8 @@ class SpeedVpnService : VpnService() {
         private const val EXTRA_EXPECTED_GENERATION = "expected_generation"
         private const val EXTRA_START_REQUEST_ID = "start_request_id"
         private const val NOTIF_ID = 1
+        // Diagnostic isolation: keep the JNI UID callback disabled until native startup is proven stable.
+        private const val ENABLE_UID_POC_JNI_HOOK = false
         private const val HEALTH_INTERVAL_MS = 30_000L
         private const val UPSTREAM_PROBE_TIMEOUT_MS = 3_000
         private const val UPSTREAM_PROBE_IP_1 = "1.1.1.1"
@@ -278,20 +280,30 @@ class SpeedVpnService : VpnService() {
         // trigger a VPN generation rebuild because the VPN-facing resolver is fixed.
         val dnsServers = listOf(InetAddress.getByName(MAP_DNS_V4))
 
+        UidPocDiagnostics.log(this, "TUN_BUILDER_BEGIN session=$mySession mtu=${compatibility.mtu} physicalNetwork=$physicalNetwork")
         val pfd = try {
             val builder = Builder()
-                .setSession("SpeedVPN")
+            UidPocDiagnostics.log(this, "TUN_BUILDER_CREATED session=$mySession")
+            builder.setSession("SpeedVPN")
                 .setMtu(compatibility.mtu)
                 .setUnderlyingNetworks(physicalNetwork?.let { arrayOf(it) } ?: emptyArray())
-                .addAddress(TUN_V4, 32)
-                .addRoute("0.0.0.0", 0)
+            UidPocDiagnostics.log(this, "TUN_ADD_ADDRESS_V4_BEGIN address=$TUN_V4")
+            builder.addAddress(TUN_V4, 32)
+            UidPocDiagnostics.log(this, "TUN_ADD_ADDRESS_V4_RETURN")
+            UidPocDiagnostics.log(this, "TUN_ADD_ROUTE_V4_BEGIN route=0.0.0.0/0")
+            builder.addRoute("0.0.0.0", 0)
+            UidPocDiagnostics.log(this, "TUN_ADD_ROUTE_V4_RETURN")
                 // Feed Android the actual DNS servers from the current physical link.
                 // No public resolver is hard-coded.
                 .apply { dnsServers.forEach { addDnsServer(it) } }
                 .apply {
                     if (compatibility.ipv6Enabled) {
+                        UidPocDiagnostics.log(this@SpeedVpnService, "TUN_ADD_ADDRESS_V6_BEGIN address=$TUN_V6")
                         addAddress(TUN_V6, 128)
+                        UidPocDiagnostics.log(this@SpeedVpnService, "TUN_ADD_ADDRESS_V6_RETURN")
+                        UidPocDiagnostics.log(this@SpeedVpnService, "TUN_ADD_ROUTE_V6_BEGIN route=::/0")
                         addRoute("::", 0)
+                        UidPocDiagnostics.log(this@SpeedVpnService, "TUN_ADD_ROUTE_V6_RETURN")
                     }
                 }
                 .apply {
@@ -379,7 +391,8 @@ class SpeedVpnService : VpnService() {
                     // continues to exclude SpeedVPN itself.
                 }
 
-            builder.establish()
+            UidPocDiagnostics.log(this, "TUN_ESTABLISH_BEGIN session=$mySession")
+            builder.establish().also { UidPocDiagnostics.log(this, "TUN_ESTABLISH_RETURN session=$mySession success=${it != null}") }
         } catch (e: IllegalStateException) {
             failLocked(e.message ?: "Unable to establish VPN interface", e)
             return@withLock
@@ -1022,7 +1035,8 @@ class SpeedVpnService : VpnService() {
             SpeedLimiter.beginSession(newGeneration)
         }
         val started = runCatching {
-            if (BuildConfig.DEBUG) {
+            UidPocDiagnostics.log(this, "JNI_SETUP_BEGIN generation=$newGeneration hookEnabled=$ENABLE_UID_POC_JNI_HOOK fd=${expectedTun.fd}")
+            if (BuildConfig.DEBUG && ENABLE_UID_POC_JNI_HOOK) {
                 UidPocDiagnostics.log(this, "JNI_HOOK_REGISTER_BEGIN generation=$newGeneration")
                 val diagnostic = uidDetectionPoc ?: UidDetectionPoc(this).also {
                     uidDetectionPoc = it
@@ -1034,8 +1048,10 @@ class SpeedVpnService : VpnService() {
                 }
             }
             UidPocDiagnostics.log(this, "JNI_NATIVE_START_BEGIN generation=$newGeneration fd=${expectedTun.fd}")
+            UidPocDiagnostics.log(this, "JNI_TUNNEL_START_BEGIN generation=$newGeneration config=$configPath fd=${expectedTun.fd}")
             val nativeStarted = TProxyService.TProxyStartService(configPath, expectedTun.fd)
             UidPocDiagnostics.log(this, "JNI_NATIVE_START_RETURN started=$nativeStarted")
+            UidPocDiagnostics.log(this, "JNI_TUNNEL_START_RETURN generation=$newGeneration started=$nativeStarted")
             nativeStarted
         }.getOrElse {
             UidPocDiagnostics.error(this, "JNI/native startup raised a throwable", it)
