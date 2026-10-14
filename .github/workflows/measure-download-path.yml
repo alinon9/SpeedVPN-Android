@@ -1,11 +1,6 @@
 name: Measure Download Path
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - scripts/e2e/run-download-unlimited.sh
   workflow_dispatch:
     inputs:
       measurement_timeout_seconds:
