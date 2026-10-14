@@ -15,8 +15,8 @@ import statistics
 from collections import defaultdict
 from pathlib import Path
 
+TIMESTAMP_RE = re.compile(r"(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)")
 PACKET_RE = re.compile(
-    r"(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+).*?\bIP\s+"
     r"(?P<src>(?:\d{1,3}\.){3}\d{1,3})\.(?P<sport>\d+)\s+>\s+"
     r"(?P<dst>(?:\d{1,3}\.){3}\d{1,3})\.(?P<dport>\d+):\s+Flags\s+"
     r"\[(?P<flags>[^\]]+)\]"
@@ -50,8 +50,8 @@ def main() -> int:
     capture = capture_path.read_text(errors="replace") if capture_path.exists() else ""
     logcat = logcat_path.read_text(errors="replace") if logcat_path.exists() else ""
     packet_lines = capture.splitlines()
-    first_packet = next((PACKET_RE.search(line) for line in packet_lines if PACKET_RE.search(line)), None)
-    year = int(first_packet.group("ts")[:4]) if first_packet else dt.datetime.now().year
+    first_timestamp = next((TIMESTAMP_RE.search(line) for line in packet_lines if TIMESTAMP_RE.search(line)), None)
+    year = int(first_timestamp.group("ts")[:4]) if first_timestamp else dt.datetime.now().year
 
     target_ips = set(FLOW_IP_RE.findall(logcat))
     phase_starts: list[dt.datetime] = []
@@ -72,14 +72,20 @@ def main() -> int:
 
     pending: dict[tuple[str, int, str, int], tuple[dt.datetime, str]] = {}
     matches: list[tuple[dt.datetime, str, str, int, str, int, float]] = []
+    current_timestamp: dt.datetime | None = None
     for line in packet_lines:
+        time_match = TIMESTAMP_RE.search(line)
+        if time_match:
+            try:
+                current_timestamp = dt.datetime.fromisoformat(time_match.group("ts"))
+            except ValueError:
+                current_timestamp = None
         match = PACKET_RE.search(line)
-        if not match:
+        # tcpdump -vvv prints packet timestamps on a header line and the TCP
+        # 4-tuple/flags on the following indented line. Carry that timestamp across.
+        if not match or current_timestamp is None:
             continue
-        try:
-            timestamp = dt.datetime.fromisoformat(match.group("ts"))
-        except ValueError:
-            continue
+        timestamp = current_timestamp
         src, dst = match.group("src"), match.group("dst")
         sport, dport = int(match.group("sport")), int(match.group("dport"))
         flags = match.group("flags")
