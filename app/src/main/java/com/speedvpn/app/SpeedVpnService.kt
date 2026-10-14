@@ -304,7 +304,7 @@ class SpeedVpnService : VpnService() {
             UidPocDiagnostics.stage(this, "TUN.addDnsServer.begin count=${dnsServers.size}")
             builder.apply { dnsServers.forEach { addDnsServer(it) } }
             UidPocDiagnostics.stage(this, "TUN.addDnsServer.return")
-                .apply {
+            builder.apply {
                     if (compatibility.ipv6Enabled) {
                         UidPocDiagnostics.stage(this@SpeedVpnService, "TUN.addAddress.v6.begin address=$TUN_V6")
                         addAddress(TUN_V6, 128)
@@ -314,7 +314,7 @@ class SpeedVpnService : VpnService() {
                         UidPocDiagnostics.stage(this@SpeedVpnService, "TUN.addRoute.v6.return")
                     }
                 }
-                .apply {
+            builder.apply {
                     // Quota-blocked apps are enforced independently from the manual App Firewall.
                     val quotaBlocked = VpnAppControl.quotaBlockedPackages(this@SpeedVpnService)
                     val manualBlocked = if (firewall.firewallEnabled) {
