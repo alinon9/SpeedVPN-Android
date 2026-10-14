@@ -36,10 +36,12 @@ internal class UidDetectionPoc(
 
     private val connectivity = service.getSystemService(ConnectivityManager::class.java)
     private val packageManager = service.packageManager
+    // These are present in the Google Play emulator image used by the POC workflow.
+    // The workflow launches each app while the local VPN is active to generate distinct UID traffic.
     private val targets = listOf(
         "com.android.chrome",
-        "com.whatsapp",
-        "com.google.android.youtube", // Replace with an installed third-party test app if absent.
+        "com.google.android.youtube",
+        "com.android.vending",
     )
     private val expectedUidPackages: Map<Int, List<String>> = targets
         .mapNotNull { pkg ->
