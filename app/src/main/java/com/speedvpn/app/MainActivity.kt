@@ -57,6 +57,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -120,6 +121,8 @@ class MainActivity : ComponentActivity() {
     }
     private val notifPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
     private val usageAccessState = mutableStateOf(false)
+    // Refresh the installed-app catalog whenever the Activity resumes.
+    private val appCatalogRefreshTrigger = mutableStateOf(0)
     private val showVpnDisclosure = mutableStateOf(false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -171,6 +174,7 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         usageAccessState.value = AppTrafficManager.hasUsageAccess(this)
+        appCatalogRefreshTrigger.value += 1
         VpnRuntime.update { it.copy(permissionGranted = VpnService.prepare(this) == null) }
     }
 
@@ -873,10 +877,11 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun AppsScreen(s: Snapshot) {
         val usageAccess = usageAccessState.value
+        val catalogRefreshVersion = appCatalogRefreshTrigger.value
+        var isLoadingAppCatalog by remember { mutableStateOf(true) }
         var firewallEnabled by remember { mutableStateOf(VpnAppControl.read(this@MainActivity).firewallEnabled) }
         var blockedPackages by remember { mutableStateOf(VpnAppControl.read(this@MainActivity).blockedPackages) }
         var apps by remember { mutableStateOf<List<AppTrafficUsage>>(emptyList()) }
-        var appCatalog by remember { mutableStateOf<List<android.content.pm.ApplicationInfo>>(emptyList()) }
         var policies by remember { mutableStateOf<Map<String, AppPolicy>>(emptyMap()) }
         var quotaPolicies by remember { mutableStateOf<Map<String, List<AppQuotaPolicy>>>(emptyMap()) }
         var appQuery by remember { mutableStateOf("") }
@@ -884,22 +889,34 @@ class MainActivity : ComponentActivity() {
         var editingSpeedApp by remember { mutableStateOf<AppTrafficUsage?>(null) }
         var statsEnabled by remember { mutableStateOf(SmartSettings.isStatsEnabled(this@MainActivity)) }
 
-        LaunchedEffect(Unit) {
-            appCatalog = withContext(Dispatchers.IO) {
-                AppTrafficManager.installedLaunchableApps(this@MainActivity)
+        LaunchedEffect(s.connectedAtMillis, s.status, usageAccess, statsEnabled, catalogRefreshVersion) {
+            isLoadingAppCatalog = true
+            val installedApps = try {
+                withContext(Dispatchers.IO) {
+                    AppTrafficManager.installedLaunchableApps(this@MainActivity)
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                emptyList()
             }
-            apps = appCatalog.map { app ->
-                AppTrafficUsage(
-                    packageName = app.packageName,
-                    label = app.loadLabel(packageManager).toString(),
-                    uid = app.uid,
-                    downloadBytes = 0L,
-                    uploadBytes = 0L,
-                )
-            }
-        }
 
-        LaunchedEffect(s.connectedAtMillis, s.status, usageAccess, statsEnabled) {
+            // Publish the complete installed-app list before collecting usage statistics.
+            // The catalog and usage refresh share one coroutine so an initial empty catalog
+            // can never overwrite the freshly loaded list.
+            apps = withContext(Dispatchers.IO) {
+                installedApps.map { app ->
+                    AppTrafficUsage(
+                        packageName = app.packageName,
+                        label = app.loadLabel(packageManager).toString(),
+                        uid = app.uid,
+                        downloadBytes = 0L,
+                        uploadBytes = 0L,
+                    )
+                }
+            }
+            isLoadingAppCatalog = false
+
             while (isActive) {
                 apps = withContext(Dispatchers.IO) {
                     if (statsEnabled && usageAccess) UsageCollector.collectToday(this@MainActivity)
@@ -907,7 +924,7 @@ class MainActivity : ComponentActivity() {
                         UsageRepository.topUsage(this@MainActivity, UsageDate.today(), 100)
                             .associateBy { it.packageName }
                     } else emptyMap()
-                    appCatalog.map { app ->
+                    installedApps.map { app ->
                         val row = usageByPackage[app.packageName]
                         AppTrafficUsage(
                             packageName = app.packageName,
@@ -988,8 +1005,15 @@ class MainActivity : ComponentActivity() {
                 val shownApps = apps.filter {
                     appQuery.isBlank() || it.label.contains(appQuery, true) || it.packageName.contains(appQuery, true)
                 }
-                if (shownApps.isEmpty()) {
-                    Text("لا توجد بيانات بعد. فعّل الإحصاءات ومنح Usage Access.", color = TextSecondary, fontSize = 11.sp)
+                if (isLoadingAppCatalog) {
+                    Text("جارٍ تحميل التطبيقات المثبّتة...", color = TextSecondary, fontSize = 11.sp)
+                } else if (shownApps.isEmpty()) {
+                    val emptyMessage = if (appQuery.isBlank()) {
+                        "لم يتم العثور على تطبيقات مثبّتة قابلة للتشغيل."
+                    } else {
+                        "لا توجد تطبيقات تطابق البحث."
+                    }
+                    Text(emptyMessage, color = TextSecondary, fontSize = 11.sp)
                 } else {
                     shownApps.forEach { app ->
                         val policy = policies[app.packageName]
