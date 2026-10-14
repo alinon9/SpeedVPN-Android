@@ -57,24 +57,31 @@ The latest nine-run investigation recorded:
 
 These observations support substantial CI/environment measurement variability, but they do **not** turn the results from runs #7 or #8 into policy passes: both are below the unchanged 80% Unlimited threshold. Run #9 is above the threshold. CI must continue reporting the measured outcome and must not lower the product threshold to accommodate unstable baselines.
 
-### Verified directly in the current main source
+### Reconciled source audit (2026-10-14)
 
-- **19 choices:** MainActivity defines 10 slow, 5 medium, 3 fast finite presets and a separate Unlimited choice.
-- **Broken pipe handling (partial):** Socks5Server contains a SOCKS relay path that preserves the reverse response flow for an upload-side Broken pipe.
-- **Preflight fields:** verify_metrics.py declares both `baseline_preflight_download_value` and `baseline_preflight_upload_value` and reports `PREFLIGHT_FIELDS_CAPTURED=2/2`.
-- **Unlimited policy:** the main-source verification policy still uses the 80% retention floor (equivalent to the existing 20% tolerance for Unlimited).
+The earlier source-audit subsection below this heading has been superseded by the post-merge verification. Its statements that the low-rate policy, upload flush recovery, and OkHttp request-body counter/test were absent, and that PRs #15 and #16 were still open, are stale.
 
-### Source-level discrepancies that prevent claiming full implementation closure
+Verified in current main at the closure audit:
 
-The PR #18 description says several earlier fixes were included, but the current source at the time of this audit does not contain all of those implementations. This discrepancy is recorded rather than silently assuming that a PR description proves the code is present.
+- **19 choices:** 18 finite speed presets plus Unlimited are present. No plan was removed.
+- **75/100 KB/s low-rate policy:** `SpeedVerificationPolicy.kt` contains `setOf(600L, 800L)`; the 1.0× baseline floor applies to those low-rate plans only, while the other finite plans retain 1.2× headroom.
+- **Upload final-flush recovery:** `SpeedTestEngine.kt` contains `isRecoverableCompletedUploadFlushFailure`; it permits only the scoped final-flush `Broken pipe` / `Connection reset` condition when the entire declared body is written and the buffer is empty. A successful HTTP response remains required for a sample.
+- **OkHttp body byte accounting:** `EventListener.requestBodyEnd(call, byteCount)` and `UploadBodyByteCounter` exist in `SpeedTestEngine.kt`.
+- **Regression test:** `app/src/test/java/com/speedvpn/app/UploadByteAccountingTest.kt` is present and runs with `RobolectricTestRunner`, API 35.
+- **SOCKS5 Broken pipe handling:** the main relay preserves the reverse response flow for the scoped upload-side Broken pipe / half-close path.
 
-- **75/100 KB/s policy — NOT verified in main:** the 75 KB/s and 100 KB/s presets exist in the UI, but SpeedVerificationPolicy.kt still applies the 1.2× headroom multiplier to every finite plan and has no special 600/800 Kbps headroom exception. PR #14 remains open.
-- **2 MB/s upload Connection reset handling — NOT verified in main:** Socks5Server.kt contains the Broken pipe preservation path, but its active upload-write preservation condition does not include the explicit Connection reset branch described by PR #14. PR #14 remains open.
-- **Completed-upload final-flush recovery — NOT verified in main:** SpeedTestEngine.kt does not contain the narrowly scoped final-flush recovery checks described in PR #15. PR #15 remains open.
-- **OkHttp completed request-body byte counter — NOT verified in main:** SpeedTestEngine.kt does not contain `EventListener.requestBodyEnd(call, byteCount)` / `UploadBodyByteCounter`, and `app/src/test/java/com/speedvpn/app/UploadByteAccountingTest.kt` is not present on main. PR #16 remains open.
+### Remaining source-level exception
 
-The above are source-audit findings, not application code changes. In keeping with the requested guardrails, this closure did not edit app code, weaken thresholds, remove presets, or merge any additional PR. The diagnostic PRs #19 and #20 were closed without merging after the investigation was documented. The implementation items above must not be reported as complete until main is reconciled and the relevant tests are present.
+The explicit SOCKS5 active-upload-write `Connection reset` reverse-flow preservation condition is **not verified in current main**. The error classifier recognizes connection reset as a network event, but that is not equivalent to preserving the reverse flow for the requested active upload-write case. Keep [PR #13](https://github.com/alinon9/SpeedVPN-Android/pull/13) open for this isolated follow-up. This closure did not modify application code or merge another PR.
 
-### Future validation
+### Final workflow evidence (2026-10-14)
 
-Run the 19-preset × 2-direction sweep on a suitably provisioned self-hosted runner or manually on real Android devices and a controlled network. Record repeated baseline samples and raw Download/Upload results. Keep HTTP response-header delay as a separate performance item and retain the existing 80%, ±20%, and headroom policies.
+- [Build #452](https://github.com/alinon9/SpeedVPN-Android/actions/runs/38553740084): success on PR #22's head.
+- [Android E2E #199](https://github.com/alinon9/SpeedVPN-Android/actions/runs/38553740094): success on PR #22's head; its accepted `ENV_INSUFFICIENT` result is an environmental outcome, not evidence of a complete 38-measurement sweep.
+- [Build #454 on main](https://github.com/alinon9/SpeedVPN-Android/actions/runs/38555920128): success on `f53ebb9`.
+- [Speed Limit Sweep #147 on main](https://github.com/alinon9/SpeedVPN-Android/actions/runs/38555919975): success on `f53ebb9`.
+- Post-merge [Android E2E #201](https://github.com/alinon9/SpeedVPN-Android/actions/runs/38555919968) was still in progress at the time of this audit and is not recorded here as a pass.
+
+PR #22 merged as `a41c4dc35db21ac06d60ce2a4efbe9232df7980f`. PR #15 and PR #16 have since been **closed without merging** because the related flush-recovery and upload-accounting implementation/tests are present in main. PRs #14, #19, and #20 are closed without merging; PRs #6, #7, #9, #10, and #12 remain open pre-existing feature/diagnostic work and were not altered during this finalization.
+
+For project status and the full source checklist, see [FINAL_PROJECT_CLOSURE_REPORT.md](https://github.com/alinon9/SpeedVPN-Android/blob/main/FINAL_PROJECT_CLOSURE_REPORT.md).
