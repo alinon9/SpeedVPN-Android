@@ -71,6 +71,8 @@ android {
 
     buildTypes {
         debug {
+            // Keep POC APKs isolated from the production SpeedVPN package.
+            applicationIdSuffix = ".uidpoc"
             // Only the CI Debug APK can target the runner-local deterministic fixture.
             buildConfigField("String", "SPEED_TEST_BASE_URL", "\"$configuredSpeedTestBaseUrl\"")
         }
