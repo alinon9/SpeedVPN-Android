@@ -146,6 +146,7 @@ class SpeedVpnService : VpnService() {
     private var meter: Job? = null
     private var healthMonitor: Job? = null
     private var quotaMonitor: Job? = null
+    @Volatile private var uidDetectionPoc: UidDetectionPoc? = null
     private val upstreamProbeDnsExecutor: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "vpn-upstream-dns").apply { isDaemon = true }
     }
@@ -1019,6 +1020,14 @@ class SpeedVpnService : VpnService() {
             SpeedLimiter.beginSession(newGeneration)
         }
         val started = runCatching {
+            if (BuildConfig.DEBUG) {
+                val diagnostic = uidDetectionPoc ?: UidDetectionPoc(this).also {
+                    uidDetectionPoc = it
+                }
+                check(TProxyService.TProxySetUidPocCallback(diagnostic)) {
+                    "Unable to register temporary UID detection callback"
+                }
+            }
             TProxyService.TProxyStartService(configPath, expectedTun.fd)
         }.getOrElse {
             logE("Native start threw an exception", it)
@@ -1053,6 +1062,13 @@ class SpeedVpnService : VpnService() {
                 }
                 if (endLimiterSession) SpeedLimiter.endSession(expectedGeneration)
                 return@synchronized false
+            }
+
+            if (BuildConfig.DEBUG) {
+                runCatching { TProxyService.TProxySetUidPocCallback(null) }
+                    .onFailure { logE("Unable to clear temporary UID detection callback", it) }
+                uidDetectionPoc?.close()
+                uidDetectionPoc = null
             }
 
             val stopReported = runCatching { TProxyService.TProxyStopService() }
