@@ -44,13 +44,13 @@ internal object UidPocDiagnostics {
     }
 
     /** The native handler writes to this exact app-private directory. */
-    fun nativeDirectoryPath(context: Context): String = directory(context).absolutePath
+    fun nativeDirectoryPath(context: Context): String = nativeDirectory(context).absolutePath
 
     fun logFile(context: Context): File = File(directory(context), "SpeedVPN-POC-Log.txt")
     fun crashFile(context: Context): File = File(directory(context), "SpeedVPN-POC-Crash.txt")
-    fun nativeCrashFile(context: Context): File = File(directory(context), "SpeedVPN-POC-Native-Crash.txt")
-    fun nativeStageFile(context: Context): File = File(directory(context), "SpeedVPN-POC-Native-Stage.txt")
-    fun nativeLastStageFile(context: Context): File = File(directory(context), "SpeedVPN-POC-Native-Last-Stage.txt")
+    fun nativeCrashFile(context: Context): File = File(nativeDirectory(context), "SpeedVPN-POC-Native-Crash.txt")
+    fun nativeStageFile(context: Context): File = File(nativeDirectory(context), "SpeedVPN-POC-Native-Stage.txt")
+    fun nativeLastStageFile(context: Context): File = File(nativeDirectory(context), "SpeedVPN-POC-Native-Last-Stage.txt")
     fun lastStageFile(context: Context): File = File(directory(context), "SpeedVPN-POC-Last-Stage.txt")
 
     fun hasCrashFile(context: Context): Boolean =
@@ -60,14 +60,14 @@ internal object UidPocDiagnostics {
 
     fun readLog(context: Context): String = buildString {
         append(readFile(logFile(context)))
-        appendSection("Kotlin last stage", readFile(lastStageFile(context)))
-        appendSection("Native stage trace", readFile(nativeStageFile(context)))
-        appendSection("Native last stage", readFile(nativeLastStageFile(context)))
+        appendSection(this, "Kotlin last stage", readFile(lastStageFile(context)))
+        appendSection(this, "Native stage trace", readFile(nativeStageFile(context)))
+        appendSection(this, "Native last stage", readFile(nativeLastStageFile(context)))
     }.ifBlank { "لا يوجد سجل محفوظ بعد: ${logFile(context).absolutePath}" }
 
     fun readCrash(context: Context): String = buildString {
-        appendSection("Java/Kotlin uncaught exception", readFile(crashFile(context)))
-        appendSection("Native fatal signal", readFile(nativeCrashFile(context)))
+        appendSection(this, "Java/Kotlin uncaught exception", readFile(crashFile(context)))
+        appendSection(this, "Native fatal signal", readFile(nativeCrashFile(context)))
     }.ifBlank { "لا يوجد ملف انهيار محفوظ بعد. راجع ${nativeLastStageFile(context).absolutePath}" }
 
     fun pathsText(context: Context): String =
@@ -112,12 +112,12 @@ internal object UidPocDiagnostics {
         postCrashNotification(context, crashPath.absolutePath, logFile(context).absolutePath)
     }
 
-    private fun appendSection(title: String, contents: String) {
+    private fun appendSection(target: StringBuilder, title: String, contents: String) {
         if (contents.isNotBlank()) {
-            append("===== $title =====\n")
-            append(contents)
-            if (!contents.endsWith("\n")) append('\n')
-            append('\n')
+            target.append("===== $title =====\n")
+            target.append(contents)
+            if (!contents.endsWith("\n")) target.append('\n')
+            target.append('\n')
         }
     }
 
@@ -149,10 +149,13 @@ internal object UidPocDiagnostics {
         }
     }
 
+    private fun nativeDirectory(context: Context): File =
+        File(context.filesDir, "uid-poc-diagnostics").also { it.mkdirs() }
+
     private fun directory(context: Context): File {
         val external = runCatching { context.getExternalFilesDir("uid-poc-diagnostics") }.getOrNull()
         if (external != null && (external.isDirectory || external.mkdirs()) && external.canWrite()) return external
-        return File(context.filesDir, "uid-poc-diagnostics").also { it.mkdirs() }
+        return nativeDirectory(context)
     }
 
     private fun postCrashNotification(context: Context, crashPath: String, logPath: String) {
