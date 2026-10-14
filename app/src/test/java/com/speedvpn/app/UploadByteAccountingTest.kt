@@ -58,7 +58,7 @@ class UploadByteAccountingTest {
                         "Connection: close",
                         "",
                         "",
-                    ).joinToString("\\r\\n")
+                    ).joinToString("\r\n")
                     socket.getOutputStream().apply {
                         write(response.toByteArray(StandardCharsets.ISO_8859_1))
                         flush()
