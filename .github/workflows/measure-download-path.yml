@@ -162,7 +162,7 @@ jobs:
       - name: Run Download Unlimited diagnostic
         shell: bash
         env:
-          MEASURE_TIMEOUT: ${{ inputs.measurement_timeout_seconds }}
+          MEASURE_TIMEOUT: ${{ inputs.measurement_timeout_seconds || '900' }}
         run: |
           set +e
           PACKAGE=com.speedvpn.app OUT_DIR=artifacts/download-path \
