@@ -27,6 +27,12 @@ internal object UidPocDiagnostics {
         appendLog(context, line)
     }
 
+    fun error(context: Context, message: String, throwable: Throwable? = null) {
+        Log.e(TAG, message, throwable)
+        val details = if (throwable == null) "" else "\n${throwable.stackTraceToString()}"
+        appendLog(context, "${timestamp()} E/$TAG: $message$details\n")
+    }
+
     /** Persist a last-stage marker before the risky operation. */
     fun stage(context: Context, message: String) {
         val line = "${timestamp()} STAGE: $message\n"
