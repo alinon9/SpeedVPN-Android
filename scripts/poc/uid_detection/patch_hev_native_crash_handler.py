@@ -36,6 +36,7 @@ def main() -> None:
             raise SystemExit(f"Missing pinned hev source file: {required}")
 
     jni_includes = r'''
+#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdint.h>
@@ -151,7 +152,7 @@ uid_poc_native_signal_handler (int signal_number, siginfo_t *info, void *context
         UidPocCrashTrace trace;
         ucontext_t *uc = (ucontext_t *) context;
 
-        uid_poc_write_all (fd, "\n*** NATIVE FATAL SIGNAL ***\n", 29);
+        uid_poc_write_all (fd, "\n*** NATIVE FATAL SIGNAL ***\n", sizeof ("\n*** NATIVE FATAL SIGNAL ***\n") - 1);
         uid_poc_write_all (fd, "signal=", 7);
         /* Signal numbers are small positive integers; emit decimal without snprintf. */
         {
@@ -206,13 +207,13 @@ uid_poc_native_signal_handler (int signal_number, siginfo_t *info, void *context
 #endif
 
         uid_poc_write_all (fd,
-            "best_effort_native_backtrace_addresses:\n", 39);
+            "best_effort_native_backtrace_addresses:\n", sizeof ("best_effort_native_backtrace_addresses:\n") - 1);
         trace.fd = fd;
         trace.count = 0;
         /* Best effort only in a fatal signal handler; see Android tombstone for symbols. */
         (void) _Unwind_Backtrace (uid_poc_collect_frame, &trace);
         uid_poc_write_all (fd,
-            "end_native_backtrace; consult Android tombstone/logcat for full symbols\n", 69);
+            "end_native_backtrace; consult Android tombstone/logcat for full symbols\n", sizeof ("end_native_backtrace; consult Android tombstone/logcat for full symbols\n") - 1);
         (void) fsync (fd);
     }
 
@@ -293,7 +294,7 @@ uid_poc_open_diagnostics (const char *directory, int reset_trace)
         (void) lseek (uid_poc_native_trace_fd, 0, SEEK_SET);
     }
     uid_poc_native_crash_fd = open (uid_poc_crash_path,
-        O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        O_WRONLY | O_CREAT | (reset_trace ? O_TRUNC : O_APPEND) | O_CLOEXEC, 0600);
 
     return uid_poc_native_trace_fd >= 0 && uid_poc_native_crash_fd >= 0;
 }
@@ -324,7 +325,7 @@ native_set_diagnostic_path (JNIEnv *env, jobject thiz, jstring directory)
     path = (*env)->GetStringUTFChars (env, directory, NULL);
     if (!path)
         return JNI_FALSE;
-    ok = uid_poc_open_diagnostics (path, 1);
+    ok = uid_poc_open_diagnostics (path, 0);
     (*env)->ReleaseStringUTFChars (env, directory, path);
     if (ok) {
         hev_jni_uid_poc_stage ("JNI diagnostics path configured");
