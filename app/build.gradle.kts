@@ -32,6 +32,9 @@ android {
         versionCode = 30
         versionName = "1.1.1"
 
+        // Isolated UID POC switch; false is the native-startup baseline build.
+        buildConfigField("boolean", "UID_POC_JNI_HOOK", uidPocJniHook.toString())
+
         // Public values only (same ones the website uses). No secrets here.
         buildConfigField("String", "API_BASE", "\"${System.getenv("SPEEDVPN_API_BASE") ?: "https://read-fix-build-magic.lovable.app/api/public/vpn"}\"")
         buildConfigField("String", "AUTH_URL", "\"${System.getenv("SPEEDVPN_AUTH_URL") ?: "https://abzykxcudjnceqdqurrc.supabase.co/auth/v1"}\"")
