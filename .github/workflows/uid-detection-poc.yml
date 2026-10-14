@@ -1,25 +1,26 @@
-name: UID Detection POC (Real Device APK)
+name: UID Detection POC — Native Crash A/B (Physical Device APKs)
 
 on:
   push:
     branches:
       - poc/uid-detection-test
+      - poc/vpn-native-crash-diagnostic
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: uid-detection-poc-real-device-${{ github.ref }}
+  group: uid-detection-poc-crash-ab-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build-poc-apk:
-    name: Build diagnostic APK for a physical Android device
+  build-poc-ab-apks:
+    name: Build no-hook and JNI-hook diagnostic APKs
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
     steps:
-      - name: Checkout isolated POC branch
+      - name: Checkout isolated POC branch only
         uses: actions/checkout@v4
         with:
           ref: ${{ github.ref }}
@@ -48,33 +49,44 @@ jobs:
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/30.0.16248370" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/30.0.16248370" >> "$GITHUB_ENV"
 
-      - name: Prepare pinned native tunnel and apply POC-only hook
+      - name: Prepare pinned native tunnel and POC-only diagnostic patches
         shell: bash
         run: |
           set -euo pipefail
           test -x ./gradlew
           bash ./setup.sh
           test "$(git -C app/src/main/jni/hev-socks5-tunnel rev-parse HEAD)" = 'd9dca26c7ad0e494492244f0309e80ee583e739e'
+          python3 scripts/poc/uid_detection/patch_hev_native_crash_handler.py app/src/main/jni/hev-socks5-tunnel
           bash -n setup.sh
           python3 -m py_compile scripts/poc/uid_detection/patch_hev_uid_detection_poc.py
+          python3 -m py_compile scripts/poc/uid_detection/patch_hev_native_crash_handler.py
 
-      - name: Build diagnostic APK
+      - name: Build baseline APK (JNI packet callback disabled)
         shell: bash
         run: |
           set -euo pipefail
-          ./gradlew --no-daemon --stacktrace :app:assembleDebug
+          mkdir -p artifacts
+          ./gradlew --no-daemon --stacktrace :app:assembleDebug -PuidPocJniHook=false
           APK="app/build/outputs/apk/debug/app-debug.apk"
           test -s "$APK"
-          sha256sum "$APK" | tee apk-sha256.txt
+          cp "$APK" artifacts/uid-poc-no-jni-hook.apk
+          sha256sum artifacts/uid-poc-no-jni-hook.apk | tee artifacts/uid-poc-no-jni-hook.sha256
 
-      # Keep this immediately after the build so no test/device setup can block delivery.
-      - name: Upload diagnostic APK
+      - name: Build comparison APK (JNI packet callback enabled)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon --stacktrace :app:assembleDebug -PuidPocJniHook=true
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+          test -s "$APK"
+          cp "$APK" artifacts/uid-poc-with-jni-hook.apk
+          sha256sum artifacts/uid-poc-with-jni-hook.apk | tee artifacts/uid-poc-with-jni-hook.sha256
+
+      - name: Upload both POC APKs and checksums
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: SpeedVPN-UID-Detection-POC
-          path: |
-            app/build/outputs/apk/debug/app-debug.apk
-            apk-sha256.txt
-          if-no-files-found: warn
+          name: SpeedVPN-UID-POC-Crash-AB
+          path: artifacts/*
+          if-no-files-found: error
           retention-days: 14
