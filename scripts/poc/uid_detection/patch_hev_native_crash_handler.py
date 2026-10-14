@@ -64,7 +64,25 @@ static char uid_poc_crash_path[PATH_MAX];
 static int uid_poc_native_trace_fd = -1;
 static int uid_poc_native_crash_fd = -1;
 static volatile sig_atomic_t uid_poc_native_crashing;
+static struct sigaction uid_poc_old_sigsegv;
+static struct sigaction uid_poc_old_sigabrt;
+static struct sigaction uid_poc_old_sigbus;
+static struct sigaction uid_poc_old_sigill;
+static struct sigaction uid_poc_old_sigfpe;
 static char uid_poc_last_stage[UID_POC_STAGE_CAP] = "JNI_OnLoad.begin";
+
+static struct sigaction *
+uid_poc_previous_action (int signal_number)
+{
+    switch (signal_number) {
+    case SIGSEGV: return &uid_poc_old_sigsegv;
+    case SIGABRT: return &uid_poc_old_sigabrt;
+    case SIGBUS:  return &uid_poc_old_sigbus;
+    case SIGILL:  return &uid_poc_old_sigill;
+    case SIGFPE:  return &uid_poc_old_sigfpe;
+    default: return NULL;
+    }
+}
 
 static void
 uid_poc_write_all (int fd, const char *buffer, size_t length)
@@ -217,8 +235,28 @@ uid_poc_native_signal_handler (int signal_number, siginfo_t *info, void *context
         (void) fsync (fd);
     }
 
-    /* SA_RESETHAND restores the default action. Re-deliver to this thread so
-       Android's debuggerd can still collect its native tombstone. */
+    /* Restore and chain the handler that Android installed before this POC
+       handler, so debuggerd can still produce the authoritative tombstone. */
+    {
+        struct sigaction *previous = uid_poc_previous_action (signal_number);
+        if (previous) {
+            struct sigaction action = *previous;
+            (void) sigaction (signal_number, &action, NULL);
+            if (action.sa_handler != SIG_DFL && action.sa_handler != SIG_IGN) {
+                if (action.sa_flags & SA_SIGINFO)
+                    action.sa_sigaction (signal_number, info, context);
+                else
+                    action.sa_handler (signal_number);
+            } else {
+                struct sigaction default_action;
+                memset (&default_action, 0, sizeof (default_action));
+                sigemptyset (&default_action.sa_mask);
+                default_action.sa_handler = SIG_DFL;
+                (void) sigaction (signal_number, &default_action, NULL);
+            }
+        }
+    }
+
     (void) syscall (SYS_tgkill, syscall (SYS_getpid), syscall (SYS_gettid),
                     signal_number);
     _exit (128 + signal_number);
@@ -307,12 +345,12 @@ uid_poc_install_crash_handlers (void)
     memset (&action, 0, sizeof (action));
     sigemptyset (&action.sa_mask);
     action.sa_sigaction = uid_poc_native_signal_handler;
-    action.sa_flags = SA_SIGINFO | SA_RESETHAND;
-    (void) sigaction (SIGSEGV, &action, NULL);
-    (void) sigaction (SIGABRT, &action, NULL);
-    (void) sigaction (SIGBUS, &action, NULL);
-    (void) sigaction (SIGILL, &action, NULL);
-    (void) sigaction (SIGFPE, &action, NULL);
+    action.sa_flags = SA_SIGINFO;
+    (void) sigaction (SIGSEGV, &action, &uid_poc_old_sigsegv);
+    (void) sigaction (SIGABRT, &action, &uid_poc_old_sigabrt);
+    (void) sigaction (SIGBUS, &action, &uid_poc_old_sigbus);
+    (void) sigaction (SIGILL, &action, &uid_poc_old_sigill);
+    (void) sigaction (SIGFPE, &action, &uid_poc_old_sigfpe);
 }
 
 static jboolean
