@@ -36,6 +36,8 @@ extern void hev_jni_uid_poc_packet (int protocol,
                                      int src_port,
                                      const unsigned char *dst, int dst_len,
                                      int dst_port);
+extern void hev_jni_uid_poc_stage (const char *stage);
+static atomic_int uid_poc_first_packet_seen;
 
 /* Diagnostic parser only: outgoing IP packets as they enter lwIP from Android TUN.
  * IPv6 extension headers and non-initial IPv4 fragments are deliberately skipped. */
@@ -92,6 +94,8 @@ uid_poc_report_packet (const struct pbuf *buf)
 
     src_port = ((unsigned int) l4[0] << 8) | l4[1];
     dst_port = ((unsigned int) l4[2] << 8) | l4[3];
+    if (!atomic_exchange_explicit (&uid_poc_first_packet_seen, 1, memory_order_relaxed))
+        hev_jni_uid_poc_stage ("hev.uid_poc.first_packet_callback");
     hev_jni_uid_poc_packet (protocol, src, src_len, src_port,
                             dst, src_len, dst_port);
 }
