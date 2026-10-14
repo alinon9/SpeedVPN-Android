@@ -131,12 +131,16 @@ object SpeedVerificationEngine {
                             SpeedTestEngine.minimumRequiredSampleBytes(planDownloadKbps, verificationProfile = true)
                         val minimumUploadBytes =
                             SpeedTestEngine.minimumRequiredSampleBytes(planUploadKbps, verificationProfile = true)
+                        val uploadPayloadBytesWritten = vpn.uploadPayloadBytesWritten
+                        val uploadEvidence =
+                            uploadPayloadBytesWritten >= minimumUploadBytes && relayUploadBytes > 0L
                         Log.i(
                             TAG,
                             "Tunnel byte evidence download=" + relayDownloadBytes + "/" + minimumDownloadBytes +
-                                " upload=" + relayUploadBytes + "/" + minimumUploadBytes +
+                                " uploadRelay=" + relayUploadBytes +
+                                " uploadPayloadWritten=" + uploadPayloadBytesWritten + "/" + minimumUploadBytes +
                                 " downloadEvidence=" + (relayDownloadBytes >= minimumDownloadBytes) +
-                                " uploadEvidence=" + (relayUploadBytes >= minimumUploadBytes),
+                                " uploadEvidence=" + uploadEvidence,
                         )
 
                         if (vpn.downloadBps == null && vpn.uploadBps == null) {
@@ -169,17 +173,21 @@ object SpeedVerificationEngine {
                             } else {
                                 downloadEvaluation
                             }
-                            val upload = if (
-                                vpn.uploadBps != null && relayUploadBytes < minimumUploadBytes
-                            ) {
-                                uploadEvaluation.copy(
-                                    status = SpeedVerificationStatus.NOT_VERIFIABLE,
-                                    accuracyPercent = null,
-                                    reason = "لم يثبت مرور بيانات قياس Upload عبر مرحّل VPN: " +
-                                        relayUploadBytes + "/" + minimumUploadBytes + " بايت.",
-                                )
-                            } else {
-                                uploadEvaluation
+                            val upload = when {
+                                vpn.uploadBps != null && uploadPayloadBytesWritten < minimumUploadBytes ->
+                                    uploadEvaluation.copy(
+                                        status = SpeedVerificationStatus.NOT_VERIFIABLE,
+                                        accuracyPercent = null,
+                                        reason = "لم تكتمل كتابة حمولة Upload عبر OkHttp: " +
+                                            uploadPayloadBytesWritten + "/" + minimumUploadBytes + " بايت.",
+                                    )
+                                vpn.uploadBps != null && relayUploadBytes <= 0L ->
+                                    uploadEvaluation.copy(
+                                        status = SpeedVerificationStatus.NOT_VERIFIABLE,
+                                        accuracyPercent = null,
+                                        reason = "لم تُرصد بايتات Upload عبر مرحّل VPN (relay=0).",
+                                    )
+                                else -> uploadEvaluation
                             }
 
                             result = SpeedVerificationResult(
