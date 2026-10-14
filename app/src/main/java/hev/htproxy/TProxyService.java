@@ -23,6 +23,9 @@ public final class TProxyService {
     /** Temporary POC JNI hook. Present only on poc/uid-detection-test. */
     public static native boolean TProxySetUidPocCallback(Object callback);
 
+    /** POC-only native crash diagnostics path, located under app-private filesDir. */
+    public static native boolean TProxySetDiagnosticPath(String directory);
+
     /** [txPackets, txBytes, rxPackets, rxBytes] */
     public static native long[] TProxyGetStats();
 }
