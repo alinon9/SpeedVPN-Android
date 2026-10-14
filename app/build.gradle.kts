@@ -4,6 +4,11 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+val uidPocJniHook = providers.gradleProperty("uidPocJniHook")
+    .orNull
+    ?.toBooleanStrictOrNull()
+    ?: false
+
 val configuredSpeedTestBaseUrl = providers.gradleProperty("speedTestBaseUrl")
     .orNull
     ?.trim()
