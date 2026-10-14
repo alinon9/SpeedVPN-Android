@@ -1,6 +1,5 @@
 package com.speedvpn.app
 
-import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.os.Build
 import android.os.Process
@@ -31,7 +30,7 @@ internal class UidDetectionPoc(
         val dstPort: Int,
     ) {
         override fun toString(): String =
-            "${when (protocol) { IPPROTO_TCP -> "TCP"; IPPROTO_UDP -> "UDP"; else -> protocol.toString() }}|" +
+            "${when (protocol) { 6 -> "TCP"; 17 -> "UDP"; else -> protocol.toString() }}|" +
                 "$src|$srcPort|$dst|$dstPort"
     }
 
