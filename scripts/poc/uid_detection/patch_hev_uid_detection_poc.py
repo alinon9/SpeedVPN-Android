@@ -1045,6 +1045,21 @@ native_is_running (JNIEnv *env, jobject thiz)
     # exists from an earlier invocation of this patcher).
     jni_text = jni_c.read_text()
 
+    # Refuse to produce an APK if the asynchronous worker or actual native DROP path
+    # was lost in a source update. Logging-only UID observation is not enforcement.
+    required_native_markers = (
+        "AttachCurrentThread (java_vm, &env, NULL)",
+        "DetachCurrentThread (java_vm)",
+        "UID_WORKER_READY stack=1048576",
+        "uid_poc_store_result_locked",
+        "PACKET_DROP uid=%d",
+        "if (uid_poc_report_packet (buf))",
+    )
+    for marker in required_native_markers:
+        source = tunnel_c.read_text() if marker == "if (uid_poc_report_packet (buf))" else jni_text
+        if marker not in source:
+            raise SystemExit(f"Refusing incomplete UID firewall patch: missing native marker: {marker}")
+
     # The UID worker attaches to the JVM once per worker lifetime and detaches on exit.
     # The Java PFD remains owned by Service, but Native now duplicates the descriptor:
     # closing/collecting the Java wrapper cannot invalidate the FD used by HEV.

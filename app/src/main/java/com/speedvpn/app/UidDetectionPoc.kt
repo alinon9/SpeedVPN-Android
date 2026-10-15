@@ -112,18 +112,34 @@ internal class UidDetectionPoc(
 ) : TProxyService.UidPocCallback, AutoCloseable {
     private val connectivity = service.getSystemService(ConnectivityManager::class.java)
     private val packageManager = service.packageManager
-    // MATCH_TARGET intentionally means an app that this POC must block.
-    // Other apps retain the existing Android/VpnApplicationPolicy firewall behavior.
-    private val targets = listOf(
-        "com.whatsapp",
-        "com.whatsapp.w4b",
+    private data class BlockPolicySnapshot(
+        val packages: Set<String>,
+        val uids: Set<Int>,
+        val packagesByUid: Map<Int, Set<String>>,
     )
-    private val expectedUidPackages: Map<Int, List<String>> = targets
-        .mapNotNull { pkg ->
-            runCatching { packageManager.getApplicationInfo(pkg, 0).uid to pkg }.getOrNull()
-        }
-        .groupBy({ it.first }, { it.second })
+
+    @Volatile private var blockedUids: Set<Int> = emptySet()
+    @Volatile private var blockedPackages: Set<String> = emptySet()
+    @Volatile private var blockPolicy = BlockPolicySnapshot(emptySet(), emptySet(), emptyMap())
     private val nativeCallbackSequence = AtomicLong(0L)
+
+    internal fun updateBlockedPackages(packages: Set<String>) {
+        val normalized = packages.toSet()
+        val byUid = normalized.mapNotNull { pkg ->
+            runCatching { pkg to packageManager.getApplicationInfo(pkg, 0).uid }
+                .getOrNull()
+        }.filter { it.second > 0 }
+            .groupBy({ it.second }, { it.first })
+            .mapValues { (_, names) -> names.toSet() }
+        val nextUids = byUid.keys
+        blockPolicy = BlockPolicySnapshot(normalized, nextUids, byUid)
+        blockedPackages = normalized
+        blockedUids = nextUids
+        Log.i(TAG, "BLOCK_POLICY_UPDATED packages=${normalized.sorted().joinToString(",")} uids=${nextUids.sorted().joinToString(",")}")
+    }
+
+    internal fun isUidBlocked(uid: Int): Boolean =
+        uid > 0 && blockedUids.contains(uid)
 
     init {
         Log.i(TAG, "START Android API=${Build.VERSION.SDK_INT}; package=${service.packageName}")
@@ -131,11 +147,7 @@ internal class UidDetectionPoc(
             service,
             "UidDetectionPoc.init; API=${Build.VERSION.SDK_INT}; package=${service.packageName}; resolver=dedicated-native-worker",
         )
-        targets.forEach { pkg ->
-            val expected = runCatching { packageManager.getApplicationInfo(pkg, 0).uid }
-                .getOrNull()
-            Log.i(TAG, "EXPECTED package=$pkg uid=${expected ?: "NOT_INSTALLED"}")
-        }
+        updateBlockedPackages(service.currentBlockedPackages())
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
             Log.w(TAG, "UNSUPPORTED getConnectionOwnerUid requires Android 10 / API 29+")
             UidPocDiagnostics.log(service, "UNSUPPORTED: getConnectionOwnerUid requires API 29+")
@@ -236,16 +248,18 @@ internal class UidDetectionPoc(
         } else {
             packageManager.getPackagesForUid(uid)?.sorted().orEmpty()
         }
-        val knownPackages = (packages + expectedUidPackages[uid].orEmpty()).distinct().sorted()
-        val targetMatch = expectedUidPackages[uid]?.joinToString(",") ?: "-"
+        val policy = blockPolicy
+        val policyPackagesForUid = policy.packagesByUid[uid].orEmpty()
+        val knownPackages = (packages + policyPackagesForUid).distinct().sorted()
+        val blockedPackageMatches = knownPackages.filter { it in policy.packages }
+        val shouldBlock = uid != Process.INVALID_UID && uid in policy.uids
+        val targetMatch = blockedPackageMatches.joinToString(",").ifBlank { "-" }
         val verdict = when {
             uid == Process.INVALID_UID -> "INVALID_UID"
-            targetMatch != "-" -> "MATCH_TARGET"
+            shouldBlock -> "BLOCKED_UID"
             else -> "UID_FOUND_OTHER_OR_UNLISTED"
         }
-        val shouldBlock = uid != Process.INVALID_UID &&
-            (targetMatch != "-" || knownPackages.any { it in BLOCKED_PACKAGES })
-        val action = if (shouldBlock) "BLOCK" else "OBSERVE_ONLY"
+        val action = if (shouldBlock) "BLOCK" else "ALLOW"
         UidDetectionPocResultStore.add(
             protocol, src, srcPort, dst, dstPort, uid, knownPackages,
             if (uid == Process.INVALID_UID) "INVALID" else "MATCH",
@@ -261,6 +275,23 @@ internal class UidDetectionPoc(
             service,
             "OWNER_UID_QUERY_RESULT id=$callId verdict=$verdict uid=$uid packages=${knownPackages.joinToString(",").ifBlank { "-" }} action=$action packetBlocking=IMPLEMENTED",
         )
+        if (uid != Process.INVALID_UID) {
+            service.recordDetectedFlow(protocol, src, srcPort, dst, dstPort, uid, knownPackages)
+        }
+        if (shouldBlock) {
+            Log.w(TAG, "BLOCKED_UID uid=$uid packages=${blockedPackageMatches.joinToString(",").ifBlank { "-" }} tuple=$tuple")
+            service.enforceBlockedDetectedFlow(
+                protocol = protocol,
+                srcIp = src,
+                srcPort = srcPort,
+                dstIp = dst,
+                dstPort = dstPort,
+                uid = uid,
+                packages = knownPackages,
+                policyBlockedPackages = blockedPackageMatches,
+                permanent = false,
+            )
+        }
         return UidResolution(uid, verdict, shouldBlock)
     }
 
@@ -307,7 +338,6 @@ internal class UidDetectionPoc(
 
     private companion object {
         const val TAG = "UidDetectionPOC"
-        val BLOCKED_PACKAGES = setOf("com.whatsapp", "com.whatsapp.w4b")
         const val IPPROTO_TCP = 6
         const val IPPROTO_UDP = 17
     }

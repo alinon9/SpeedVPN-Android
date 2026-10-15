@@ -76,6 +76,16 @@ jobs:
           grep -Fq 'long onTunPacket(' app/src/main/java/hev/htproxy/TProxyService.java
           grep -Fq '): Long {' app/src/main/java/com/speedvpn/app/UidDetectionPoc.kt
           grep -Fq '"com.whatsapp.w4b"' app/src/main/java/com/speedvpn/app/UidDetectionPoc.kt
+          grep -Fq 'BLOCKED_UID uid=' app/src/main/java/com/speedvpn/app/UidDetectionPoc.kt
+          grep -Fq 'blockedUids: Set<Int>' app/src/main/java/com/speedvpn/app/UidDetectionPoc.kt
+          grep -Fq 'blockedUids(context: Context, blockedPackages: Set<String>)' app/src/main/java/com/speedvpn/app/VpnApplicationPolicy.kt
+          grep -Fq 'addDisallowedApplication(packageName)' app/src/main/java/com/speedvpn/app/SpeedVpnService.kt
+          grep -Fq 'addRoute("::", 0)' app/src/main/java/com/speedvpn/app/SpeedVpnService.kt
+          if grep -Fq 'addAllowedApplication(' app/src/main/java/com/speedvpn/app/SpeedVpnService.kt; then
+            echo "::error::Runtime VPN routing must not use an application allow-list."
+            exit 1
+          fi
+          grep -Fq 'globalDestinationBlock=false' app/src/main/java/com/speedvpn/app/Socks5Server.kt
           grep -Fq '(I[BI[BI)J' "$JNI_C"
           if grep -Fq 'task_lwip_io = hev_task_new (131072);' "$TUNNEL_C"; then
             echo "::error::The HEV coroutine stack is still enlarged for JNI. JNI must only run on the dedicated worker."
