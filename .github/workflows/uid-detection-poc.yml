@@ -69,9 +69,14 @@ jobs:
           grep -Fq 'UID_WORKER_READY stack=1048576' "$JNI_C"
           grep -Fq 'HIT_RATE=%.2f%%' "$JNI_C"
           grep -Fq 'uid_poc_find_slot_locked' "$JNI_C"
-          grep -Fq 'uid_poc_report_packet (buf);' "$TUNNEL_C"
+          grep -Fq 'if (uid_poc_report_packet (buf))' "$TUNNEL_C"
+          grep -Fq 'pbuf_free (buf);' "$TUNNEL_C"
+          grep -Fq 'PACKET_DROP uid=%d' "$JNI_C"
+          grep -Fq 'packetBlocking=IMPLEMENTED' "$JNI_C"
           grep -Fq 'int onTunPacket(' app/src/main/java/hev/htproxy/TProxyService.java
-          grep -Fq '): Int {' app/src/main/java/com/speedvpn/app/UidDetectionPoc.kt
+          grep -Fq '): Long {' app/src/main/java/com/speedvpn/app/UidDetectionPoc.kt
+          grep -Fq '"com.whatsapp.w4b"' app/src/main/java/com/speedvpn/app/UidDetectionPoc.kt
+          grep -Fq '(I[BI[BI)J' "$JNI_C"
           if grep -Fq 'task_lwip_io = hev_task_new (131072);' "$TUNNEL_C"; then
             echo "::error::The HEV coroutine stack is still enlarged for JNI. JNI must only run on the dedicated worker."
             exit 1
