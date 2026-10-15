@@ -91,6 +91,7 @@ jobs:
           must_contain 'blockedUids(context: Context, blockedPackages: Set<String>)' app/src/main/java/com/speedvpn/app/VpnApplicationPolicy.kt
           must_contain 'updateBlockedUids(' app/src/main/java/com/speedvpn/app/SpeedVpnService.kt
           must_contain 'BLOCKED_UID_POLICY_UPDATED' app/src/main/java/com/speedvpn/app/Socks5Server.kt
+          must_contain 'killConnectionsForBlockedUids(' app/src/main/java/com/speedvpn/app/Socks5Server.kt
           must_contain 'addDisallowedApplication(packageName)' app/src/main/java/com/speedvpn/app/SpeedVpnService.kt
           must_contain 'addRoute("::", 0)' app/src/main/java/com/speedvpn/app/SpeedVpnService.kt
           if grep -Fq 'addAllowedApplication(' app/src/main/java/com/speedvpn/app/SpeedVpnService.kt; then

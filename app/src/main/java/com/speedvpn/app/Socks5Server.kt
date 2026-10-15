@@ -360,9 +360,30 @@ class Socks5Server(
     private fun untrackUpstream(socket: DatagramSocket) { upstreamUdp.remove(socket); openUdp.remove(socket) }
 
     internal fun updateBlockedUids(uids: Set<Int>) {
-        val normalized = uids.toSet()
+        val normalized = uids.filter { it > 0 }.toSet()
         blockedUids = normalized
+        killConnectionsForBlockedUids(normalized)
         log("BLOCKED_UID_POLICY_UPDATED count=${normalized.size} uids=${normalized.sorted().joinToString(",")}")
+    }
+
+    /**
+     * Close relay sockets whose original flow has a resolved owner in the blocked UID set.
+     * The native per-flow DROP remains authoritative when a SOCKS destination is ambiguous.
+     */
+    internal fun killConnectionsForBlockedUids(blocked: Set<Int>) {
+        val normalized = blocked.filter { it > 0 }.toSet()
+        if (normalized.isEmpty()) return
+        var closedTcp = 0
+        upstreamTcpMetadata.entries.toList().forEach { entry ->
+            val ownerUid = entry.value.uid
+            if (ownerUid != null && ownerUid in normalized) {
+                runCatching { entry.key.close() }
+                untrackUpstream(entry.key)
+                closedTcp++
+            }
+        }
+        activeUdpMuxes.toList().forEach { it.killConnectionsForBlockedUids(normalized) }
+        log("BLOCKED_UID_CONNECTIONS_KILLED uidCount=${normalized.size} tcpClosed=$closedTcp")
     }
 
     private fun endpointKey(protocol: Int, host: String, port: Int): String =
@@ -1146,6 +1167,20 @@ class Socks5Server(
                     flowTuple = binding.tuple,
                     policyPackages = packages,
                 )
+            }
+        }
+
+        fun killConnectionsForBlockedUids(blockedUids: Set<Int>) {
+            synchronized(lock) {
+                val entries = bindings.entries.toList()
+                entries.forEach { entry ->
+                    val binding = entry.value
+                    val uid = binding.uid
+                    if (uid != null && uid in blockedUids) {
+                        bindings.remove(entry.key)
+                        closeBindingLocked(binding)
+                    }
+                }
             }
         }
 
