@@ -28,6 +28,95 @@ def replace_text_once(text: str, old: str, new: str, label: str) -> str:
     return text.replace(old, new, 1)
 
 
+def inject_native_start_step_logs(jni_text: str) -> str:
+    """Inject ordered native startup breadcrumbs into the isolated UID POC JNI source."""
+    if "STEP 1: nativeStart entered" in jni_text:
+        return jni_text
+
+    start = jni_text.find("native_start_service (")
+    if start < 0:
+        raise SystemExit("Refusing unsafe native logging patch: native_start_service anchor missing")
+    body_start = jni_text.find("{", start)
+    if body_start < 0:
+        raise SystemExit("Refusing unsafe native logging patch: native start body missing")
+
+    depth = 0
+    body_end = -1
+    for index in range(body_start, len(jni_text)):
+        char = jni_text[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                body_end = index + 1
+                break
+    if body_end < 0:
+        raise SystemExit("Refusing unsafe native logging patch: unterminated native start function")
+
+    function = jni_text[start:body_end]
+
+    def insert_before(source: str, needle: str, statement: str, label: str) -> str:
+        if source.count(needle) != 1:
+            raise SystemExit(
+                f"Refusing unsafe native logging patch: expected one {label} anchor, "
+                f"found {source.count(needle)}"
+            )
+        index = source.find(needle)
+        line_start = source.rfind("\n", 0, index) + 1
+        line = source[line_start:]
+        indent = line[:len(line) - len(line.lstrip(" \t"))]
+        return source[:line_start] + indent + statement + "\n" + source[line_start:]
+
+    function = insert_before(
+        function,
+        "pthread_mutex_lock (&mutex);",
+        '__android_log_print (ANDROID_LOG_INFO, "SpeedVPN-POC-Native", '
+        '"STEP 1: nativeStart entered, fd=%d", fd);',
+        "native start lock",
+    )
+    function = insert_before(
+        function,
+        "tdata->fd = dup (fd);",
+        '__android_log_print (ANDROID_LOG_INFO, "SpeedVPN-POC-Native", '
+        '"STEP 2: before dup(fd), fd=%d", fd);',
+        "native fd duplication",
+    )
+    function = insert_before(
+        function,
+        "GetStringUTFChars (env, config_path, NULL)",
+        '__android_log_print (ANDROID_LOG_INFO, "SpeedVPN-POC-Native", '
+        '"STEP 3: before hev config path read");',
+        "native config path",
+    )
+    function = insert_before(
+        function,
+        "pthread_create (",
+        '__android_log_print (ANDROID_LOG_INFO, "SpeedVPN-POC-Native", '
+        '"STEP 4: before pthread_create");',
+        "native worker creation",
+    )
+    function = insert_before(
+        function,
+        "return result;",
+        '__android_log_print (ANDROID_LOG_INFO, "SpeedVPN-POC-Native", '
+        '"STEP 6: nativeStart returning result=%d", result == JNI_TRUE ? 1 : 0);',
+        "native start return",
+    )
+    jni_text = jni_text[:start] + function + jni_text[body_end:]
+
+    if jni_text.count("hev_socks5_tunnel_main (tdata->path, tdata->fd);") != 1:
+        raise SystemExit("Refusing unsafe native logging patch: hev main anchor is not unique")
+    needle = "hev_socks5_tunnel_main (tdata->path, tdata->fd);"
+    index = jni_text.find(needle)
+    line_start = jni_text.rfind("\n", 0, index) + 1
+    line = jni_text[line_start:]
+    indent = line[:len(line) - len(line.lstrip(" \t"))]
+    logline = indent + '__android_log_print (ANDROID_LOG_INFO, "SpeedVPN-POC-Native", ' \
+        '"STEP 5: before hev_socks5_tunnel_main");\n'
+    jni_text = jni_text[:line_start] + logline + jni_text[line_start:]
+    return jni_text
+
 def main() -> None:
     if len(sys.argv) != 2:
         raise SystemExit("usage: patch_hev_uid_detection_poc.py <hev-socks5-tunnel-dir>")
@@ -532,9 +621,10 @@ native_is_running (JNIEnv *env, jobject thiz)
         "        free (tdata->path);",
         "pthread_create cleanup",
     )
+    jni_text = inject_native_start_step_logs(jni_text)
     jni_c.write_text(jni_text)
 
-    print("OK - temporary UID detection POC hook applied to pinned hev source")
+    print("OK - temporary UID detection POC hook and native STEP 1-6 logging applied")
 
 
 if __name__ == "__main__":
