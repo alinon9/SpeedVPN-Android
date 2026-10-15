@@ -1022,8 +1022,10 @@ class SpeedVpnService : VpnService() {
             SpeedLimiter.beginSession(newGeneration)
         }
         val started = runCatching {
-            if (BuildConfig.DEBUG) {
-                UidPocDiagnostics.log(this, "JNI_HOOK_REGISTER_BEGIN generation=$newGeneration")
+            val hookDisabled = getSharedPreferences(UidPocSettings.PREFS, MODE_PRIVATE)
+                .getBoolean(UidPocSettings.KEY_DISABLE_JNI_HOOK, false)
+            if (BuildConfig.DEBUG && !hookDisabled) {
+                UidPocDiagnostics.log(this, "JNI_HOOK_REGISTER_BEGIN generation=$newGeneration mode=HOOK_ENABLED")
                 val diagnostic = uidDetectionPoc ?: UidDetectionPoc(this).also {
                     uidDetectionPoc = it
                 }
@@ -1032,6 +1034,12 @@ class SpeedVpnService : VpnService() {
                 check(callbackRegistered) {
                     "Unable to register temporary UID detection callback"
                 }
+            } else if (BuildConfig.DEBUG) {
+                UidPocDiagnostics.log(this, "JNI_HOOK_DISABLED generation=$newGeneration; continuing native start without Kotlin callback")
+                runCatching { TProxyService.TProxySetUidPocCallback(null) }
+                    .onFailure { UidPocDiagnostics.error(this, "Unable to clear UID POC callback in disabled mode", it) }
+                uidDetectionPoc?.close()
+                uidDetectionPoc = null
             }
             UidPocDiagnostics.log(this, "JNI_NATIVE_START_BEGIN generation=$newGeneration fd=${expectedTun.fd}")
             val nativeStarted = TProxyService.TProxyStartService(configPath, expectedTun.fd)
