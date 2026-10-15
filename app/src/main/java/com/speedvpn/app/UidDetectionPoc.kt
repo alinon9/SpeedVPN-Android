@@ -266,6 +266,8 @@ internal class UidDetectionPoc(
                 dstPort = dstPort,
                 uid = uid,
                 packages = packages,
+                policyBlockedPackages = policyBlockedPackages,
+                permanent = targetPackages.isNotEmpty(),
             )
         }
         return UidResolution(uid, shouldBlock)
