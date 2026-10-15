@@ -117,9 +117,176 @@ task_io_yielder (HevTaskYieldType type, void *data)
     # JNI bridge: callback invocations are rate-limited and moved off the TUN thread in Kotlin.
     jni_text = jni_c.read_text()
     if BEGIN not in jni_text:
+        crash_handler = r''' 
+/* SPEEDVPN_NATIVE_CRASH_BEGIN */
+#include <signal.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <dlfcn.h>
+#include <android/log.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+static int native_crash_fd = -1;
+static struct sigaction native_prev_segv;
+static struct sigaction native_prev_abrt;
+static struct sigaction native_prev_bus;
+static struct sigaction native_default_action;
+static volatile sig_atomic_t native_crash_handling = 0;
+static __thread void *native_alt_stack_mem = NULL;
+static __thread int native_alt_stack_ready = 0;
+typedef int (*native_backtrace_fn) (void **, int);
+typedef char **(*native_backtrace_symbols_fn) (void *const *, int);
+static native_backtrace_fn native_backtrace = NULL;
+static native_backtrace_symbols_fn native_backtrace_symbols = NULL;
+
+/* The first low-level write happens before optional symbolization. The latter is not
+ * async-signal-safe; this is diagnostic-only and the original Android handler is chained. */
+static void native_write_text (const char *text)
+{
+    if (native_crash_fd >= 0 && text)
+        (void) write (native_crash_fd, text, strlen (text));
+}
+static void native_write_number (long value)
+{
+    char digits[24];
+    unsigned int count = 0;
+    unsigned long number;
+    if (native_crash_fd < 0) return;
+    if (value < 0) {
+        (void) write (native_crash_fd, "-", 1);
+        number = (unsigned long) (-value);
+    } else number = (unsigned long) value;
+    do {
+        digits[count++] = (char) ('0' + (number % 10));
+        number /= 10;
+    } while (number && count < sizeof (digits));
+    while (count) (void) write (native_crash_fd, &digits[--count], 1);
+}
+
+static void native_install_alt_stack_for_thread (void)
+{
+    stack_t stack;
+    if (native_alt_stack_ready) return;
+    native_alt_stack_mem = malloc (64 * 1024);
+    if (!native_alt_stack_mem) return;
+    stack.ss_sp = native_alt_stack_mem;
+    stack.ss_size = 64 * 1024;
+    stack.ss_flags = 0;
+    if (sigaltstack (&stack, NULL) == 0) native_alt_stack_ready = 1;
+    else { free (native_alt_stack_mem); native_alt_stack_mem = NULL; }
+}
+
+static struct sigaction *native_previous_action (int signal_number)
+{
+    if (signal_number == SIGSEGV) return &native_prev_segv;
+    if (signal_number == SIGABRT) return &native_prev_abrt;
+    if (signal_number == SIGBUS) return &native_prev_bus;
+    return NULL;
+}
+
+static void native_crash_handler (int signal_number, siginfo_t *info, void *context)
+{
+    struct timespec now;
+    struct sigaction *previous;
+    void *frames[32];
+    int frame_count = 0;
+    char **symbols = NULL;
+    int i;
+    if (native_crash_handling) _exit (128 + signal_number);
+    native_crash_handling = 1;
+
+    native_write_text ("\n=== SPEEDVPN POC NATIVE CRASH ===\nsignal=");
+    native_write_number (signal_number);
+    native_write_text (" pid=");
+    native_write_number ((long) getpid ());
+    native_write_text (" tid=");
+    native_write_number ((long) syscall (SYS_gettid));
+    if (clock_gettime (CLOCK_REALTIME, &now) == 0) {
+        native_write_text (" epoch_sec=");
+        native_write_number ((long) now.tv_sec);
+    }
+    if (info) {
+        uintptr_t address = (uintptr_t) info->si_addr;
+        static const char hex[] = "0123456789abcdef";
+        char encoded[2 * sizeof (uintptr_t)];
+        size_t j;
+        for (j = 0; j < sizeof (encoded); j++) {
+            unsigned int shift = (unsigned int) ((sizeof (encoded) - 1 - j) * 4);
+            encoded[j] = hex[(address >> shift) & 0xf];
+        }
+        native_write_text (" addr=0x");
+        if (native_crash_fd >= 0) (void) write (native_crash_fd, encoded, sizeof (encoded));
+    }
+    native_write_text ("\n");
+
+    /* Dynamic resolution avoids a hard link dependency on API levels lacking these symbols. */
+    if (native_backtrace) frame_count = native_backtrace (frames, (int) (sizeof (frames) / sizeof (frames[0])));
+    native_write_text ("backtrace_count=");
+    native_write_number (frame_count);
+    native_write_text ("\n");
+    if (frame_count > 0 && native_backtrace_symbols)
+        symbols = native_backtrace_symbols (frames, frame_count);
+    if (symbols) {
+        for (i = 0; i < frame_count; i++) {
+            native_write_text ("  ");
+            native_write_text (symbols[i]);
+            native_write_text ("\n");
+        }
+    } else native_write_text ("backtrace_symbols unavailable or failed\n");
+    native_write_text ("=== END SPEEDVPN POC NATIVE CRASH ===\n");
+    if (native_crash_fd >= 0) (void) fsync (native_crash_fd);
+    __android_log_print (ANDROID_LOG_FATAL, "SpeedVPN-POC-NativeCrash",
+                         "Captured signal %d; chaining original crash handler", signal_number);
+
+    previous = native_previous_action (signal_number);
+    if (previous && (previous->sa_flags & SA_SIGINFO) &&
+        previous->sa_sigaction && previous->sa_sigaction != native_crash_handler)
+        previous->sa_sigaction (signal_number, info, context);
+    else if (previous && previous->sa_handler != SIG_DFL &&
+             previous->sa_handler != SIG_IGN && previous->sa_handler != NULL)
+        previous->sa_handler (signal_number);
+    (void) sigaction (signal_number, &native_default_action, NULL);
+    (void) syscall (SYS_tgkill, getpid (), syscall (SYS_gettid), signal_number);
+    _exit (128 + signal_number);
+}
+
+static void native_install_crash_handler (void)
+{
+    struct sigaction action;
+    if (native_crash_fd < 0) {
+        native_crash_fd = open (
+            "/data/user/0/com.speedvpn.app/files/uid-poc-diagnostics/Native-Crash.txt",
+            O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+    }
+    native_backtrace = (native_backtrace_fn) dlsym (RTLD_DEFAULT, "backtrace");
+    native_backtrace_symbols = (native_backtrace_symbols_fn) dlsym (RTLD_DEFAULT, "backtrace_symbols");
+    native_install_alt_stack_for_thread ();
+    memset (&native_default_action, 0, sizeof (native_default_action));
+    native_default_action.sa_handler = SIG_DFL;
+    sigemptyset (&native_default_action.sa_mask);
+    memset (&action, 0, sizeof (action));
+    sigemptyset (&action.sa_mask);
+    action.sa_sigaction = native_crash_handler;
+    action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    (void) sigaction (SIGSEGV, &action, &native_prev_segv);
+    (void) sigaction (SIGABRT, &action, &native_prev_abrt);
+    (void) sigaction (SIGBUS, &action, &native_prev_bus);
+}
+__attribute__((constructor)) static void native_poc_crash_init (void)
+{
+    native_install_crash_handler ();
+}
+/* SPEEDVPN_NATIVE_CRASH_END */
+'''
         jni_text = jni_text.replace(
             "static pthread_key_t current_jni_env;\n",
             "static pthread_key_t current_jni_env;\n"
+            + crash_handler + "\n"
             + BEGIN + "\n"
             + "static pthread_mutex_t uid_poc_mutex = PTHREAD_MUTEX_INITIALIZER;\n"
             + "static jobject uid_poc_callback;\n"
@@ -190,9 +357,20 @@ hev_jni_uid_poc_packet (int protocol,
     jmethodID method = NULL;
     jbyteArray src_array = NULL, dst_array = NULL;
     jint status;
+    static unsigned long long callback_sequence = 0;
+    unsigned long long callback_id = __sync_add_and_fetch (&callback_sequence, 1);
+    int log_callback = callback_id <= 16 || (callback_id % 128) == 0;
 
-    if (!java_vm)
+    native_install_alt_stack_for_thread ();
+    if (log_callback)
+        __android_log_print (ANDROID_LOG_DEBUG, "SpeedVPN-POC-JNI",
+                             "C_CALLBACK_ENTRY id=%llu protocol=%d src_port=%d dst_port=%d",
+                             callback_id, protocol, src_port, dst_port);
+    if (!java_vm) {
+        if (log_callback)
+            __android_log_print (ANDROID_LOG_ERROR, "SpeedVPN-POC-JNI", "C_CALLBACK_EXIT id=%llu outcome=no_java_vm", callback_id);
         return;
+    }
     status = (*java_vm)->GetEnv (java_vm, (void **) &env, JNI_VERSION_1_4);
     if (status == JNI_EDETACHED) {
         if ((*java_vm)->AttachCurrentThread (java_vm, &env, NULL) != JNI_OK)
@@ -226,8 +404,21 @@ hev_jni_uid_poc_packet (int protocol,
     (*env)->CallVoidMethod (env, callback, method, (jint) protocol,
                             src_array, (jint) src_port,
                             dst_array, (jint) dst_port);
-    if ((*env)->ExceptionCheck (env))
-        (*env)->ExceptionClear (env);
+    {
+        jboolean exception_pending = (*env)->ExceptionCheck (env);
+        if (log_callback)
+            __android_log_print (exception_pending ? ANDROID_LOG_ERROR : ANDROID_LOG_DEBUG,
+                                 "SpeedVPN-POC-JNI",
+                                 "C_CALLBACK_AFTER_CALL id=%llu exception_pending=%d",
+                                 callback_id, exception_pending ? 1 : 0);
+        if (exception_pending) {
+            (*env)->ExceptionDescribe (env);
+            (*env)->ExceptionClear (env);
+        }
+    }
+    if (log_callback)
+        __android_log_print (ANDROID_LOG_DEBUG, "SpeedVPN-POC-JNI",
+                             "C_CALLBACK_EXIT id=%llu outcome=returned", callback_id);
 
 done:
     if (src_array)
