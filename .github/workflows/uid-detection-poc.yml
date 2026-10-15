@@ -78,6 +78,13 @@ jobs:
           fi
           echo "Verified: native flow cache, dedicated UID worker, bounded queue metrics, and return-UID callback are patched."
 
+      - name: Run JVM regression tests
+        id: test_poc
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon --stacktrace :app:testDebugUnitTest
+
       - name: Build diagnostic APK
         id: build_poc
         shell: bash
