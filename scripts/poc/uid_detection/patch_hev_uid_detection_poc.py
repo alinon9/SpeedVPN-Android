@@ -413,8 +413,8 @@ __attribute__((constructor)) static void native_poc_crash_init (void)
             + "#define UID_POC_NEGATIVE_CACHE_MS 750ULL\n"
             + "#define UID_POC_PENDING_TIMEOUT_MS 10000ULL\n"
             + "typedef struct { int protocol; int addr_len; unsigned char a[16]; unsigned char b[16]; unsigned short port_a; unsigned short port_b; } uid_poc_flow_key;\n"
-            + "typedef struct { int state; uid_poc_flow_key key; int uid; unsigned long long updated_ms; } uid_poc_cache_entry;\n"
-            + "typedef struct { uid_poc_flow_key key; int protocol; int src_len; unsigned char src[16]; int src_port; int dst_len; unsigned char dst[16]; int dst_port; } uid_poc_request;\n"
+            + "typedef struct { int state; uid_poc_flow_key key; int uid; unsigned long long updated_ms; unsigned long long request_id; } uid_poc_cache_entry;\n"
+            + "typedef struct { uid_poc_flow_key key; int protocol; int src_len; unsigned char src[16]; int src_port; int dst_len; unsigned char dst[16]; int dst_port; unsigned long long request_id; } uid_poc_request;\n"
             + "static pthread_mutex_t uid_poc_mutex = PTHREAD_MUTEX_INITIALIZER;\n"
             + "static pthread_cond_t uid_poc_condition = PTHREAD_COND_INITIALIZER;\n"
             + "static jobject uid_poc_callback = NULL;\n"
@@ -425,6 +425,7 @@ __attribute__((constructor)) static void native_poc_crash_init (void)
             + "static unsigned int uid_poc_active_flows = 0;\n"
             + "static pthread_t uid_poc_worker_thread;\n"
             + "static int uid_poc_worker_started = 0, uid_poc_worker_ready = 0, uid_poc_worker_stop_requested = 0;\n"
+            + "static volatile unsigned long long uid_poc_next_request_id = 0;\n"
             + "static volatile unsigned long long uid_poc_packets = 0, uid_poc_cache_hits = 0, uid_poc_cache_misses = 0;\n"
             + "static volatile unsigned long long uid_poc_pending_hits = 0, uid_poc_unique_requests = 0, uid_poc_jni_lookups = 0;\n"
             + "static volatile unsigned long long uid_poc_queue_full = 0, uid_poc_lookup_failures = 0;\n"
@@ -597,30 +598,20 @@ uid_poc_evict_oldest_locked (void)
 
 static void
 uid_poc_store_result_locked (const uid_poc_flow_key *key, int uid,
-                             unsigned long long now)
+                             unsigned long long now,
+                             unsigned long long request_id)
 {
     int found = 0;
     int slot = uid_poc_find_slot_locked (key, now, &found);
-    if (slot < 0) {
-        uid_poc_evict_oldest_locked ();
-        slot = uid_poc_find_slot_locked (key, now, &found);
-    }
-    if (slot < 0)
+    uid_poc_cache_entry *entry;
+    /* Do not let a slow/expired request overwrite a newer request for the same tuple. */
+    if (slot < 0 || !found)
         return;
-    if (!found) {
-        if (uid_poc_active_flows >= UID_POC_MAX_FLOWS) {
-            uid_poc_evict_oldest_locked ();
-            slot = uid_poc_find_slot_locked (key, now, &found);
-            if (slot < 0)
-                return;
-        }
-        if (!found)
-            uid_poc_active_flows++;
-    }
-    uid_poc_cache[slot].state = UID_POC_CACHE_USED;
-    uid_poc_cache[slot].key = *key;
-    uid_poc_cache[slot].uid = uid;
-    uid_poc_cache[slot].updated_ms = now;
+    entry = &uid_poc_cache[slot];
+    if (entry->uid != UID_POC_UID_PENDING || entry->request_id != request_id)
+        return;
+    entry->uid = uid;
+    entry->updated_ms = now;
 }
 
 static void
@@ -726,7 +717,7 @@ uid_poc_worker_main (void *unused)
 
         pthread_mutex_lock (&uid_poc_mutex);
         uid_poc_store_result_locked (&request.key, call_ok ? (int) uid : -1,
-                                     uid_poc_now_ms ());
+                                     uid_poc_now_ms (), request.request_id);
         pthread_mutex_unlock (&uid_poc_mutex);
     }
 
@@ -909,10 +900,12 @@ hev_jni_uid_poc_packet (int protocol,
     if (slot >= 0) {
         if (!found)
             uid_poc_active_flows++;
+        request.request_id = __sync_add_and_fetch (&uid_poc_next_request_id, 1ULL);
         uid_poc_cache[slot].state = UID_POC_CACHE_USED;
         uid_poc_cache[slot].key = key;
         uid_poc_cache[slot].uid = UID_POC_UID_PENDING;
         uid_poc_cache[slot].updated_ms = now;
+        uid_poc_cache[slot].request_id = request.request_id;
         uid_poc_queue[uid_poc_queue_tail] = request;
         uid_poc_queue_tail = (uid_poc_queue_tail + 1u) % UID_POC_QUEUE_CAPACITY;
         uid_poc_queue_count++;
