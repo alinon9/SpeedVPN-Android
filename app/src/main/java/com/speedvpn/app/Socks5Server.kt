@@ -104,6 +104,28 @@ class Socks5Server(
         private const val CONNECT_TIMEOUT_MS = 12_000L
         private const val UDP_DNS_TIMEOUT_MS = 3_000L
 
+        /**
+         * Keep DNS burst handling testable: four workers must not reject the fifth lookup
+         * merely because no worker is idle. The bounded queue provides back-pressure while
+         * retaining a hard upper bound on pending DNS work.
+         */
+        internal fun createDnsExecutor(
+            workerCount: Int = UDP_DNS_WORKERS,
+            queueCapacity: Int = UDP_DNS_QUEUE_CAPACITY,
+        ): ThreadPoolExecutor {
+            require(workerCount > 0) { "workerCount must be positive" }
+            require(queueCapacity > 0) { "queueCapacity must be positive" }
+            return ThreadPoolExecutor(
+                workerCount,
+                workerCount,
+                30L,
+                TimeUnit.SECONDS,
+                ArrayBlockingQueue<Runnable>(queueCapacity),
+                ThreadFactory { r -> Thread(r, "socks-dns").apply { isDaemon = true } },
+                ThreadPoolExecutor.AbortPolicy(),
+            ).apply { allowCoreThreadTimeOut(true) }
+        }
+
         internal fun acceptsUdpAddressType(atyp: Int, ipv6Enabled: Boolean): Boolean = when (atyp) {
             1 -> true
             4 -> ipv6Enabled
@@ -146,15 +168,7 @@ class Socks5Server(
     // Chrome/YouTube may resolve several domains at once. A SynchronousQueue rejected
     // every lookup beyond the four currently-running workers, turning harmless bursts into
     // DNS failures. Keep four concurrent workers and a small bounded queue instead.
-    private val dnsPool: ThreadPoolExecutor = ThreadPoolExecutor(
-        UDP_DNS_WORKERS,
-        UDP_DNS_WORKERS,
-        30L,
-        TimeUnit.SECONDS,
-        ArrayBlockingQueue<Runnable>(UDP_DNS_QUEUE_CAPACITY),
-        ThreadFactory { r -> Thread(r, "socks-dns").apply { isDaemon = true } },
-        ThreadPoolExecutor.AbortPolicy(),
-    ).apply { allowCoreThreadTimeOut(true) }
+    private val dnsPool: ThreadPoolExecutor = createDnsExecutor()
 
     @Volatile private var encryptedDnsNetwork: Network? = null
     @Volatile private var encryptedDnsResolver: EncryptedDnsResolver? = null
