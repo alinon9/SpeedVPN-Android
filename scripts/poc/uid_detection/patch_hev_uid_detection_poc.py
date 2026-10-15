@@ -33,7 +33,7 @@ def inject_native_start_step_logs(jni_text: str) -> str:
     if "STEP 1: nativeStart entered" in jni_text:
         return jni_text
 
-    start = jni_text.find("native_start_service (")
+    # Skip the prototype and anchor to the actual function definition, whose name starts a line.\n    start = jni_text.find("\nnative_start_service (")
     if start < 0:
         raise SystemExit("Refusing unsafe native logging patch: native_start_service anchor missing")
     body_start = jni_text.find("{", start)
