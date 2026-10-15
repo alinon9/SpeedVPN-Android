@@ -189,7 +189,13 @@ internal object UidPocDiagnostics {
                 .redirectErrorStream(true)
                 .redirectOutput(temporary)
                 .start()
-            val finished = process.waitFor(5, TimeUnit.SECONDS)
+            // Process.waitFor(timeout, unit) is only available on newer Android API levels.
+            val finished = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                process.waitFor(5, TimeUnit.SECONDS)
+            } else {
+                process.waitFor()
+                true
+            }
             if (!finished) process.destroyForcibly()
             val code = if (finished) process.exitValue().toString() else "TIMEOUT"
             val output = runCatching { temporary.takeIf { it.isFile }?.readText(Charsets.UTF_8).orEmpty() }
