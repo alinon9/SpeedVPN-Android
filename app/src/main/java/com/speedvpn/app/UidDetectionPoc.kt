@@ -168,6 +168,8 @@ internal class UidDetectionPoc(
         }
     }
 
+    private val nativeCallbackSequence = AtomicLong(0L)
+
     override fun onTunPacket(
         protocol: Int,
         srcAddress: ByteArray,
@@ -175,10 +177,24 @@ internal class UidDetectionPoc(
         dstAddress: ByteArray,
         dstPort: Int,
     ) {
+        val callId = nativeCallbackSequence.incrementAndGet()
+        val protocolName = when (protocol) { 6 -> "TCP"; 17 -> "UDP"; else -> protocol.toString() }
+        val source = runCatching { InetAddress.getByAddress(srcAddress).hostAddress }
+            .getOrElse { "invalid-address-${srcAddress.size}-bytes" }
+        val destination = runCatching { InetAddress.getByAddress(dstAddress).hostAddress }
+            .getOrElse { "invalid-address-${dstAddress.size}-bytes" }
+        UidPocDiagnostics.jniEvent(
+            service,
+            "KOTLIN_CALLBACK_ENTRY id=$callId protocol=$protocolName src=$source:$srcPort dst=$destination:$dstPort srcBytes=${srcAddress.size} dstBytes=${dstAddress.size}",
+        )
+        var outcome = "returned"
         try {
             handleTunPacket(protocol, srcAddress, srcPort, dstAddress, dstPort)
         } catch (t: Throwable) {
-            UidPocDiagnostics.error(service, "Unhandled error inside native UID callback", t)
+            outcome = "throwable:${t.javaClass.simpleName}"
+            UidPocDiagnostics.error(service, "Unhandled error inside native UID callback id=$callId", t)
+        } finally {
+            UidPocDiagnostics.jniEvent(service, "KOTLIN_CALLBACK_EXIT id=$callId outcome=$outcome")
         }
     }
 
