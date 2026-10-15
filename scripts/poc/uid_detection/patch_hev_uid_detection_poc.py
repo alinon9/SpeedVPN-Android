@@ -145,73 +145,113 @@ def main() -> None:
     parser = r'''
 /* SPEEDVPN_UID_POC_BEGIN */
 #ifdef __ANDROID__
-extern void hev_jni_uid_poc_packet (int protocol,
-                                     const unsigned char *src, int src_len,
-                                     int src_port,
-                                     const unsigned char *dst, int dst_len,
-                                     int dst_port);
+extern int hev_jni_uid_poc_packet (int protocol,
+                                    const unsigned char *src, int src_len,
+                                    int src_port,
+                                    const unsigned char *dst, int dst_len,
+                                    int dst_port);
 
-/* Diagnostic parser only: outgoing IP packets as they enter lwIP from Android TUN.
- * IPv6 extension headers and non-initial IPv4 fragments are deliberately skipped. */
-static void
+/* Parse outbound IP packets before lwIP. A cached BLOCK decision returns 1 so
+ * the caller frees the pbuf instead of handing the packet to netif->input(). */
+static int
 uid_poc_report_packet (const struct pbuf *buf)
 {
     unsigned char ip[60], l4[20], src[16], dst[16];
     unsigned int total, offset, ip_header_len, src_len, need;
-    unsigned int protocol, src_port, dst_port;
-    unsigned int version;
+    unsigned int protocol, src_port, dst_port, version;
 
     if (!buf)
-        return;
+        return 0;
     total = buf->tot_len;
     if (total < 20 || pbuf_copy_partial (buf, ip, 1, 0) != 1)
-        return;
+        return 0;
     version = ip[0] >> 4;
 
     if (version == 4) {
+        unsigned int fragment_field;
         if (total < 20 || pbuf_copy_partial (buf, ip, 20, 0) != 20)
-            return;
+            return 0;
         ip_header_len = (ip[0] & 0x0f) * 4;
         if (ip_header_len < 20 || ip_header_len > sizeof (ip) ||
             total < ip_header_len + 8 ||
             pbuf_copy_partial (buf, ip, ip_header_len, 0) != ip_header_len)
-            return;
-        /* A non-initial fragment does not contain TCP/UDP ports. */
-        if ((((unsigned int) ip[6] << 8) | ip[7]) & 0x1fff)
-            return;
+            return 0;
+        fragment_field = ((unsigned int) ip[6] << 8) | ip[7];
+        /* Non-initial IPv4 fragments do not contain the TCP/UDP ports. */
+        if (fragment_field & 0x1fff)
+            return 0;
         protocol = ip[9];
         src_len = 4;
         offset = ip_header_len;
         memcpy (src, ip + 12, 4);
         memcpy (dst, ip + 16, 4);
     } else if (version == 6) {
-        if (total < 48 || pbuf_copy_partial (buf, ip, 40, 0) != 40)
-            return;
+        unsigned int extensions;
+        if (total < 40 || pbuf_copy_partial (buf, ip, 40, 0) != 40)
+            return 0;
         protocol = ip[6];
         src_len = 16;
         offset = 40;
         memcpy (src, ip + 8, 16);
         memcpy (dst, ip + 24, 16);
-        /* POC v1 handles the common direct TCP/UDP next-header case only. */
+
+        /* Handle common IPv6 extension headers, including Fragment and AH. */
+        for (extensions = 0; extensions < 8; extensions++) {
+            unsigned int next_header, extension_length;
+            if (protocol == 0 || protocol == 43 || protocol == 60 ||
+                protocol == 135 || protocol == 139 || protocol == 140) {
+                if (total < offset + 2 ||
+                    pbuf_copy_partial (buf, ip, 2, offset) != 2)
+                    return 0;
+                next_header = ip[0];
+                extension_length = ((unsigned int) ip[1] + 1u) * 8u;
+            } else if (protocol == 44) {
+                unsigned int fragment_offset;
+                if (total < offset + 8 ||
+                    pbuf_copy_partial (buf, ip, 8, offset) != 8)
+                    return 0;
+                next_header = ip[0];
+                fragment_offset = (((unsigned int) ip[2] << 8) | ip[3]) & 0xfff8u;
+                /* Non-initial IPv6 fragments do not contain the TCP/UDP ports. */
+                if (fragment_offset != 0)
+                    return 0;
+                extension_length = 8;
+            } else if (protocol == 51) {
+                if (total < offset + 2 ||
+                    pbuf_copy_partial (buf, ip, 2, offset) != 2)
+                    return 0;
+                next_header = ip[0];
+                extension_length = ((unsigned int) ip[1] + 2u) * 4u;
+            } else {
+                break;
+            }
+
+            if (extension_length == 0 ||
+                extension_length > total - offset)
+                return 0;
+            protocol = next_header;
+            offset += extension_length;
+        }
     } else {
-        return;
+        return 0;
     }
 
     if (protocol != 6 && protocol != 17)
-        return;
+        return 0;
     need = protocol == 6 ? 20 : 8;
     if (total < offset + need ||
         pbuf_copy_partial (buf, l4, need, offset) != need)
-        return;
+        return 0;
 
     src_port = ((unsigned int) l4[0] << 8) | l4[1];
     dst_port = ((unsigned int) l4[2] << 8) | l4[3];
-    hev_jni_uid_poc_packet (protocol, src, src_len, src_port,
-                            dst, src_len, dst_port);
+    /* No port allow-list: block all TCP/UDP destinations for a matched UID. */
+    return hev_jni_uid_poc_packet (protocol, src, src_len, src_port,
+                                   dst, src_len, dst_port);
 }
-/* SPEEDVPN_UID_POC_END */
+ /* SPEEDVPN_UID_POC_END */
 #else
-#define uid_poc_report_packet(buf) ((void) 0)
+#define uid_poc_report_packet(buf) 0
 #endif
 
 static int
@@ -225,7 +265,7 @@ task_io_yielder (HevTaskYieldType type, void *data)
     replace_once(
         tunnel_c,
         "        if (!buf)\n            continue;\n\n        stat_tx_packets++;",
-        "        if (!buf)\n            continue;\n\n        uid_poc_report_packet (buf);\n        stat_tx_packets++;",
+        "        if (!buf)\n            continue;\n\n        if (uid_poc_report_packet (buf)) {\n            pbuf_free (buf);\n            continue;\n        }\n\n        stat_tx_packets++;",
     )
 
     # The packet path performs a native cache lookup and queue operation only.
@@ -409,11 +449,13 @@ __attribute__((constructor)) static void native_poc_crash_init (void)
             + "#define UID_POC_MAX_FLOWS 4096u\n"
             + "#define UID_POC_QUEUE_CAPACITY 256u\n"
             + "#define UID_POC_UID_PENDING (-2)\n"
+            + "#define UID_POC_ACTION_ALLOW 0\n"
+            + "#define UID_POC_ACTION_BLOCK 1\n"
             + "#define UID_POC_FLOW_IDLE_MS 30000ULL\n"
             + "#define UID_POC_NEGATIVE_CACHE_MS 750ULL\n"
             + "#define UID_POC_PENDING_TIMEOUT_MS 10000ULL\n"
             + "typedef struct { int protocol; int addr_len; unsigned char a[16]; unsigned char b[16]; unsigned short port_a; unsigned short port_b; } uid_poc_flow_key;\n"
-            + "typedef struct { int state; uid_poc_flow_key key; int uid; unsigned long long updated_ms; unsigned long long request_id; } uid_poc_cache_entry;\n"
+            + "typedef struct { int state; uid_poc_flow_key key; int uid; int action; int drop_logged; unsigned long long updated_ms; unsigned long long request_id; } uid_poc_cache_entry;\n"
             + "typedef struct { uid_poc_flow_key key; int protocol; int src_len; unsigned char src[16]; int src_port; int dst_len; unsigned char dst[16]; int dst_port; unsigned long long request_id; } uid_poc_request;\n"
             + "static pthread_mutex_t uid_poc_mutex = PTHREAD_MUTEX_INITIALIZER;\n"
             + "static pthread_cond_t uid_poc_condition = PTHREAD_COND_INITIALIZER;\n"
@@ -428,7 +470,7 @@ __attribute__((constructor)) static void native_poc_crash_init (void)
             + "static volatile unsigned long long uid_poc_next_request_id = 0;\n"
             + "static volatile unsigned long long uid_poc_packets = 0, uid_poc_cache_hits = 0, uid_poc_cache_misses = 0;\n"
             + "static volatile unsigned long long uid_poc_pending_hits = 0, uid_poc_unique_requests = 0, uid_poc_jni_lookups = 0;\n"
-            + "static volatile unsigned long long uid_poc_queue_full = 0, uid_poc_lookup_failures = 0;\n"
+            + "static volatile unsigned long long uid_poc_queue_full = 0, uid_poc_lookup_failures = 0, uid_poc_dropped_packets = 0;\n"
             + END + "\n",
             1,
         )
@@ -450,9 +492,47 @@ __attribute__((constructor)) static void native_poc_crash_init (void)
         if jni_text.count(fn_anchor) != 1:
             raise SystemExit("Refusing unsafe patch: native_is_running anchor is not unique")
         functions = r'''/* SPEEDVPN_UID_POC_BEGIN */
+#include <stdio.h>
 #define UID_POC_CACHE_EMPTY 0
 #define UID_POC_CACHE_USED 1
 #define UID_POC_CACHE_DELETED 2
+
+/* Format IPv4 as dotted decimal and IPv6 as eight hexadecimal groups. */
+static void
+uid_poc_format_address (const unsigned char *address, int addr_len,
+                        char *buffer, size_t buffer_len)
+{
+    size_t used = 0;
+    int i;
+
+    if (!buffer || buffer_len == 0)
+        return;
+    buffer[0] = '\0';
+    if (!address) {
+        (void) snprintf (buffer, buffer_len, "?");
+        return;
+    }
+    if (addr_len == 4) {
+        (void) snprintf (buffer, buffer_len, "%u.%u.%u.%u",
+            (unsigned int) address[0], (unsigned int) address[1],
+            (unsigned int) address[2], (unsigned int) address[3]);
+        return;
+    }
+    if (addr_len != 16) {
+        (void) snprintf (buffer, buffer_len, "?");
+        return;
+    }
+    for (i = 0; i < 16; i += 2) {
+        int written = snprintf (buffer + used, buffer_len - used,
+            "%s%02x%02x", i == 0 ? "" : ":",
+            (unsigned int) address[i], (unsigned int) address[i + 1]);
+        if (written < 0 || (size_t) written >= buffer_len - used) {
+            buffer[buffer_len - 1] = '\0';
+            return;
+        }
+        used += (size_t) written;
+    }
+}
 
 static unsigned long long
 uid_poc_now_ms (void)
@@ -533,6 +613,9 @@ uid_poc_entry_expired (const uid_poc_cache_entry *entry, unsigned long long now)
         return age > UID_POC_PENDING_TIMEOUT_MS;
     if (entry->uid < 0)
         return age > UID_POC_NEGATIVE_CACHE_MS;
+    /* A confirmed DROP flow is pinned until the callback/session is reset. */
+    if (entry->action == UID_POC_ACTION_BLOCK)
+        return 0;
     return age > UID_POC_FLOW_IDLE_MS;
 }
 
@@ -587,6 +670,7 @@ uid_poc_evict_oldest_locked (void)
     unsigned long long oldest_time = ~0ULL;
     for (i = 0; i < UID_POC_FLOW_TABLE_SLOTS; i++) {
         if (uid_poc_cache[i].state == UID_POC_CACHE_USED &&
+            uid_poc_cache[i].action != UID_POC_ACTION_BLOCK &&
             uid_poc_cache[i].updated_ms < oldest_time) {
             oldest = i;
             oldest_time = uid_poc_cache[i].updated_ms;
@@ -597,7 +681,7 @@ uid_poc_evict_oldest_locked (void)
 }
 
 static void
-uid_poc_store_result_locked (const uid_poc_flow_key *key, int uid,
+uid_poc_store_result_locked (const uid_poc_flow_key *key, int uid, int action,
                              unsigned long long now,
                              unsigned long long request_id)
 {
@@ -611,13 +695,25 @@ uid_poc_store_result_locked (const uid_poc_flow_key *key, int uid,
     if (entry->uid != UID_POC_UID_PENDING || entry->request_id != request_id)
         return;
     entry->uid = uid;
+    entry->action = (uid >= 0 && action == UID_POC_ACTION_BLOCK)
+        ? UID_POC_ACTION_BLOCK : UID_POC_ACTION_ALLOW;
+    entry->drop_logged = 0;
     entry->updated_ms = now;
+    if (entry->action == UID_POC_ACTION_BLOCK) {
+        __android_log_print (ANDROID_LOG_WARN, "SpeedVPN-POC-JNI",
+            "UID_POLICY_RESULT uid=%d action=BLOCK packetBlocking=IMPLEMENTED",
+            uid);
+    } else {
+        __android_log_print (ANDROID_LOG_INFO, "SpeedVPN-POC-JNI",
+            "UID_POLICY_RESULT uid=%d action=ALLOW hookMode=HOOK_BLOCKING packetBlocking=IMPLEMENTED",
+            uid);
+    }
 }
 
 static void
 uid_poc_log_metrics (unsigned long long packet_count)
 {
-    unsigned long long hits, misses, pending, lookups, full, failures, unique;
+    unsigned long long hits, misses, pending, lookups, full, failures, unique, drops;
     double hit_rate;
     if (packet_count == 0 || packet_count % 1000ULL != 0)
         return;
@@ -628,10 +724,11 @@ uid_poc_log_metrics (unsigned long long packet_count)
     full = __sync_add_and_fetch (&uid_poc_queue_full, 0ULL);
     failures = __sync_add_and_fetch (&uid_poc_lookup_failures, 0ULL);
     unique = __sync_add_and_fetch (&uid_poc_unique_requests, 0ULL);
+    drops = __sync_add_and_fetch (&uid_poc_dropped_packets, 0ULL);
     hit_rate = (hits + misses) == 0 ? 0.0 : (100.0 * (double) hits / (double) (hits + misses));
     __android_log_print (ANDROID_LOG_INFO, "SpeedVPN-POC-JNI",
-        "PACKETS=%llu CACHE_HITS=%llu CACHE_MISSES=%llu PENDING_HITS=%llu UNIQUE_LOOKUPS=%llu JNI_LOOKUPS=%llu HIT_RATE=%.2f%% QUEUE_FULL=%llu LOOKUP_FAILS=%llu",
-        packet_count, hits, misses, pending, unique, lookups, hit_rate, full, failures);
+        "PACKETS=%llu CACHE_HITS=%llu CACHE_MISSES=%llu PENDING_HITS=%llu UNIQUE_LOOKUPS=%llu JNI_LOOKUPS=%llu HIT_RATE=%.2f%% QUEUE_FULL=%llu LOOKUP_FAILS=%llu DROPPED_PACKETS=%llu",
+        packet_count, hits, misses, pending, unique, lookups, hit_rate, full, failures, drops);
 }
 
 static void *
@@ -660,7 +757,9 @@ uid_poc_worker_main (void *unused)
     for (;;) {
         uid_poc_request request;
         jbyteArray src_array = NULL, dst_array = NULL;
+        jlong packed_result = 0;
         jint uid = -1;
+        int action = UID_POC_ACTION_ALLOW;
         int call_ok = 0;
 
         pthread_mutex_lock (&uid_poc_mutex);
@@ -690,7 +789,7 @@ uid_poc_worker_main (void *unused)
                 (*env)->ExceptionClear (env);
             } else if (src_array && dst_array) {
                 __sync_add_and_fetch (&uid_poc_jni_lookups, 1ULL);
-                uid = (*env)->CallIntMethod (env, uid_poc_callback, uid_poc_method,
+                packed_result = (*env)->CallLongMethod (env, uid_poc_callback, uid_poc_method,
                     (jint) request.protocol, src_array, (jint) request.src_port,
                     dst_array, (jint) request.dst_port);
                 if ((*env)->ExceptionCheck (env)) {
@@ -700,7 +799,14 @@ uid_poc_worker_main (void *unused)
                     (*env)->ExceptionDescribe (env);
                     (*env)->ExceptionClear (env);
                     uid = -1;
+                    action = UID_POC_ACTION_ALLOW;
                 } else {
+                    unsigned long long packed_bits = (unsigned long long) packed_result;
+                    uid = (jint) (packed_bits >> 32);
+                    action = (packed_bits & 1ULL)
+                        ? UID_POC_ACTION_BLOCK : UID_POC_ACTION_ALLOW;
+                    if (uid < 0)
+                        action = UID_POC_ACTION_ALLOW;
                     call_ok = 1;
                 }
             } else {
@@ -717,6 +823,7 @@ uid_poc_worker_main (void *unused)
 
         pthread_mutex_lock (&uid_poc_mutex);
         uid_poc_store_result_locked (&request.key, call_ok ? (int) uid : -1,
+                                     call_ok ? action : UID_POC_ACTION_ALLOW,
                                      uid_poc_now_ms (), request.request_id);
         pthread_mutex_unlock (&uid_poc_mutex);
     }
@@ -821,7 +928,7 @@ native_set_uid_poc_callback (JNIEnv *env, jobject thiz, jobject callback)
         jclass klass = (*env)->GetObjectClass (env, callback);
         if (!klass)
             return JNI_FALSE;
-        method = (*env)->GetMethodID (env, klass, "onTunPacket", "(I[BI[BI)I");
+        method = (*env)->GetMethodID (env, klass, "onTunPacket", "(I[BI[BI)J");
         (*env)->DeleteLocalRef (env, klass);
         if (!method) {
             if ((*env)->ExceptionCheck (env))
@@ -855,9 +962,10 @@ native_set_uid_poc_callback (JNIEnv *env, jobject thiz, jobject callback)
     return JNI_TRUE;
 }
 
-/* Called for each candidate TCP/UDP packet by the HEV coroutine. This function
- * only performs a native table lookup and queues a cache miss; it never calls ART. */
-void
+/* Called for each candidate TCP/UDP packet by the HEV coroutine.
+ * It does only a native cache lookup and bounded queue operation; JNI is worker-only.
+ * Return 1 only when the known UID policy says to drop this packet. */
+int
 hev_jni_uid_poc_packet (int protocol,
                         const unsigned char *src, int src_len, int src_port,
                         const unsigned char *dst, int dst_len, int dst_port)
@@ -865,13 +973,14 @@ hev_jni_uid_poc_packet (int protocol,
     uid_poc_flow_key key;
     uid_poc_request request;
     unsigned long long now, packet_count;
-    int found = 0, slot;
+    int found = 0, slot, should_drop = 0;
+    char src_text[64], dst_text[64], tuple_text[200];
 
     if (!src || !dst || src_len != dst_len ||
         (src_len != 4 && src_len != 16) ||
         (protocol != 6 && protocol != 17) ||
         src_port < 0 || src_port > 65535 || dst_port < 0 || dst_port > 65535)
-        return;
+        return 0;
 
     uid_poc_make_key (&key, protocol, src, src_len, src_port, dst, dst_len, dst_port);
     memset (&request, 0, sizeof (request));
@@ -888,24 +997,39 @@ hev_jni_uid_poc_packet (int protocol,
     if (!uid_poc_worker_started || !uid_poc_worker_ready ||
         uid_poc_worker_stop_requested || !uid_poc_callback || !uid_poc_method) {
         pthread_mutex_unlock (&uid_poc_mutex);
-        return;
+        return 0;
     }
     packet_count = __sync_add_and_fetch (&uid_poc_packets, 1ULL);
-    now = uid_poc_now_ms();
+    now = uid_poc_now_ms ();
     slot = uid_poc_find_slot_locked (&key, now, &found);
     if (found) {
         uid_poc_cache_entry *entry = &uid_poc_cache[slot];
         if (entry->uid == UID_POC_UID_PENDING) {
-            /* Pending de-duplication is not a completed cache hit. */
             __sync_add_and_fetch (&uid_poc_pending_hits, 1ULL);
         } else {
             __sync_add_and_fetch (&uid_poc_cache_hits, 1ULL);
-            if (entry->uid >= 0)
+            if (entry->uid >= 0 && entry->action == UID_POC_ACTION_BLOCK) {
+                should_drop = 1;
+                __sync_add_and_fetch (&uid_poc_dropped_packets, 1ULL);
+                if (!entry->drop_logged) {
+                    entry->drop_logged = 1;
+                    uid_poc_format_address (src, src_len, src_text, sizeof (src_text));
+                    uid_poc_format_address (dst, dst_len, dst_text, sizeof (dst_text));
+                    (void) snprintf (tuple_text, sizeof (tuple_text),
+                        "%s|[%s]:%d->[%s]:%d",
+                        protocol == 6 ? "tcp" : "udp", src_text, src_port,
+                        dst_text, dst_port);
+                    __android_log_print (ANDROID_LOG_WARN, "SpeedVPN-POC-JNI",
+                        "PACKET_DROPPED uid=%d tuple=%s action=DROP hookMode=HOOK_BLOCKING packetBlocking=IMPLEMENTED",
+                        entry->uid, tuple_text);
+                }
+            } else if (entry->uid >= 0) {
                 entry->updated_ms = now;
+            }
         }
         pthread_mutex_unlock (&uid_poc_mutex);
         uid_poc_log_metrics (packet_count);
-        return;
+        return should_drop;
     }
 
     __sync_add_and_fetch (&uid_poc_cache_misses, 1ULL);
@@ -922,12 +1046,14 @@ hev_jni_uid_poc_packet (int protocol,
             uid_poc_cache[slot].state = UID_POC_CACHE_USED;
             uid_poc_cache[slot].key = key;
             uid_poc_cache[slot].uid = -1;
+            uid_poc_cache[slot].action = UID_POC_ACTION_ALLOW;
+            uid_poc_cache[slot].drop_logged = 0;
             uid_poc_cache[slot].updated_ms = now;
             uid_poc_cache[slot].request_id = 0;
         }
         pthread_mutex_unlock (&uid_poc_mutex);
         uid_poc_log_metrics (packet_count);
-        return;
+        return 0;
     }
     if (slot >= 0) {
         if (!found)
@@ -936,6 +1062,8 @@ hev_jni_uid_poc_packet (int protocol,
         uid_poc_cache[slot].state = UID_POC_CACHE_USED;
         uid_poc_cache[slot].key = key;
         uid_poc_cache[slot].uid = UID_POC_UID_PENDING;
+        uid_poc_cache[slot].action = UID_POC_ACTION_ALLOW;
+        uid_poc_cache[slot].drop_logged = 0;
         uid_poc_cache[slot].updated_ms = now;
         uid_poc_cache[slot].request_id = request.request_id;
         uid_poc_queue[uid_poc_queue_tail] = request;
@@ -948,6 +1076,7 @@ hev_jni_uid_poc_packet (int protocol,
     }
     pthread_mutex_unlock (&uid_poc_mutex);
     uid_poc_log_metrics (packet_count);
+    return 0;
 }
 /* SPEEDVPN_UID_POC_END */
 
@@ -960,6 +1089,21 @@ native_is_running (JNIEnv *env, jobject thiz)
     # Harden JNI/thread/FD ownership on every run (even if the injected marker already
     # exists from an earlier invocation of this patcher).
     jni_text = jni_c.read_text()
+
+    # Refuse to produce an APK if the asynchronous worker or actual native DROP path
+    # was lost in a source update. Logging-only UID observation is not enforcement.
+    required_native_markers = (
+        "AttachCurrentThread (java_vm, &env, NULL)",
+        "DetachCurrentThread (java_vm)",
+        "UID_WORKER_READY stack=1048576",
+        "uid_poc_store_result_locked",
+        "PACKET_DROPPED uid=%d tuple=%s",
+        "if (uid_poc_report_packet (buf))",
+    )
+    for marker in required_native_markers:
+        source = Path(__file__).read_text() if marker == "if (uid_poc_report_packet (buf))" else jni_text
+        if marker not in source:
+            raise SystemExit(f"Refusing incomplete UID firewall patch: missing native marker: {marker}")
 
     # The UID worker attaches to the JVM once per worker lifetime and detaches on exit.
     # The Java PFD remains owned by Service, but Native now duplicates the descriptor:
