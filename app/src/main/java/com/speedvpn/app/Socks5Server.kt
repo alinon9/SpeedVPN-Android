@@ -150,6 +150,8 @@ class Socks5Server(
     private val upstreamTcp = Collections.newSetFromMap(ConcurrentHashMap<Socket, Boolean>())
     private val upstreamUdp = Collections.newSetFromMap(ConcurrentHashMap<DatagramSocket, Boolean>())
     private val blockedDestinations = ConcurrentHashMap.newKeySet<String>()
+    private val permanentlyBlockedDestinations = ConcurrentHashMap.newKeySet<String>()
+    private val policyBlockedPackagesByDestination = ConcurrentHashMap<String, Set<String>>()
     private val blockedFlowTuples = ConcurrentHashMap.newKeySet<String>()
     private val flowOwnersByEndpoint = ConcurrentHashMap<String, FlowOwnerMetadata>()
     private val upstreamTcpMetadata = ConcurrentHashMap<Socket, FlowOwnerMetadata>()
@@ -263,6 +265,8 @@ class Socks5Server(
         activeUdpMuxes.toList().forEach { runCatching { it.close() } }
         activeUdpMuxes.clear()
         blockedDestinations.clear()
+        permanentlyBlockedDestinations.clear()
+        policyBlockedPackagesByDestination.clear()
         blockedFlowTuples.clear()
         flowOwnersByEndpoint.clear()
         pool.shutdownNow()
@@ -400,25 +404,75 @@ class Socks5Server(
         dstPort: Int,
         uid: Int,
         packages: Collection<String>,
+        policyBlockedPackages: Collection<String>,
+        permanent: Boolean,
     ) {
         recordDetectedFlow(protocol, srcIp, srcPort, dstIp, dstPort, uid, packages)
         val endpoint = endpointKey(protocol, dstIp, dstPort)
         val flowTuple = protocol.toString() + "|" + srcIp + ":" + srcPort + "->" +
             dstIp + ":" + dstPort + "|uid=" + uid
-        blockEndpoint(protocol, endpoint, uid, flowTuple)
+        blockEndpoint(
+            protocol = protocol,
+            endpoint = endpoint,
+            uid = uid,
+            flowTuple = flowTuple,
+            policyPackages = policyBlockedPackages,
+            permanent = permanent,
+        )
     }
 
     internal fun enforceBlockedPackages(blockedPackages: Set<String>) {
+        // Remove endpoint blocks whose dynamic policy reason no longer exists.
+        policyBlockedPackagesByDestination.entries.toList().forEach { entry ->
+            val stillBlocked = entry.value.intersect(blockedPackages)
+            if (stillBlocked.isEmpty()) {
+                policyBlockedPackagesByDestination.remove(entry.key, entry.value)
+            } else {
+                policyBlockedPackagesByDestination[entry.key] = stillBlocked
+            }
+            refreshBlockedDestination(entry.key)
+        }
+
         upstreamTcpMetadata.values.toList().forEach { metadata ->
-            if (metadata.packages.any { it in blockedPackages }) {
-                blockEndpoint(IPPROTO_TCP, metadata.endpointKey, metadata.uid, metadata.tuple)
+            val matches = metadata.packages.intersect(blockedPackages)
+            if (matches.isNotEmpty()) {
+                blockEndpoint(
+                    protocol = IPPROTO_TCP,
+                    endpoint = metadata.endpointKey,
+                    uid = metadata.uid,
+                    flowTuple = metadata.tuple,
+                    policyPackages = matches,
+                )
             }
         }
         activeUdpMuxes.toList().forEach { it.enforceBlockedPackages(blockedPackages) }
     }
 
-    private fun blockEndpoint(protocol: Int, endpoint: String, uid: Int?, flowTuple: String) {
-        blockedDestinations.add(endpoint)
+    private fun refreshBlockedDestination(endpoint: String) {
+        if (endpoint in permanentlyBlockedDestinations ||
+            policyBlockedPackagesByDestination[endpoint].orEmpty().isNotEmpty()
+        ) {
+            blockedDestinations.add(endpoint)
+        } else {
+            blockedDestinations.remove(endpoint)
+        }
+    }
+
+    private fun blockEndpoint(
+        protocol: Int,
+        endpoint: String,
+        uid: Int?,
+        flowTuple: String,
+        policyPackages: Collection<String> = emptySet(),
+        permanent: Boolean = false,
+    ) {
+        if (permanent) permanentlyBlockedDestinations.add(endpoint)
+        if (policyPackages.isNotEmpty()) {
+            policyBlockedPackagesByDestination.compute(endpoint) { _, existing ->
+                (existing.orEmpty() + policyPackages).toSet()
+            }
+        }
+        refreshBlockedDestination(endpoint)
         if (flowTuple.isNotBlank()) blockedFlowTuples.add(flowTuple)
         when (protocol) {
             IPPROTO_TCP -> upstreamTcpMetadata.entries.toList()
@@ -436,7 +490,6 @@ class Socks5Server(
         log("APP_FLOW_BLOCKED protocol=$protocol endpoint=$endpoint uid=" +
             (uid ?: -1) + " flow=" + flowTuple)
     }
-
     fun onUnderlyingNetworkChanged() {
         upstreamTcp.toList().forEach { socket ->
             runCatching { socket.close() }
@@ -1047,10 +1100,21 @@ class Socks5Server(
 
         fun enforceBlockedPackages(blockedPackages: Set<String>) {
             val matches = synchronized(lock) {
-                bindings.values.filter { binding -> binding.packages.any { it in blockedPackages } }
-                    .map { Triple(it.endpointKey, it.uid, it.tuple) }
+                bindings.values.mapNotNull { binding ->
+                    val packages = binding.packages.intersect(blockedPackages)
+                    if (packages.isEmpty()) null
+                    else Triple(binding, packages)
+                }
             }
-            matches.forEach { (endpoint, uid, tuple) -> blockEndpoint(IPPROTO_UDP, endpoint, uid, tuple) }
+            matches.forEach { (binding, packages) ->
+                blockEndpoint(
+                    protocol = IPPROTO_UDP,
+                    endpoint = binding.endpointKey,
+                    uid = binding.uid,
+                    flowTuple = binding.tuple,
+                    policyPackages = packages,
+                )
+            }
         }
 
         fun blockDestination(endpoint: String, uid: Int?, tuple: String) {
