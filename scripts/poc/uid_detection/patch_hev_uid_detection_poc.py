@@ -895,26 +895,39 @@ hev_jni_uid_poc_packet (int protocol,
     slot = uid_poc_find_slot_locked (&key, now, &found);
     if (found) {
         uid_poc_cache_entry *entry = &uid_poc_cache[slot];
-        __sync_add_and_fetch (&uid_poc_cache_hits, 1ULL);
-        if (entry->uid == UID_POC_UID_PENDING)
+        if (entry->uid == UID_POC_UID_PENDING) {
+            /* Pending de-duplication is not a completed cache hit. */
             __sync_add_and_fetch (&uid_poc_pending_hits, 1ULL);
-        else if (entry->uid >= 0)
-            entry->updated_ms = now;
+        } else {
+            __sync_add_and_fetch (&uid_poc_cache_hits, 1ULL);
+            if (entry->uid >= 0)
+                entry->updated_ms = now;
+        }
         pthread_mutex_unlock (&uid_poc_mutex);
         uid_poc_log_metrics (packet_count);
         return;
     }
 
     __sync_add_and_fetch (&uid_poc_cache_misses, 1ULL);
-    if (uid_poc_queue_count >= UID_POC_QUEUE_CAPACITY) {
-        __sync_add_and_fetch (&uid_poc_queue_full, 1ULL);
-        pthread_mutex_unlock (&uid_poc_mutex);
-        uid_poc_log_metrics (packet_count);
-        return;
-    }
     if (slot < 0 || uid_poc_active_flows >= UID_POC_MAX_FLOWS) {
         uid_poc_evict_oldest_locked ();
         slot = uid_poc_find_slot_locked (&key, now, &found);
+    }
+    if (uid_poc_queue_count >= UID_POC_QUEUE_CAPACITY) {
+        /* Briefly negative-cache overload so every packet does not retry the full queue. */
+        __sync_add_and_fetch (&uid_poc_queue_full, 1ULL);
+        if (slot >= 0) {
+            if (!found)
+                uid_poc_active_flows++;
+            uid_poc_cache[slot].state = UID_POC_CACHE_USED;
+            uid_poc_cache[slot].key = key;
+            uid_poc_cache[slot].uid = -1;
+            uid_poc_cache[slot].updated_ms = now;
+            uid_poc_cache[slot].request_id = 0;
+        }
+        pthread_mutex_unlock (&uid_poc_mutex);
+        uid_poc_log_metrics (packet_count);
+        return;
     }
     if (slot >= 0) {
         if (!found)
