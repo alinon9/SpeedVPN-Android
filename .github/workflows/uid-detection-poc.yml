@@ -64,31 +64,40 @@ jobs:
           HEV_DIR="app/src/main/jni/hev-socks5-tunnel"
           JNI_C="$HEV_DIR/src/hev-jni.c"
           TUNNEL_C="$HEV_DIR/src/hev-socks5-tunnel.c"
-          # Fail early if the POC patch did not inject the native cache and worker.
-          grep -Fq 'UID_POC_FLOW_TABLE_SLOTS 8192u' "$JNI_C"
-          grep -Fq 'UID_WORKER_READY stack=1048576' "$JNI_C"
-          grep -Fq 'HIT_RATE=%.2f%%' "$JNI_C"
-          grep -Fq 'uid_poc_find_slot_locked' "$JNI_C"
-          grep -Fq 'if (uid_poc_report_packet (buf))' "$TUNNEL_C"
-          grep -Fq 'pbuf_free (buf);' "$TUNNEL_C"
-          grep -Fq 'PACKET_DROP uid=%d' "$JNI_C"
-          grep -Fq 'packetBlocking=IMPLEMENTED' "$JNI_C"
-          grep -Fq 'long onTunPacket(' app/src/main/java/hev/htproxy/TProxyService.java
-          grep -Fq '): Long {' app/src/main/java/com/speedvpn/app/UidDetectionPoc.kt
-          grep -Fq '"com.whatsapp.w4b"' app/src/main/java/com/speedvpn/app/UidDetectionPoc.kt
-          grep -Fq 'BLOCKED_UID uid=' app/src/main/java/com/speedvpn/app/UidDetectionPoc.kt
-          grep -Fq 'blockedUids: Set<Int>' app/src/main/java/com/speedvpn/app/UidDetectionPoc.kt
-          grep -Fq 'blockedUids(context: Context, blockedPackages: Set<String>)' app/src/main/java/com/speedvpn/app/VpnApplicationPolicy.kt
-          grep -Fq 'updateBlockedUids(' app/src/main/java/com/speedvpn/app/SpeedVpnService.kt
-          grep -Fq 'BLOCKED_UID_POLICY_UPDATED' app/src/main/java/com/speedvpn/app/Socks5Server.kt
-          grep -Fq 'addDisallowedApplication(packageName)' app/src/main/java/com/speedvpn/app/SpeedVpnService.kt
-          grep -Fq 'addRoute("::", 0)' app/src/main/java/com/speedvpn/app/SpeedVpnService.kt
+          # Fail with the precise missing marker rather than a silent grep exit.
+          must_contain() {
+            local marker="$1"
+            local file="$2"
+            if ! grep -Fq -- "$marker" "$file"; then
+              echo "::error::Missing required marker [$marker] in [$file]"
+              grep -n -E 'UID_POC|uid_poc|onTunPacket|PACKET_DROP|AttachCurrentThread' "$file" | head -60 || true
+              exit 1
+            fi
+          }
+          must_contain 'UID_POC_FLOW_TABLE_SLOTS 8192u' "$JNI_C"
+          must_contain 'UID_WORKER_READY stack=1048576' "$JNI_C"
+          must_contain 'HIT_RATE=%.2f%%' "$JNI_C"
+          must_contain 'uid_poc_find_slot_locked' "$JNI_C"
+          must_contain 'if (uid_poc_report_packet (buf))' "$TUNNEL_C"
+          must_contain 'pbuf_free (buf);' "$TUNNEL_C"
+          must_contain 'PACKET_DROP uid=%d' "$JNI_C"
+          must_contain 'packetBlocking=IMPLEMENTED' "$JNI_C"
+          must_contain 'long onTunPacket(' app/src/main/java/hev/htproxy/TProxyService.java
+          must_contain '): Long {' app/src/main/java/com/speedvpn/app/UidDetectionPoc.kt
+          must_contain '"com.whatsapp.w4b"' app/src/main/java/com/speedvpn/app/UidDetectionPoc.kt
+          must_contain 'BLOCKED_UID uid=' app/src/main/java/com/speedvpn/app/UidDetectionPoc.kt
+          must_contain 'blockedUids: Set<Int>' app/src/main/java/com/speedvpn/app/UidDetectionPoc.kt
+          must_contain 'blockedUids(context: Context, blockedPackages: Set<String>)' app/src/main/java/com/speedvpn/app/VpnApplicationPolicy.kt
+          must_contain 'updateBlockedUids(' app/src/main/java/com/speedvpn/app/SpeedVpnService.kt
+          must_contain 'BLOCKED_UID_POLICY_UPDATED' app/src/main/java/com/speedvpn/app/Socks5Server.kt
+          must_contain 'addDisallowedApplication(packageName)' app/src/main/java/com/speedvpn/app/SpeedVpnService.kt
+          must_contain 'addRoute("::", 0)' app/src/main/java/com/speedvpn/app/SpeedVpnService.kt
           if grep -Fq 'addAllowedApplication(' app/src/main/java/com/speedvpn/app/SpeedVpnService.kt; then
             echo "::error::Runtime VPN routing must not use an application allow-list."
             exit 1
           fi
-          grep -Fq 'globalDestinationBlock=false' app/src/main/java/com/speedvpn/app/Socks5Server.kt
-          grep -Fq '(I[BI[BI)J' "$JNI_C"
+          must_contain 'globalDestinationBlock=false' app/src/main/java/com/speedvpn/app/Socks5Server.kt
+          must_contain '(I[BI[BI)J' "$JNI_C"
           if grep -Fq 'task_lwip_io = hev_task_new (131072);' "$TUNNEL_C"; then
             echo "::error::The HEV coroutine stack is still enlarged for JNI. JNI must only run on the dedicated worker."
             exit 1
