@@ -7,9 +7,15 @@ internal object VpnApplicationPolicy {
         ownPackage: String,
         includeOwnPackageForVerification: Boolean,
     ): Set<String> {
+        // addAllowedApplication() is a routing allow-list, not a block-list.
+        // Include blocked packages so their packets still enter TUN and are dropped
+        // by native flow enforcement instead of escaping directly to the physical network.
         val allowed = launchablePackages
-            .filter { it != ownPackage && it !in blockedPackages }
+            .filter { it != ownPackage }
             .toCollection(LinkedHashSet())
+        blockedPackages
+            .filter { it != ownPackage }
+            .forEach { allowed += it }
         if (includeOwnPackageForVerification && ownPackage !in blockedPackages) {
             allowed += ownPackage
         }
