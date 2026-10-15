@@ -35,11 +35,11 @@ def main() -> None:
     android_text = android_mk.read_text()
     link_flags = "LOCAL_LDLIBS += -llog -ldl"
     if link_flags not in android_text:
-        source_anchor = "LOCAL_SRC_FILES := $(HEV_SOCKS5_TUNNEL_SRC)\\n"
+        source_anchor = "LOCAL_SRC_FILES := $(HEV_SOCKS5_TUNNEL_SRC)\n"
         count = android_text.count(source_anchor)
         if count < 1:
             raise SystemExit("Refusing unsafe native build patch: LOCAL_SRC_FILES anchor missing")
-        android_text = android_text.replace(source_anchor, source_anchor + link_flags + "\\n")
+        android_text = android_text.replace(source_anchor, source_anchor + link_flags + "\n")
         android_mk.write_text(android_text)
 
     parser = r'''
