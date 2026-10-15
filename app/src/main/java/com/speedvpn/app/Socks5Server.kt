@@ -463,7 +463,7 @@ class Socks5Server(
 
         upstreamTcpMetadata.values.toList().forEach { metadata ->
             val matches = metadata.packages.intersect(blockedPackages)
-            val uidIsBlocked = metadata.uid != null && metadata.uid in blockedUids
+            val uidIsBlocked = metadata.uid?.let { it in blockedUids } == true
             if (uidIsBlocked || matches.isNotEmpty()) {
                 blockEndpoint(
                     protocol = IPPROTO_TCP,
