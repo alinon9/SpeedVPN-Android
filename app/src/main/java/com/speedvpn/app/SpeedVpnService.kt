@@ -495,8 +495,20 @@ class SpeedVpnService : VpnService() {
         dstPort: Int,
         uid: Int,
         packages: Collection<String>,
+        policyBlockedPackages: Collection<String>,
+        permanent: Boolean,
     ) {
-        socks?.enforceBlockedFlow(protocol, srcIp, srcPort, dstIp, dstPort, uid, packages)
+        socks?.enforceBlockedFlow(
+            protocol = protocol,
+            srcIp = srcIp,
+            srcPort = srcPort,
+            dstIp = dstIp,
+            dstPort = dstPort,
+            uid = uid,
+            packages = packages,
+            policyBlockedPackages = policyBlockedPackages,
+            permanent = permanent,
+        )
     }
 
     private fun startUidPolicyMonitor(mySession: Long) {
