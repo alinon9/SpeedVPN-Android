@@ -84,7 +84,8 @@ jobs:
           must_contain 'packetBlocking=IMPLEMENTED' "$JNI_C"
           must_contain 'long onTunPacket(' app/src/main/java/hev/htproxy/TProxyService.java
           must_contain '): Long {' app/src/main/java/com/speedvpn/app/UidDetectionPoc.kt
-          must_contain '"com.whatsapp.w4b"' app/src/main/java/com/speedvpn/app/UidDetectionPoc.kt
+          must_contain 'val blockedPackageMatches = knownPackages.filter { it in policy.packages }' app/src/main/java/com/speedvpn/app/UidDetectionPoc.kt
+          must_contain 'val shouldBlock = uid != Process.INVALID_UID && uid in policy.uids' app/src/main/java/com/speedvpn/app/UidDetectionPoc.kt
           must_contain 'BLOCKED_UID uid=' app/src/main/java/com/speedvpn/app/UidDetectionPoc.kt
           must_contain 'blockedUids: Set<Int>' app/src/main/java/com/speedvpn/app/UidDetectionPoc.kt
           must_contain 'blockedUids(context: Context, blockedPackages: Set<String>)' app/src/main/java/com/speedvpn/app/VpnApplicationPolicy.kt
