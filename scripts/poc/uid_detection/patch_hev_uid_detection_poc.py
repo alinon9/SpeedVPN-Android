@@ -264,6 +264,7 @@ task_io_yielder (HevTaskYieldType type, void *data)
     )
     replace_once(
         tunnel_c,
+        "        if (!buf)\n            continue;\n\n        stat_tx_packets++;",
         "        if (!buf)\n            continue;\n\n        if (uid_poc_report_packet (buf)) {\n            pbuf_free (buf);\n            continue;\n        }\n\n        stat_tx_packets++;",
     )
 
