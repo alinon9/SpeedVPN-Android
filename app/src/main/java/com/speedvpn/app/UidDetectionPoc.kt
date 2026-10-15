@@ -115,6 +115,8 @@ internal class UidDetectionPoc(
     private val targets = listOf(
         "com.android.chrome",
         "com.whatsapp",
+        "com.facebook.katana",
+        "com.facebook.lite",
         "com.google.android.youtube",
         "com.android.vending",
     )
@@ -124,6 +126,8 @@ internal class UidDetectionPoc(
         }
         .groupBy({ it.first }, { it.second })
     private val nativeCallbackSequence = AtomicLong(0L)
+
+    private data class UidResolution(val uid: Int, val blocked: Boolean)
 
     init {
         Log.i(TAG, "START Android API=${Build.VERSION.SDK_INT}; package=${service.packageName}")
@@ -161,8 +165,9 @@ internal class UidDetectionPoc(
         var uid = Process.INVALID_UID
         var outcome = "returned"
         try {
-            uid = resolveUid(protocol, srcAddress, srcPort, dstAddress, dstPort, callId)
-            return uid
+            val resolution = resolveUid(protocol, srcAddress, srcPort, dstAddress, dstPort, callId)
+            uid = resolution.uid
+            return if (resolution.blocked) NATIVE_UID_BLOCKED else resolution.uid
         } catch (error: Throwable) {
             outcome = "throwable:${error.javaClass.simpleName}"
             reportException(protocol, source, srcPort, destination, dstPort, callId, error)
@@ -183,20 +188,20 @@ internal class UidDetectionPoc(
         dstAddress: ByteArray,
         dstPort: Int,
         callId: Long,
-    ): Int {
+    ): UidResolution {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
             UidPocDiagnostics.log(service, "OWNER_UID_QUERY_SKIPPED id=$callId reason=API_BELOW_29")
-            return Process.INVALID_UID
+            return UidResolution(Process.INVALID_UID, false)
         }
         if (protocol != IPPROTO_TCP && protocol != IPPROTO_UDP) {
             UidPocDiagnostics.log(service, "OWNER_UID_QUERY_SKIPPED id=$callId reason=UNSUPPORTED_PROTOCOL protocol=$protocol")
-            return Process.INVALID_UID
+            return UidResolution(Process.INVALID_UID, false)
         }
         if (srcPort !in 0..65535 || dstPort !in 0..65535 ||
             srcAddress.size !in setOf(4, 16) || dstAddress.size != srcAddress.size
         ) {
             UidPocDiagnostics.log(service, "OWNER_UID_QUERY_SKIPPED id=$callId reason=INVALID_TUPLE")
-            return Process.INVALID_UID
+            return UidResolution(Process.INVALID_UID, false)
         }
 
         val src = InetAddress.getByAddress(srcAddress).hostAddress ?: "unknown"
@@ -212,30 +217,59 @@ internal class UidDetectionPoc(
         } else {
             packageManager.getPackagesForUid(uid)?.sorted().orEmpty()
         }
-        val targetMatch = expectedUidPackages[uid]?.joinToString(",") ?: "-"
+        val targetPackages = expectedUidPackages[uid].orEmpty()
+        val targetMatch = targetPackages.joinToString(",").ifBlank { "-" }
+        val policyBlockedPackages = packages.filter { it in service.currentBlockedPackages() }
+        val shouldBlock = uid != Process.INVALID_UID &&
+            (targetPackages.isNotEmpty() || policyBlockedPackages.isNotEmpty())
         val verdict = when {
             uid == Process.INVALID_UID -> "INVALID_UID"
-            targetMatch != "-" -> "MATCH_TARGET"
+            shouldBlock -> "MATCH_TARGET"
             else -> "UID_FOUND_OTHER_OR_UNLISTED"
         }
+        val status = when {
+            uid == Process.INVALID_UID -> "INVALID"
+            shouldBlock -> "MATCH_TARGET"
+            else -> "MATCH"
+        }
+        val matchedPackages = (targetPackages + policyBlockedPackages).distinct()
         UidDetectionPocResultStore.add(
-            protocol, src, srcPort, dst, dstPort, uid, packages,
-            if (uid == Process.INVALID_UID) "INVALID" else "MATCH",
-            "resolverCall=$callId; targetMatch=$targetMatch; thread=${Thread.currentThread().name}",
+            protocol, src, srcPort, dst, dstPort, uid, packages, status,
+            "resolverCall=$callId; verdict=$verdict; targetMatch=$targetMatch; " +
+                "blockedPackages=" + matchedPackages.joinToString(",") +
+                "; thread=" + Thread.currentThread().name,
         )
         Log.i(
             TAG,
             "RESULT verdict=$verdict tuple=$tuple uid=$uid " +
-                "packages=${packages.joinToString(",").ifBlank { "-" }} " +
-                "targetMatch=$targetMatch resolverCall=$callId",
+                "packages=" + packages.joinToString(",").ifBlank { "-" } +
+                " targetMatch=$targetMatch blocked=$shouldBlock " +
+                "blockedPackages=" + matchedPackages.joinToString(",").ifBlank { "-" } +
+                " resolverCall=$callId",
         )
         UidPocDiagnostics.jniEvent(
             service,
-            "OWNER_UID_QUERY_RESULT id=$callId verdict=$verdict uid=$uid packages=${packages.joinToString(",").ifBlank { "-" }}",
+            "OWNER_UID_QUERY_RESULT id=$callId verdict=$verdict uid=$uid " +
+                "packages=" + packages.joinToString(",").ifBlank { "-" } +
+                " blocked=$shouldBlock",
         )
-        return uid
-    }
 
+        // Attach the UID and tuple to any relay sessions already opened for this
+        // destination. A block verdict then closes those sessions immediately.
+        service.recordDetectedFlow(protocol, src, srcPort, dst, dstPort, uid, packages)
+        if (shouldBlock) {
+            service.enforceBlockedDetectedFlow(
+                protocol = protocol,
+                srcIp = src,
+                srcPort = srcPort,
+                dstIp = dst,
+                dstPort = dstPort,
+                uid = uid,
+                packages = packages,
+            )
+        }
+        return UidResolution(uid, shouldBlock)
+    }
     private fun reportException(
         protocol: Int,
         src: String,
@@ -281,6 +315,7 @@ internal class UidDetectionPoc(
         const val TAG = "UidDetectionPOC"
         const val IPPROTO_TCP = 6
         const val IPPROTO_UDP = 17
+        const val NATIVE_UID_BLOCKED = -3
     }
 }
 
