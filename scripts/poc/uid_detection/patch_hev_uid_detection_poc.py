@@ -428,7 +428,7 @@ __attribute__((constructor)) static void native_poc_crash_init (void)
             + "static volatile unsigned long long uid_poc_packets = 0, uid_poc_cache_hits = 0, uid_poc_cache_misses = 0;\n"
             + "static volatile unsigned long long uid_poc_pending_hits = 0, uid_poc_unique_requests = 0, uid_poc_jni_lookups = 0;\n"
             + "static volatile unsigned long long uid_poc_queue_full = 0, uid_poc_lookup_failures = 0;\n"
-            + END + "\\n",
+            + END + "\n",
             1,
         )
         jni_text = jni_text.replace(
