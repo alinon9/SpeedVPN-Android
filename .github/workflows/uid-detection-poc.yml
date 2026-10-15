@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - poc/uid-detection-test
+  pull_request:
+    branches:
+      - poc/uid-detection-test
   workflow_dispatch:
 
 permissions:
