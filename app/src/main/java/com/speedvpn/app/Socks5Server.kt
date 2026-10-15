@@ -236,6 +236,10 @@ class Socks5Server(
     }
 
     fun stop() {
+        log(
+            "SOCKET_TEARDOWN_BEGIN tcp=${openTcp.size} udp=${openUdp.size} " +
+                "upstreamTcp=${upstreamTcp.size} upstreamUdp=${upstreamUdp.size} reason=relay_stop"
+        )
         running = false
         runCatching { server.close() }
         openTcp.toList().forEach { runCatching { it.close() } }

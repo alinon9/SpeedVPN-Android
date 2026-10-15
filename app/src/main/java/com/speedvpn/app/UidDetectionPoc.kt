@@ -155,7 +155,7 @@ internal class UidDetectionPoc(
         val destination = addressText(dstAddress)
         UidPocDiagnostics.jniEvent(
             service,
-            "KOTLIN_RESOLVER_ENTRY id=$callId protocol=$protocolName src=$source:$srcPort dst=$destination:$dstPort srcBytes=${srcAddress.size} dstBytes=${dstAddress.size}",
+            "UID_POC_CALLBACK reason=NATIVE_FLOW_CACHE_MISS action=OBSERVE_ONLY id=$callId protocol=$protocolName src=$source:$srcPort dst=$destination:$dstPort srcBytes=${srcAddress.size} dstBytes=${dstAddress.size}",
         )
 
         var uid = Process.INVALID_UID
@@ -227,11 +227,11 @@ internal class UidDetectionPoc(
             TAG,
             "RESULT verdict=$verdict tuple=$tuple uid=$uid " +
                 "packages=${packages.joinToString(",").ifBlank { "-" }} " +
-                "targetMatch=$targetMatch resolverCall=$callId",
+                "targetMatch=$targetMatch resolverCall=$callId action=OBSERVE_ONLY packetBlocking=NOT_IMPLEMENTED",
         )
         UidPocDiagnostics.jniEvent(
             service,
-            "OWNER_UID_QUERY_RESULT id=$callId verdict=$verdict uid=$uid packages=${packages.joinToString(",").ifBlank { "-" }}",
+            "OWNER_UID_QUERY_RESULT action=OBSERVE_ONLY packetBlocking=NOT_IMPLEMENTED id=$callId verdict=$verdict uid=$uid packages=${packages.joinToString(",").ifBlank { "-" }}",
         )
         return uid
     }

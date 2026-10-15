@@ -171,6 +171,16 @@ class SpeedVpnService : VpnService() {
                 }
             }
             ACTION_RESTART_FOR_SETTINGS -> {
+                val policy = VpnAppControl.read(this)
+                val whatsAppBlocked = policy.blockedPackages.any {
+                    it == "com.whatsapp" || it.startsWith("com.whatsapp.")
+                }
+                log(
+                    "APP_POLICY_RESTART reason=settings firewallEnabled=${policy.firewallEnabled} " +
+                        "blockedCount=${policy.blockedPackages.size} whatsappBlocked=$whatsAppBlocked " +
+                        "whatsappBlockedPackages=${policy.blockedPackages.filter { it == "com.whatsapp" || it.startsWith("com.whatsapp.") }.sorted()} " +
+                        "vpnStatus=${VpnRuntime.state.value.status}"
+                )
                 reconnectAfterDisconnect = true
                 goForeground()
                 scope.launch { disconnect() }
@@ -312,6 +322,21 @@ class SpeedVpnService : VpnService() {
                         Build.VERSION.SDK_INT >= 29 &&
                             runCatching { isLockdownEnabled }.getOrDefault(false)
 
+                    val isWhatsAppPackage: (String) -> Boolean = {
+                        it == "com.whatsapp" || it.startsWith("com.whatsapp.")
+                    }
+                    val blockedWhatsAppPackages = effectiveBlocked.filter(isWhatsAppPackage).sorted()
+                    log(
+                        "APP_POLICY_SNAPSHOT firewallEnabled=${firewall.firewallEnabled} " +
+                            "manualBlockedCount=${manualBlocked.size} quotaBlockedCount=${quotaBlocked.size} " +
+                            "effectiveBlockedCount=${effectiveBlocked.size} " +
+                            "whatsappExactBlocked=${"com.whatsapp" in effectiveBlocked} " +
+                            "manualWhatsAppBlocked=${manualBlocked.any(isWhatsAppPackage)} " +
+                            "quotaWhatsAppBlocked=${quotaBlocked.any(isWhatsAppPackage)} " +
+                            "blockedWhatsAppPackages=$blockedWhatsAppPackages lockdownReady=$lockdownReady " +
+                            "allowListRequired=$needsAllowList"
+                    )
+
                     if (needsAllowList && !lockdownReady) {
                         val message = when {
                             quotaEnforcementRequested && firewallRequested ->
@@ -336,11 +361,23 @@ class SpeedVpnService : VpnService() {
                                 "SpeedVPN is blocked by the active app policy and cannot verify traffic through the VPN."
                             )
                         }
+                        val launchablePackageNames = launchable.map { it.packageName }
                         val allowedPackages = VpnApplicationPolicy.allowedPackages(
-                            launchablePackages = launchable.map { it.packageName },
+                            launchablePackages = launchablePackageNames,
                             blockedPackages = effectiveBlocked,
                             ownPackage = packageName,
                             includeOwnPackageForVerification = includeOwnPackage,
+                        )
+                        val whatsappLaunchable = launchablePackageNames.filter(isWhatsAppPackage).sorted()
+                        val whatsappAllowed = allowedPackages.filter(isWhatsAppPackage).sorted()
+                        log(
+                            "WHATSAPP_ALLOWLIST_AUDIT package=com.whatsapp " +
+                                "exactBlocked=${"com.whatsapp" in effectiveBlocked} " +
+                                "exactLaunchable=${"com.whatsapp" in launchablePackageNames} " +
+                                "exactInAllowedList=${"com.whatsapp" in allowedPackages} " +
+                                "blockedVariants=$blockedWhatsAppPackages launchableVariants=$whatsappLaunchable " +
+                                "allowedVariants=$whatsappAllowed lockdownReady=$lockdownReady " +
+                                "enforcement=ANDROID_LOCKDOWN_REQUIRED"
                         )
                         var allowed = 0
 
@@ -1136,6 +1173,11 @@ class SpeedVpnService : VpnService() {
         probeNativeState(expectedGeneration) == NativeProbe.RUNNING
 
     private fun cleanupLocked() {
+        log(
+            "VPN_CLEANUP_BEGIN session=${sessionId.get()} nativeGeneration=$nativeGeneration " +
+                "tunPresent=${tun != null} relayPresent=${socks != null} " +
+                "reason=disconnect_or_settings_restart"
+        )
         meter?.cancel(); meter = null
         healthMonitor?.cancel(); healthMonitor = null
         val configFile = tunnelConfigFile
