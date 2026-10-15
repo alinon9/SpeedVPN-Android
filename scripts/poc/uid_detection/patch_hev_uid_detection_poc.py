@@ -154,7 +154,7 @@ extern int hev_jni_uid_poc_packet (int protocol,
 /* Return non-zero only when the already-cached flow verdict is blocked.
  * UID lookup stays asynchronous on the dedicated native worker. */
 static int
-uid_poc_drop_packet (const struct pbuf *buf)
+uid_poc_report_packet (const struct pbuf *buf)
 {
     unsigned char ip[60], l4[20], src[16], dst[16];
     unsigned int total, offset, ip_header_len, src_len, need;
@@ -217,7 +217,7 @@ uid_poc_drop_packet (const struct pbuf *buf)
                                    dst, (int) src_len, (int) dst_port) ? 1 : 0;
 }
 #else
-#define uid_poc_drop_packet(buf) 0
+#define uid_poc_report_packet(buf) 0
 #endif
 
 static int
@@ -232,7 +232,7 @@ task_io_yielder (HevTaskYieldType type, void *data)
     replace_once(
         tunnel_c,
         "        if (!buf)\n            continue;\n\n        stat_tx_packets++;",
-        "        if (!buf)\n            continue;\n\n        if (uid_poc_drop_packet (buf)) {\n            pbuf_free (buf);\n            continue;\n        }\n        stat_tx_packets++;",
+        "        if (!buf)\n            continue;\n\n        int uid_poc_drop = uid_poc_report_packet (buf);\n        if (uid_poc_drop) {\n            pbuf_free (buf);\n            continue;\n        }\n        stat_tx_packets++;",
     )
 
     # The packet path performs a native cache lookup and queue operation only.
