@@ -16,8 +16,10 @@ public final class TProxyService {
 
     /** Temporary POC callback for outbound packets observed at the native TUN read point. */
     public interface UidPocCallback {
-        void onTunPacket(int protocol, byte[] srcAddress, int srcPort,
-                         byte[] dstAddress, int dstPort);
+        /** Synchronous UID resolution. Native invokes this only on its dedicated UID worker,
+         * never on the HEV packet coroutine. */
+        int onTunPacket(int protocol, byte[] srcAddress, int srcPort,
+                        byte[] dstAddress, int dstPort);
     }
 
     /** Temporary POC JNI hook. Present only on poc/uid-detection-test. */
