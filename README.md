@@ -249,3 +249,20 @@ See `CHANGELOG.md` for the version history and `TESTING.md` for the device-test 
 - Moved synchronous SharedPreferences persistence in `MainActivity` off the UI thread while serializing writes.
 - UDP reply correlation remains fail-closed for an intrinsically indistinguishable identical UDP 5-tuple; this is not safely solvable by heuristics.
 - The Gradle Wrapper JAR is bootstrapped only from Gradle's official pinned URL when absent and is SHA-256 verified before execution; GitHub CI runs through `./gradlew` so the wrapper path itself is validated.
+
+
+## WhatsApp firewall / Force Stop acceptance test
+
+The `poc/uid-detection-test` build is a diagnostic POC. UID lookup events marked `action=OBSERVE_ONLY` do **not** drop packets. The Android app-firewall policy separately builds an allowed-app list and requires Android **Always-on VPN + Block connections without VPN (Lockdown)** for denied apps to be blocked.
+
+1. On a physical device, enable the app firewall, add the exact WhatsApp package to the blocked list, and confirm Android Always-on VPN and Lockdown are enabled.
+2. Start the VPN and wait until its status is Connected. Export the diagnostic log before the test.
+3. Go to Android Settings → Apps → WhatsApp → **Force stop**, then launch WhatsApp from its app icon. Attempt an action that needs the network (refresh chats / send a test message).
+4. Export the diagnostic log and CSV again. Compare the entries below, using the timestamp around the Force Stop/relaunch:
+   - `APP_POLICY_RESTART` and `APP_POLICY_SNAPSHOT`: firewall state and the stored blocked-package set.
+   - `WHATSAPP_ALLOWLIST_AUDIT`: whether `com.whatsapp` is blocked, launchable, and mistakenly included in the VPN allow-list.
+   - `UID_POC_CALLBACK`, `OWNER_UID_QUERY_BEGIN`, and `OWNER_UID_QUERY_RESULT`: newly observed flow tuples, UID, package names, and `MATCH_TARGET` result where Android resolves the owner UID.
+   - `VPN_CLEANUP_BEGIN` and `SOCKET_TEARDOWN_BEGIN`: whether the settings restart closed the TUN/relay and the existing relay sockets.
+5. Repeat with WhatsApp unblocked as a control. Keep the exact APK SHA-256, Android version, and both exports with the result.
+
+Pass condition: with the exact WhatsApp package in `effectiveBlocked`, `WHATSAPP_ALLOWLIST_AUDIT` must show it absent from `allowedVariants`, Lockdown must be true, and a Force-Stopped/reopened WhatsApp must not refresh or send. If the app still has network access, capture the logs rather than assuming old sockets are responsible. A different WhatsApp package/profile, Lockdown bypass, or enforcement not wired to the actual packet path must be ruled out first.
