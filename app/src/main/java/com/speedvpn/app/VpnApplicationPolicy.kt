@@ -26,11 +26,8 @@ internal object VpnApplicationPolicy {
         includeOwnPackageForVerification: Boolean,
     ): Set<String> {
         val allowed = launchablePackages
-            .filter { it != ownPackage }
+            .filter { it != ownPackage && it !in blockedPackages }
             .toCollection(LinkedHashSet())
-        blockedPackages
-            .filter { it != ownPackage }
-            .forEach { allowed += it }
         if (includeOwnPackageForVerification && ownPackage !in blockedPackages) {
             allowed += ownPackage
         }
