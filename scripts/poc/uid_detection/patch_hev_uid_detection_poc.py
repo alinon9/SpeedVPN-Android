@@ -762,7 +762,7 @@ static int
 uid_poc_worker_start (void)
 {
     pthread_attr_t attr;
-    int result;
+    int result, ready;
     pthread_mutex_lock (&uid_poc_mutex);
     uid_poc_worker_stop_requested = 0;
     uid_poc_worker_ready = 0;
@@ -786,6 +786,25 @@ uid_poc_worker_start (void)
     if (result != 0) {
         __android_log_print (ANDROID_LOG_ERROR, "SpeedVPN-POC-JNI",
                              "UID_WORKER_START_FAILED error=%d", result);
+        return 0;
+    }
+
+    /* Do not report callback registration success until this thread is JVM-attached. */
+    pthread_mutex_lock (&uid_poc_mutex);
+    while (!uid_poc_worker_ready && !uid_poc_worker_stop_requested)
+        pthread_cond_wait (&uid_poc_condition, &uid_poc_mutex);
+    ready = uid_poc_worker_ready;
+    pthread_mutex_unlock (&uid_poc_mutex);
+    if (!ready) {
+        (void) pthread_join (uid_poc_worker_thread, NULL);
+        pthread_mutex_lock (&uid_poc_mutex);
+        uid_poc_worker_started = 0;
+        uid_poc_worker_ready = 0;
+        uid_poc_worker_stop_requested = 0;
+        uid_poc_reset_locked ();
+        pthread_mutex_unlock (&uid_poc_mutex);
+        __android_log_print (ANDROID_LOG_ERROR, "SpeedVPN-POC-JNI",
+                             "UID_WORKER_START_FAILED reason=attach_failed");
         return 0;
     }
     return 1;
