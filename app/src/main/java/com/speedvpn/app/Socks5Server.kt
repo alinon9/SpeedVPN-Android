@@ -22,6 +22,7 @@ import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -97,6 +98,7 @@ class Socks5Server(
         private const val UDP_BUFFER_SIZE = 65_535
         private const val MAX_UDP_ASSOCIATIONS = 24
         private const val UDP_DNS_WORKERS = 4
+        private const val UDP_DNS_QUEUE_CAPACITY = 64
         private const val UDP_FLOW_TTL_MS = 30_000L
         private const val UDP_CANDIDATE_FALLBACK_MS = 750L
         private const val CONNECT_TIMEOUT_MS = 12_000L
@@ -141,17 +143,18 @@ class Socks5Server(
     private val probeSourcePorts = ConcurrentHashMap.newKeySet<Int>()
     private val upstreamTcp = Collections.newSetFromMap(ConcurrentHashMap<Socket, Boolean>())
     private val upstreamUdp = Collections.newSetFromMap(ConcurrentHashMap<DatagramSocket, Boolean>())
-    // User-domain DNS resolution is encrypted DoH. The bounded pool prevents
-    // stalled encrypted lookups from building an unbounded backlog.
-    private val dnsPool: ExecutorService = ThreadPoolExecutor(
-        0,
+    // Chrome/YouTube may resolve several domains at once. A SynchronousQueue rejected
+    // every lookup beyond the four currently-running workers, turning harmless bursts into
+    // DNS failures. Keep four concurrent workers and a small bounded queue instead.
+    private val dnsPool: ThreadPoolExecutor = ThreadPoolExecutor(
+        UDP_DNS_WORKERS,
         UDP_DNS_WORKERS,
         30L,
         TimeUnit.SECONDS,
-        SynchronousQueue(),
+        ArrayBlockingQueue<Runnable>(UDP_DNS_QUEUE_CAPACITY),
         ThreadFactory { r -> Thread(r, "socks-dns").apply { isDaemon = true } },
         ThreadPoolExecutor.AbortPolicy(),
-    )
+    ).apply { allowCoreThreadTimeOut(true) }
 
     @Volatile private var encryptedDnsNetwork: Network? = null
     @Volatile private var encryptedDnsResolver: EncryptedDnsResolver? = null
@@ -416,7 +419,8 @@ class Socks5Server(
         val network = currentNetwork()
         log(
             "SOCKS5_DNS_BEGIN host=$host timeoutMs=$timeoutMs ipv6Enabled=$ipv6Enabled " +
-                "networkAvailable=${network != null} dnsWorkers=$UDP_DNS_WORKERS",
+                "networkAvailable=${network != null} dnsWorkers=$UDP_DNS_WORKERS " +
+                "activeDnsWorkers=${dnsPool.activeCount} dnsQueueDepth=${dnsPool.queue.size}/$UDP_DNS_QUEUE_CAPACITY",
         )
         if (network == null) {
             val error = UnknownHostException("No physical network available for encrypted DNS resolution: $host")
