@@ -79,14 +79,23 @@ jobs:
           must_contain 'HIT_RATE=%.2f%%' "$JNI_C"
           must_contain 'uid_poc_find_slot_locked' "$JNI_C"
           must_contain 'if (uid_poc_report_packet (buf))' "$TUNNEL_C"
+          must_contain 'version == 4' "$TUNNEL_C"
+          must_contain 'version == 6' "$TUNNEL_C"
+          must_contain 'protocol == 44' "$TUNNEL_C"
           must_contain 'pbuf_free (buf);' "$TUNNEL_C"
-          must_contain 'PACKET_DROP uid=%d' "$JNI_C"
+          must_contain 'PACKET_DROPPED uid=%d tuple=%s' "$JNI_C"
+          must_contain 'hookMode=HOOK_BLOCKING' "$JNI_C"
           must_contain 'packetBlocking=IMPLEMENTED' "$JNI_C"
           must_contain 'long onTunPacket(' app/src/main/java/hev/htproxy/TProxyService.java
           must_contain '): Long {' app/src/main/java/com/speedvpn/app/UidDetectionPoc.kt
           must_contain 'val blockedPackageMatches = knownPackages.filter { it in policy.packages }' app/src/main/java/com/speedvpn/app/UidDetectionPoc.kt
           must_contain 'val shouldBlock = uid != Process.INVALID_UID && uid in policy.uids' app/src/main/java/com/speedvpn/app/UidDetectionPoc.kt
           must_contain 'BLOCKED_UID uid=' app/src/main/java/com/speedvpn/app/UidDetectionPoc.kt
+          must_contain 'hookMode=HOOK_BLOCKING' app/src/main/java/com/speedvpn/app/UidDetectionPoc.kt
+          if grep -Fq 'action=OBSERVE_ONLY' app/src/main/java/com/speedvpn/app/UidDetectionPoc.kt; then
+            echo "::error::UID resolver still reports OBSERVE_ONLY instead of the active hook policy."
+            exit 1
+          fi
           must_contain 'blockedUids: Set<Int>' app/src/main/java/com/speedvpn/app/UidDetectionPoc.kt
           must_contain 'blockedUids(context: Context, blockedPackages: Set<String>)' app/src/main/java/com/speedvpn/app/VpnApplicationPolicy.kt
           must_contain 'updateBlockedUids(' app/src/main/java/com/speedvpn/app/SpeedVpnService.kt
