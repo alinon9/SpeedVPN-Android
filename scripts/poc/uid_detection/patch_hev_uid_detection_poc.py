@@ -18,6 +18,16 @@ def replace_once(path: Path, old: str, new: str) -> None:
     path.write_text(text.replace(old, new, 1))
 
 
+def replace_text_once(text: str, old: str, new: str, label: str) -> str:
+    """Apply a unique in-memory replacement, including on idempotent reruns."""
+    if new in text:
+        return text
+    count = text.count(old)
+    if count != 1:
+        raise SystemExit(f"Refusing unsafe patch: expected one {label} anchor, found {count}")
+    return text.replace(old, new, 1)
+
+
 def main() -> None:
     if len(sys.argv) != 2:
         raise SystemExit("usage: patch_hev_uid_detection_poc.py <hev-socks5-tunnel-dir>")
@@ -126,6 +136,15 @@ task_io_yielder (HevTaskYieldType type, void *data)
         tunnel_c,
         "        if (!buf)\n            continue;\n\n        stat_tx_packets++;",
         "        if (!buf)\n            continue;\n\n        uid_poc_report_packet (buf);\n        stat_tx_packets++;",
+    )
+
+    # The packet hook runs on HEV's lwIP I/O coroutine (64 KiB default), not a
+    # per-session task. Give that coroutine the same 128 KiB headroom required by ART.
+    replace_once(
+        tunnel_c,
+        "    task_lwip_io = hev_task_new (-1);\n",
+        "    /* POC callback crosses into ART from this coroutine: use a larger stack. */\n"
+        "    task_lwip_io = hev_task_new (131072);\n",
     )
 
     # JNI bridge: callback invocations are rate-limited and moved off the TUN thread in Kotlin.
@@ -449,6 +468,71 @@ native_is_running (JNIEnv *env, jobject thiz)
 '''
         jni_text = jni_text.replace(fn_anchor, functions, 1)
         jni_c.write_text(jni_text)
+
+    # Harden JNI/thread/FD ownership on every run (even if the injected marker already
+    # exists from an earlier invocation of this patcher).
+    jni_text = jni_c.read_text()
+
+    # Never retain JNIEnv*: it is valid only for the current OS thread and this call.
+    # The pthread key stores an attachment marker solely so its destructor detaches.
+    jni_text = replace_text_once(
+        jni_text,
+        "        pthread_setspecific (current_jni_env, env);",
+        "        if (pthread_setspecific (current_jni_env, (void *) 1) != 0) {\n"
+        "            (void) (*java_vm)->DetachCurrentThread (java_vm);\n"
+        "            return;\n"
+        "        }",
+        "JNI attachment marker",
+    )
+
+    # The Java PFD remains owned by Service, but Native now duplicates the descriptor:
+    # closing/collecting the Java wrapper cannot invalidate the FD used by HEV.
+    jni_text = replace_text_once(
+        jni_text,
+        "    tdata->fd = fd;",
+        "    tdata->fd = dup (fd);\n"
+        "    if (tdata->fd < 0) {\n"
+        "        free (tdata);\n"
+        "        goto exit;\n"
+        "    }",
+        "owned TUN descriptor",
+    )
+    jni_text = replace_text_once(
+        jni_text,
+        "    if (!bytes) {\n        free (tdata);\n        goto exit;\n    }",
+        "    if (!bytes) {\n        close (tdata->fd);\n        free (tdata);\n        goto exit;\n    }",
+        "GetStringUTFChars cleanup",
+    )
+    jni_text = replace_text_once(
+        jni_text,
+        "    if (!tdata->path) {\n        free (tdata);\n        goto exit;\n    }",
+        "    if (!tdata->path) {\n        close (tdata->fd);\n        free (tdata);\n        goto exit;\n    }",
+        "path allocation cleanup",
+    )
+    jni_text = replace_text_once(
+        jni_text,
+        "    hev_socks5_tunnel_main (tdata->path, tdata->fd);\n\n"
+        "    atomic_store_explicit (&is_running, 0, memory_order_release);",
+        "    /* Install SA_ONSTACK storage on the worker OS thread before HEV switches stacks. */\n"
+        "    native_install_alt_stack_for_thread ();\n"
+        "    hev_socks5_tunnel_main (tdata->path, tdata->fd);\n\n"
+        "    /* TUN FD is a native-owned dup; close only after the engine exits. */\n"
+        "    close (tdata->fd);\n\n"
+        "    atomic_store_explicit (&is_running, 0, memory_order_release);",
+        "native worker stack/FD lifetime",
+    )
+    jni_text = replace_text_once(
+        jni_text,
+        "    if (res != 0) {\n"
+        "        atomic_store_explicit (&is_running, 0, memory_order_release);\n"
+        "        free (tdata->path);",
+        "    if (res != 0) {\n"
+        "        atomic_store_explicit (&is_running, 0, memory_order_release);\n"
+        "        close (tdata->fd);\n"
+        "        free (tdata->path);",
+        "pthread_create cleanup",
+    )
+    jni_c.write_text(jni_text)
 
     print("OK - temporary UID detection POC hook applied to pinned hev source")
 
