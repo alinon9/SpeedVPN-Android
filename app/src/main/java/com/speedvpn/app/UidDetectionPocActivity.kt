@@ -6,6 +6,7 @@ import android.net.VpnService
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import java.net.InetAddress
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -44,9 +45,12 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 
 /** Persisted diagnostic mode; deliberately local to the isolated POC APK. */
 internal object UidPocSettings {
@@ -59,6 +63,8 @@ class UidDetectionPocActivity : ComponentActivity() {
     private var vpnStartRequested = false
     private val startupError = mutableStateOf<String?>(null)
     private val hookDisabled = mutableStateOf(false)
+    private val dnsTestRunning = mutableStateOf(false)
+    private val dnsTestResult = mutableStateOf("لم يُجر اختبار DNS بعد")
 
     private val notificationPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission(),
@@ -147,6 +153,9 @@ class UidDetectionPocActivity : ComponentActivity() {
                             startupError = startupError.value,
                             diagnosticPaths = UidPocDiagnostics.pathsText(this@UidDetectionPocActivity),
                             hookDisabled = hookDisabled.value,
+                            dnsTestRunning = dnsTestRunning.value,
+                            dnsTestResult = dnsTestResult.value,
+                            onDnsTest = { runDnsTest() },
                             onToggleHook = { disabled ->
                                 hookDisabled.value = disabled
                                 getSharedPreferences(UidPocSettings.PREFS, MODE_PRIVATE).edit()
@@ -240,6 +249,60 @@ class UidDetectionPocActivity : ComponentActivity() {
             }
     }
 
+    /**
+     * Resolve through Android's system resolver while the current VPN state is left intact.
+     * Run on Dispatchers.IO and bound the UI wait so a broken DNS path is visible, not frozen.
+     */
+    private fun runDnsTest() {
+        if (dnsTestRunning.value) return
+        dnsTestRunning.value = true
+        dnsTestResult.value = "جارٍ الاستعلام عن google.com…"
+        val vpn = VpnRuntime.state.value.status.name
+        UidPocDiagnostics.log(this, "SYSTEM_DNS_TEST_BEGIN host=google.com vpn=$vpn timeoutMs=8000")
+        lifecycleScope.launch {
+            val startedNs = System.nanoTime()
+            try {
+                val addresses = withTimeout(8_000L) {
+                    withContext(Dispatchers.IO) {
+                        InetAddress.getAllByName("google.com")
+                            .mapNotNull { it.hostAddress }
+                            .distinct()
+                    }
+                }
+                val elapsedMs = (System.nanoTime() - startedNs) / 1_000_000L
+                dnsTestResult.value = if (addresses.isEmpty()) {
+                    "فشل: لم يُرجع DNS أي عنوان (${elapsedMs}ms)"
+                } else {
+                    "نجح (${elapsedMs}ms): ${addresses.joinToString(", ")}"
+                }
+                UidPocDiagnostics.log(
+                    this@UidDetectionPocActivity,
+                    "SYSTEM_DNS_TEST_OK host=google.com vpn=$vpn elapsedMs=$elapsedMs addresses=${addresses.joinToString(",")}",
+                )
+            } catch (e: TimeoutCancellationException) {
+                val elapsedMs = (System.nanoTime() - startedNs) / 1_000_000L
+                dnsTestResult.value = "انتهت المهلة بعد ${elapsedMs}ms؛ افحص DNS/MapDNS ومسار النفق."
+                UidPocDiagnostics.error(
+                    this@UidDetectionPocActivity,
+                    "SYSTEM_DNS_TEST_TIMEOUT host=google.com vpn=$vpn elapsedMs=$elapsedMs",
+                    e,
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                val elapsedMs = (System.nanoTime() - startedNs) / 1_000_000L
+                dnsTestResult.value = "فشل (${elapsedMs}ms): ${e.javaClass.simpleName}: ${e.message.orEmpty()}"
+                UidPocDiagnostics.error(
+                    this@UidDetectionPocActivity,
+                    "SYSTEM_DNS_TEST_FAIL host=google.com vpn=$vpn elapsedMs=$elapsedMs",
+                    e,
+                )
+            } finally {
+                dnsTestRunning.value = false
+            }
+        }
+    }
+
     private fun collectCrashAndExport() {
         UidPocDiagnostics.log(this, "Crash export requested; attempting logcat crash buffer and tombstones")
         lifecycleScope.launch {
@@ -301,6 +364,9 @@ private fun UidDetectionPocScreen(
     startupError: String?,
     diagnosticPaths: String,
     hookDisabled: Boolean,
+    dnsTestRunning: Boolean,
+    dnsTestResult: String,
+    onDnsTest: () -> Unit,
     onToggleHook: (Boolean) -> Unit,
     onStartVpn: () -> Unit,
     onExportLog: () -> Unit,
@@ -350,6 +416,33 @@ private fun UidDetectionPocScreen(
                 color = Color(0xFF9FB2D0),
                 fontSize = 12.sp,
             )
+        }
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(12.dp),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF101A2B)),
+        ) {
+            Column(
+                Modifier.fillMaxWidth().padding(10.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text("اختبار DNS النظامي", fontWeight = FontWeight.SemiBold)
+                    Button(onClick = onDnsTest, enabled = !dnsTestRunning) {
+                        Text(if (dnsTestRunning) "جارٍ الفحص…" else "اختبار DNS")
+                    }
+                }
+                Text(
+                    "شغّله أثناء اتصال VPN. يستخدم InetAddress للنظام ويحدّد مهلة 8 ثوانٍ.",
+                    color = Color(0xFF9FB2D0),
+                    fontSize = 11.sp,
+                )
+                Text(dnsTestResult, color = if (dnsTestResult.startsWith("نجح")) Color(0xFF58E0B5) else Color(0xFFFFC857), fontSize = 12.sp)
+            }
         }
         Row(
             modifier = Modifier.fillMaxWidth(),
