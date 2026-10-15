@@ -492,9 +492,47 @@ __attribute__((constructor)) static void native_poc_crash_init (void)
         if jni_text.count(fn_anchor) != 1:
             raise SystemExit("Refusing unsafe patch: native_is_running anchor is not unique")
         functions = r'''/* SPEEDVPN_UID_POC_BEGIN */
+#include <stdio.h>
 #define UID_POC_CACHE_EMPTY 0
 #define UID_POC_CACHE_USED 1
 #define UID_POC_CACHE_DELETED 2
+
+/* Format IPv4 as dotted decimal and IPv6 as eight hexadecimal groups. */
+static void
+uid_poc_format_address (const unsigned char *address, int addr_len,
+                        char *buffer, size_t buffer_len)
+{
+    size_t used = 0;
+    int i;
+
+    if (!buffer || buffer_len == 0)
+        return;
+    buffer[0] = '\0';
+    if (!address) {
+        (void) snprintf (buffer, buffer_len, "?");
+        return;
+    }
+    if (addr_len == 4) {
+        (void) snprintf (buffer, buffer_len, "%u.%u.%u.%u",
+            (unsigned int) address[0], (unsigned int) address[1],
+            (unsigned int) address[2], (unsigned int) address[3]);
+        return;
+    }
+    if (addr_len != 16) {
+        (void) snprintf (buffer, buffer_len, "?");
+        return;
+    }
+    for (i = 0; i < 16; i += 2) {
+        int written = snprintf (buffer + used, buffer_len - used,
+            "%s%02x%02x", i == 0 ? "" : ":",
+            (unsigned int) address[i], (unsigned int) address[i + 1]);
+        if (written < 0 || (size_t) written >= buffer_len - used) {
+            buffer[buffer_len - 1] = '\0';
+            return;
+        }
+        used += (size_t) written;
+    }
+}
 
 static unsigned long long
 uid_poc_now_ms (void)
@@ -667,7 +705,7 @@ uid_poc_store_result_locked (const uid_poc_flow_key *key, int uid, int action,
             uid);
     } else {
         __android_log_print (ANDROID_LOG_INFO, "SpeedVPN-POC-JNI",
-            "UID_POLICY_RESULT uid=%d action=OBSERVE_ONLY packetBlocking=IMPLEMENTED",
+            "UID_POLICY_RESULT uid=%d action=ALLOW hookMode=HOOK_BLOCKING packetBlocking=IMPLEMENTED",
             uid);
     }
 }
@@ -936,6 +974,7 @@ hev_jni_uid_poc_packet (int protocol,
     uid_poc_request request;
     unsigned long long now, packet_count;
     int found = 0, slot, should_drop = 0;
+    char src_text[64], dst_text[64], tuple_text[200];
 
     if (!src || !dst || src_len != dst_len ||
         (src_len != 4 && src_len != 16) ||
@@ -974,9 +1013,15 @@ hev_jni_uid_poc_packet (int protocol,
                 __sync_add_and_fetch (&uid_poc_dropped_packets, 1ULL);
                 if (!entry->drop_logged) {
                     entry->drop_logged = 1;
+                    uid_poc_format_address (src, src_len, src_text, sizeof (src_text));
+                    uid_poc_format_address (dst, dst_len, dst_text, sizeof (dst_text));
+                    (void) snprintf (tuple_text, sizeof (tuple_text),
+                        "%s|[%s]:%d->[%s]:%d",
+                        protocol == 6 ? "tcp" : "udp", src_text, src_port,
+                        dst_text, dst_port);
                     __android_log_print (ANDROID_LOG_WARN, "SpeedVPN-POC-JNI",
-                        "PACKET_DROP uid=%d protocol=%d port_a=%u port_b=%u action=DROP packetBlocking=IMPLEMENTED",
-                        entry->uid, protocol, entry->key.port_a, entry->key.port_b);
+                        "PACKET_DROPPED uid=%d tuple=%s action=DROP hookMode=HOOK_BLOCKING packetBlocking=IMPLEMENTED",
+                        entry->uid, tuple_text);
                 }
             } else if (entry->uid >= 0) {
                 entry->updated_ms = now;
@@ -1052,7 +1097,7 @@ native_is_running (JNIEnv *env, jobject thiz)
         "DetachCurrentThread (java_vm)",
         "UID_WORKER_READY stack=1048576",
         "uid_poc_store_result_locked",
-        "PACKET_DROP uid=%d",
+        "PACKET_DROPPED uid=%d tuple=%s",
         "if (uid_poc_report_packet (buf))",
     )
     for marker in required_native_markers:
