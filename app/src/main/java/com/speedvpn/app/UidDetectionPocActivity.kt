@@ -28,11 +28,13 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalLayoutDirection
@@ -46,10 +48,17 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
+/** Persisted diagnostic mode; deliberately local to the isolated POC APK. */
+internal object UidPocSettings {
+    const val PREFS = "uid_detection_poc_settings"
+    const val KEY_DISABLE_JNI_HOOK = "disable_jni_hook"
+}
+
 /** Launcher activity used only by the isolated UID diagnostic APK on this POC branch. */
 class UidDetectionPocActivity : ComponentActivity() {
     private var vpnStartRequested = false
     private val startupError = mutableStateOf<String?>(null)
+    private val hookDisabled = mutableStateOf(false)
 
     private val notificationPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission(),
@@ -109,6 +118,9 @@ class UidDetectionPocActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        hookDisabled.value = getSharedPreferences(UidPocSettings.PREFS, MODE_PRIVATE)
+            .getBoolean(UidPocSettings.KEY_DISABLE_JNI_HOOK, false)
+        UidPocDiagnostics.prepareNativeCrashHandlerStorage(this)
         UidPocDiagnostics.log(
             this,
             "UidDetectionPocActivity.onCreate; API=${Build.VERSION.SDK_INT}; " +
@@ -134,10 +146,24 @@ class UidDetectionPocActivity : ComponentActivity() {
                             supported = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q,
                             startupError = startupError.value,
                             diagnosticPaths = UidPocDiagnostics.pathsText(this@UidDetectionPocActivity),
-                            hasCrashLog = UidPocDiagnostics.hasCrashFile(this@UidDetectionPocActivity),
+                            hookDisabled = hookDisabled.value,
+                            onToggleHook = { disabled ->
+                                hookDisabled.value = disabled
+                                getSharedPreferences(UidPocSettings.PREFS, MODE_PRIVATE).edit()
+                                    .putBoolean(UidPocSettings.KEY_DISABLE_JNI_HOOK, disabled)
+                                    .apply()
+                                UidPocDiagnostics.log(
+                                    this@UidDetectionPocActivity,
+                                    "JNI_HOOK_MODE disabled=$disabled; applies to next native start",
+                                )
+                                if (VpnRuntime.state.value.status == VpnStatus.CONNECTED) {
+                                    UidPocDiagnostics.log(this@UidDetectionPocActivity, "Restarting VPN to apply JNI hook test mode")
+                                    SpeedVpnService.restartForSettings(this@UidDetectionPocActivity)
+                                }
+                            },
                             onStartVpn = { ensureVpnConnected() },
                             onExportLog = { exportLogDocument.launch("SpeedVPN-POC-Log.txt") },
-                            onExportCrash = { exportCrashDocument.launch("SpeedVPN-POC-Crash.txt") },
+                            onExportCrash = { collectCrashAndExport() },
                             onToggleRecording = {
                                 if (recording) {
                                     UidDetectionPocResultStore.stopRecording()
@@ -214,6 +240,25 @@ class UidDetectionPocActivity : ComponentActivity() {
             }
     }
 
+    private fun collectCrashAndExport() {
+        UidPocDiagnostics.log(this, "Crash export requested; attempting logcat crash buffer and tombstones")
+        lifecycleScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                UidPocDiagnostics.captureCrashReport(this@UidDetectionPocActivity, hookDisabled.value)
+            }
+            UidPocDiagnostics.log(
+                this@UidDetectionPocActivity,
+                "Crash capture saved locally; bytes=${result.toByteArray(Charsets.UTF_8).size}",
+            )
+            Toast.makeText(
+                this@UidDetectionPocActivity,
+                "تم حفظ Crash.txt داخل مساحة التطبيق. اختر موقعًا لتصدير نسخة.",
+                Toast.LENGTH_LONG,
+            ).show()
+            exportCrashDocument.launch("Crash.txt")
+        }
+    }
+
     private fun exportDiagnostic(uri: Uri?, crash: Boolean) {
         if (uri == null) return
         lifecycleScope.launch {
@@ -255,7 +300,8 @@ private fun UidDetectionPocScreen(
     supported: Boolean,
     startupError: String?,
     diagnosticPaths: String,
-    hasCrashLog: Boolean,
+    hookDisabled: Boolean,
+    onToggleHook: (Boolean) -> Unit,
     onStartVpn: () -> Unit,
     onExportLog: () -> Unit,
     onExportCrash: () -> Unit,
@@ -305,6 +351,21 @@ private fun UidDetectionPocScreen(
                 fontSize = 12.sp,
             )
         }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text("تعطيل JNI hook", fontWeight = FontWeight.SemiBold)
+                Text(
+                    if (hookDisabled) "لن يُسجّل callback؛ النفق الأصلي يستمر" else "سيُفعّل callback التشخيصي عند بدء النفق",
+                    color = Color(0xFF9FB2D0),
+                    fontSize = 11.sp,
+                )
+            }
+            Switch(checked = hookDisabled, onCheckedChange = onToggleHook)
+        }
         startupError?.let {
             Text("خطأ بدء التشغيل: $it", color = Color(0xFFFF7D8A), fontWeight = FontWeight.SemiBold)
         }
@@ -327,7 +388,6 @@ private fun UidDetectionPocScreen(
                     OutlinedButton(
                         modifier = Modifier.weight(1f),
                         onClick = onExportCrash,
-                        enabled = hasCrashLog,
                     ) { Text("تصدير Crash") }
                 }
             }
