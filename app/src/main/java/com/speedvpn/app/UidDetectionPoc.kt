@@ -3,7 +3,6 @@ package com.speedvpn.app
 import android.net.ConnectivityManager
 import android.os.Build
 import android.os.Process
-import android.os.SystemClock
 import android.util.Log
 import hev.htproxy.TProxyService
 import java.net.InetAddress
@@ -11,11 +10,6 @@ import java.net.InetSocketAddress
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import java.util.concurrent.ArrayBlockingQueue
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.ThreadPoolExecutor
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -109,25 +103,13 @@ internal object UidDetectionPocResultStore {
 }
 
 /**
- * Temporary diagnostic only. It observes tuples reported at the native TUN read point and
- * asks Android which UID owns each tuple. The records are shown in the POC screen and are
- * never used to change packet forwarding or enforce a firewall.
+ * Temporary POC observer. The native flow cache invokes this synchronous resolver only
+ * on a cache miss, using its dedicated JVM-attached worker thread. Never called per packet
+ * on the HEV coroutine.
  */
 internal class UidDetectionPoc(
     private val service: SpeedVpnService,
 ) : TProxyService.UidPocCallback, AutoCloseable {
-    private data class Tuple(
-        val protocol: Int,
-        val src: String,
-        val srcPort: Int,
-        val dst: String,
-        val dstPort: Int,
-    ) {
-        override fun toString(): String =
-            "${when (protocol) { 6 -> "TCP"; 17 -> "UDP"; else -> protocol.toString() }}|" +
-                "$src|$srcPort|$dst|$dstPort"
-    }
-
     private val connectivity = service.getSystemService(ConnectivityManager::class.java)
     private val packageManager = service.packageManager
     private val targets = listOf(
@@ -141,22 +123,14 @@ internal class UidDetectionPoc(
             runCatching { packageManager.getApplicationInfo(pkg, 0).uid to pkg }.getOrNull()
         }
         .groupBy({ it.first }, { it.second })
-    private val lastQueuedAt = ConcurrentHashMap<Tuple, Long>()
-    private val attempts = ConcurrentHashMap<Tuple, AtomicInteger>()
-    private val resolved = ConcurrentHashMap.newKeySet<Tuple>()
-    private val executor = ThreadPoolExecutor(
-        1,
-        1,
-        0L,
-        TimeUnit.MILLISECONDS,
-        ArrayBlockingQueue(128),
-        { task -> Thread(task, "uid-detection-poc").apply { isDaemon = true } },
-        ThreadPoolExecutor.DiscardOldestPolicy(),
-    )
+    private val nativeCallbackSequence = AtomicLong(0L)
 
     init {
         Log.i(TAG, "START Android API=${Build.VERSION.SDK_INT}; package=${service.packageName}")
-        UidPocDiagnostics.log(service, "UidDetectionPoc.init; API=${Build.VERSION.SDK_INT}; package=${service.packageName}")
+        UidPocDiagnostics.log(
+            service,
+            "UidDetectionPoc.init; API=${Build.VERSION.SDK_INT}; package=${service.packageName}; resolver=dedicated-native-worker",
+        )
         targets.forEach { pkg ->
             val expected = runCatching { packageManager.getApplicationInfo(pkg, 0).uid }
                 .getOrNull()
@@ -168,110 +142,98 @@ internal class UidDetectionPoc(
         }
     }
 
-    private val nativeCallbackSequence = AtomicLong(0L)
-
     override fun onTunPacket(
         protocol: Int,
         srcAddress: ByteArray,
         srcPort: Int,
         dstAddress: ByteArray,
         dstPort: Int,
-    ) {
+    ): Int {
         val callId = nativeCallbackSequence.incrementAndGet()
-        val protocolName = when (protocol) { 6 -> "TCP"; 17 -> "UDP"; else -> protocol.toString() }
-        val source = runCatching { InetAddress.getByAddress(srcAddress).hostAddress }
-            .getOrElse { "invalid-address-${srcAddress.size}-bytes" }
-        val destination = runCatching { InetAddress.getByAddress(dstAddress).hostAddress }
-            .getOrElse { "invalid-address-${dstAddress.size}-bytes" }
+        val protocolName = protocolName(protocol)
+        val source = addressText(srcAddress)
+        val destination = addressText(dstAddress)
         UidPocDiagnostics.jniEvent(
             service,
-            "KOTLIN_CALLBACK_ENTRY id=$callId protocol=$protocolName src=$source:$srcPort dst=$destination:$dstPort srcBytes=${srcAddress.size} dstBytes=${dstAddress.size}",
+            "KOTLIN_RESOLVER_ENTRY id=$callId protocol=$protocolName src=$source:$srcPort dst=$destination:$dstPort srcBytes=${srcAddress.size} dstBytes=${dstAddress.size}",
         )
+
+        var uid = Process.INVALID_UID
         var outcome = "returned"
         try {
-            handleTunPacket(protocol, srcAddress, srcPort, dstAddress, dstPort)
-        } catch (t: Throwable) {
-            outcome = "throwable:${t.javaClass.simpleName}"
-            UidPocDiagnostics.error(service, "Unhandled error inside native UID callback id=$callId", t)
+            uid = resolveUid(protocol, srcAddress, srcPort, dstAddress, dstPort, callId)
+            return uid
+        } catch (error: Throwable) {
+            outcome = "throwable:${error.javaClass.simpleName}"
+            reportException(protocol, source, srcPort, destination, dstPort, callId, error)
+            return Process.INVALID_UID
         } finally {
-            UidPocDiagnostics.jniEvent(service, "KOTLIN_CALLBACK_EXIT id=$callId outcome=$outcome")
+            UidPocDiagnostics.jniEvent(
+                service,
+                "KOTLIN_RESOLVER_EXIT id=$callId outcome=$outcome uid=$uid",
+            )
         }
     }
 
-    private fun handleTunPacket(
+    /** Runs only on the dedicated native UID worker, never on the TUN coroutine. */
+    private fun resolveUid(
         protocol: Int,
         srcAddress: ByteArray,
         srcPort: Int,
         dstAddress: ByteArray,
         dstPort: Int,
-    ) {
-        if (!UidDetectionPocResultStore.isRecording) return
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
-        if (protocol != IPPROTO_TCP && protocol != IPPROTO_UDP) return
-        if (srcPort !in 0..65535 || dstPort !in 0..65535) return
-        if (srcAddress.size !in setOf(4, 16) || dstAddress.size != srcAddress.size) return
-
-        val src = runCatching { InetAddress.getByAddress(srcAddress).hostAddress }.getOrNull() ?: return
-        val dst = runCatching { InetAddress.getByAddress(dstAddress).hostAddress }.getOrNull() ?: return
-        val tuple = Tuple(protocol, src, srcPort, dst, dstPort)
-        if (tuple in resolved) return
-
-        val now = SystemClock.elapsedRealtime()
-        val previous = lastQueuedAt.put(tuple, now)
-        if (previous != null && now - previous < RETRY_INTERVAL_MS) return
-
-        val attemptCounter = attempts.computeIfAbsent(tuple) { AtomicInteger() }
-        if (attemptCounter.get() >= MAX_ATTEMPTS) return
-        val attempt = attemptCounter.incrementAndGet()
-
-        // Never perform the Binder-backed Android UID lookup on the TUN engine thread.
-        runCatching {
-            executor.execute {
-                try {
-                    val local = InetSocketAddress(InetAddress.getByAddress(srcAddress), srcPort)
-                    val remote = InetSocketAddress(InetAddress.getByAddress(dstAddress), dstPort)
-                    UidPocDiagnostics.log(service, "OWNER_UID_QUERY_BEGIN tuple=$tuple attempt=$attempt")
-                    val uid = connectivity.getConnectionOwnerUid(protocol, local, remote)
-                    val packages = if (uid == Process.INVALID_UID) {
-                        emptyList()
-                    } else {
-                        packageManager.getPackagesForUid(uid)?.sorted().orEmpty()
-                    }
-                    val targetMatch = expectedUidPackages[uid]?.joinToString(",") ?: "-"
-                    val verdict = when {
-                        uid == Process.INVALID_UID -> "INVALID_UID"
-                        targetMatch != "-" -> "MATCH_TARGET"
-                        else -> "UID_FOUND_OTHER_OR_UNLISTED"
-                    }
-                    UidDetectionPocResultStore.add(
-                        protocol, src, srcPort, dst, dstPort, uid, packages,
-                        if (uid == Process.INVALID_UID) "INVALID" else "MATCH",
-                        "attempt=$attempt; targetMatch=$targetMatch",
-                    )
-                    Log.i(
-                        TAG,
-                        "RESULT verdict=$verdict tuple=$tuple uid=$uid " +
-                            "packages=${packages.joinToString(",").ifBlank { "-" }} " +
-                            "targetMatch=$targetMatch attempt=$attempt",
-                    )
-                    if (uid != Process.INVALID_UID) resolved.add(tuple)
-                } catch (e: SecurityException) {
-                    reportException(protocol, src, srcPort, dst, dstPort, attempt, e)
-                } catch (e: IllegalArgumentException) {
-                    reportException(protocol, src, srcPort, dst, dstPort, attempt, e)
-                } catch (e: Exception) {
-                    reportException(protocol, src, srcPort, dst, dstPort, attempt, e)
-                } catch (t: Throwable) {
-                    reportException(protocol, src, srcPort, dst, dstPort, attempt, t)
-                }
-            }
-        }.onFailure {
-            UidDetectionPocResultStore.add(
-                protocol, src, srcPort, dst, dstPort, null, emptyList(), "EXCEPTION",
-                "Queue error: ${it.javaClass.simpleName}: ${it.message.orEmpty()}",
-            )
-            Log.w(TAG, "QUEUE_DROP tuple=$tuple reason=${it.javaClass.simpleName}")
+        callId: Long,
+    ): Int {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            UidPocDiagnostics.log(service, "OWNER_UID_QUERY_SKIPPED id=$callId reason=API_BELOW_29")
+            return Process.INVALID_UID
         }
+        if (protocol != IPPROTO_TCP && protocol != IPPROTO_UDP) {
+            UidPocDiagnostics.log(service, "OWNER_UID_QUERY_SKIPPED id=$callId reason=UNSUPPORTED_PROTOCOL protocol=$protocol")
+            return Process.INVALID_UID
+        }
+        if (srcPort !in 0..65535 || dstPort !in 0..65535 ||
+            srcAddress.size !in setOf(4, 16) || dstAddress.size != srcAddress.size
+        ) {
+            UidPocDiagnostics.log(service, "OWNER_UID_QUERY_SKIPPED id=$callId reason=INVALID_TUPLE")
+            return Process.INVALID_UID
+        }
+
+        val src = InetAddress.getByAddress(srcAddress).hostAddress ?: "unknown"
+        val dst = InetAddress.getByAddress(dstAddress).hostAddress ?: "unknown"
+        val tuple = "${protocolName(protocol)}|$src|$srcPort|$dst|$dstPort"
+        val local = InetSocketAddress(InetAddress.getByAddress(srcAddress), srcPort)
+        val remote = InetSocketAddress(InetAddress.getByAddress(dstAddress), dstPort)
+
+        UidPocDiagnostics.log(service, "OWNER_UID_QUERY_BEGIN id=$callId tuple=$tuple thread=${Thread.currentThread().name}")
+        val uid = connectivity.getConnectionOwnerUid(protocol, local, remote)
+        val packages = if (uid == Process.INVALID_UID) {
+            emptyList()
+        } else {
+            packageManager.getPackagesForUid(uid)?.sorted().orEmpty()
+        }
+        val targetMatch = expectedUidPackages[uid]?.joinToString(",") ?: "-"
+        val verdict = when {
+            uid == Process.INVALID_UID -> "INVALID_UID"
+            targetMatch != "-" -> "MATCH_TARGET"
+            else -> "UID_FOUND_OTHER_OR_UNLISTED"
+        }
+        UidDetectionPocResultStore.add(
+            protocol, src, srcPort, dst, dstPort, uid, packages,
+            if (uid == Process.INVALID_UID) "INVALID" else "MATCH",
+            "resolverCall=$callId; targetMatch=$targetMatch; thread=${Thread.currentThread().name}",
+        )
+        Log.i(
+            TAG,
+            "RESULT verdict=$verdict tuple=$tuple uid=$uid " +
+                "packages=${packages.joinToString(",").ifBlank { "-" }} " +
+                "targetMatch=$targetMatch resolverCall=$callId",
+        )
+        UidPocDiagnostics.jniEvent(
+            service,
+            "OWNER_UID_QUERY_RESULT id=$callId verdict=$verdict uid=$uid packages=${packages.joinToString(",").ifBlank { "-" }}",
+        )
+        return uid
     }
 
     private fun reportException(
@@ -280,28 +242,45 @@ internal class UidDetectionPoc(
         srcPort: Int,
         dst: String,
         dstPort: Int,
-        attempt: Int,
+        callId: Long,
         error: Throwable,
     ) {
         val details = "${error.javaClass.simpleName}: ${error.message.orEmpty()}"
         UidDetectionPocResultStore.add(
             protocol, src, srcPort, dst, dstPort, null, emptyList(), "EXCEPTION",
-            "attempt=$attempt; $details",
+            "resolverCall=$callId; $details",
         )
-        Log.e(TAG, "RESULT verdict=EXCEPTION tuple=${protocol}|$src|$srcPort|$dst|$dstPort attempt=$attempt details=$details", error)
-        UidPocDiagnostics.error(service, "OWNER_UID_QUERY_EXCEPTION tuple=${protocol}|$src|$srcPort|$dst|$dstPort attempt=$attempt", error)
+        Log.e(
+            TAG,
+            "RESULT verdict=EXCEPTION tuple=${protocol}|$src|$srcPort|$dst|$dstPort resolverCall=$callId details=$details",
+            error,
+        )
+        UidPocDiagnostics.error(
+            service,
+            "OWNER_UID_QUERY_EXCEPTION tuple=${protocol}|$src|$srcPort|$dst|$dstPort resolverCall=$callId",
+            error,
+        )
     }
 
+    private fun protocolName(protocol: Int): String = when (protocol) {
+        IPPROTO_TCP -> "TCP"
+        IPPROTO_UDP -> "UDP"
+        else -> protocol.toString()
+    }
+
+    private fun addressText(address: ByteArray): String =
+        runCatching { InetAddress.getByAddress(address).hostAddress ?: "unknown" }
+            .getOrElse { "invalid-address-${address.size}-bytes" }
+
     override fun close() {
-        executor.shutdownNow()
-        Log.i(TAG, "STOP")
+        // The native setter joins the worker before the Service releases this callback.
+        Log.i(TAG, "STOP resolverCalls=${nativeCallbackSequence.get()}")
     }
 
     private companion object {
         const val TAG = "UidDetectionPOC"
         const val IPPROTO_TCP = 6
         const val IPPROTO_UDP = 17
-        const val RETRY_INTERVAL_MS = 750L
-        const val MAX_ATTEMPTS = 4
     }
 }
+
