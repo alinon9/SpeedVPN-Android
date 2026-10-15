@@ -1103,7 +1103,7 @@ class Socks5Server(
                 bindings.values.mapNotNull { binding ->
                     val packages = binding.packages.intersect(blockedPackages)
                     if (packages.isEmpty()) null
-                    else Triple(binding, packages)
+                    else binding to packages
                 }
             }
             matches.forEach { (binding, packages) ->
