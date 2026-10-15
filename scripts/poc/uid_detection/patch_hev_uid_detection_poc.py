@@ -28,6 +28,20 @@ def main() -> None:
         if not required.is_file():
             raise SystemExit(f"Missing pinned hev source file: {required}")
 
+    # The injected signal handler uses Android log + dlsym; link these libraries explicitly.
+    android_mk = root / "Android.mk"
+    if not android_mk.is_file():
+        raise SystemExit(f"Missing native Android.mk: {android_mk}")
+    android_text = android_mk.read_text()
+    link_flags = "LOCAL_LDLIBS += -llog -ldl"
+    if link_flags not in android_text:
+        source_anchor = "LOCAL_SRC_FILES := $(HEV_SOCKS5_TUNNEL_SRC)\\n"
+        count = android_text.count(source_anchor)
+        if count < 1:
+            raise SystemExit("Refusing unsafe native build patch: LOCAL_SRC_FILES anchor missing")
+        android_text = android_text.replace(source_anchor, source_anchor + link_flags + "\\n")
+        android_mk.write_text(android_text)
+
     parser = r'''
 /* SPEEDVPN_UID_POC_BEGIN */
 #ifdef __ANDROID__
