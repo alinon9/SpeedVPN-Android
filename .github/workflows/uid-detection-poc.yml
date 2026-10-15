@@ -73,7 +73,7 @@ jobs:
           grep -Fq 'pbuf_free (buf);' "$TUNNEL_C"
           grep -Fq 'PACKET_DROP uid=%d' "$JNI_C"
           grep -Fq 'packetBlocking=IMPLEMENTED' "$JNI_C"
-          grep -Fq 'int onTunPacket(' app/src/main/java/hev/htproxy/TProxyService.java
+          grep -Fq 'long onTunPacket(' app/src/main/java/hev/htproxy/TProxyService.java
           grep -Fq '): Long {' app/src/main/java/com/speedvpn/app/UidDetectionPoc.kt
           grep -Fq '"com.whatsapp.w4b"' app/src/main/java/com/speedvpn/app/UidDetectionPoc.kt
           grep -Fq '(I[BI[BI)J' "$JNI_C"
@@ -81,7 +81,7 @@ jobs:
             echo "::error::The HEV coroutine stack is still enlarged for JNI. JNI must only run on the dedicated worker."
             exit 1
           fi
-          echo "Verified: native flow cache, dedicated UID worker, bounded queue metrics, and return-UID callback are patched."
+          echo "Verified: native flow cache, dedicated UID worker, packed UID/action callback, and native packet DROP path are patched."
 
       - name: Build diagnostic APK
         id: build_poc
