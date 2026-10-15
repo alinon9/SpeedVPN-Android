@@ -39,7 +39,7 @@ jobs:
         run: |
           set -euo pipefail
           SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
-          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          printf 'y\n%.0s' {1..100} | "$SDKMANAGER" --licenses >/dev/null
           "$SDKMANAGER" --install \
             "platform-tools" \
             "platforms;android-36" \
@@ -59,22 +59,51 @@ jobs:
           python3 -m py_compile scripts/poc/uid_detection/patch_hev_uid_detection_poc.py
 
       - name: Build diagnostic APK
+        id: build_poc
         shell: bash
         run: |
           set -euo pipefail
           ./gradlew --no-daemon --stacktrace :app:assembleDebug
-          APK="app/build/outputs/apk/debug/app-debug.apk"
-          test -s "$APK"
-          sha256sum "$APK" | tee apk-sha256.txt
 
-      # Keep this immediately after the build so no test/device setup can block delivery.
-      - name: Upload diagnostic APK
+      - name: Diagnose APK outputs
         if: always()
+        shell: bash
+        run: |
+          echo "Build outcome: ${{ steps.build_poc.outcome }}"
+          echo "APK files found:"
+          find . -type f -name '*.apk' -print || true
+
+      - name: Verify diagnostic APK
+        id: verify_poc_apk
+        if: steps.build_poc.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK_DIR="app/build/outputs/apk"
+          if [[ ! -d "$APK_DIR" ]]; then
+            echo "::error::Gradle succeeded, but the APK output directory was not created: $APK_DIR"
+            exit 1
+          fi
+          mapfile -d '' APK_FILES < <(find "$APK_DIR" -type f -name '*.apk' -print0)
+          if ((${#APK_FILES[@]} == 0)); then
+            echo "::error::Gradle succeeded, but no APK files were found under $APK_DIR"
+            exit 1
+          fi
+          for apk in "${APK_FILES[@]}"; do
+            if [[ ! -s "$apk" ]]; then
+              echo "::error::APK exists but is empty: $apk"
+              exit 1
+            fi
+            stat -c 'APK: %n | size: %s bytes' "$apk"
+          done
+          sha256sum "${APK_FILES[@]}" | tee apk-sha256.txt
+
+      - name: Upload POC APK
         uses: actions/upload-artifact@v4
         with:
-          name: SpeedVPN-UID-Detection-POC
+          name: SpeedVPN-POC
           path: |
-            app/build/outputs/apk/debug/app-debug.apk
+            app/build/outputs/apk/**/*.apk
             apk-sha256.txt
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 14
