@@ -175,11 +175,11 @@ internal class UidDetectionPoc(
         try {
             val resolution = resolveUid(protocol, srcAddress, srcPort, dstAddress, dstPort, callId)
             uid = resolution.uid
-            val action = if (resolution.shouldBlock) "BLOCK" else "OBSERVE_ONLY"
+            val action = if (resolution.shouldBlock) "BLOCK" else "ALLOW"
             val encoded = encodeUidDecision(resolution.uid, resolution.shouldBlock)
             UidPocDiagnostics.jniEvent(
                 service,
-                "KOTLIN_RESOLVER_DECISION id=$callId verdict=${resolution.verdict} uid=${resolution.uid} action=$action packetBlocking=IMPLEMENTED",
+                "KOTLIN_RESOLVER_DECISION id=$callId verdict=${resolution.verdict} uid=${resolution.uid} action=$action hookMode=HOOK_BLOCKING packetBlocking=IMPLEMENTED",
             )
             outcome = "returned:$action"
             return encoded
@@ -269,17 +269,17 @@ internal class UidDetectionPoc(
             TAG,
             "RESULT verdict=$verdict tuple=$tuple uid=$uid " +
                 "packages=${knownPackages.joinToString(",").ifBlank { "-" }} " +
-                "targetMatch=$targetMatch action=$action packetBlocking=IMPLEMENTED resolverCall=$callId",
+                "targetMatch=$targetMatch action=$action hookMode=HOOK_BLOCKING packetBlocking=IMPLEMENTED resolverCall=$callId",
         )
         UidPocDiagnostics.jniEvent(
             service,
-            "OWNER_UID_QUERY_RESULT id=$callId verdict=$verdict uid=$uid packages=${knownPackages.joinToString(",").ifBlank { "-" }} action=$action packetBlocking=IMPLEMENTED",
+            "OWNER_UID_QUERY_RESULT id=$callId verdict=$verdict uid=$uid packages=${knownPackages.joinToString(",").ifBlank { "-" }} action=$action hookMode=HOOK_BLOCKING packetBlocking=IMPLEMENTED",
         )
         if (uid != Process.INVALID_UID) {
             service.recordDetectedFlow(protocol, src, srcPort, dst, dstPort, uid, knownPackages)
         }
         if (shouldBlock) {
-            Log.w(TAG, "BLOCKED_UID uid=$uid packages=${blockedPackageMatches.joinToString(",").ifBlank { "-" }} tuple=$tuple")
+            Log.w(TAG, "BLOCKED_UID uid=$uid packages=${blockedPackageMatches.joinToString(",").ifBlank { "-" }} tuple=$tuple hookMode=HOOK_BLOCKING packetBlocking=IMPLEMENTED")
             service.enforceBlockedDetectedFlow(
                 protocol = protocol,
                 srcIp = src,
