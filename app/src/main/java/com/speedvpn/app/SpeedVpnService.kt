@@ -373,6 +373,17 @@ class SpeedVpnService : VpnService() {
                         )
                     }
 
+                    // POC diagnostic isolation: keep SpeedVPN's own app/control traffic
+                    // out of the TUN to test for a self-routing loop. Android does not allow
+                    // mixing addDisallowedApplication() with an active addAllowedApplication()
+                    // policy, so only install this explicit exclusion when no allow-list exists.
+                    if (!needsAllowList) {
+                        addDisallowedApplication(packageName)
+                        log("POC_SELF_PACKAGE_DISALLOWED package=$packageName")
+                    } else {
+                        log("POC_SELF_PACKAGE_EXCLUSION_SKIPPED reason=app_allow_list_active")
+                    }
+
                     // VPN control/native sockets are protected before connecting.
                     // The verifier includes the app UID in an active allow-list so
                     // its probe measures the tunnel path; regular firewall policy
