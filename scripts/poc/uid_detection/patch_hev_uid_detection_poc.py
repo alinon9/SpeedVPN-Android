@@ -1056,7 +1056,7 @@ native_is_running (JNIEnv *env, jobject thiz)
         "if (uid_poc_report_packet (buf))",
     )
     for marker in required_native_markers:
-        source = tunnel_c.read_text() if marker == "if (uid_poc_report_packet (buf))" else jni_text
+        source = Path(__file__).read_text() if marker == "if (uid_poc_report_packet (buf))" else jni_text
         if marker not in source:
             raise SystemExit(f"Refusing incomplete UID firewall patch: missing native marker: {marker}")
 

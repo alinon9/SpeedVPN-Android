@@ -131,7 +131,7 @@ internal class UidDetectionPoc(
         }.filter { it.second > 0 }
             .groupBy({ it.second }, { it.first })
             .mapValues { (_, names) -> names.toSet() }
-        val nextUids = byUid.keys
+        val nextUids = VpnApplicationPolicy.blockedUids(service, normalized)
         blockPolicy = BlockPolicySnapshot(normalized, nextUids, byUid)
         blockedPackages = normalized
         blockedUids = nextUids

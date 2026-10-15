@@ -255,7 +255,12 @@ class SpeedVpnService : VpnService() {
                 protectUdp = { protect(it) },
                 currentNetwork = { findUnderlyingNetwork() },
                 ipv6Enabled = true,
-            ).also { it.start() }
+            ).also {
+                it.updateBlockedUids(
+                    VpnApplicationPolicy.blockedUids(this@SpeedVpnService, currentBlockedPackages())
+                )
+                it.start()
+            }
         } catch (e: Exception) {
             failLocked("VPN relay failed to start", e)
             return@withLock
@@ -456,6 +461,9 @@ class SpeedVpnService : VpnService() {
                 val callback = uidDetectionPoc
                 runCatching { callback?.updateBlockedPackages(current) }
                     .onFailure { logE("Unable to refresh blocked UID policy", it) }
+                runCatching {
+                    socks?.updateBlockedUids(VpnApplicationPolicy.blockedUids(this@SpeedVpnService, current))
+                }.onFailure { logE("Unable to refresh SOCKS blocked UIDs", it) }
                 runCatching { socks?.enforceBlockedPackages(current) }
                     .onFailure { logE("Unable to enforce changed app block-list", it) }
                 if (BuildConfig.DEBUG && callback != null) {

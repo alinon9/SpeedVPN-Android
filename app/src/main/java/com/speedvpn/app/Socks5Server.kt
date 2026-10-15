@@ -156,6 +156,7 @@ class Socks5Server(
     private val flowOwnersByEndpoint = ConcurrentHashMap<String, FlowOwnerMetadata>()
     private val upstreamTcpMetadata = ConcurrentHashMap<Socket, FlowOwnerMetadata>()
     private val activeUdpMuxes = ConcurrentHashMap.newKeySet<UdpUpstreamMux>()
+    @Volatile private var blockedUids: Set<Int> = emptySet()
     // User-domain DNS resolution is encrypted DoH. The bounded pool prevents
     // stalled encrypted lookups from building an unbounded backlog.
     private val dnsPool: ExecutorService = ThreadPoolExecutor(
@@ -358,6 +359,12 @@ class Socks5Server(
     private fun trackUpstream(socket: DatagramSocket): DatagramSocket = socket.also { upstreamUdp.add(it); openUdp.add(it) }
     private fun untrackUpstream(socket: DatagramSocket) { upstreamUdp.remove(socket); openUdp.remove(socket) }
 
+    internal fun updateBlockedUids(uids: Set<Int>) {
+        val normalized = uids.toSet()
+        blockedUids = normalized
+        log("BLOCKED_UID_POLICY_UPDATED count=${normalized.size} uids=${normalized.sorted().joinToString(",")}")
+    }
+
     private fun endpointKey(protocol: Int, host: String, port: Int): String =
         protocol.toString() + "|" + host.substringBefore("%").trim('[', ']').lowercase() + "|" + port
 
@@ -456,7 +463,8 @@ class Socks5Server(
 
         upstreamTcpMetadata.values.toList().forEach { metadata ->
             val matches = metadata.packages.intersect(blockedPackages)
-            if (matches.isNotEmpty()) {
+            val uidIsBlocked = metadata.uid != null && metadata.uid in blockedUids
+            if (uidIsBlocked || matches.isNotEmpty()) {
                 blockEndpoint(
                     protocol = IPPROTO_TCP,
                     endpoint = metadata.endpointKey,

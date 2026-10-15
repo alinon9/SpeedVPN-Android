@@ -79,6 +79,8 @@ jobs:
           grep -Fq 'BLOCKED_UID uid=' app/src/main/java/com/speedvpn/app/UidDetectionPoc.kt
           grep -Fq 'blockedUids: Set<Int>' app/src/main/java/com/speedvpn/app/UidDetectionPoc.kt
           grep -Fq 'blockedUids(context: Context, blockedPackages: Set<String>)' app/src/main/java/com/speedvpn/app/VpnApplicationPolicy.kt
+          grep -Fq 'updateBlockedUids(' app/src/main/java/com/speedvpn/app/SpeedVpnService.kt
+          grep -Fq 'BLOCKED_UID_POLICY_UPDATED' app/src/main/java/com/speedvpn/app/Socks5Server.kt
           grep -Fq 'addDisallowedApplication(packageName)' app/src/main/java/com/speedvpn/app/SpeedVpnService.kt
           grep -Fq 'addRoute("::", 0)' app/src/main/java/com/speedvpn/app/SpeedVpnService.kt
           if grep -Fq 'addAllowedApplication(' app/src/main/java/com/speedvpn/app/SpeedVpnService.kt; then
