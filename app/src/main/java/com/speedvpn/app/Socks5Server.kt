@@ -35,6 +35,7 @@ import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 
@@ -128,6 +129,7 @@ class Socks5Server(
     val password: String = randomToken(32)
 
     @Volatile private var running = true
+    private val connectSequence = AtomicLong(0L)
 
     private val openTcp = Collections.newSetFromMap(ConcurrentHashMap<Socket, Boolean>())
     private val openUdp = Collections.newSetFromMap(ConcurrentHashMap<DatagramSocket, Boolean>())
@@ -212,6 +214,7 @@ class Socks5Server(
                 val isHealthProbe = sourcePort != null && probeSourcePorts.remove(sourcePort)
 
                 if (!isHealthProbe && !sessions.tryAcquire()) {
+                    log("SOCKS_ACCEPT_REJECT reason=session_limit source=${client.remoteSocketAddress} maxSessions=$MAX_SESSIONS")
                     runCatching { client.close() }
                     continue
                 }
@@ -225,8 +228,13 @@ class Socks5Server(
                             if (!isHealthProbe) sessions.release()
                         }
                     }
-                } catch (_: RejectedExecutionException) {
+                } catch (e: RejectedExecutionException) {
                     if (!isHealthProbe) sessions.release()
+                    logE(
+                        "SOCKS_ACCEPT_REJECT reason=worker_pool_saturated source=${client.remoteSocketAddress} " +
+                            "maxWorkers=$MAX_WORKERS activeSockets=${openTcp.size}",
+                        e,
+                    )
                     untrack(client)
                     runCatching { client.close() }
                 }
@@ -404,54 +412,123 @@ class Socks5Server(
     }
 
     private fun resolveAll(host: String, timeoutMs: Long): List<InetAddress> {
+        val startedNs = System.nanoTime()
         val network = currentNetwork()
-            ?: throw UnknownHostException("No physical network available for encrypted DNS resolution: $host")
-        if (timeoutMs <= 0L) throw SocketTimeoutException("DNS deadline exceeded for $host")
+        log(
+            "SOCKS5_DNS_BEGIN host=$host timeoutMs=$timeoutMs ipv6Enabled=$ipv6Enabled " +
+                "networkAvailable=${network != null} dnsWorkers=$UDP_DNS_WORKERS",
+        )
+        if (network == null) {
+            val error = UnknownHostException("No physical network available for encrypted DNS resolution: $host")
+            logE("SOCKS5_DNS_FAIL host=$host stage=network reason=${error.message}", error)
+            throw error
+        }
+        if (timeoutMs <= 0L) {
+            val error = SocketTimeoutException("DNS deadline exceeded for $host")
+            logE("SOCKS5_DNS_FAIL host=$host stage=deadline elapsedMs=0", error)
+            throw error
+        }
 
-        val future = dnsPool.submit<List<InetAddress>> {
-            encryptedResolver(network).resolve(host)
+        val future = try {
+            dnsPool.submit<List<InetAddress>> {
+                encryptedResolver(network).resolve(host)
+            }
+        } catch (e: RejectedExecutionException) {
+            logE("SOCKS5_DNS_FAIL host=$host stage=queue reason=dns_pool_rejected elapsedMs=${TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNs)}", e)
+            throw UnknownHostException("Encrypted DNS worker pool saturated for $host")
         }
         return try {
-            future.get(timeoutMs, TimeUnit.MILLISECONDS)
+            val addresses = future.get(timeoutMs, TimeUnit.MILLISECONDS)
                 .filter { ipv6Enabled || it is java.net.Inet4Address }
-                .also { if (it.isEmpty()) throw UnknownHostException("No usable DNS address for $host") }
+            if (addresses.isEmpty()) throw UnknownHostException("No usable DNS address for $host")
+            log(
+                "SOCKS5_DNS_OK host=$host addresses=${addresses.joinToString(",") { it.hostAddress ?: "unknown" }} " +
+                    "elapsedMs=${TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNs)}",
+            )
+            addresses
         } catch (e: TimeoutException) {
             future.cancel(true)
-            throw SocketTimeoutException("Encrypted DNS timeout for $host")
+            val error = SocketTimeoutException("Encrypted DNS timeout for $host")
+            logE("SOCKS5_DNS_FAIL host=$host stage=lookup reason=timeout elapsedMs=${TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNs)}", error)
+            throw error
         } catch (e: Exception) {
             future.cancel(true)
-            if (e.cause is UnknownHostException) throw e.cause as UnknownHostException
-            throw UnknownHostException("Encrypted DNS failed for $host: ${e.cause?.message ?: e.message}")
+            val cause = e.cause
+            val error = if (cause is UnknownHostException) {
+                cause
+            } else {
+                UnknownHostException("Encrypted DNS failed for $host: ${cause?.message ?: e.message}")
+            }
+            logE(
+                "SOCKS5_DNS_FAIL host=$host stage=lookup error=${error.javaClass.simpleName} " +
+                    "reason=${error.message} elapsedMs=${TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNs)}",
+                error,
+            )
+            throw error
         }
     }
     private fun connect(client: Socket, cin: InputStream, cout: OutputStream, target: Any, port: Int) {
-        val deadlineNs = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(CONNECT_TIMEOUT_MS)
-        val candidates = when (target) {
-            is InetAddress -> listOf(target)
-            is String -> {
-                val remainingMs = TimeUnit.NANOSECONDS.toMillis(deadlineNs - System.nanoTime())
-                resolveAll(target, remainingMs)
-            }
-            else -> emptyList()
+        val connectId = connectSequence.incrementAndGet()
+        val startedNs = System.nanoTime()
+        val targetLabel = when (target) {
+            is InetAddress -> target.hostAddress ?: target.toString()
+            is String -> target
+            else -> "<invalid-target>"
         }
-            .filter { ipv6Enabled || it is java.net.Inet4Address }
-            .sortedBy { if (it.address.size == 4) 0 else 1 }
-
-        if (candidates.isEmpty()) {
+        val clientEndpoint = client.remoteSocketAddress?.toString() ?: "unknown"
+        // SOCKS5 CONNECT does not carry Android's originating app UID. Do not invent a UID:
+        // the native POC observer records the original packet tuple separately.
+        log(
+            "SOCKS5_CONNECT_BEGIN id=$connectId target=$targetLabel port=$port " +
+                "client=$clientEndpoint uid=unavailable uidReason=socks5_has_no_uid_field " +
+                "ipv6Enabled=$ipv6Enabled activeTcpSockets=${openTcp.size} maxSessions=$MAX_SESSIONS maxWorkers=$MAX_WORKERS",
+        )
+        val deadlineNs = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(CONNECT_TIMEOUT_MS)
+        val candidates = try {
+            (when (target) {
+                is InetAddress -> listOf(target)
+                is String -> {
+                    val remainingMs = TimeUnit.NANOSECONDS.toMillis(deadlineNs - System.nanoTime())
+                    resolveAll(target, remainingMs)
+                }
+                else -> emptyList()
+            })
+                .filter { ipv6Enabled || it is java.net.Inet4Address }
+                .sortedBy { if (it.address.size == 4) 0 else 1 }
+        } catch (e: Exception) {
+            logE(
+                "SOCKS5_CONNECT_FAIL id=$connectId stage=dns target=$targetLabel port=$port " +
+                    "replyCode=4 error=${e.javaClass.simpleName} reason=${e.message} " +
+                    "elapsedMs=${TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNs)}",
+                e,
+            )
+            log("SOCKS5_REPLY id=$connectId result=FAIL replyCode=4 stage=dns")
             replyFailure(cout, 4)
-            client.close()
+            return
+        }
+
+        log("SOCKS5_CONNECT_CANDIDATES id=$connectId target=$targetLabel port=$port candidates=${candidates.joinToString(",") { it.hostAddress ?: "unknown" }} count=${candidates.size}")
+        if (candidates.isEmpty()) {
+            log("SOCKS5_CONNECT_FAIL id=$connectId stage=address-filter target=$targetLabel port=$port reason=no_usable_ip ipv6Enabled=$ipv6Enabled replyCode=4")
+            log("SOCKS5_REPLY id=$connectId result=FAIL replyCode=4 stage=address-filter")
+            replyFailure(cout, 4)
             return
         }
 
         var upstream: Socket? = null
+        var lastConnectFailure: Throwable? = null
         for (addr in candidates) {
             val remainingMs = TimeUnit.NANOSECONDS.toMillis(deadlineNs - System.nanoTime())
                 .coerceAtMost(5_000L)
                 .toInt()
-            if (remainingMs <= 0) break
+            if (remainingMs <= 0) {
+                log("SOCKS5_CONNECT_ATTEMPT_SKIP id=$connectId address=${addr.hostAddress} reason=deadline_exceeded")
+                break
+            }
 
             val socket = Socket()
             trackUpstream(socket)
+            log("SOCKS5_CONNECT_ATTEMPT id=$connectId address=${addr.hostAddress} family=${if (addr is java.net.Inet4Address) "IPv4" else "IPv6"} port=$port timeoutMs=$remainingMs")
             try {
                 val network = currentNetwork() ?: throw UnknownHostException("No physical network available")
                 network.bindSocket(socket)
@@ -459,26 +536,43 @@ class Socks5Server(
                 socket.connect(InetSocketAddress(addr, port), remainingMs)
                 socket.tcpNoDelay = true
                 upstream = socket
+                log(
+                    "SOCKS5_UPSTREAM_CONNECTED id=$connectId target=$targetLabel address=${addr.hostAddress} port=$port " +
+                        "local=${socket.localSocketAddress} remote=${socket.remoteSocketAddress} " +
+                        "elapsedMs=${TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNs)}",
+                )
                 break
             } catch (e: Exception) {
-                when (classifySocketError(e)) {
-                    SockErrKind.EXPECTED_CLOSE -> Unit
-                    SockErrKind.NETWORK_EVENT -> log("SOCKS upstream network event: ${e.message}")
-                    SockErrKind.UNKNOWN -> logE("SOCKS upstream connect failed", e)
-                }
+                lastConnectFailure = e
+                logE(
+                    "SOCKS5_CONNECT_ATTEMPT_FAIL id=$connectId target=$targetLabel address=${addr.hostAddress} port=$port " +
+                        "kind=${classifySocketError(e)} error=${e.javaClass.simpleName} reason=${e.message} " +
+                        "elapsedMs=${TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNs)}",
+                    e,
+                )
                 untrackUpstream(socket)
                 runCatching { socket.close() }
             }
         }
 
         val remote = upstream ?: run {
+            log(
+                "SOCKS5_CONNECT_FAIL id=$connectId stage=upstream-connect target=$targetLabel port=$port " +
+                    "candidateCount=${candidates.size} lastError=${lastConnectFailure?.javaClass?.simpleName ?: "none"} " +
+                    "lastReason=${lastConnectFailure?.message ?: "deadline_exceeded"} " +
+                    "elapsedMs=${TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNs)} replyCode=5",
+            )
+            log("SOCKS5_REPLY id=$connectId result=FAIL replyCode=5 stage=upstream-connect")
             replyFailure(cout, 5)
-            client.close()
             return
         }
 
         cout.write(byteArrayOf(5, 0, 0, 1, 0, 0, 0, 0, 0, 0))
         cout.flush()
+        log(
+            "SOCKS5_REPLY id=$connectId result=OK replyCode=0 target=$targetLabel port=$port " +
+                "elapsedMs=${TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNs)}",
+        )
 
         val closeOnce = AtomicBoolean(false)
         val remaining = AtomicInteger(2)
@@ -525,7 +619,12 @@ class Socks5Server(
             // If upload hit EOF while download is still draining, keep the client and
             // remote pair alive until the reverse direction also completes.
             done.await()
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            logE(
+                "SOCKS5_RELAY_SETUP_FAIL id=$connectId target=$targetLabel port=$port " +
+                    "submitted=$submitted activeTcpSockets=${openTcp.size} error=${e.javaClass.simpleName}: ${e.message}",
+                e,
+            )
             closeBoth()
             repeat(2 - submitted) { done.countDown() }
         }
