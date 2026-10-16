@@ -57,7 +57,10 @@ jobs:
         run: ./gradlew :app:lintDebug --stacktrace --no-daemon
 
       - name: Build debug APK
-        run: ./gradlew :app:assembleDebug --stacktrace --no-daemon
+        run: ./gradlew clean :app:assembleDebug --no-build-cache --rerun-tasks --stacktrace --no-daemon
+
+      - name: Verify debug APK SHA-256 and native library
+        run: python3 scripts/e2e/verify_apk_native.py app/build/outputs/apk/debug/app-debug.apk --variant debug --output app/build/outputs/apk/debug/native-build-fingerprint.txt
 
       - name: Upload debug APK for emulator
         uses: actions/upload-artifact@v7
@@ -85,11 +88,11 @@ jobs:
             printf "%s" "${RELEASE_KEYSTORE_BASE64}" | base64 -d > "$RELEASE_KEYSTORE_PATH"
             chmod 600 "$RELEASE_KEYSTORE_PATH"
             test -s "$RELEASE_KEYSTORE_PATH"
-            ./gradlew :app:assembleRelease --stacktrace --no-daemon
+            ./gradlew :app:assembleRelease --no-build-cache --rerun-tasks --stacktrace --no-daemon
           else
             echo "Release signing inputs missing: ${missing[*]}"
             echo "Building unsigned release for CI validation only."
-            ./gradlew :app:assembleRelease --stacktrace --no-daemon
+            ./gradlew :app:assembleRelease --no-build-cache --rerun-tasks --stacktrace --no-daemon
           fi
 
       - name: Verify APK
