@@ -16,6 +16,22 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 
+/**
+ * Normalize IPv4-mapped IPv6 socket endpoints before calling ConnectivityManager.
+ * Android's owner-UID table may contain the IPv4 socket as an Inet4Address even
+ * when the packet parser surfaced the same endpoint as ::ffff:a.b.c.d.
+ */
+internal fun normalizeOwnerAddressBytes(address: ByteArray): ByteArray {
+    if (address.size != 16 ||
+        address.take(10).any { it != 0.toByte() } ||
+        address[10] != 0xff.toByte() ||
+        address[11] != 0xff.toByte()
+    ) {
+        return address.copyOf()
+    }
+    return address.copyOfRange(12, 16)
+}
+
 internal data class UidDetectionRecord(
     val id: Long,
     val timestampMillis: Long,
@@ -205,8 +221,11 @@ internal class UidDetectionPoc(
      * JNI wire format: signed UID in the high 32 bits; low bit 1 = BLOCK/DROP,
      * low bit 0 = allow/observe. This keeps the resolver decision attached to its UID.
      */
-    private fun encodeUidDecision(uid: Int, shouldBlock: Boolean): Long =
-        (uid.toLong() shl 32) or (if (shouldBlock) 1L else 0L)
+    private fun encodeUidDecision(uid: Int, shouldBlock: Boolean): Long {
+        val safeUid = uid.takeIf { it > 0 } ?: Process.INVALID_UID
+        val safeBlock = safeUid > 0 && shouldBlock
+        return (safeUid.toLong() shl 32) or (if (safeBlock) 1L else 0L)
+    }
 
     private fun unresolvedUid(): UidResolution =
         UidResolution(Process.INVALID_UID, "INVALID_UID", false)
@@ -229,21 +248,30 @@ internal class UidDetectionPoc(
             return unresolvedUid()
         }
         if (srcPort !in 0..65535 || dstPort !in 0..65535 ||
-            srcAddress.size !in setOf(4, 16) || dstAddress.size != srcAddress.size
+            srcAddress.size !in setOf(4, 16) || dstAddress.size !in setOf(4, 16)
         ) {
             UidPocDiagnostics.log(service, "OWNER_UID_QUERY_SKIPPED id=$callId reason=INVALID_TUPLE")
             return unresolvedUid()
         }
 
-        val src = InetAddress.getByAddress(srcAddress).hostAddress ?: "unknown"
-        val dst = InetAddress.getByAddress(dstAddress).hostAddress ?: "unknown"
+                val localBytes = normalizeOwnerAddressBytes(srcAddress)
+        val remoteBytes = normalizeOwnerAddressBytes(dstAddress)
+        if (localBytes.size != remoteBytes.size) {
+            UidPocDiagnostics.log(service, "OWNER_UID_QUERY_SKIPPED id=$callId reason=ADDRESS_FAMILY_MISMATCH")
+            return unresolvedUid()
+        }
+        // The TUN packet's source endpoint is the app-local endpoint; destination is
+        // the remote server. Ports arrive as host-order integers from native byte parsing.
+        val src = InetAddress.getByAddress(localBytes).hostAddress ?: "unknown"
+        val dst = InetAddress.getByAddress(remoteBytes).hostAddress ?: "unknown"
         val tuple = "${protocolName(protocol)}|$src|$srcPort|$dst|$dstPort"
-        val local = InetSocketAddress(InetAddress.getByAddress(srcAddress), srcPort)
-        val remote = InetSocketAddress(InetAddress.getByAddress(dstAddress), dstPort)
+        val local = InetSocketAddress(InetAddress.getByAddress(localBytes), srcPort)
+        val remote = InetSocketAddress(InetAddress.getByAddress(remoteBytes), dstPort)
 
         UidPocDiagnostics.log(service, "OWNER_UID_QUERY_BEGIN id=$callId tuple=$tuple thread=${Thread.currentThread().name}")
-        val uid = connectivity.getConnectionOwnerUid(protocol, local, remote)
-        val packages = if (uid == Process.INVALID_UID) {
+        val queriedUid = connectivity.getConnectionOwnerUid(protocol, local, remote)
+        val uid = queriedUid.takeIf { it > 0 } ?: Process.INVALID_UID
+        val packages = if (uid <= 0) {
             emptyList()
         } else {
             packageManager.getPackagesForUid(uid)?.sorted().orEmpty()
@@ -252,17 +280,17 @@ internal class UidDetectionPoc(
         val policyPackagesForUid = policy.packagesByUid[uid].orEmpty()
         val knownPackages = (packages + policyPackagesForUid).distinct().sorted()
         val blockedPackageMatches = knownPackages.filter { it in policy.packages }
-        val shouldBlock = uid != Process.INVALID_UID && uid in policy.uids
+        val shouldBlock = VpnApplicationPolicy.isUidBlocked(uid, policy.uids)
         val targetMatch = blockedPackageMatches.joinToString(",").ifBlank { "-" }
         val verdict = when {
-            uid == Process.INVALID_UID -> "INVALID_UID"
+            uid <= 0 -> "INVALID_UID"
             shouldBlock -> "BLOCKED_UID"
             else -> "UID_FOUND_OTHER_OR_UNLISTED"
         }
         val action = if (shouldBlock) "BLOCK" else "ALLOW"
         UidDetectionPocResultStore.add(
             protocol, src, srcPort, dst, dstPort, uid, knownPackages,
-            if (uid == Process.INVALID_UID) "INVALID" else "MATCH",
+            if (uid <= 0) "INVALID" else "MATCH",
             "resolverCall=$callId; targetMatch=$targetMatch; action=$action; thread=${Thread.currentThread().name}",
         )
         Log.i(
@@ -275,7 +303,7 @@ internal class UidDetectionPoc(
             service,
             "OWNER_UID_QUERY_RESULT id=$callId verdict=$verdict uid=$uid packages=${knownPackages.joinToString(",").ifBlank { "-" }} action=$action hookMode=HOOK_BLOCKING packetBlocking=IMPLEMENTED",
         )
-        if (uid != Process.INVALID_UID) {
+        if (uid > 0) {
             service.recordDetectedFlow(protocol, src, srcPort, dst, dstPort, uid, knownPackages)
         }
         if (shouldBlock) {
