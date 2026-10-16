@@ -146,6 +146,8 @@ class SpeedVpnService : VpnService() {
     private var meter: Job? = null
     private var healthMonitor: Job? = null
     private var quotaMonitor: Job? = null
+    @Volatile private var appUidBlocker: AppUidBlocker? = null
+    @Volatile private var uidPolicyMonitor: Job? = null
     private val upstreamProbeDnsExecutor: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "vpn-upstream-dns").apply { isDaemon = true }
     }
@@ -244,15 +246,19 @@ class SpeedVpnService : VpnService() {
         }
 
         val compatibility = VpnSettings.read(this)
-        val firewall = VpnAppControl.read(this)
         val relay = try {
             Socks5Server(
                 generation = myServiceGeneration,
                 protectTcp = { protect(it) },
                 protectUdp = { protect(it) },
                 currentNetwork = { findUnderlyingNetwork() },
-                ipv6Enabled = compatibility.ipv6Enabled,
-            ).also { it.start() }
+                ipv6Enabled = true,
+            ).also {
+                it.updateBlockedUids(
+                    VpnApplicationPolicy.blockedUids(this@SpeedVpnService, currentBlockedPackages())
+                )
+                it.start()
+            }
         } catch (e: Exception) {
             failLocked("VPN relay failed to start", e)
             return@withLock
@@ -286,96 +292,17 @@ class SpeedVpnService : VpnService() {
                 // No public resolver is hard-coded.
                 .apply { dnsServers.forEach { addDnsServer(it) } }
                 .apply {
-                    if (compatibility.ipv6Enabled) {
-                        addAddress(TUN_V6, 128)
-                        addRoute("::", 0)
-                    }
+                    // Capture IPv6 in TUN as well; otherwise blocked apps can bypass via IPv6.
+                    addAddress(TUN_V6, 128)
+                    addRoute("::", 0)
                 }
                 .apply {
-                    // Quota-blocked apps are enforced independently from the manual App Firewall.
-                    val quotaBlocked = VpnAppControl.quotaBlockedPackages(this@SpeedVpnService)
-                    val manualBlocked = if (firewall.firewallEnabled) {
-                        firewall.blockedPackages - quotaBlocked
-                    } else {
-                        emptySet()
-                    }
-                    val effectiveBlocked = manualBlocked + quotaBlocked
-
-                    val firewallRequested = firewall.firewallEnabled && manualBlocked.isNotEmpty()
-                    val quotaEnforcementRequested = quotaBlocked.isNotEmpty()
-                    val needsAllowList = firewallRequested || quotaEnforcementRequested
-
-                    val lockdownReady =
-                        Build.VERSION.SDK_INT >= 29 &&
-                            runCatching { isLockdownEnabled }.getOrDefault(false)
-
-                    if (needsAllowList && !lockdownReady) {
-                        val message = when {
-                            quotaEnforcementRequested && firewallRequested ->
-                                "Quota enforcement and app firewall require Android VPN Lockdown. " +
-                                    "Enable Always-on VPN and 'Block connections without VPN' in Android VPN settings."
-                            quotaEnforcementRequested ->
-                                "Quota enforcement requires Android VPN Lockdown. " +
-                                    "Enable Always-on VPN and 'Block connections without VPN' in Android VPN settings."
-                            else ->
-                                "App firewall requires Android VPN Lockdown. " +
-                                    "Enable Always-on VPN and 'Block connections without VPN' in Android VPN settings."
-                        }
-                        throw IllegalStateException(message)
-                    }
-
-                    if (needsAllowList) {
-                        val launchable =
-                            AppTrafficManager.installedLaunchableApps(this@SpeedVpnService)
-                        val includeOwnPackage = SpeedLimiter.routeVerificationTrafficThroughVpn
-                        if (includeOwnPackage && packageName in effectiveBlocked) {
-                            throw IllegalStateException(
-                                "SpeedVPN is blocked by the active app policy and cannot verify traffic through the VPN."
-                            )
-                        }
-                        val allowedPackages = VpnApplicationPolicy.allowedPackages(
-                            launchablePackages = launchable.map { it.packageName },
-                            blockedPackages = effectiveBlocked,
-                            ownPackage = packageName,
-                            includeOwnPackageForVerification = includeOwnPackage,
-                        )
-                        var allowed = 0
-
-                        allowedPackages.forEach { pkg ->
-                            runCatching {
-                                addAllowedApplication(pkg)
-                            }.onSuccess {
-                                allowed++
-                            }.onFailure {
-                                log(
-                                    "Skipping unavailable allowed package $pkg: ${it.message}"
-                                )
-                            }
-                        }
-
-                        if (allowed == 0) {
-                            throw IllegalStateException(
-                                "No valid applications are available for the VPN allow-list"
-                            )
-                        }
-
-                        val reason = when {
-                            quotaEnforcementRequested && firewallRequested -> "quota+firewall"
-                            quotaEnforcementRequested -> "quota"
-                            else -> "firewall"
-                        }
-                        log(
-                            "VPN allow-list active ($reason): " +
-                                "$allowed apps allowed; ${effectiveBlocked.size} blocked"
-                        )
-                    }
-
-                    // VPN control/native sockets are protected before connecting.
-                    // The verifier includes the app UID in an active allow-list so
-                    // its probe measures the tunnel path; regular firewall policy
-                    // continues to exclude SpeedVPN itself.
+                    // Do not install the VpnService application allow-list: omitted apps route outside TUN.
+                    // All apps except SpeedVPN itself use TUN for UID-based firewalling.
+                    addDisallowedApplication(packageName)
+                    log("VPN_TUN_POLICY mode=all-apps-except-self ipv4=0.0.0.0/0 ipv6=::/0 blockedPackages=" +
+                        currentBlockedPackages().sorted().joinToString(","))
                 }
-
             builder.establish()
         } catch (e: IllegalStateException) {
             failLocked(e.message ?: "Unable to establish VPN interface", e)
@@ -462,6 +389,7 @@ class SpeedVpnService : VpnService() {
         log("VPN session $mySession connected")
         startMeter(mySession, myServiceGeneration)
         startQuotaMonitor(mySession)
+        startUidPolicyMonitor(mySession)
         startHealthMonitor(mySession)
     }
 
@@ -471,6 +399,95 @@ class SpeedVpnService : VpnService() {
             serviceGeneration != 0L &&
             activeServiceGeneration.get() == serviceGeneration
 
+    internal fun currentBlockedPackages(): Set<String> {
+        val state = VpnAppControl.read(this)
+        val quotaBlocked = VpnAppControl.quotaBlockedPackages(this)
+        val manualBlocked = if (state.firewallEnabled) state.blockedPackages else emptySet()
+        return (manualBlocked + quotaBlocked).toSet()
+    }
+
+    internal fun recordDetectedFlow(
+        protocol: Int,
+        srcIp: String,
+        srcPort: Int,
+        dstIp: String,
+        dstPort: Int,
+        uid: Int,
+        packages: Collection<String>,
+    ) {
+        socks?.recordDetectedFlow(protocol, srcIp, srcPort, dstIp, dstPort, uid, packages)
+    }
+
+    internal fun enforceBlockedDetectedFlow(
+        protocol: Int,
+        srcIp: String,
+        srcPort: Int,
+        dstIp: String,
+        dstPort: Int,
+        uid: Int,
+        packages: Collection<String>,
+        policyBlockedPackages: Collection<String>,
+        permanent: Boolean,
+    ) {
+        socks?.enforceBlockedFlow(
+            protocol = protocol,
+            srcIp = srcIp,
+            srcPort = srcPort,
+            dstIp = dstIp,
+            dstPort = dstPort,
+            uid = uid,
+            packages = packages,
+            policyBlockedPackages = policyBlockedPackages,
+            permanent = permanent,
+        )
+    }
+
+    private fun startUidPolicyMonitor(mySession: Long) {
+        uidPolicyMonitor?.cancel()
+        uidPolicyMonitor = scope.launch {
+            var previous = currentBlockedPackages()
+            while (isActive && sessionIsCurrent(mySession)) {
+                delay(1_000)
+                if (!sessionIsCurrent(mySession)) break
+                val current = runCatching { currentBlockedPackages() }.getOrElse { previous }
+                if (current == previous) continue
+                previous = current
+
+                // Close relay sessions whose resolved owner is now blocked. Clear/re-register
+                // the native callback to invalidate cached non-blocked UID results; lookups
+                // still execute on the dedicated native worker, never on the TUN coroutine.
+                val callback = appUidBlocker
+                runCatching { callback?.updateBlockedPackages(current) }
+                    .onFailure { logE("Unable to refresh blocked UID policy", it) }
+                runCatching {
+                    socks?.updateBlockedUids(VpnApplicationPolicy.blockedUids(this@SpeedVpnService, current))
+                }.onFailure { logE("Unable to refresh SOCKS blocked UIDs", it) }
+                runCatching { socks?.enforceBlockedPackages(current) }
+                    .onFailure { logE("Unable to enforce changed app block-list", it) }
+                if (callback != null) {
+                    synchronized(processNativeLifecycleLock) {
+                        if (sessionIsCurrent(mySession) &&
+                            nativeOwnerGeneration.get() == nativeGeneration &&
+                            nativeGeneration > 0L
+                        ) {
+                            runCatching {
+                                check(TProxyService.TProxySetAppUidBlockCallback(null)) {
+                                    "Unable to clear UID cache after app policy change"
+                                }
+                                check(TProxyService.TProxySetAppUidBlockCallback(callback)) {
+                                    "Unable to re-register UID callback after app policy change"
+                                }
+                            }.onFailure {
+                                logE("UID policy cache refresh failed", it)
+                            }
+                        }
+                    }
+                }
+                log("UID_POLICY_CHANGED blockedPackages=" + current.sorted().joinToString(","))
+            }
+        }
+    }
+
     private fun writeTunnelConfig(relay: Socks5Server, compatibility: VpnCompatibilitySettings): File {
         val conf = File(filesDir, "tunnel-${serviceGeneration}.yml")
         tunnelConfigFile = conf
@@ -478,7 +495,7 @@ class SpeedVpnService : VpnService() {
             appendLine("tunnel:")
             appendLine("  mtu: ${compatibility.mtu}")
             appendLine("  ipv4: $TUN_V4")
-            if (compatibility.ipv6Enabled) appendLine("  ipv6: '$TUN_V6'")
+            appendLine("  ipv6: '$TUN_V6'")
             appendLine("socks5:")
             appendLine("  port: ${relay.port}")
             appendLine("  address: 127.0.0.1")
@@ -1019,6 +1036,13 @@ class SpeedVpnService : VpnService() {
             SpeedLimiter.beginSession(newGeneration)
         }
         val started = runCatching {
+            val callback = appUidBlocker ?: AppUidBlocker(this).also {
+                appUidBlocker = it
+            }
+            callback.updateBlockedPackages(currentBlockedPackages())
+            check(TProxyService.TProxySetAppUidBlockCallback(callback)) {
+                "Unable to register app-blocking callback"
+            }
             TProxyService.TProxyStartService(configPath, expectedTun.fd)
         }.getOrElse {
             logE("Native start threw an exception", it)
@@ -1030,6 +1054,10 @@ class SpeedVpnService : VpnService() {
             nativeOwnerGeneration.set(newGeneration)
             engineRunning = true
         } else {
+            runCatching { TProxyService.TProxySetAppUidBlockCallback(null) }
+                .onFailure { logE("Unable to clear app UID callback", it) }
+            appUidBlocker?.close()
+            appUidBlocker = null
             SpeedLimiter.endSession(newGeneration)
         }
         started
@@ -1054,6 +1082,11 @@ class SpeedVpnService : VpnService() {
                 if (endLimiterSession) SpeedLimiter.endSession(expectedGeneration)
                 return@synchronized false
             }
+
+            runCatching { TProxyService.TProxySetAppUidBlockCallback(null) }
+                .onFailure { logE("Unable to clear app UID callback", it) }
+            appUidBlocker?.close()
+            appUidBlocker = null
 
             val stopReported = runCatching { TProxyService.TProxyStopService() }
                 .onFailure { logE("Native stop threw for generation $expectedGeneration", it) }
@@ -1088,6 +1121,7 @@ class SpeedVpnService : VpnService() {
     private fun cleanupLocked() {
         meter?.cancel(); meter = null
         healthMonitor?.cancel(); healthMonitor = null
+        uidPolicyMonitor?.cancel(); uidPolicyMonitor = null
         val configFile = tunnelConfigFile
         tunnelConfigFile = null
         val (pfd, relay) = synchronized(resourceLifecycleLock) {
@@ -1269,6 +1303,7 @@ class SpeedVpnService : VpnService() {
         reconnectAfterDisconnect = false
         meter?.cancel(); meter = null
         healthMonitor?.cancel(); healthMonitor = null
+        uidPolicyMonitor?.cancel(); uidPolicyMonitor = null
 
         // Snapshot and detach this instance's resources on the main thread, then do
         // blocking teardown off-main. Process-wide ownership prevents stale cleanup
