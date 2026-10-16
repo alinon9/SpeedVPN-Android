@@ -1018,6 +1018,22 @@ class SpeedVpnService : VpnService() {
                     return@synchronized false
                 }
                 NativeProbe.STOPPED -> {
+                    // is_running may become false just before the native worker returns.
+                    // Reap/join it explicitly before relinquishing ownership or allowing a
+                    // replacement generation to use the process-wide native singleton.
+                    val joined = runCatching { TProxyService.TProxyStopService() }
+                        .onFailure {
+                            logE("Unable to join exited native worker for generation $currentOwner", it)
+                        }
+                        .getOrDefault(false)
+                    if (!joined) {
+                        logE("Refusing native takeover: previous generation $currentOwner exited but thread join is unconfirmed")
+                        return@synchronized false
+                    }
+                    if (probeNativeStateLocked(currentOwner) != NativeProbe.STOPPED) {
+                        logE("Refusing native takeover: old native worker state changed during join")
+                        return@synchronized false
+                    }
                     nativeOwnerGeneration.compareAndSet(currentOwner, 0L)
                     if (nativeGeneration == currentOwner) {
                         nativeGeneration = 0L
@@ -1110,6 +1126,13 @@ class SpeedVpnService : VpnService() {
             val stopReported = runCatching { TProxyService.TProxyStopService() }
                 .onFailure { logE("Native stop threw for generation $expectedGeneration", it) }
                 .getOrNull()
+            // A false stop result means pthread_join was not confirmed. The worker may
+            // have already cleared is_running, but it can still be unwinding native code.
+            // Never report teardown success or let cleanup close the TUN PFD in that case.
+            if (stopReported != true) {
+                logE("Native stop/join not confirmed for generation $expectedGeneration; retaining TUN ownership")
+                return@synchronized false
+            }
             val probeAfterStop = probeNativeStateLocked(expectedGeneration)
             when (probeAfterStop) {
                 NativeProbe.RUNNING -> {
