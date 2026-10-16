@@ -466,7 +466,7 @@ class SpeedVpnService : VpnService() {
                 }.onFailure { logE("Unable to refresh SOCKS blocked UIDs", it) }
                 runCatching { socks?.enforceBlockedPackages(current) }
                     .onFailure { logE("Unable to enforce changed app block-list", it) }
-                if (BuildConfig.DEBUG && callback != null) {
+                if (callback != null) {
                     synchronized(processNativeLifecycleLock) {
                         if (sessionIsCurrent(mySession) &&
                             nativeOwnerGeneration.get() == nativeGeneration &&
@@ -1040,7 +1040,8 @@ class SpeedVpnService : VpnService() {
         val started = runCatching {
             val hookDisabled = getSharedPreferences(UidPocSettings.PREFS, MODE_PRIVATE)
                 .getBoolean(UidPocSettings.KEY_DISABLE_JNI_HOOK, false)
-            if (BuildConfig.DEBUG && !hookDisabled) {
+            // App blocking must also be active in Release. The test preference may disable the hook only in Debug builds.
+            if (!BuildConfig.DEBUG || !hookDisabled) {
                 UidPocDiagnostics.log(this, "JNI_HOOK_REGISTER_BEGIN generation=$newGeneration mode=HOOK_ENABLED")
                 val diagnostic = uidDetectionPoc ?: UidDetectionPoc(this).also {
                     uidDetectionPoc = it
@@ -1072,12 +1073,10 @@ class SpeedVpnService : VpnService() {
             nativeOwnerGeneration.set(newGeneration)
             engineRunning = true
         } else {
-            if (BuildConfig.DEBUG) {
-                runCatching { TProxyService.TProxySetUidPocCallback(null) }
-                    .onFailure { logE("Unable to clear failed-start UID POC callback", it) }
-                uidDetectionPoc?.close()
-                uidDetectionPoc = null
-            }
+            runCatching { TProxyService.TProxySetUidPocCallback(null) }
+                .onFailure { logE("Unable to clear failed-start UID callback", it) }
+            uidDetectionPoc?.close()
+            uidDetectionPoc = null
             SpeedLimiter.endSession(newGeneration)
         }
         started
@@ -1103,12 +1102,10 @@ class SpeedVpnService : VpnService() {
                 return@synchronized false
             }
 
-            if (BuildConfig.DEBUG) {
-                runCatching { TProxyService.TProxySetUidPocCallback(null) }
-                    .onFailure { logE("Unable to clear temporary UID detection callback", it) }
-                uidDetectionPoc?.close()
-                uidDetectionPoc = null
-            }
+            runCatching { TProxyService.TProxySetUidPocCallback(null) }
+                .onFailure { logE("Unable to clear UID callback", it) }
+            uidDetectionPoc?.close()
+            uidDetectionPoc = null
 
             val stopReported = runCatching { TProxyService.TProxyStopService() }
                 .onFailure { logE("Native stop threw for generation $expectedGeneration", it) }
