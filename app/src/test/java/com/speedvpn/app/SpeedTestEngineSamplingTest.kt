@@ -8,10 +8,61 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertNull
 import org.junit.Test
+import java.io.IOException
+import kotlinx.coroutines.runBlocking
 import okhttp3.MediaType.Companion.toMediaType
 
 class SpeedTestEngineSamplingTest {
+    @Test
+    fun downloadFailureDoesNotEraseAValidUploadMeasurement() = runBlocking {
+        val download = SpeedTestEngine.captureDirection(SpeedTestPhase.DOWNLOAD) {
+            throw IOException("synthetic download failure")
+        }
+        val upload = SpeedTestEngine.captureDirection(SpeedTestPhase.UPLOAD) {
+            SpeedTestEngine.PhaseMeasurement(8_000_000L, 1_000_000L)
+        }
+
+        assertNull(download.measurement)
+        assertTrue(download.error?.contains("synthetic download failure") == true)
+        assertEquals(8_000_000L, upload.measurement?.throughputBps)
+        assertEquals(1_000_000L, upload.measurement?.completedPayloadBytes)
+    }
+
+    @Test
+    fun uploadFailureDoesNotEraseAValidDownloadMeasurement() = runBlocking {
+        val download = SpeedTestEngine.captureDirection(SpeedTestPhase.DOWNLOAD) {
+            SpeedTestEngine.PhaseMeasurement(12_000_000L, 1_500_000L)
+        }
+        val upload = SpeedTestEngine.captureDirection(SpeedTestPhase.UPLOAD) {
+            throw IOException("synthetic upload failure")
+        }
+
+        assertEquals(12_000_000L, download.measurement?.throughputBps)
+        assertEquals(1_500_000L, download.measurement?.completedPayloadBytes)
+        assertNull(upload.measurement)
+        assertTrue(upload.error?.contains("synthetic upload failure") == true)
+    }
+
+    @Test
+    fun permanentAuthorizationErrorsAreNotRetriedButTransientStatusesAre() {
+        assertFalse(SpeedTestEngine.isRetryableSpeedTestFailure(IOException("Download HTTP 403")))
+        assertFalse(
+            SpeedTestEngine.isRetryableSpeedTestFailure(
+                IOException("Unexpected Download HTTP status 403; expected 200..206"),
+            ),
+        )
+        assertTrue(SpeedTestEngine.isRetryableSpeedTestFailure(IOException("Download HTTP 429")))
+        assertTrue(
+            SpeedTestEngine.isRetryableSpeedTestFailure(
+                IOException("Unexpected Download HTTP status 429; expected 200..206"),
+            ),
+        )
+        assertTrue(SpeedTestEngine.isRetryableSpeedTestFailure(IOException("Upload HTTP 503")))
+        assertTrue(SpeedTestEngine.isRetryableSpeedTestFailure(IOException("socket reset")))
+    }
+
     @Test
     fun configuredDebugFixtureIsUsedForBothEndpoints() {
         val baseUrl = "http://10.0.2.2:18765/"

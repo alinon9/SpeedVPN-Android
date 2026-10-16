@@ -28,6 +28,58 @@ def replace_text_once(text: str, old: str, new: str, label: str) -> str:
     return text.replace(old, new, 1)
 
 
+def upgrade_native_uid_fail_open(jni_text: str) -> str:
+    """Upgrade the UID fail-open invariants in clean and previously patched C files."""
+    replacements = (
+        (
+            "                    if (uid < 0)\n                        action = UID_POC_ACTION_ALLOW;",
+            "                    if (uid <= 0)\n                        action = UID_POC_ACTION_ALLOW;",
+            "nonpositive UID action",
+        ),
+        (
+            "        if (!call_ok || uid < 0)\n            __sync_add_and_fetch (&uid_poc_lookup_failures, 1ULL);",
+            "        if (!call_ok || uid <= 0)\n            __sync_add_and_fetch (&uid_poc_lookup_failures, 1ULL);",
+            "nonpositive UID metrics",
+        ),
+        (
+            "        uid_poc_store_result_locked (&request.key, call_ok ? (int) uid : -1,",
+            "        uid_poc_store_result_locked (&request.key, call_ok && uid > 0 ? (int) uid : -1,",
+            "invalid UID cache store",
+        ),
+        (
+            "    entry->action = (uid >= 0 && action == UID_POC_ACTION_BLOCK)",
+            "    entry->action = (uid > 0 && action == UID_POC_ACTION_BLOCK)",
+            "positive UID cache guard",
+        ),
+        (
+            "            if (entry->uid >= 0 && entry->action == UID_POC_ACTION_BLOCK) {",
+            "            if (entry->uid > 0 && entry->action == UID_POC_ACTION_BLOCK) {",
+            "positive UID drop guard",
+        ),
+        (
+            "        replacement = (*env)->NewGlobalRef (env, callback);\n"
+            "        if (!replacement)\n"
+            "            return JNI_FALSE;",
+            "        replacement = (*env)->NewGlobalRef (env, callback);\n"
+            "        if (!replacement) {\n"
+            "            if ((*env)->ExceptionCheck (env))\n"
+            "                (*env)->ExceptionClear (env);\n"
+            "            return JNI_FALSE;\n"
+            "        }",
+            "clear JNI exception after global ref failure",
+        ),
+    )
+    for old, new, label in replacements:
+        if old in jni_text:
+            count = jni_text.count(old)
+            if count != 1:
+                raise SystemExit(f"Refusing unsafe UID policy upgrade: expected one {label} anchor, found {count}")
+            jni_text = jni_text.replace(old, new, 1)
+        elif new not in jni_text:
+            raise SystemExit(f"Refusing incomplete UID policy upgrade: missing {label} anchor")
+    return jni_text
+
+
 def inject_native_start_step_logs(jni_text: str) -> str:
     """Inject ordered native startup breadcrumbs into the isolated UID POC JNI source."""
     if "STEP 1: nativeStart entered" in jni_text:
@@ -243,8 +295,11 @@ uid_poc_report_packet (const struct pbuf *buf)
         pbuf_copy_partial (buf, l4, need, offset) != need)
         return 0;
 
+    /* Decode the wire-order bytes explicitly into host-order integer ports;
+     * applying ntohs() here would byte-swap the already-decoded values. */
     src_port = ((unsigned int) l4[0] << 8) | l4[1];
     dst_port = ((unsigned int) l4[2] << 8) | l4[3];
+    /* src is the app-local endpoint; dst is the remote server endpoint. */
     /* No port allow-list: block all TCP/UDP destinations for a matched UID. */
     return hev_jni_uid_poc_packet (protocol, src, src_len, src_port,
                                    dst, src_len, dst_port);
@@ -695,7 +750,7 @@ uid_poc_store_result_locked (const uid_poc_flow_key *key, int uid, int action,
     if (entry->uid != UID_POC_UID_PENDING || entry->request_id != request_id)
         return;
     entry->uid = uid;
-    entry->action = (uid >= 0 && action == UID_POC_ACTION_BLOCK)
+    entry->action = (uid > 0 && action == UID_POC_ACTION_BLOCK)
         ? UID_POC_ACTION_BLOCK : UID_POC_ACTION_ALLOW;
     entry->drop_logged = 0;
     entry->updated_ms = now;
@@ -805,7 +860,7 @@ uid_poc_worker_main (void *unused)
                     uid = (jint) (packed_bits >> 32);
                     action = (packed_bits & 1ULL)
                         ? UID_POC_ACTION_BLOCK : UID_POC_ACTION_ALLOW;
-                    if (uid < 0)
+                    if (uid <= 0)
                         action = UID_POC_ACTION_ALLOW;
                     call_ok = 1;
                 }
@@ -818,11 +873,11 @@ uid_poc_worker_main (void *unused)
         if (src_array) (*env)->DeleteLocalRef (env, src_array);
         if (dst_array) (*env)->DeleteLocalRef (env, dst_array);
 
-        if (!call_ok || uid < 0)
+        if (!call_ok || uid <= 0)
             __sync_add_and_fetch (&uid_poc_lookup_failures, 1ULL);
 
         pthread_mutex_lock (&uid_poc_mutex);
-        uid_poc_store_result_locked (&request.key, call_ok ? (int) uid : -1,
+        uid_poc_store_result_locked (&request.key, call_ok && uid > 0 ? (int) uid : -1,
                                      call_ok ? action : UID_POC_ACTION_ALLOW,
                                      uid_poc_now_ms (), request.request_id);
         pthread_mutex_unlock (&uid_poc_mutex);
@@ -936,8 +991,11 @@ native_set_uid_poc_callback (JNIEnv *env, jobject thiz, jobject callback)
             return JNI_FALSE;
         }
         replacement = (*env)->NewGlobalRef (env, callback);
-        if (!replacement)
+        if (!replacement) {
+            if ((*env)->ExceptionCheck (env))
+                (*env)->ExceptionClear (env);
             return JNI_FALSE;
+        }
     }
 
     uid_poc_worker_stop ();
@@ -1008,7 +1066,7 @@ hev_jni_uid_poc_packet (int protocol,
             __sync_add_and_fetch (&uid_poc_pending_hits, 1ULL);
         } else {
             __sync_add_and_fetch (&uid_poc_cache_hits, 1ULL);
-            if (entry->uid >= 0 && entry->action == UID_POC_ACTION_BLOCK) {
+            if (entry->uid > 0 && entry->action == UID_POC_ACTION_BLOCK) {
                 should_drop = 1;
                 __sync_add_and_fetch (&uid_poc_dropped_packets, 1ULL);
                 if (!entry->drop_logged) {
@@ -1089,6 +1147,7 @@ native_is_running (JNIEnv *env, jobject thiz)
     # Harden JNI/thread/FD ownership on every run (even if the injected marker already
     # exists from an earlier invocation of this patcher).
     jni_text = jni_c.read_text()
+    jni_text = upgrade_native_uid_fail_open(jni_text)
 
     # Refuse to produce an APK if the asynchronous worker or actual native DROP path
     # was lost in a source update. Logging-only UID observation is not enforcement.
@@ -1097,6 +1156,8 @@ native_is_running (JNIEnv *env, jobject thiz)
         "DetachCurrentThread (java_vm)",
         "UID_WORKER_READY stack=1048576",
         "uid_poc_store_result_locked",
+        "if (uid <= 0)",
+        "uid > 0 && action == UID_POC_ACTION_BLOCK",
         "PACKET_DROPPED uid=%d tuple=%s",
         "if (uid_poc_report_packet (buf))",
     )

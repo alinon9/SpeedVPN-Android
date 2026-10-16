@@ -99,16 +99,16 @@ jobs:
       - name: Build debug APK
         run: ./gradlew :app:assembleDebug -PspeedTestBaseUrl=http://10.0.2.2:18765 --stacktrace --no-daemon
 
-      - name: Fingerprint measured APK
+      - name: Verify current-build native libraries and fingerprint measured APK
         run: |
           set -euo pipefail
           APK=app/build/outputs/apk/debug/app-debug.apk
           test -s "$APK"
+          python3 scripts/e2e/verify_apk_native.py "$APK" --variant debug --native-build-root app/build/intermediates --output speedvpn-debug-apk-native-fingerprint.txt
           COMMIT="$(git rev-parse HEAD)"
-          HASH="$(sha256sum "$APK" | cut -d' ' -f1)"
           {
+            cat speedvpn-debug-apk-native-fingerprint.txt
             echo "commit=$COMMIT"
-            echo "apk_sha256=$HASH"
             echo "speed_test_base_url=http://10.0.2.2:18765"
           } | tee speedvpn-debug-apk-fingerprint.txt
 
@@ -292,10 +292,14 @@ jobs:
           esac
 
       - name: Strict 38/38 speed-limiter gate
-        if: ${{ !cancelled() && steps.sweep.outputs.sweep_status != 'ENV_INSUFFICIENT' }}
+        if: ${{ always() && !cancelled() }}
         run: |
           set -euo pipefail
-          test -s speed-limit-sweep/speed-limit-sweep-results.csv || { echo "Missing speed-limit-sweep/speed-limit-sweep-results.csv"; exit 1; }
+          if [ "${{ steps.sweep.outputs.sweep_status }}" = "ENV_INSUFFICIENT" ]; then
+            echo "ENVIRONMENT_LIMITATION: baseline preflight did not establish the required headroom. No 38/38 result is claimed; this is not a software metric failure, but the acceptance gate remains unsatisfied."
+            exit 1
+          fi
+          test -s speed-limit-sweep/speed-limit-sweep-results.csv || { echo "Missing speed-limit-sweep-results.csv"; exit 1; }
           python3 scripts/e2e/verify_metrics.py validate-sweep speed-limit-sweep/speed-limit-sweep-results.csv
 
       - name: Upload exhaustive sweep results

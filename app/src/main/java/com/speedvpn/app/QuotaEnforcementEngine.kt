@@ -87,10 +87,20 @@ internal object QuotaEnforcementEngine {
         nowMillis: Long = System.currentTimeMillis(),
         restart: (Context) -> Unit = SpeedVpnService::restartForSettings,
     ): Boolean {
-        val evaluated = evaluateBlockedPackages(context, nowMillis)
-        val current = VpnAppControl.quotaBlockedPackages(context)
-        if (evaluated == current) return false
+        // Snapshot the effective persisted state BEFORE pruning it. Pruning is a durable
+        // cleanup, but it must not hide a removed block from the comparison below: the
+        // native/VpnService per-app policy may still contain that package until VPN restart.
+        val previouslyBlocked = VpnAppControl.quotaBlockedPackages(context)
 
+        // Remove persisted blocks for packages whose quota was deleted or disabled.
+        // If policy loading fails, do not erase state based on an incomplete read.
+        val staleRemoved = prunePersistedQuotaBlocks(context)
+        val evaluated = evaluateBlockedPackages(context, nowMillis)
+        val current = previouslyBlocked
+        if (evaluated == current) return staleRemoved
+
+        // Apply the new durable block set even when pruning already changed storage. The
+        // before-prune snapshot above is the state the running VPN must be reconciled with.
         VpnAppControl.replaceQuotaBlockedPackages(context, evaluated)
 
         evaluated.minus(current).forEach { packageName ->
@@ -132,6 +142,21 @@ internal object QuotaEnforcementEngine {
             }
             requestRestart(context, nowMillis, restart)
         }
+        return true
+    }
+
+    /** Returns true when durable quota-block state was pruned. */
+    private fun prunePersistedQuotaBlocks(context: Context): Boolean {
+        val configuredPackages = runCatching {
+            UsageRepository.readQuotaPolicies(context).map { it.packageName }.toSet()
+        }.getOrNull() ?: return false
+
+        val persisted = VpnAppControl.quotaBlockedPackages(context)
+        val retained = persisted.intersect(configuredPackages)
+        if (retained == persisted) return false
+
+        // This is the durable SharedPreferences-backed block set, not transient flow state.
+        VpnAppControl.replaceQuotaBlockedPackages(context, retained)
         return true
     }
 

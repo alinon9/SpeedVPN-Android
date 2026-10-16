@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "repository": "alinon9/SpeedVPN-Android",
+  "integration_branch": "fix/integrated-all-stages",
+  "integration_order": [
+    {
+      "pr": 36,
+      "head": "fix/uid-policy-fail-open-phase1-20261016",
+      "head_sha": "0c5f820adc5703b84e5ccf075e653aa3308081f9",
+      "scope": "UID policy fail-open and stale quota blocks"
+    },
+    {
+      "pr": 37,
+      "head": "fix/speed-limiter-accuracy-udp-shared-20261016",
+      "head_sha": "8f704b7f969807bdec77d2219d0ab6b416d9be27",
+      "scope": "TCP/UDP speed limiter accuracy"
+    },
+    {
+      "pr": 38,
+      "head": "fix/speed-test-engine-reliability",
+      "head_sha": "8bfa79e58fa69f585ffcaf0707f2ba3fa2a2b9f9",
+      "scope": "SpeedTestEngine reliability and routing"
+    },
+    {
+      "pr": 39,
+      "head": "fix/verify-speed-tun-routing-evidence-20261016",
+      "head_sha": "9f52456656f3a3728ff69f2284c3228711f5184d",
+      "scope": "Verify Speed TUN routing and relay evidence"
+    },
+    {
+      "pr": 40,
+      "head": "fix/verify-speed-ci-473",
+      "head_sha": "dc5fc0de1ca76af1b36e0ab10333f06656f1d13e",
+      "scope": "APK native fingerprints and strict CI gate"
+    }
+  ],
+  "policy": {
+    "integration_is_reviewed_branch": "fix/integrated-all-stages",
+    "merge_source_heads_again_into_integrated_branch": false,
+    "reason": "The integration branch already contains reconciled commits from PRs #36–#40; merging the original heads again would reintroduce their main-based histories and known conflicts.",
+    "required_checks": [
+      "python3 -m unittest discover -s scripts/e2e/tests -v",
+      "./gradlew testDebugUnitTest lintDebug assembleDebug assembleRelease"
+    ],
+    "environmental_state": "ENV_INSUFFICIENT must be reported distinctly and must never count as a passing 38/38 acceptance result."
+  }
+}

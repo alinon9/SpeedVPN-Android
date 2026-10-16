@@ -26,6 +26,39 @@ class SpeedTestEngineResponseValidationTest {
     }
 
     @Test
+    fun rejectsForbiddenRateLimitedAndOutOfRangeHttpStatusCodes() {
+        for (status in listOf(403, 429, 207)) {
+            val error = SpeedTestEngine.downloadResponseValidationError(
+                contentType = "application/octet-stream",
+                requestedBytes = 1_000_000L,
+                responseBytes = 1_000_000L,
+                responseCode = status,
+            )
+            assertTrue("Expected status $status to be rejected, got $error", error?.contains("HTTP status") == true)
+        }
+    }
+
+    @Test
+    fun acceptsMatchingPartialContentWhenPayloadLengthMatches() {
+        assertEquals(
+            null,
+            SpeedTestEngine.downloadResponseValidationError(
+                contentType = "application/octet-stream",
+                requestedBytes = 1_000_000L,
+                responseBytes = 1_000_000L,
+                responseCode = 206,
+            ),
+        )
+    }
+
+    @Test
+    fun rejectsEmptyAndActuallyTruncatedDownloadPayloads() {
+        assertTrue(SpeedTestEngine.downloadPayloadValidationError(1_000_000L, 0L)?.contains("empty") == true)
+        assertTrue(SpeedTestEngine.downloadPayloadValidationError(1_000_000L, 999_999L)?.contains("truncated") == true)
+        assertEquals(null, SpeedTestEngine.downloadPayloadValidationError(1_000_000L, 1_000_000L))
+    }
+
+    @Test
     fun acceptsMatchingBinaryDownloadResponse() {
         assertEquals(
             null,
