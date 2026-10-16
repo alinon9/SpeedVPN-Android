@@ -40,7 +40,7 @@ jobs:
         run: bash ./setup.sh 2>&1 | tee native-setup.log
 
       - name: Test native TCP patcher
-        run: python3 -m pytest -q scripts/e2e/tests/test_hev_tcp_buffer_patch.py
+        run: python3 -m pytest -q scripts/e2e/tests/test_hev_tcp_buffer_patch.py scripts/e2e/tests/test_native_build_contract.py
 
       - name: Verify native pin
         run: |
