@@ -1,7 +1,6 @@
 package com.speedvpn.app
 
 import android.content.Context
-import android.net.Network
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex

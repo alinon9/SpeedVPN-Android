@@ -462,7 +462,8 @@ internal class SpeedOverlayService : Service() {
                             ensureOverlayPermission()
                         } else {
                             recordOverlayFailure("OVERLAY_LAYOUT_UPDATE_FAILED", error)
-                            root = null
+                            // Keep the root reference until onDestroy so the attached
+                            // window can be removed even after updateViewLayout fails.
                             stopSelf()
                         }
                     }
