@@ -686,7 +686,7 @@ class MainActivity : ComponentActivity() {
     private fun AppFirewallSettingsCard() {
         val savedSettings = remember { VpnAppControl.read(this@MainActivity) }
         var firewallEnabled by remember { mutableStateOf(savedSettings.firewallEnabled) }
-        var blockedPackages by remember { mutableStateOf(savedSettings.blockedPackages) }
+        val blockedPackages = savedSettings.blockedPackages
 
         GlassCard {
             SectionLabel("جدار التطبيقات", "إعداد عام للحظر على مستوى التطبيقات")
@@ -920,7 +920,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-@Composable
+    @Composable
     private fun AppsScreen(s: Snapshot) {
         val usageAccess = usageAccessState.value
         val catalogRefreshVersion = appCatalogRefreshTrigger.value
