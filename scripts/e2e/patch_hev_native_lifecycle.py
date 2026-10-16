@@ -49,6 +49,14 @@ def _replace_state(content: str, old: str, patched: str, label: str) -> tuple[st
 
 
 def check_native_lifecycle_content(content: str) -> None:
+    # The unique guard is part of the reviewed block. A duplicate guard may leave
+    # an extra brace/control-flow shell after a superficially successful replacement.
+    guard_count = content.count("if (thread_joinable) {")
+    if guard_count != 1:
+        raise PatchError(
+            "native_start_service join guard: expected exactly one occurrence, "
+            f"found {guard_count}"
+        )
     for old, patched, label in (
         (START_JOIN_OLD, START_JOIN_PATCHED, "native_start_service previous-worker join"),
         (STOP_JOIN_OLD, STOP_JOIN_PATCHED, "native_stop_service worker join"),
