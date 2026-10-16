@@ -2,6 +2,12 @@ package com.speedvpn.app
 
 import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -34,10 +40,12 @@ class UdpFlowTableTest {
     }
 
     @Test
-    fun flowExpiresByTtl() {
-        val table = UdpFlowTable(maxFlows = 2, ttlMs = 1000)
+    fun flowExpiresByTtlAndNotifiesResourceOwner() {
+        val evicted = ConcurrentHashMap.newKeySet<String>()
+        val table = UdpFlowTable(maxFlows = 2, ttlMs = 1000, onFlowEvicted = { evicted.add(it.logicalKey) })
         table.getOrCreate("host:test", 443, InetSocketAddress("10.0.0.2", 50000), listOf(a), 0)
         assertNull(table.findByDestination(a, 443, 2001))
+        assertTrue("TTL eviction must notify the owner so its UDP channel is closed", "host:test" in evicted)
     }
 
     @Test
@@ -128,6 +136,104 @@ class UdpFlowTableTest {
         )!!
         table.touchSent(flow, 2)
         assertEquals(flow, table.findByDestination(a, 443, 3))
+    }
+
+    @Test
+    fun ttlEvictionUnderConcurrentLookupsClosesEachExpiredFlowExactlyOnce() {
+        val closedFlowKeys = ConcurrentHashMap.newKeySet<String>()
+        val duplicateClose = AtomicBoolean(false)
+        val table = UdpFlowTable(
+            maxFlows = 64,
+            ttlMs = 100,
+            onFlowEvicted = { flow ->
+                if (!closedFlowKeys.add(flow.logicalKey)) duplicateClose.set(true)
+            },
+        )
+        repeat(64) { index ->
+            table.getOrCreate(
+                "expired-$index",
+                443,
+                InetSocketAddress("10.0.0.2", 20_000 + index),
+                listOf(a),
+                10,
+            )
+        }
+
+        val pool = Executors.newFixedThreadPool(8)
+        val gate = CountDownLatch(1)
+        try {
+            val tasks = (0 until 8).map { worker ->
+                pool.submit {
+                    gate.await()
+                    repeat(100) { iteration ->
+                        val now = 1_000L + worker * 100L + iteration
+                        when ((worker + iteration) % 3) {
+                            0 -> table.size(now)
+                            1 -> table.contains("expired-${iteration % 64}", now)
+                            else -> table.findByDestination(a, 443, now)
+                        }
+                    }
+                }
+            }
+            gate.countDown()
+            tasks.forEach { it.get(5, TimeUnit.SECONDS) }
+        } finally {
+            pool.shutdownNow()
+            pool.awaitTermination(2, TimeUnit.SECONDS)
+        }
+
+        assertEquals("all TTL-expired flow resources must be closed", 64, closedFlowKeys.size)
+        assertTrue(closedFlowKeys.containsAll((0 until 64).map { "expired-$it" }))
+        assertTrue("a flow must never be closed twice", !duplicateClose.get())
+        assertEquals(0, table.size(2_000))
+    }
+
+    @Test
+    fun concurrentCapacityEvictionClosesEveryFlowExactlyOnce() {
+        val closedFlowKeys = ConcurrentHashMap.newKeySet<String>()
+        val createdFlowKeys = ConcurrentHashMap.newKeySet<String>()
+        val duplicateClose = AtomicBoolean(false)
+        val timestamp = AtomicLong(0L)
+        val table = UdpFlowTable(
+            maxFlows = 24,
+            ttlMs = Long.MAX_VALUE / 4,
+            onFlowEvicted = { flow ->
+                if (!closedFlowKeys.add(flow.logicalKey)) duplicateClose.set(true)
+            },
+        )
+        val pool = Executors.newFixedThreadPool(8)
+        val gate = CountDownLatch(1)
+        try {
+            val tasks = (0 until 8).map { worker ->
+                pool.submit {
+                    gate.await()
+                    repeat(150) { iteration ->
+                        val key = "worker-$worker-flow-$iteration"
+                        createdFlowKeys.add(key)
+                        val now = timestamp.incrementAndGet()
+                        table.getOrCreate(
+                            key,
+                            443,
+                            InetSocketAddress("10.0.0.2", 30_000 + worker * 200 + iteration),
+                            listOf(a),
+                            now,
+                        )
+                        if (iteration % 4 == 0) table.size(timestamp.incrementAndGet())
+                    }
+                }
+            }
+            gate.countDown()
+            tasks.forEach { it.get(10, TimeUnit.SECONDS) }
+        } finally {
+            pool.shutdownNow()
+            pool.awaitTermination(2, TimeUnit.SECONDS)
+        }
+
+        assertTrue(table.size(timestamp.incrementAndGet()) <= 24)
+        table.clear()
+        assertEquals("every created flow must be closed exactly once", createdFlowKeys.size, closedFlowKeys.size)
+        assertTrue(closedFlowKeys.containsAll(createdFlowKeys))
+        assertTrue("capacity/clear must not close one flow twice", !duplicateClose.get())
     }
 
     @Test
