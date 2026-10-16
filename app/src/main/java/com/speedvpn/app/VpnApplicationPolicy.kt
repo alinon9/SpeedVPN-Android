@@ -48,6 +48,18 @@ internal object VpnApplicationPolicy {
     internal fun isUidBlocked(uid: Int, blockedUids: Set<Int>): Boolean =
         uid > 0 && uid in blockedUids
 
+    /** Normalize ::ffff:a.b.c.d so the owner-UID query matches IPv4 socket tuples. */
+    internal fun normalizeUidQueryAddressBytes(address: ByteArray): ByteArray {
+        if (address.size != 16 ||
+            address.take(10).any { it != 0.toByte() } ||
+            address[10] != 0xff.toByte() ||
+            address[11] != 0xff.toByte()
+        ) {
+            return address.copyOf()
+        }
+        return address.copyOfRange(12, 16)
+    }
+
     // Kept for source compatibility with existing tests/tools. The service does not
     // use this result for routing; it routes all apps through TUN instead.
     fun allowedPackages(
