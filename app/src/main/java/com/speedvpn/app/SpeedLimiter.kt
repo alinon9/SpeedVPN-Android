@@ -27,9 +27,10 @@ class TokenBucket {
     companion object {
         private const val NANOS_PER_SECOND = 1_000_000_000.0
         private const val BURST_WINDOW_NS = 10_000_000L
-        // Preserve the relay's normal 16 KiB TCP read size as the minimum burst.
-        // At higher rates, permit at most 256 KiB of accumulated credit.
-        private const val MIN_BURST_BYTES = 16 * 1024
+        // Do not impose a fixed 16 KiB minimum: at low rates that creates a
+        // large first burst and lets each relay read overshoot its 10 ms budget.
+        // One byte is enough for the slowest supported finite rate.
+        private const val MIN_BURST_BYTES = 1
         private const val MAX_BURST_BYTES = 256 * 1024
     }
 
@@ -54,8 +55,9 @@ class TokenBucket {
             val newRate = max(0L, bytesPerSec)
             this.bytesPerSec = newRate
             capacityBytes = burstCapacity(newRate)
-            // Apply a changed rate immediately. One in-flight chunk can complete
-            // under the old schedule; subsequent acquires use the new token budget.
+            // Applying a plan clears accumulated debt and starts with only the new
+            // plan's bounded burst. signalAll wakes waiters so old-rate waits do not
+            // delay a plan change (Unlimited bypasses pacing on the next acquire).
             availableBytes = capacityBytes
             lastRefillNs = System.nanoTime()
             changed.signalAll()
@@ -96,6 +98,9 @@ class TokenBucket {
                     .toLong()
                     .coerceAtLeast(1L)
                 try {
+                    // Condition.awaitNanos releases this lock while blocked. Other
+                    // flows can take available credit, and setRate() can reset debt
+                    // and signal waiters without waiting for a sleeping thread.
                     changed.awaitNanos(waitNs)
                 } catch (_: InterruptedException) {
                     // No reservation was made for this waiter, so returning cannot
@@ -111,11 +116,10 @@ class TokenBucket {
     }
 
     /**
-     * Chooses a relay read size close to the token bucket's bounded burst window.
-     *
-     * Small plans retain the 16 KiB minimum so a single read cannot create a
-     * large burst. Faster plans use larger reads to reduce per-chunk scheduler
-     * and lock overhead, up to the same 256 KiB maximum used by the bucket.
+     * Chooses a relay read size from the current rate's bounded 10 ms credit.
+     * There is deliberately no fixed minimum chunk: keeping small-plan reads small
+     * prevents the TCP relay from reading a much larger chunk than the plan allows.
+     * Faster plans use larger reads to reduce per-chunk scheduler/lock overhead.
      */
     internal fun recommendedReadBytes(): Int = lock.withLock {
         if (bytesPerSec <= 0L) {
@@ -280,14 +284,15 @@ object SpeedLimiter {
         }
         if (!normalized.isFinite() || normalized <= 0.0) return null
         // TokenBucket stores bytes/sec as Long. 1 Kbps == 125 bytes/sec.
-        return normalized.toLong().coerceAtMost(Long.MAX_VALUE / 125L).takeIf { it > 0L }
+        return normalizeKbps(normalized.toLong())
     }
 
+    /** Zero/null mean Unlimited; cap finite values before multiplying by 125. */
+    internal fun normalizeKbps(kbps: Long?): Long? =
+        kbps?.takeIf { it > 0L }?.coerceAtMost(Long.MAX_VALUE / 125L)
+
     private fun kbpsToBytesPerSec(kbps: Long?): Long =
-        kbps?.takeIf { it > 0L }
-            ?.coerceAtMost(Long.MAX_VALUE / 125L)
-            ?.times(125L)
-            ?: 0L
+        normalizeKbps(kbps)?.times(125L) ?: 0L
 
     /** Begins a verification and freezes the limiter at the requested rates. */
     fun beginVerification(downloadKbps: Long?, uploadKbps: Long?): Boolean =
@@ -385,14 +390,16 @@ object SpeedLimiter {
     }
 
     private fun applyDownloadKbps(kbps: Long?) {
-        download.setRate(kbpsToBytesPerSec(kbps))
-        VpnRuntime.update { it.copy(downloadLimitKbps = kbps) }
-        log("Download limit applied: ${kbps?.let { "$it Kbps" } ?: "unlimited"}")
+        val normalized = normalizeKbps(kbps)
+        download.setRate(kbpsToBytesPerSec(normalized))
+        VpnRuntime.update { it.copy(downloadLimitKbps = normalized) }
+        log("Download limit applied: ${normalized?.let { "$it Kbps" } ?: "unlimited"}")
     }
 
     private fun applyUploadKbps(kbps: Long?) {
-        upload.setRate(kbpsToBytesPerSec(kbps))
-        VpnRuntime.update { it.copy(uploadLimitKbps = kbps) }
-        log("Upload limit applied: ${kbps?.let { "$it Kbps" } ?: "unlimited"}")
+        val normalized = normalizeKbps(kbps)
+        upload.setRate(kbpsToBytesPerSec(normalized))
+        VpnRuntime.update { it.copy(uploadLimitKbps = normalized) }
+        log("Upload limit applied: ${normalized?.let { "$it Kbps" } ?: "unlimited"}")
     }
 }
