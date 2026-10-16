@@ -13,10 +13,14 @@ import java.net.Socket
 import javax.net.SocketFactory
 import java.util.concurrent.TimeUnit
 
+internal fun shouldQueryIpv6Dns(ipv6Enabled: Boolean, dnsIpv4Only: Boolean): Boolean =
+    ipv6Enabled && !dnsIpv4Only
+
 class EncryptedDnsResolver(
     private val network: Network,
     private val protect: (Socket) -> Boolean,
     private val ipv6Enabled: Boolean,
+    private val dnsIpv4Only: Boolean = false,
 ) {
     companion object {
         private const val DOH_HOST = "cloudflare-dns.com"
@@ -49,7 +53,9 @@ class EncryptedDnsResolver(
             .build()
         val addresses = mutableListOf<InetAddress>()
         query(base, addresses, 4)
-        if (ipv6Enabled) query(base.newBuilder().setQueryParameter("type", "AAAA").build(), addresses, 6)
+        if (shouldQueryIpv6Dns(ipv6Enabled, dnsIpv4Only)) {
+            query(base.newBuilder().setQueryParameter("type", "AAAA").build(), addresses, 6)
+        }
         if (addresses.isEmpty()) throw IOException("Encrypted DNS returned no usable address for $host")
         return addresses.distinctBy { it.hostAddress }.sortedBy { if (it.address.size == 4) 0 else 1 }
     }
