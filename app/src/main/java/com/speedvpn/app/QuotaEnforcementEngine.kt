@@ -87,9 +87,13 @@ internal object QuotaEnforcementEngine {
         nowMillis: Long = System.currentTimeMillis(),
         restart: (Context) -> Unit = SpeedVpnService::restartForSettings,
     ): Boolean {
+        // Remove persisted blocks for packages whose quota was deleted or disabled
+        // before comparing effective state. If policy loading fails, do not erase state
+        // based on an incomplete read.
+        val staleRemoved = prunePersistedQuotaBlocks(context)
         val evaluated = evaluateBlockedPackages(context, nowMillis)
         val current = VpnAppControl.quotaBlockedPackages(context)
-        if (evaluated == current) return false
+        if (evaluated == current) return staleRemoved
 
         VpnAppControl.replaceQuotaBlockedPackages(context, evaluated)
 
@@ -132,6 +136,21 @@ internal object QuotaEnforcementEngine {
             }
             requestRestart(context, nowMillis, restart)
         }
+        return true
+    }
+
+    /** Returns true when durable quota-block state was pruned. */
+    private fun prunePersistedQuotaBlocks(context: Context): Boolean {
+        val configuredPackages = runCatching {
+            UsageRepository.readQuotaPolicies(context).map { it.packageName }.toSet()
+        }.getOrNull() ?: return false
+
+        val persisted = VpnAppControl.quotaBlockedPackages(context)
+        val retained = persisted.intersect(configuredPackages)
+        if (retained == persisted) return false
+
+        // This is the durable SharedPreferences-backed block set, not transient flow state.
+        VpnAppControl.replaceQuotaBlockedPackages(context, retained)
         return true
     }
 
