@@ -309,7 +309,7 @@ object SpeedTestEngine {
 
                     override fun onResponse(call: Call, response: Response) {
                         if (continuation.isActive) {
-                            continuation.resume(response) { _, responseToClose, _ -> responseToClose.close() }
+                            continuation.resume(response) { _ -> response.close() }
                         } else {
                             response.close()
                         }
