@@ -429,7 +429,6 @@ class MainActivity : ComponentActivity() {
                                         lifecycleScope.launch(Dispatchers.Main.immediate) { verifyProgress = message }
                                     },
                                 )
-                                SpeedVerificationStore.save(this@MainActivity, lastVerification!!)
                                 verificationHistory = SpeedVerificationStore.loadRecent(this@MainActivity, 8)
                                 verifyBusy = false
                                 verifyProgress = null
