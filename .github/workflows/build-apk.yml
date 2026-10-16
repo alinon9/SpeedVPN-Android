@@ -43,24 +43,40 @@ jobs:
           test -s gradle/wrapper/gradle-wrapper.jar.sha256
           ./gradlew --version
 
+      - name: Set up Python for native tests
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install pytest
+        run: python -m pip install --upgrade pip pytest
+
       - name: Fetch pinned native tunnel
-        run: bash ./setup.sh 2>&1 | tee native-setup.log
+        run: |
+          set -o pipefail
+          bash ./setup.sh 2>&1 | tee native-setup.log
 
       - name: Test native TCP patcher
-        run: python3 -m pytest -q scripts/e2e/tests/test_hev_tcp_buffer_patch.py scripts/e2e/tests/test_native_build_contract.py
+        run: python -m pytest -q scripts/e2e/tests/test_hev_tcp_buffer_patch.py scripts/e2e/tests/test_native_build_contract.py
 
       - name: Verify native pin
         run: |
           test "$(git -C app/src/main/jni/hev-socks5-tunnel rev-parse HEAD)" = "d9dca26c7ad0e494492244f0309e80ee583e739e"
 
       - name: Run unit tests
-        run: ./gradlew :app:testDebugUnitTest --stacktrace --no-daemon 2>&1 | tee unit-tests.log
+        run: |
+          set -o pipefail
+          ./gradlew :app:testDebugUnitTest --stacktrace --no-daemon 2>&1 | tee unit-tests.log
 
       - name: Run lint
-        run: ./gradlew :app:lintDebug --stacktrace --no-daemon 2>&1 | tee lint.log
+        run: |
+          set -o pipefail
+          ./gradlew :app:lintDebug --stacktrace --no-daemon 2>&1 | tee lint.log
 
       - name: Build debug APK
-        run: ./gradlew :app:assembleDebug --stacktrace --no-daemon 2>&1 | tee debug-build.log
+        run: |
+          set -o pipefail
+          ./gradlew :app:assembleDebug --stacktrace --no-daemon 2>&1 | tee debug-build.log
 
       - name: Upload debug APK for emulator
         uses: actions/upload-artifact@v7
@@ -88,6 +104,7 @@ jobs:
             printf "%s" "${RELEASE_KEYSTORE_BASE64}" | base64 -d > "$RELEASE_KEYSTORE_PATH"
             chmod 600 "$RELEASE_KEYSTORE_PATH"
             test -s "$RELEASE_KEYSTORE_PATH"
+            set -o pipefail
             ./gradlew :app:assembleRelease --stacktrace --no-daemon 2>&1 | tee release-build.log
           else
             echo "Release signing inputs missing: ${missing[*]}"
@@ -163,7 +180,9 @@ jobs:
           if-no-files-found: error
 
       - name: Build deterministic fixture debug APK
-        run: ./gradlew :app:assembleDebug -PspeedTestBaseUrl=http://10.0.2.2:18765 --rerun-tasks --stacktrace --no-daemon 2>&1 | tee fixture-build.log
+        run: |
+          set -o pipefail
+          ./gradlew :app:assembleDebug -PspeedTestBaseUrl=http://10.0.2.2:18765 --rerun-tasks --stacktrace --no-daemon 2>&1 | tee fixture-build.log
 
       - name: Upload fixture debug APK for Verify Speed
         uses: actions/upload-artifact@v7
@@ -185,7 +204,8 @@ jobs:
             echo "java_version:"
             java -version 2>&1
             echo "gradle_version:"
-            ./gradlew --version 2>&1 | head -n 12
+            ./gradlew --version > build-evidence/gradle-version.txt 2>&1
+            sed -n '1,12p' build-evidence/gradle-version.txt
           } > build-evidence/build-summary.txt
 
           : > build-evidence/native-library-inventory.txt
