@@ -41,6 +41,26 @@ class UdpFlowTableTest {
     }
 
     @Test
+    fun clearRemovesEveryFlowAndReplyMapping() {
+        val table = UdpFlowTable(maxFlows = 4, ttlMs = 60_000)
+        table.getOrCreate("a", 443, InetSocketAddress("10.0.0.2", 50001), listOf(a), 1)
+        table.getOrCreate("b", 53, InetSocketAddress("10.0.0.2", 50002), listOf(b), 2)
+        assertEquals(2, table.size(2))
+        table.clear()
+        assertEquals(0, table.size(3))
+        assertNull(table.findByDestination(a, 443, 3))
+        assertNull(table.findByDestination(b, 53, 3))
+    }
+
+    @Test
+    fun expiredEntriesArePurgedFromTableAndReplyIndex() {
+        val table = UdpFlowTable(maxFlows = 4, ttlMs = 1000)
+        table.getOrCreate("expired", 443, InetSocketAddress("10.0.0.2", 50001), listOf(a), 0)
+        assertEquals(0, table.size(1001))
+        assertNull(table.findByDestination(a, 443, 1001))
+    }
+
+    @Test
     fun oldestFlowIsEvicted() {
         val table = UdpFlowTable(maxFlows = 2, ttlMs = 60_000)
         table.getOrCreate("a", 1, InetSocketAddress("10.0.0.2", 1), listOf(a), 1)
