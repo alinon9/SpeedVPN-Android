@@ -14,24 +14,29 @@ internal data class UdpFlow(
     @Volatile var lastSentMs: Long,
 )
 
-/** Thread-safe per-association UDP flow table with TTL + true access-order LRU. */
+/**
+ * Thread-safe per-association UDP flow table with TTL + true access-order LRU.
+ *
+ * Eviction notifications are delivered outside the table lock. The owner can then
+ * close the flow's DatagramChannel without introducing a table-lock/mux-lock cycle.
+ */
 internal class UdpFlowTable(
     private val maxFlows: Int = 256,
     private val ttlMs: Long = 30_000L,
+    private val onFlowEvicted: (String) -> Unit = {},
 ) {
     init {
         require(maxFlows > 0) { "maxFlows must be positive" }
         require(ttlMs > 0L) { "ttlMs must be positive" }
     }
 
+    private val lock = Any()
     private val flows = LinkedHashMap<String, UdpFlow>(16, 0.75f, true)
-    // Kept as a defensive lookup/index for tests and diagnostics. The live UDP relay
-    // now uses one connected upstream DatagramChannel per logical flow, so production
-    // reply delivery does not depend on this remote-IP:port correlation index.
+    // Defensive lookup/index for tests and diagnostics. Production replies use one
+    // connected upstream DatagramChannel per logical flow.
     private val replyIndex = HashMap<String, LinkedHashSet<String>>()
     private var endpointCollisionCount = 0L
 
-    @Synchronized
     fun getOrCreate(
         logicalKey: String,
         destinationPort: Int,
@@ -39,106 +44,128 @@ internal class UdpFlowTable(
         candidates: List<InetAddress>,
         nowMs: Long,
     ): UdpFlow? {
-        if (destinationPort !in 0..65_535 || candidates.isEmpty()) return null
-        purgeLocked(nowMs)
-        var flow = flows[logicalKey]
-        if (flow == null) {
-            while (flows.size >= maxFlows) evictOldestLocked()
-            flow = UdpFlow(
-                logicalKey = logicalKey,
-                destinationPort = destinationPort,
-                clientEndpoint = clientEndpoint,
-                candidates = candidates,
-                selectedIndex = 0,
-                lastSeenMs = nowMs,
-                lastReplyMs = 0L,
-                lastSentMs = 0L,
-            )
-            flows[logicalKey] = flow
-        } else {
-            removeReplyMappingsLocked(flow)
-            val previousSelected = flow.candidates.getOrNull(flow.selectedIndex)
-            flow.clientEndpoint = clientEndpoint
-            flow.candidates = candidates
-            flow.selectedIndex = previousSelected?.let { candidates.indexOf(it).takeIf { it >= 0 } }
-                ?: flow.selectedIndex.coerceIn(0, candidates.lastIndex)
-            flow.lastSeenMs = nowMs
-        }
+        val candidateSnapshot = candidates.toList()
+        val evicted = ArrayList<String>()
+        val result = synchronized(lock) {
+            if (destinationPort !in 0..65_535 || candidateSnapshot.isEmpty()) {
+                return@synchronized null
+            }
+            purgeLocked(nowMs, evicted)
+            var flow = flows[logicalKey]
+            if (flow == null) {
+                while (flows.size >= maxFlows) evictOldestLocked(evicted)
+                flow = UdpFlow(
+                    logicalKey = logicalKey,
+                    destinationPort = destinationPort,
+                    clientEndpoint = clientEndpoint,
+                    candidates = candidateSnapshot,
+                    selectedIndex = 0,
+                    lastSeenMs = nowMs,
+                    lastReplyMs = 0L,
+                    lastSentMs = 0L,
+                )
+                flows[logicalKey] = flow
+            } else {
+                removeReplyMappingsLocked(flow)
+                val previousSelected = flow.candidates.getOrNull(flow.selectedIndex)
+                flow.clientEndpoint = clientEndpoint
+                flow.candidates = candidateSnapshot
+                flow.selectedIndex = previousSelected?.let {
+                    candidateSnapshot.indexOf(it).takeIf { index -> index >= 0 }
+                } ?: flow.selectedIndex.coerceIn(0, candidateSnapshot.lastIndex)
+                flow.lastSeenMs = nowMs
+            }
 
-        candidates.forEach { candidate ->
-            registerReplyMappingLocked(endpointKey(candidate, flow.destinationPort), logicalKey)
+            candidateSnapshot.forEach { candidate ->
+                registerReplyMappingLocked(endpointKey(candidate, flow.destinationPort), logicalKey)
+            }
+            flow
         }
-        return flow
+        notifyEvicted(evicted)
+        return result
     }
 
-    @Synchronized
     fun findByDestination(address: InetAddress, port: Int, nowMs: Long): UdpFlow? {
-        purgeLocked(nowMs)
-        val endpoint = endpointKey(address, port)
-        val keys = replyIndex[endpoint] ?: return null
-        var matched: UdpFlow? = null
-        var matchCount = 0
-        for (key in keys) {
-            val candidate = flows[key] ?: continue
-            matchCount++
-            if (matchCount > 1) return null
-            matched = candidate
+        val evicted = ArrayList<String>()
+        val result = synchronized(lock) {
+            purgeLocked(nowMs, evicted)
+            val endpoint = endpointKey(address, port)
+            val keys = replyIndex[endpoint] ?: return@synchronized null
+            var matched: UdpFlow? = null
+            var matchCount = 0
+            for (key in keys) {
+                val candidate = flows[key] ?: continue
+                matchCount++
+                if (matchCount > 1) return@synchronized null
+                matched = candidate
+            }
+            val flow = matched ?: return@synchronized null
+            flow.lastSeenMs = nowMs
+            flow.lastReplyMs = nowMs
+            flow
         }
-        val flow = matched ?: return null
-        flow.lastSeenMs = nowMs
-        flow.lastReplyMs = nowMs
-        return flow
+        notifyEvicted(evicted)
+        return result
     }
 
-    @Synchronized
-    fun markReply(flow: UdpFlow, nowMs: Long) {
-        val current = flows[flow.logicalKey] ?: return
+    fun markReply(flow: UdpFlow, nowMs: Long) = synchronized(lock) {
+        val current = flows[flow.logicalKey] ?: return@synchronized
         current.lastSeenMs = nowMs
         current.lastReplyMs = nowMs
     }
 
-    @Synchronized
     fun contains(logicalKey: String, nowMs: Long): Boolean {
-        purgeLocked(nowMs)
-        return flows.containsKey(logicalKey)
+        val evicted = ArrayList<String>()
+        val result = synchronized(lock) {
+            purgeLocked(nowMs, evicted)
+            flows.containsKey(logicalKey)
+        }
+        notifyEvicted(evicted)
+        return result
     }
 
-    @Synchronized
-    fun touchSent(flow: UdpFlow, nowMs: Long) {
-        val current = flows[flow.logicalKey] ?: return
+    fun touchSent(flow: UdpFlow, nowMs: Long) = synchronized(lock) {
+        val current = flows[flow.logicalKey] ?: return@synchronized
         current.lastSeenMs = nowMs
         current.lastSentMs = nowMs
     }
 
-    @Synchronized
-    fun advanceCandidateIfUnanswered(flow: UdpFlow, nowMs: Long, waitMs: Long): Boolean {
-        val current = flows[flow.logicalKey] ?: return false
-        if (current.selectedIndex >= current.candidates.lastIndex) return false
-        if (current.lastSentMs <= current.lastReplyMs) return false
-        if (nowMs - current.lastSentMs < waitMs) return false
-        current.selectedIndex += 1
-        current.lastSeenMs = nowMs
-        current.lastSentMs = 0L
-        current.lastReplyMs = 0L
-        return true
-    }
+    fun advanceCandidateIfUnanswered(flow: UdpFlow, nowMs: Long, waitMs: Long): Boolean =
+        synchronized(lock) {
+            val current = flows[flow.logicalKey] ?: return@synchronized false
+            if (current.selectedIndex >= current.candidates.lastIndex) return@synchronized false
+            if (current.lastSentMs <= current.lastReplyMs) return@synchronized false
+            if (nowMs - current.lastSentMs < waitMs) return@synchronized false
+            current.selectedIndex += 1
+            current.lastSeenMs = nowMs
+            current.lastSentMs = 0L
+            current.lastReplyMs = 0L
+            true
+        }
 
-    @Synchronized
     fun clear() {
-        flows.clear()
-        replyIndex.clear()
+        val removed = synchronized(lock) {
+            val keys = flows.keys.toList()
+            flows.clear()
+            replyIndex.clear()
+            keys
+        }
+        notifyEvicted(removed)
     }
 
-    @Synchronized
     fun size(nowMs: Long): Int {
-        purgeLocked(nowMs)
-        return flows.size
+        val evicted = ArrayList<String>()
+        val result = synchronized(lock) {
+            purgeLocked(nowMs, evicted)
+            flows.size
+        }
+        notifyEvicted(evicted)
+        return result
     }
 
-    @Synchronized
-    fun endpointCollisionCount(): Long = endpointCollisionCount
+    fun endpointCollisionCount(): Long = synchronized(lock) { endpointCollisionCount }
 
-    private fun purgeLocked(nowMs: Long) {
+    private fun purgeLocked(nowMs: Long, evicted: MutableList<String>) {
         val iterator = flows.entries.iterator()
         while (iterator.hasNext()) {
             val entry = iterator.next()
@@ -146,16 +173,18 @@ internal class UdpFlowTable(
                 val flow = entry.value
                 iterator.remove()
                 removeReplyMappingsLocked(flow)
+                evicted.add(flow.logicalKey)
             }
         }
     }
 
-    private fun evictOldestLocked() {
+    private fun evictOldestLocked(evicted: MutableList<String>) {
         val iterator = flows.entries.iterator()
         if (!iterator.hasNext()) return
         val flow = iterator.next().value
         iterator.remove()
         removeReplyMappingsLocked(flow)
+        evicted.add(flow.logicalKey)
     }
 
     private fun registerReplyMappingLocked(endpoint: String, logicalKey: String) {
@@ -170,6 +199,16 @@ internal class UdpFlowTable(
             val set = replyIndex[key] ?: return@forEach
             set.remove(flow.logicalKey)
             if (set.isEmpty()) replyIndex.remove(key)
+        }
+    }
+
+    private fun notifyEvicted(logicalKeys: List<String>) {
+        logicalKeys.distinct().forEach { key ->
+            try {
+                onFlowEvicted(key)
+            } catch (e: Exception) {
+                logE("UDP flow eviction cleanup failed for logicalKey=$key", e)
+            }
         }
     }
 

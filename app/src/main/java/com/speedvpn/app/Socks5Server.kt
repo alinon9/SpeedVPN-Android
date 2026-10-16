@@ -93,6 +93,9 @@ class Socks5Server(
         // than 3. UDP still uses two workers plus its control handler.
         private const val MAX_WORKERS = 192
         private const val HANDSHAKE_TIMEOUT_MS = 10_000
+        // Close half-open/idle TCP relay pipes after a generous idle window. Service
+        // teardown/network changes still close sockets immediately.
+        private const val RELAY_READ_TIMEOUT_MS = 120_000
         private const val UDP_BUFFER_SIZE = 65_535
         private const val MAX_UDP_ASSOCIATIONS = 24
         private const val UDP_DNS_WORKERS = 4
@@ -138,6 +141,8 @@ class Socks5Server(
     val password: String = randomToken(32)
 
     @Volatile private var running = true
+    private val resourceLifecycleLock = Any()
+    @Volatile private var acceptThread: Thread? = null
 
     private val openTcp = Collections.newSetFromMap(ConcurrentHashMap<Socket, Boolean>())
     private val openUdp = Collections.newSetFromMap(ConcurrentHashMap<DatagramSocket, Boolean>())
@@ -215,70 +220,145 @@ class Socks5Server(
     )
 
     fun start() {
-        thread(name = "socks-accept", isDaemon = true) {
-            while (running) {
-                val client = try {
-                    server.accept()
-                } catch (_: Exception) {
-                    break
-                }
-                if (!running) {
-                    runCatching { client.close() }
-                    break
-                }
-                val sourcePort = (client.remoteSocketAddress as? InetSocketAddress)?.port
-                val isHealthProbe = sourcePort != null && probeSourcePorts.remove(sourcePort)
-
-                if (!isHealthProbe && !sessions.tryAcquire()) {
-                    runCatching { client.close() }
-                    continue
-                }
-                track(client)
-                val executor = if (isHealthProbe) probePool else pool
-                try {
-                    executor.execute {
-                        try {
-                            handle(client)
-                        } finally {
-                            if (!isHealthProbe) sessions.release()
-                        }
-                    }
-                } catch (_: RejectedExecutionException) {
-                    if (!isHealthProbe) sessions.release()
-                    untrack(client)
-                    runCatching { client.close() }
-                }
+        synchronized(resourceLifecycleLock) {
+            check(running) { "Cannot start a stopped SOCKS relay" }
+            if (acceptThread != null) return
+            acceptThread = thread(name = "socks-accept", isDaemon = true, start = false) {
+                acceptLoop()
             }
+            acceptThread?.start()
         }
         log("SOCKS relay listening on 127.0.0.1:$port (authenticated)")
     }
 
+    private fun acceptLoop() {
+        while (running) {
+            val client = try {
+                server.accept()
+            } catch (e: Exception) {
+                if (running) logE("SOCKS accept failed while relay was running", e)
+                break
+            }
+            if (!running) {
+                closeResource("accepted SOCKS client after stop", client::close)
+                break
+            }
+            val sourcePort = (client.remoteSocketAddress as? InetSocketAddress)?.port
+            val isHealthProbe = sourcePort != null && probeSourcePorts.remove(sourcePort)
+
+            if (!isHealthProbe && !sessions.tryAcquire()) {
+                closeResource("rejected SOCKS client", client::close)
+                continue
+            }
+            try {
+                // Tracking and the running check share a lock with stop(): a socket
+                // cannot be published after stop has taken its close snapshot.
+                track(client)
+            } catch (e: Exception) {
+                if (!isHealthProbe) sessions.release()
+                closeResource("SOCKS client rejected during shutdown", client::close)
+                if (running) logE("Unable to track accepted SOCKS client", e)
+                if (!running) break
+                continue
+            }
+
+            val executor = if (isHealthProbe) probePool else pool
+            try {
+                executor.execute {
+                    try {
+                        handle(client)
+                    } finally {
+                        if (!isHealthProbe) sessions.release()
+                    }
+                }
+            } catch (e: RejectedExecutionException) {
+                if (!isHealthProbe) sessions.release()
+                untrack(client)
+                closeResource("SOCKS client rejected by worker pool", client::close)
+                if (running) logE("SOCKS worker rejected an accepted client", e)
+            }
+        }
+    }
+
     fun stop() {
-        running = false
-        runCatching { server.close() }
-        openTcp.toList().forEach { runCatching { it.close() } }
-        openUdp.toList().forEach { runCatching { it.close() } }
+        val resources = synchronized(resourceLifecycleLock) {
+            if (!running) return
+            running = false
+            Triple(openTcp.toList(), openUdp.toList(), activeUdpMuxes.toList())
+        }
+
+        // Close listener and every published socket before waiting for workers.
+        closeResource("SOCKS listener", server::close)
+        resources.first.forEach { closeResource("tracked TCP socket", it::close) }
+        resources.second.forEach { closeResource("tracked UDP socket", it::close) }
+        resources.third.forEach { mux ->
+            try {
+                mux.close()
+            } catch (e: Exception) {
+                logE("Failed to close active UDP mux during relay stop", e)
+            }
+        }
+
+        synchronized(this) {
+            try {
+                encryptedDnsResolver?.close()
+            } catch (e: Exception) {
+                logE("Failed to close encrypted DNS resolver during relay stop", e)
+            } finally {
+                encryptedDnsResolver = null
+                encryptedDnsNetwork = null
+            }
+        }
+
+        pool.shutdownNow()
+        probePool.shutdownNow()
+        dnsPool.shutdownNow()
+        awaitTermination("SOCKS data", pool)
+        awaitTermination("SOCKS probe", probePool)
+        awaitTermination("SOCKS DNS", dnsPool)
+        acceptThread?.takeIf { it !== Thread.currentThread() }?.let { worker ->
+            try {
+                worker.join(1_000)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                logE("Interrupted while waiting for SOCKS accept thread to exit", e)
+            }
+        }
+
         openTcp.clear()
         openUdp.clear()
         upstreamTcp.clear()
         upstreamUdp.clear()
         upstreamTcpMetadata.clear()
-        activeUdpMuxes.toList().forEach { runCatching { it.close() } }
         activeUdpMuxes.clear()
         blockedDestinations.clear()
         permanentlyBlockedDestinations.clear()
         policyBlockedPackagesByDestination.clear()
         blockedFlowTuples.clear()
         flowOwnersByEndpoint.clear()
-        pool.shutdownNow()
-        probePool.shutdownNow()
-        dnsPool.shutdownNow()
-        runCatching { pool.awaitTermination(3, TimeUnit.SECONDS) }
-        runCatching { probePool.awaitTermination(3, TimeUnit.SECONDS) }
-        // Global pacing lifecycle is owned by SpeedVpnService's session generation.
-        // A relay must not reset process-wide schedulers because an older relay can
-        // outlive a newer VPN Service instance during asynchronous teardown.
+        log("SOCKS relay stopped; tracked sockets and workers released")
     }
+
+    private fun closeResource(description: String, close: () -> Unit) {
+        try {
+            close()
+        } catch (e: Exception) {
+            logE("Unable to close $description", e)
+        }
+    }
+
+    private fun awaitTermination(description: String, executor: ExecutorService) {
+        try {
+            if (!executor.awaitTermination(1, TimeUnit.SECONDS)) {
+                logE("$description executor did not terminate within 1 second")
+            }
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            logE("Interrupted while waiting for $description executor shutdown", e)
+        }
+    }
+
+    internal fun activeTcpSocketCount(): Int = openTcp.size
 
     /** Local control-plane probe: verifies the authenticated SOCKS endpoint is alive. */
     fun probe(timeoutMs: Int = 1_000): Boolean {
@@ -331,33 +411,80 @@ class Socks5Server(
         }
     }
 
-    private fun track(socket: Socket): Socket = socket.also { openTcp.add(it) }
-    private fun untrack(socket: Socket) { openTcp.remove(socket) }
-    private fun trackUpstream(socket: Socket, endpoint: String? = null): Socket {
-        upstreamTcp.add(socket)
-        openTcp.add(socket)
-        if (endpoint != null) {
-            val owner = flowOwnersByEndpoint[endpoint]
-            val metadata = FlowOwnerMetadata(endpoint).also {
-                if (owner != null) {
-                    it.uid = owner.uid
-                    it.packages = owner.packages
-                    it.tuple = owner.tuple
-                }
-            }
-            upstreamTcpMetadata[socket] = metadata
+    private fun track(socket: Socket): Socket = synchronized(resourceLifecycleLock) {
+        if (!running) {
+            closeResource("TCP socket rejected after relay stop", socket::close)
+            throw SocketException("SOCKS relay is stopped")
         }
-        return socket
+        openTcp.add(socket)
+        socket
     }
+
+    private fun untrack(socket: Socket) {
+        openTcp.remove(socket)
+    }
+
+    private fun trackUpstream(socket: Socket, endpoint: String? = null): Socket =
+        synchronized(resourceLifecycleLock) {
+            if (!running) {
+                closeResource("upstream TCP socket rejected after relay stop", socket::close)
+                throw SocketException("SOCKS relay is stopped")
+            }
+            upstreamTcp.add(socket)
+            openTcp.add(socket)
+            if (endpoint != null) {
+                val owner = flowOwnersByEndpoint[endpoint]
+                val metadata = FlowOwnerMetadata(endpoint).also {
+                    if (owner != null) {
+                        it.uid = owner.uid
+                        it.packages = owner.packages
+                        it.tuple = owner.tuple
+                    }
+                }
+                upstreamTcpMetadata[socket] = metadata
+            }
+            socket
+        }
+
     private fun untrackUpstream(socket: Socket) {
         upstreamTcp.remove(socket)
         openTcp.remove(socket)
         upstreamTcpMetadata.remove(socket)
     }
-    private fun track(socket: DatagramSocket): DatagramSocket = socket.also { openUdp.add(it) }
-    private fun untrack(socket: DatagramSocket) { openUdp.remove(socket) }
-    private fun trackUpstream(socket: DatagramSocket): DatagramSocket = socket.also { upstreamUdp.add(it); openUdp.add(it) }
-    private fun untrackUpstream(socket: DatagramSocket) { upstreamUdp.remove(socket); openUdp.remove(socket) }
+
+    private fun track(socket: DatagramSocket): DatagramSocket =
+        synchronized(resourceLifecycleLock) {
+            if (!running) {
+                closeResource("UDP socket rejected after relay stop", socket::close)
+                throw SocketException("SOCKS relay is stopped")
+            }
+            openUdp.add(socket)
+            socket
+        }
+
+    private fun untrack(socket: DatagramSocket) {
+        openUdp.remove(socket)
+    }
+
+    private fun trackUpstream(socket: DatagramSocket): DatagramSocket =
+        synchronized(resourceLifecycleLock) {
+            if (!running) {
+                closeResource("upstream UDP socket rejected after relay stop", socket::close)
+                throw SocketException("SOCKS relay is stopped")
+            }
+            upstreamUdp.add(socket)
+            openUdp.add(socket)
+            socket
+        }
+
+    private fun untrackUpstream(socket: DatagramSocket) {
+        upstreamUdp.remove(socket)
+        openUdp.remove(socket)
+    }
+
+    private fun registerMux(mux: UdpUpstreamMux): Boolean = synchronized(resourceLifecycleLock) {
+        if (!running) false else activeUdpMuxes.add(mux)
+    }
 
     internal fun updateBlockedUids(uids: Set<Int>) {
         val normalized = uids.filter { it > 0 }.toSet()
@@ -545,12 +672,22 @@ class Socks5Server(
     }
     fun onUnderlyingNetworkChanged() {
         upstreamTcp.toList().forEach { socket ->
-            runCatching { socket.close() }
+            closeResource("upstream TCP socket on network change", socket::close)
             untrackUpstream(socket)
         }
         upstreamUdp.toList().forEach { socket ->
-            runCatching { socket.close() }
+            closeResource("upstream UDP socket on network change", socket::close)
             untrackUpstream(socket)
+        }
+        synchronized(this) {
+            try {
+                encryptedDnsResolver?.close()
+            } catch (e: Exception) {
+                logE("Failed to invalidate encrypted DNS resolver on network change", e)
+            } finally {
+                encryptedDnsResolver = null
+                encryptedDnsNetwork = null
+            }
         }
     }
 
@@ -591,6 +728,8 @@ class Socks5Server(
             if (!authOk) return
 
             // Long-lived relays should not inherit the handshake timeout.
+            // Command parsing can stay idle until the client sends its request. TCP
+            // relay sessions get a bounded read timeout after CONNECT is accepted.
             client.soTimeout = 0
 
             if (input.readUnsignedByte() != 5) return
@@ -687,12 +826,16 @@ class Socks5Server(
             val endpoint = endpointKey(IPPROTO_TCP, addr, port)
             if (endpoint in blockedDestinations) continue
             val socket = Socket()
-            trackUpstream(socket, endpoint)
             try {
+                trackUpstream(socket, endpoint)
+                if (!protectTcpSocketOrClose(socket, protectTcp, "SOCKS upstream $endpoint")) {
+                    throw SocketException("SOCKS upstream rejected because protect() failed")
+                }
                 val network = currentNetwork() ?: throw UnknownHostException("No physical network available")
+                // protect() precedes Network.bindSocket(), connect(), and any payload.
                 network.bindSocket(socket)
-                if (!protectTcp(socket)) throw SocketException("VPN socket protection failed")
                 socket.connect(InetSocketAddress(addr, port), remainingMs)
+                socket.soTimeout = RELAY_READ_TIMEOUT_MS
                 if (endpoint in blockedDestinations) {
                     throw SocketException("connection blocked by app policy")
                 }
@@ -706,7 +849,7 @@ class Socks5Server(
                     SockErrKind.UNKNOWN -> logE("SOCKS upstream connect failed", e)
                 }
                 untrackUpstream(socket)
-                runCatching { socket.close() }
+                closeResource("failed upstream TCP socket", socket::close)
             }
         }
 
@@ -716,6 +859,9 @@ class Socks5Server(
             return
         }
 
+        // Both directions use finite blocking-read timeouts so a failed path cannot
+        // strand relay workers forever. Closing either socket also unblocks its peer.
+        client.soTimeout = RELAY_READ_TIMEOUT_MS
         cout.write(byteArrayOf(5, 0, 0, 1, 0, 0, 0, 0, 0, 0))
         cout.flush()
 
@@ -980,12 +1126,22 @@ class Socks5Server(
             cout.flush()
 
             val clientAddr = AtomicReference<InetAddress?>(null)
-            val udpFlows = UdpFlowTable(maxFlows = 256, ttlMs = UDP_FLOW_TTL_MS)
+            val muxReference = AtomicReference<UdpUpstreamMux?>(null)
+            val udpFlows = UdpFlowTable(
+                maxFlows = 256,
+                ttlMs = UDP_FLOW_TTL_MS,
+                onFlowEvicted = { key -> muxReference.get()?.closeFlow(key) },
+            )
             val mux = UdpUpstreamMux(
                 relaySocket = relaySocket,
                 udpFlows = udpFlows,
                 clientAddr = clientAddr,
-            ).also { activeUdpMuxes.add(it) }
+            )
+            muxReference.set(mux)
+            if (!registerMux(mux)) {
+                mux.close()
+                throw SocketException("SOCKS relay stopped while creating UDP mux")
+            }
             val closeOnce = AtomicBoolean(false)
             val closeAll = {
                 if (closeOnce.compareAndSet(false, true)) {
@@ -1248,6 +1404,13 @@ class Socks5Server(
             }
         }
 
+        fun closeFlow(logicalKey: String) {
+            synchronized(lock) {
+                val binding = bindings.remove(logicalKey) ?: return
+                closeBindingLocked(binding)
+            }
+        }
+
         fun trimClosedFlows(nowMs: Long) {
             synchronized(lock) {
                 udpFlows.size(nowMs) // Purges expired flows.
@@ -1280,13 +1443,16 @@ class Socks5Server(
             val channel = DatagramChannel.open()
             val socket = channel.socket()
             try {
+                // Publish ownership first so stop() can close this socket even if it
+                // races channel setup. No network bind/connect/send happens before protect().
+                trackUpstream(socket)
+                if (!protectUdpSocketOrClose(socket, protectUdp, "SOCKS upstream $remote")) {
+                    throw SocketException("SOCKS UDP upstream rejected because protect() failed")
+                }
                 socket.receiveBufferSize = 64 * 1024
                 socket.sendBufferSize = 64 * 1024
                 network.bindSocket(socket)
                 socket.bind(InetSocketAddress(0))
-                if (!protectUdp(socket)) {
-                    throw SocketException("VPN UDP socket protection failed")
-                }
                 channel.configureBlocking(false)
                 channel.connect(remote)
                 val endpoint = endpointKey(IPPROTO_UDP, remote.address, remote.port)
@@ -1304,19 +1470,24 @@ class Socks5Server(
                     selector.wakeup()
                     channel.register(selector, SelectionKey.OP_READ, binding)
                 }
-                trackUpstream(socket)
                 bindings[flow.logicalKey] = binding
                 return binding
             } catch (e: Exception) {
-                runCatching { channel.close() }
+                closeResource("UDP channel after setup failure", channel::close)
+                untrackUpstream(socket)
                 throw e
             }
         }
 
         private fun closeBindingLocked(binding: UdpBinding) {
             runCatching { binding.channel.keyFor(selector)?.cancel() }
-            val socket = runCatching { binding.channel.socket() }.getOrNull()
-            runCatching { binding.channel.close() }
+            val socket = try {
+                binding.channel.socket()
+            } catch (e: Exception) {
+                logE("Unable to retrieve UDP channel socket while closing a binding", e)
+                null
+            }
+            closeResource("UDP upstream channel", binding.channel::close)
             socket?.let(::untrackUpstream)
         }
 
@@ -1325,6 +1496,11 @@ class Socks5Server(
             try {
                 while (runningMux.get() && running && SpeedLimiter.isGenerationActive(generation)) {
                     selector.select(500)
+                    // Purge TTL-expired entries even when no reply datagrams arrive.
+                    // UdpFlowTable invokes the close callback outside its own state lock.
+                    trimClosedFlows(System.currentTimeMillis())
+                    if (!runningMux.get() || !running) break
+
                     val selected = selector.selectedKeys()
                     val iterator = selected.iterator()
                     while (iterator.hasNext()) {
@@ -1375,21 +1551,27 @@ class Socks5Server(
                                 }
                             }
                             if (delivered) SpeedLimiter.download.recordForwarded(count, generation)
-                        } catch (_: Exception) {
+                        } catch (e: Exception) {
+                            if (running && runningMux.get()) {
+                                logE("UDP mux flow failed for ${binding.remote}", e)
+                            }
                             synchronized(lock) {
-                                bindings.remove(binding.flow.logicalKey)
+                                if (bindings[binding.flow.logicalKey] === binding) {
+                                    bindings.remove(binding.flow.logicalKey)
+                                }
                                 closeBindingLocked(binding)
                             }
                         }
                     }
                 }
-            } catch (_: Exception) {
-                // association teardown
+            } catch (e: Exception) {
+                if (running && runningMux.get()) logE("UDP mux worker failed", e)
             } finally {
                 synchronized(lock) {
                     bindings.values.toList().forEach(::closeBindingLocked)
                     bindings.clear()
                 }
+                closeResource("UDP mux selector", selector::close)
             }
         }
     }

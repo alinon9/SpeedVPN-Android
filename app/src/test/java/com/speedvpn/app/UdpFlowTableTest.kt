@@ -2,6 +2,11 @@ package com.speedvpn.app
 
 import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.nio.channels.DatagramChannel
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -143,6 +148,91 @@ class UdpFlowTableTest {
             443,
         )
         assertTrue(first != second)
+    }
+
+    @Test
+    fun ttlEvictionClosesOwnedChannelsUnderConcurrentAccess() {
+        val totalFlows = 128
+        val channels = ConcurrentHashMap<String, DatagramChannel>()
+        val closedKeys = ConcurrentHashMap.newKeySet<String>()
+        val table = UdpFlowTable(
+            maxFlows = totalFlows + 8,
+            ttlMs = 100,
+            onFlowEvicted = { key ->
+                val channel = channels.remove(key)
+                if (channel != null) {
+                    channel.close()
+                    closedKeys.add(key)
+                }
+            },
+        )
+        val executor = Executors.newFixedThreadPool(12)
+        val gate = CountDownLatch(1)
+        try {
+            val futures = (0 until totalFlows).map { index ->
+                executor.submit {
+                    gate.await()
+                    val key = "concurrent-ttl-$index"
+                    table.getOrCreate(
+                        key,
+                        10_000 + index,
+                        InetSocketAddress("10.0.0.2", 20_000 + index),
+                        listOf(a),
+                        0L,
+                    )
+                    channels[key] = DatagramChannel.open()
+                }
+            }
+            gate.countDown()
+            futures.forEach { it.get(5, TimeUnit.SECONDS) }
+
+            assertEquals(totalFlows, table.size(1L))
+            assertEquals(0, table.size(1_000L))
+            assertEquals(totalFlows, closedKeys.size)
+            assertTrue(channels.isEmpty())
+        } finally {
+            executor.shutdownNow()
+            channels.values.forEach { channel -> channel.close() }
+        }
+    }
+
+    @Test
+    fun capacityEvictionAndClearCloseAssociatedChannels() {
+        val channels = ConcurrentHashMap<String, DatagramChannel>()
+        val closedKeys = ConcurrentHashMap.newKeySet<String>()
+        val table = UdpFlowTable(
+            maxFlows = 2,
+            ttlMs = 60_000,
+            onFlowEvicted = { key ->
+                channels.remove(key)?.let { channel ->
+                    channel.close()
+                    closedKeys.add(key)
+                }
+            },
+        )
+
+        val first = table.getOrCreate("first", 1001, InetSocketAddress("10.0.0.2", 1), listOf(a), 1L)!!
+        val firstChannel = DatagramChannel.open()
+        channels["first"] = firstChannel
+        table.getOrCreate("second", 1002, InetSocketAddress("10.0.0.2", 2), listOf(b), 2L)
+        val secondChannel = DatagramChannel.open()
+        channels["second"] = secondChannel
+        table.getOrCreate("third", 1003, InetSocketAddress("10.0.0.2", 3), listOf(c), 3L)
+        val thirdChannel = DatagramChannel.open()
+        channels["third"] = thirdChannel
+
+        assertFalse(firstChannel.isOpen)
+        assertTrue(closedKeys.contains("first"))
+        assertTrue(secondChannel.isOpen)
+        assertTrue(thirdChannel.isOpen)
+
+        table.clear()
+        assertFalse(secondChannel.isOpen)
+        assertFalse(thirdChannel.isOpen)
+        assertEquals(3, closedKeys.size)
+        assertTrue(channels.isEmpty())
+        @Suppress("UNUSED_VARIABLE")
+        val flowReference = first
     }
 
     @Test

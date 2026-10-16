@@ -1,12 +1,24 @@
 package com.speedvpn.app
 
+import java.io.IOException
 import java.io.InputStream
+import java.net.DatagramSocket
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.ServerSocket
+import java.net.Socket
+import java.net.SocketAddress
+import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
 
+@RunWith(RobolectricTestRunner::class)
 class Socks5RelayReadBatchTest {
     @Test
     fun oneRelayIterationUsesOneBlockingReadWithoutPollingAvailable() {
@@ -108,6 +120,129 @@ class Socks5RelayReadBatchTest {
         val source = SingleReadInputStream(byteArrayOf(1), maxReadBytes = 1)
         assertThrows(IllegalArgumentException::class.java) {
             readRelayBatch(source, ByteArray(8), 9)
+        }
+    }
+
+    @Test
+    fun failedTcpProtectionClosesSocketImmediately() {
+        val socket = TrackingSocket()
+        val failures = mutableListOf<String>()
+
+        val protected = protectTcpSocketOrClose(
+            socket = socket,
+            protect = { false },
+            description = "unit test TCP",
+            onFailure = { message, _ -> failures += message },
+        )
+
+        assertFalse(protected)
+        assertTrue(socket.isClosed)
+        assertEquals(1, socket.closeCalls)
+        assertTrue(failures.single().contains("SOCKET_PROTECTION_FAILED"))
+    }
+
+    @Test
+    fun failedUdpProtectionClosesSocketImmediately() {
+        val socket = TrackingDatagramSocket()
+        val failures = mutableListOf<String>()
+
+        val protected = protectUdpSocketOrClose(
+            socket = socket,
+            protect = { false },
+            description = "unit test UDP",
+            onFailure = { message, _ -> failures += message },
+        )
+
+        assertFalse(protected)
+        assertTrue(socket.isClosed)
+        assertEquals(1, socket.closeCalls)
+        assertTrue(failures.single().contains("SOCKET_PROTECTION_FAILED"))
+    }
+
+    @Test
+    fun thrownProtectionCallbackAlsoClosesTcpSocket() {
+        val socket = TrackingSocket()
+
+        val protected = protectTcpSocketOrClose(
+            socket = socket,
+            protect = { throw IOException("synthetic protect failure") },
+            description = "throwing TCP test",
+            onFailure = { _, _ -> },
+        )
+
+        assertFalse(protected)
+        assertTrue(socket.isClosed)
+        assertEquals(1, socket.closeCalls)
+    }
+
+    @Test
+    fun stopClosesActiveSocksConnectionAndReleasesListeningPortAndWorkers() {
+        val relay = Socks5Server(
+            generation = 7L,
+            protectTcp = { false },
+            protectUdp = { false },
+            currentNetwork = { null },
+            ipv6Enabled = true,
+        )
+        val port = relay.port
+        val client = Socket()
+        try {
+            relay.start()
+            client.connect(InetSocketAddress("127.0.0.1", port), 1_000)
+            // Incomplete SOCKS greeting leaves a worker blocked in readFully().
+            client.getOutputStream().write(byteArrayOf(5, 1))
+            client.getOutputStream().flush()
+
+            awaitCondition(2_000L) { relay.activeTcpSocketCount() > 0 }
+            val startedAt = System.nanoTime()
+            relay.stop()
+            val stopElapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)
+
+            assertTrue("Relay stop took too long: ${stopElapsedMs}ms", stopElapsedMs < 4_000L)
+            assertEquals(0, relay.activeTcpSocketCount())
+
+            val replacement = ServerSocket()
+            try {
+                replacement.reuseAddress = true
+                replacement.bind(InetSocketAddress(InetAddress.getByName("127.0.0.1"), port))
+            } finally {
+                replacement.close()
+            }
+
+            awaitCondition(2_000L) {
+                Thread.getAllStackTraces().keys.none { thread ->
+                    thread.isAlive && (thread.name == "socks-accept" || thread.name == "socks-worker")
+                }
+            }
+        } finally {
+            relay.stop()
+            client.close()
+        }
+    }
+
+    private fun awaitCondition(timeoutMs: Long, condition: () -> Boolean) {
+        val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+        while (!condition() && System.nanoTime() < deadline) Thread.sleep(10)
+        assertTrue("Condition was not satisfied within ${timeoutMs}ms", condition())
+    }
+
+    private class TrackingSocket : Socket() {
+        @Volatile var closeCalls = 0
+            private set
+
+        override fun close() {
+            closeCalls++
+            super.close()
+        }
+    }
+
+    private class TrackingDatagramSocket : DatagramSocket(null as SocketAddress?) {
+        @Volatile var closeCalls = 0
+            private set
+
+        override fun close() {
+            closeCalls++
+            super.close()
         }
     }
 

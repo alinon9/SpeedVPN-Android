@@ -14,7 +14,7 @@ import java.net.InetSocketAddress
 import java.util.concurrent.TimeUnit
 import org.json.JSONObject
 
-class EncryptedDnsResolver(private val network: Network, private val protect: (Socket) -> Boolean, private val ipv6Enabled: Boolean) {
+class EncryptedDnsResolver(private val network: Network, private val protect: (Socket) -> Boolean, private val ipv6Enabled: Boolean) : AutoCloseable {
     companion object { private const val DOH_HOST = "cloudflare-dns.com"; private const val DOH_IP_V4 = "1.1.1.1"; private const val TIMEOUT_MS = 3_000L }
     private val client = OkHttpClient.Builder().dns(object : Dns { override fun lookup(hostname: String): List<InetAddress> = listOf(InetAddress.getByName(DOH_IP_V4)) }).socketFactory(ProtectedNetworkSocketFactory(network, protect)).connectTimeout(TIMEOUT_MS, TimeUnit.MILLISECONDS).readTimeout(TIMEOUT_MS, TimeUnit.MILLISECONDS).writeTimeout(TIMEOUT_MS, TimeUnit.MILLISECONDS).retryOnConnectionFailure(false).build()
     fun resolve(host: String): List<InetAddress> {
@@ -41,11 +41,55 @@ class EncryptedDnsResolver(private val network: Network, private val protect: (S
         }
     }
     private fun isNumericAddress(host: String): Boolean = host.all { it.isDigit() || it == '.' || it == ':' || it in 'a'..'f' || it in 'A'..'F' }
-    private class ProtectedNetworkSocketFactory(private val network: Network, private val protect: (Socket) -> Boolean) : SocketFactory() {
-        override fun createSocket(): Socket { val socket = Socket(); try { network.bindSocket(socket); if (!protect(socket)) throw SocketException("DNS socket protection failed"); return socket } catch (t: Throwable) { runCatching { socket.close() }; throw t } }
-        override fun createSocket(host: String, port: Int): Socket = createSocket().also { it.connect(InetSocketAddress(host, port)) }
-        override fun createSocket(host: String, port: Int, localHost: InetAddress, localPort: Int): Socket = createSocket().also { it.bind(InetSocketAddress(localHost, localPort)); it.connect(InetSocketAddress(host, port)) }
-        override fun createSocket(host: InetAddress, port: Int): Socket = createSocket().also { it.connect(InetSocketAddress(host, port)) }
-        override fun createSocket(address: InetAddress, port: Int, localAddress: InetAddress, localPort: Int): Socket = createSocket().also { it.bind(InetSocketAddress(localAddress, localPort)); it.connect(InetSocketAddress(address, port)) }
+
+    override fun close() {
+        // Cancel in-flight DoH work and discard pooled sockets on network change/relay stop.
+        client.dispatcher.cancelAll()
+        client.connectionPool.evictAll()
+        client.dispatcher.executorService.shutdownNow()
+    }
+
+    private class ProtectedNetworkSocketFactory(
+        private val network: Network,
+        private val protect: (Socket) -> Boolean,
+    ) : SocketFactory() {
+        override fun createSocket(): Socket {
+            val socket = Socket()
+            try {
+                if (!protectTcpSocketOrClose(socket, protect, "encrypted DoH")) {
+                    throw SocketException("Encrypted DNS socket rejected because protect() failed")
+                }
+                // protect() must run before network binding and any connect attempt.
+                network.bindSocket(socket)
+                return socket
+            } catch (t: Throwable) {
+                try {
+                    socket.close()
+                } catch (closeError: Exception) {
+                    logE("Failed to close encrypted DNS socket after setup failure", closeError)
+                }
+                throw t
+            }
+        }
+
+        override fun createSocket(host: String, port: Int): Socket =
+            createSocket().also { it.connect(InetSocketAddress(host, port)) }
+
+        override fun createSocket(
+            host: String, port: Int, localHost: InetAddress, localPort: Int,
+        ): Socket = createSocket().also {
+            it.bind(InetSocketAddress(localHost, localPort))
+            it.connect(InetSocketAddress(host, port))
+        }
+
+        override fun createSocket(host: InetAddress, port: Int): Socket =
+            createSocket().also { it.connect(InetSocketAddress(host, port)) }
+
+        override fun createSocket(
+            address: InetAddress, port: Int, localAddress: InetAddress, localPort: Int,
+        ): Socket = createSocket().also {
+            it.bind(InetSocketAddress(localAddress, localPort))
+            it.connect(InetSocketAddress(address, port))
+        }
     }
 }

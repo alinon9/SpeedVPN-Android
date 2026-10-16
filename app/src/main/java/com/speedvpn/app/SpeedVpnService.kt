@@ -254,7 +254,7 @@ class SpeedVpnService : VpnService() {
                 protectTcp = { protect(it) },
                 protectUdp = { protect(it) },
                 currentNetwork = { findUnderlyingNetwork() },
-                ipv6Enabled = true,
+                ipv6Enabled = compatibility.ipv6Enabled,
             ).also {
                 it.updateBlockedUids(
                     VpnApplicationPolicy.blockedUids(this@SpeedVpnService, currentBlockedPackages())
@@ -294,15 +294,19 @@ class SpeedVpnService : VpnService() {
                 // No public resolver is hard-coded.
                 .apply { dnsServers.forEach { addDnsServer(it) } }
                 .apply {
-                    // Capture IPv6 in TUN as well; otherwise blocked apps can bypass via IPv6.
-                    addAddress(TUN_V6, 128)
-                    addRoute("::", 0)
+                    // Install the IPv6 address/route only when the relay and native tunnel
+                    // are configured to process IPv6. The disabled mode is explicit below.
+                    if (compatibility.ipv6Enabled) {
+                        addAddress(TUN_V6, 128)
+                        addRoute("::", 0)
+                    }
                 }
                 .apply {
                     // Do not install the VpnService application allow-list: omitted apps route outside TUN.
                     // All apps except SpeedVPN itself use TUN for UID-based firewalling.
                     addDisallowedApplication(packageName)
-                    log("VPN_TUN_POLICY mode=all-apps-except-self ipv4=0.0.0.0/0 ipv6=::/0 blockedPackages=" +
+                    log("VPN_TUN_POLICY mode=all-apps-except-self ipv4=0.0.0.0/0 " +
+                        "ipv6=${if (compatibility.ipv6Enabled) "::/0" else "disabled-outside-tunnel"} blockedPackages=" +
                         currentBlockedPackages().sorted().joinToString(","))
                 }
             builder.establish()
@@ -497,7 +501,7 @@ class SpeedVpnService : VpnService() {
             appendLine("tunnel:")
             appendLine("  mtu: ${compatibility.mtu}")
             appendLine("  ipv4: $TUN_V4")
-            appendLine("  ipv6: '$TUN_V6'")
+            if (compatibility.ipv6Enabled) appendLine("  ipv6: '$TUN_V6'")
             appendLine("socks5:")
             appendLine("  port: ${relay.port}")
             appendLine("  address: 127.0.0.1")
@@ -780,8 +784,10 @@ class SpeedVpnService : VpnService() {
             if (remaining <= 0) break
             val socket = Socket()
             try {
+                if (!protectTcpSocketOrClose(socket, { protect(it) }, "upstream reachability probe")) {
+                    continue
+                }
                 network.bindSocket(socket)
-                if (!protect(socket)) continue
                 socket.soTimeout = remaining
                 socket.connect(InetSocketAddress(ip, UPSTREAM_PROBE_PORT), remaining)
                 return true
@@ -1140,6 +1146,7 @@ class SpeedVpnService : VpnService() {
     private fun cleanupLocked() {
         meter?.cancel(); meter = null
         healthMonitor?.cancel(); healthMonitor = null
+        quotaMonitor?.cancel(); quotaMonitor = null
         uidPolicyMonitor?.cancel(); uidPolicyMonitor = null
         val configFile = tunnelConfigFile
         tunnelConfigFile = null
@@ -1312,7 +1319,12 @@ class SpeedVpnService : VpnService() {
 
     override fun onRevoke() {
         log("VPN revoked by system/user")
+        reconnectAfterDisconnect = false
         sessionId.incrementAndGet()
+        meter?.cancel(); meter = null
+        quotaMonitor?.cancel(); quotaMonitor = null
+        healthMonitor?.cancel(); healthMonitor = null
+        uidPolicyMonitor?.cancel(); uidPolicyMonitor = null
         scope.launch { disconnect() }
     }
 
@@ -1321,6 +1333,7 @@ class SpeedVpnService : VpnService() {
         sessionId.incrementAndGet()
         reconnectAfterDisconnect = false
         meter?.cancel(); meter = null
+        quotaMonitor?.cancel(); quotaMonitor = null
         healthMonitor?.cancel(); healthMonitor = null
         uidPolicyMonitor?.cancel(); uidPolicyMonitor = null
 
