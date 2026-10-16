@@ -14,6 +14,20 @@ public final class TProxyService {
 
     public static native boolean TProxyIsRunning();
 
+    /** App-blocking callback for per-flow UID resolution and packet policy decisions. */
+    public interface AppUidBlockCallback {
+        /**
+         * Synchronous resolver callback on the dedicated native UID worker (never the HEV
+         * packet coroutine). Returns a packed long: signed UID in high 32 bits, low bit 1
+         * for BLOCK/DROP and 0 for allow/observe.
+         */
+        long onTunPacket(int protocol, byte[] srcAddress, int srcPort,
+                         byte[] dstAddress, int dstPort);
+    }
+
+    /** Register or clear the native app UID-blocking callback. */
+    public static native boolean TProxySetAppUidBlockCallback(Object callback);
+
     /** [txPackets, txBytes, rxPackets, rxBytes] */
     public static native long[] TProxyGetStats();
 }
