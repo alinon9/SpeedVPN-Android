@@ -362,6 +362,7 @@ class MainActivity : ComponentActivity() {
                                     expectedDownloadKbps = 88_000L,
                                     expectedUploadKbps = 88_000L,
                                     verificationProfile = true,
+                                    networkPath = SpeedTestNetworkPath.PHYSICAL_BASELINE,
                                 ) { phase ->
                                     val label = if (phase == SpeedTestPhase.DOWNLOAD) {
                                         "قياس Download لخط الأساس…"
