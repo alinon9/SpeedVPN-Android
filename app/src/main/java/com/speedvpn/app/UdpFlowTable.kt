@@ -40,8 +40,18 @@ internal class UdpFlowTable(
         val evicted = ArrayList<UdpFlow>()
         val result = synchronized(lock) { block(evicted) }
         // Never call into UdpUpstreamMux while holding the table lock: mux operations
-        // can query this table while holding the mux lock.
-        evicted.forEach(onFlowEvicted)
+        // can query this table while holding the mux lock. Attempt every close callback
+        // even if one cleanup fails, then rethrow the combined failure to the caller.
+        var callbackFailure: Throwable? = null
+        evicted.forEach { flow ->
+            try {
+                onFlowEvicted(flow)
+            } catch (failure: Throwable) {
+                val previous = callbackFailure
+                if (previous == null) callbackFailure = failure else previous.addSuppressed(failure)
+            }
+        }
+        callbackFailure?.let { throw it }
         return result
     }
 
