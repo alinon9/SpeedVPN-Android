@@ -5,6 +5,7 @@ import android.net.VpnService
 import android.util.Log
 import java.io.IOException
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -311,8 +312,11 @@ object SpeedVerificationEngine {
                 // downgraded any provisional PASS/MATCH result. NonCancellable protects
                 // this write from caller cancellation while the final state is committed.
                 result?.let { finalized ->
-                    runCatching { SpeedVerificationStore.save(context, finalized) }
-                        .onFailure { Log.e(TAG, "Could not persist verification result", it) }
+                    runCatching {
+                        withContext(Dispatchers.IO) {
+                            SpeedVerificationStore.save(context, finalized)
+                        }
+                    }.onFailure { Log.e(TAG, "Could not persist verification result", it) }
                 }
             }
         }
