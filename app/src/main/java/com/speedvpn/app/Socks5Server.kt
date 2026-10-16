@@ -325,7 +325,14 @@ class Socks5Server(
         runCatching { server.close() }
         closeEncryptedDnsResolver()
         acceptThread?.let { accept ->
-            if (accept !== Thread.currentThread()) runCatching { accept.join(1_000) }
+            if (accept !== Thread.currentThread()) {
+                try {
+                    accept.join(1_000)
+                } catch (interrupted: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    logE("Interrupted while waiting for SOCKS accept loop to stop", interrupted)
+                }
+            }
         }
         openTcp.toList().forEach { runCatching { it.close() } }
         openUdp.toList().forEach { runCatching { it.close() } }
