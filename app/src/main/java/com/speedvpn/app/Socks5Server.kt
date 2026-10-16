@@ -814,6 +814,9 @@ class Socks5Server(
                     maxBytes = readSize,
                 )
                 sourceReadNs += System.nanoTime() - readStartedNs
+                // bytesRead is the payload actually returned by this blocking read.
+                // Never charge buf.size/readSize: those values are buffer capacity,
+                // not bytes received from the socket.
                 val n = batch.bytesRead
                 if (n < 0) {
                     eof = true
@@ -1063,6 +1066,8 @@ class Socks5Server(
                             udpFlows.advanceCandidateIfUnanswered(flow, now, UDP_CANDIDATE_FALLBACK_MS)
                             val addr = flow.candidates.getOrNull(flow.selectedIndex) ?: continue
 
+                            // UDP and QUIC share the same global upload bucket as TCP;
+                            // charge the parsed payload length, not the SOCKS header or buffer size.
                             if (!SpeedLimiter.acquire(SpeedLimiter.upload, payloadLen, generation)) break
                             if (!running || !SpeedLimiter.isGenerationActive(generation)) break
 
@@ -1341,6 +1346,8 @@ class Socks5Server(
                             val payload = ByteArray(count)
                             buffer.get(payload)
 
+                            // count is the actual upstream datagram payload length. UDP/QUIC
+                            // replies consume the same download bucket as TCP relay traffic.
                             if (!SpeedLimiter.acquire(SpeedLimiter.download, count, generation)) {
                                 continue
                             }
