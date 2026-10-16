@@ -414,13 +414,15 @@ class MainActivity : ComponentActivity() {
                         if (!s.permissionGranted) {
                             requestVpnPermission()
                         } else {
+                            val verifyStartedAt = android.os.SystemClock.elapsedRealtime()
+                            verifyBusy = true
+                            lastVerification = null
+                            verifyProgress = "جاري التحقق من الخطة…"
+                            android.util.Log.i("SpeedVPN-VerifyUI", "state=LOADING")
                             lifecycleScope.launch {
-                                verifyBusy = true
-                                // Do not expose a previous run's tagged metrics while the new
-                                // baseline/VPN measurements are still in progress.
-                                lastVerification = null
-                                verifyProgress = "جاري تحضير التحقق…"
-                                lastVerification = SpeedVerificationEngine.verify(
+                                try {
+                                    delay(250L)
+                                    lastVerification = SpeedVerificationEngine.verify(
                                     context = this@MainActivity,
                                     planDownloadKbps = s.downloadLimitKbps,
                                     planUploadKbps = s.uploadLimitKbps,
@@ -430,8 +432,18 @@ class MainActivity : ComponentActivity() {
                                 )
                                 SpeedVerificationStore.save(this@MainActivity, lastVerification!!)
                                 verificationHistory = SpeedVerificationStore.loadRecent(this@MainActivity, 8)
-                                verifyBusy = false
-                                verifyProgress = null
+                                } catch (cancelled: CancellationException) {
+                                    throw cancelled
+                                } catch (error: Throwable) {
+                                    android.util.Log.e("SpeedVPN-VerifyUI", "state=ERROR", error)
+                                    verifyProgress = "تعذر إكمال التحقق"
+                                } finally {
+                                    val elapsed = android.os.SystemClock.elapsedRealtime() - verifyStartedAt
+                                    if (elapsed < 2000L) delay(2000L - elapsed)
+                                    verifyBusy = false
+                                    verifyProgress = null
+                                    android.util.Log.i("SpeedVPN-VerifyUI", "state=IDLE")
+                                }
                             }
                         }
                     },
@@ -459,7 +471,14 @@ class MainActivity : ComponentActivity() {
                     LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                 }
                 if (verifyBusy) {
-                    Text(verifyProgress ?: "جاري التحقق…", color = Cyan, fontSize = 11.sp)
+                    Text(
+                        verifyProgress ?: "جاري التحقق…",
+                        color = Cyan,
+                        fontSize = 11.sp,
+                        modifier = Modifier.fillMaxWidth()
+                            .testTag("verify_speed_loading")
+                            .semantics { contentDescription = "verify_speed_loading" },
+                    )
                     LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                 }
             }
