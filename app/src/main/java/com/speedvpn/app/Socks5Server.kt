@@ -173,19 +173,34 @@ class Socks5Server(
     @Volatile private var encryptedDnsResolver: EncryptedDnsResolver? = null
 
     private fun encryptedResolver(network: Network): EncryptedDnsResolver {
-        val cached = encryptedDnsResolver
-        if (cached != null && encryptedDnsNetwork == network) return cached
+        if (currentNetwork() != network) throw UnknownHostException("Physical network changed during DNS resolution")
         return synchronized(this) {
+            if (currentNetwork() != network) throw UnknownHostException("Physical network changed during DNS resolver setup")
             val current = encryptedDnsResolver
-            if (current != null && encryptedDnsNetwork == network) {
-                current
-            } else {
-                EncryptedDnsResolver(network, protectTcp, ipv6Enabled).also {
-                    encryptedDnsNetwork = network
-                    encryptedDnsResolver = it
-                }
+            if (current != null && encryptedDnsNetwork == network) current
+            else {
+                val replacement = EncryptedDnsResolver(
+                    network = network,
+                    protect = protectTcp,
+                    ipv6Enabled = ipv6Enabled,
+                    isNetworkCurrent = { currentNetwork() == network },
+                )
+                encryptedDnsResolver = replacement
+                encryptedDnsNetwork = network
+                runCatching { current?.close() }
+                replacement
             }
         }
+    }
+
+    private fun closeEncryptedDnsResolver() {
+        val previous = synchronized(this) {
+            val value = encryptedDnsResolver
+            encryptedDnsResolver = null
+            encryptedDnsNetwork = null
+            value
+        }
+        runCatching { previous?.close() }
     }
 
     private val pool: ExecutorService = ThreadPoolExecutor(
@@ -265,6 +280,7 @@ class Socks5Server(
         upstreamTcpMetadata.clear()
         activeUdpMuxes.toList().forEach { runCatching { it.close() } }
         activeUdpMuxes.clear()
+        closeEncryptedDnsResolver()
         blockedDestinations.clear()
         permanentlyBlockedDestinations.clear()
         policyBlockedPackagesByDestination.clear()
@@ -544,6 +560,8 @@ class Socks5Server(
             " activeTcpClosed=$closedTcp globalDestinationBlock=false")
     }
     fun onUnderlyingNetworkChanged() {
+        closeEncryptedDnsResolver()
+        activeUdpMuxes.toList().forEach { runCatching { it.onUnderlyingNetworkChanged() } }
         upstreamTcp.toList().forEach { socket ->
             runCatching { socket.close() }
             untrackUpstream(socket)
@@ -690,8 +708,10 @@ class Socks5Server(
             trackUpstream(socket, endpoint)
             try {
                 val network = currentNetwork() ?: throw UnknownHostException("No physical network available")
-                network.bindSocket(socket)
-                if (!protectTcp(socket)) throw SocketException("VPN socket protection failed")
+                if (!protectSocketBeforeNetworkBinding(socket, protectTcp) { network.bindSocket(it) }) {
+                    throw SocketException("VPN socket protection failed")
+                }
+                if (currentNetwork() != network) throw SocketException("Physical network changed during TCP setup")
                 socket.connect(InetSocketAddress(addr, port), remainingMs)
                 if (endpoint in blockedDestinations) {
                     throw SocketException("connection blocked by app policy")
@@ -1141,6 +1161,14 @@ class Socks5Server(
             runLoop()
         }
 
+        fun onUnderlyingNetworkChanged() {
+            synchronized(lock) {
+                bindings.values.toList().forEach(::closeBindingLocked)
+                bindings.clear()
+            }
+            selector.wakeup()
+        }
+
         fun recordFlowOwner(endpoint: String, uid: Int?, packages: Set<String>, tuple: String) {
             synchronized(lock) {
                 bindings.values.filter { it.endpointKey == endpoint }.forEach { binding ->
@@ -1279,14 +1307,15 @@ class Socks5Server(
                 ?: throw UnknownHostException("No physical network available")
             val channel = DatagramChannel.open()
             val socket = channel.socket()
+            trackUpstream(socket)
             try {
-                socket.receiveBufferSize = 64 * 1024
-                socket.sendBufferSize = 64 * 1024
-                network.bindSocket(socket)
-                socket.bind(InetSocketAddress(0))
-                if (!protectUdp(socket)) {
+                if (!protectSocketBeforeNetworkBinding(socket, protectUdp) { network.bindSocket(it) }) {
                     throw SocketException("VPN UDP socket protection failed")
                 }
+                socket.receiveBufferSize = 64 * 1024
+                socket.sendBufferSize = 64 * 1024
+                socket.bind(InetSocketAddress(0))
+                if (currentNetwork() != network) throw SocketException("Physical network changed while creating UDP flow")
                 channel.configureBlocking(false)
                 channel.connect(remote)
                 val endpoint = endpointKey(IPPROTO_UDP, remote.address, remote.port)
@@ -1304,10 +1333,10 @@ class Socks5Server(
                     selector.wakeup()
                     channel.register(selector, SelectionKey.OP_READ, binding)
                 }
-                trackUpstream(socket)
                 bindings[flow.logicalKey] = binding
                 return binding
             } catch (e: Exception) {
+                untrackUpstream(socket)
                 runCatching { channel.close() }
                 throw e
             }
@@ -1325,6 +1354,8 @@ class Socks5Server(
             try {
                 while (runningMux.get() && running && SpeedLimiter.isGenerationActive(generation)) {
                     selector.select(500)
+                    // Reap TTL-expired flows even when the UDP association receives no more datagrams.
+                    trimClosedFlows(System.currentTimeMillis())
                     val selected = selector.selectedKeys()
                     val iterator = selected.iterator()
                     while (iterator.hasNext()) {
@@ -1377,7 +1408,9 @@ class Socks5Server(
                             if (delivered) SpeedLimiter.download.recordForwarded(count, generation)
                         } catch (_: Exception) {
                             synchronized(lock) {
-                                bindings.remove(binding.flow.logicalKey)
+                                if (bindings[binding.flow.logicalKey] === binding) {
+                                    bindings.remove(binding.flow.logicalKey)
+                                }
                                 closeBindingLocked(binding)
                             }
                         }

@@ -19,7 +19,8 @@ class EncryptedDnsResolver(
     private val network: Network,
     private val protect: (Socket) -> Boolean,
     private val ipv6Enabled: Boolean,
-) {
+    private val isNetworkCurrent: () -> Boolean = { true },
+) : AutoCloseable {
     companion object {
         private const val DOH_HOST = "cloudflare-dns.com"
         private const val TIMEOUT_MS = 3_000L
@@ -31,7 +32,7 @@ class EncryptedDnsResolver(
             override fun lookup(hostname: String): List<InetAddress> =
                 listOf(InetAddress.getByAddress(byteArrayOf(1, 1, 1, 1)))
         })
-        .socketFactory(ProtectedNetworkSocketFactory(network, protect))
+        .socketFactory(ProtectedNetworkSocketFactory(network, protect, isNetworkCurrent))
         .connectTimeout(TIMEOUT_MS, TimeUnit.MILLISECONDS)
         .readTimeout(TIMEOUT_MS, TimeUnit.MILLISECONDS)
         .writeTimeout(TIMEOUT_MS, TimeUnit.MILLISECONDS)
@@ -41,6 +42,7 @@ class EncryptedDnsResolver(
 
     fun resolve(host: String): List<InetAddress> {
         require(host.isNotBlank()) { "empty host" }
+        if (!isNetworkCurrent()) throw SocketException("Physical network changed before DNS query")
 
         parseNumericAddress(host)?.let { address ->
             return if (ipv6Enabled || address.address.size == 4) listOf(address) else emptyList()
@@ -106,6 +108,12 @@ class EncryptedDnsResolver(
             }
     }
 
+    override fun close() {
+        runCatching { client.dispatcher.cancelAll() }
+        runCatching { client.connectionPool.evictAll() }
+        runCatching { client.dispatcher.executorService.shutdownNow() }
+    }
+
     private fun familyBytes(family: Int): Int = if (family == 4) 4 else 16
 
     /**
@@ -139,13 +147,17 @@ class EncryptedDnsResolver(
     private class ProtectedNetworkSocketFactory(
         private val network: Network,
         private val protect: (Socket) -> Boolean,
+        private val isNetworkCurrent: () -> Boolean,
     ) : SocketFactory() {
         override fun createSocket(): Socket {
             val socket = Socket()
             try {
-                // Both calls must happen before connect(); stale networks fail closed.
-                network.bindSocket(socket)
-                if (!protect(socket)) throw SocketException("DNS socket protection failed")
+                // Protect before selecting the physical network. Old-network resolvers fail closed.
+                if (!isNetworkCurrent()) throw SocketException("Physical network changed before DNS socket creation")
+                if (!protectSocketBeforeNetworkBinding(socket, protect) { network.bindSocket(it) }) {
+                    throw SocketException("DNS socket protection failed")
+                }
+                if (!isNetworkCurrent()) throw SocketException("Physical network changed during DNS socket setup")
                 socket.soTimeout = TIMEOUT_MS.toInt()
                 return socket
             } catch (error: Throwable) {
