@@ -24,7 +24,6 @@ internal class AppUidBlocker(
         val packagesByUid: Map<Int, Set<String>>,
     )
 
-    @Volatile private var blockedUids: Set<Int> = emptySet()
     @Volatile private var blockPolicy =
         BlockPolicySnapshot(emptySet(), emptySet(), emptyMap())
 
@@ -37,7 +36,6 @@ internal class AppUidBlocker(
             .mapValues { (_, names) -> names.toSet() }
         val nextUids = VpnApplicationPolicy.blockedUids(service, normalized)
         blockPolicy = BlockPolicySnapshot(normalized, nextUids, byUid)
-        blockedUids = nextUids
     }
 
     override fun onTunPacket(
