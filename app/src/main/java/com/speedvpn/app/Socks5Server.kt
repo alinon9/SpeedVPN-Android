@@ -841,14 +841,17 @@ class Socks5Server(
                 socket.tcpNoDelay = true
                 upstream = socket
                 break
-            } catch (e: Exception) {
-                when (classifySocketError(e)) {
-                    SockErrKind.EXPECTED_CLOSE -> Unit
-                    SockErrKind.NETWORK_EVENT -> log("SOCKS upstream network event: ${e.message}")
-                    SockErrKind.UNKNOWN -> logE("SOCKS upstream connect failed", e)
-                }
+            } catch (failure: Throwable) {
+                // Even fatal setup failures must unregister and close the socket before
+                // they propagate. Ordinary networking exceptions remain candidate-local.
                 untrackUpstream(socket)
                 runCatching { socket.close() }
+                if (failure !is Exception) throw failure
+                when (classifySocketError(failure)) {
+                    SockErrKind.EXPECTED_CLOSE -> Unit
+                    SockErrKind.NETWORK_EVENT -> log("SOCKS upstream network event: ${failure.message}")
+                    SockErrKind.UNKNOWN -> logE("SOCKS upstream connect failed", failure)
+                }
             }
         }
 
@@ -1490,9 +1493,13 @@ class Socks5Server(
                 }
                 bindings[flow.logicalKey] = binding
                 return binding
-            } catch (e: Exception) {
+            } catch (failure: Throwable) {
+                // DatagramSocket.close() also closes the channel; close both defensively
+                // for failures after protect(), bind(), connect(), selector registration,
+                // or tracking.
+                runCatching { socket.close() }
                 runCatching { channel.close() }
-                throw e
+                throw failure
             }
         }
 
