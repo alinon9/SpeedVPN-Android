@@ -13,6 +13,7 @@ import java.net.InetSocketAddress
 import java.net.Socket
 import javax.net.SocketFactory
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 internal fun shouldQueryIpv6Dns(ipv6Enabled: Boolean, dnsIpv4Only: Boolean): Boolean =
     ipv6Enabled && !dnsIpv4Only
@@ -29,12 +30,14 @@ class EncryptedDnsResolver(
         private const val TIMEOUT_MS = 3_000L
     }
 
+    private val closed = AtomicBoolean(false)
+
     private val client = OkHttpClient.Builder()
         .dns(object : Dns {
             override fun lookup(hostname: String): List<InetAddress> =
                 listOf(InetAddress.getByName(DOH_IP_V4))
         })
-        .socketFactory(ProtectedNetworkSocketFactory(network, protect))
+        .socketFactory(ProtectedNetworkSocketFactory(network, protect) { closed.get() })
         .connectTimeout(TIMEOUT_MS, TimeUnit.MILLISECONDS)
         .readTimeout(TIMEOUT_MS, TimeUnit.MILLISECONDS)
         .writeTimeout(TIMEOUT_MS, TimeUnit.MILLISECONDS)
@@ -42,14 +45,16 @@ class EncryptedDnsResolver(
         .build()
 
     override fun close() {
-        // Cancel active OkHttp exchanges first, then evict idle connections and stop
-        // this resolver's dispatcher so an old physical Network cannot retain sockets.
+        if (!closed.compareAndSet(false, true)) return
+        // Mark closed before cancellation so a racing call cannot create another
+        // untracked socket after this resolver has been detached from the service.
         client.dispatcher.cancelAll()
         client.connectionPool.evictAll()
         client.dispatcher.executorService.shutdownNow()
     }
 
     fun resolve(host: String): List<InetAddress> {
+        if (closed.get()) throw IOException("Encrypted DNS resolver is closed")
         require(host.isNotBlank()) { "empty host" }
         if (isNumericAddress(host)) {
             return listOf(InetAddress.getByName(host)).filter { ipv6Enabled || it.address.size == 4 }
@@ -106,12 +111,17 @@ class EncryptedDnsResolver(
     private class ProtectedNetworkSocketFactory(
         private val network: Network,
         private val protect: (Socket) -> Boolean,
+        private val isClosed: () -> Boolean,
     ) : SocketFactory() {
         override fun createSocket(): Socket {
+            if (isClosed()) throw java.net.SocketException("Encrypted DNS resolver is closed")
             val socket = Socket()
             try {
                 protectSocketOrClose(socket, protect, "encrypted DNS upstream")
                 network.bindSocket(socket)
+                if (isClosed()) {
+                    throw java.net.SocketException("Encrypted DNS resolver closed during socket setup")
+                }
                 return socket
             } catch (failure: Throwable) {
                 try {
