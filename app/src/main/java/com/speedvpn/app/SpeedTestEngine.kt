@@ -5,19 +5,29 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.util.Log
+import java.io.Closeable
 import java.io.IOException
 import java.net.SocketException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.min
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.DisposableHandle
+import kotlinx.coroutines.InternalCoroutinesApi
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
 import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.ConnectionPool
 import okhttp3.Dns
 import okhttp3.EventListener
@@ -26,9 +36,13 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import okhttp3.Response
+import okhttp3.ResponseBody
 import okio.BufferedSink
 
 enum class SpeedTestPhase { DOWNLOAD, UPLOAD }
+
+/** Selects the socket route explicitly; ACTIVE_NETWORK preserves the public test's normal behavior. */
+enum class SpeedTestNetworkPath { ACTIVE_NETWORK, PHYSICAL_BASELINE, VPN }
 
 /**
  * A peer may close its upload half immediately after consuming the declared
@@ -63,19 +77,52 @@ data class SpeedTestResult(
 object SpeedTestEngine {
     private const val TAG = "SpeedTestEngine"
 
-    private data class SampleMeasurement(val throughputBps: Long, val payloadBytesWritten: Long)
-    private data class PhaseMeasurement(val throughputBps: Long, val completedPayloadBytes: Long)
+    private data class SampleMeasurement(
+        val throughputBps: Long,
+        val payloadBytesWritten: Long,
+        val transferStartedNanos: Long,
+        val transferCompletedNanos: Long,
+    )
+    internal data class PhaseMeasurement(val throughputBps: Long, val completedPayloadBytes: Long)
+    internal data class DirectionOutcome(val measurement: PhaseMeasurement?, val error: String?)
+
+    /** Keeps the active Call cancellable until the response body has been fully consumed. */
+    private class MeasuredResponse(
+        private val delegate: Response,
+        private val cancellationRegistration: DisposableHandle?,
+    ) : Closeable {
+        val code: Int get() = delegate.code
+        val isSuccessful: Boolean get() = delegate.isSuccessful
+        val body: ResponseBody? get() = delegate.body
+        val request: Request get() = delegate.request
+        fun header(name: String): String? = delegate.header(name)
+
+        override fun close() {
+            cancellationRegistration?.dispose()
+            delegate.close()
+        }
+    }
+
+    private val measurementMutex = Mutex()
 
     /** Receives OkHttp's completed request-body byte count, excluding HTTP headers/TLS framing. */
     internal class UploadBodyByteCounter {
         val bytesWritten = AtomicLong(0L)
+        val transferStartedNanos = AtomicLong(0L)
+        val transferCompletedNanos = AtomicLong(0L)
     }
 
     private val uploadBodyEventListenerFactory: EventListener.Factory = EventListener.Factory { _ ->
         object : EventListener() {
+            override fun requestBodyStart(call: Call) {
+                call.request().tag(UploadBodyByteCounter::class.java)?.transferStartedNanos
+                    ?.compareAndSet(0L, System.nanoTime())
+            }
+
             override fun requestBodyEnd(call: Call, byteCount: Long) {
                 call.request().tag(UploadBodyByteCounter::class.java)?.let { counter ->
                     counter.bytesWritten.set(byteCount)
+                    counter.transferCompletedNanos.set(System.nanoTime())
                     Log.d(TAG, "OkHttp requestBodyEnd method=${call.request().method} payloadBytesWritten=$byteCount")
                 }
             }
@@ -108,7 +155,6 @@ object SpeedTestEngine {
 
     private const val WARMUP_BYTES = 100_000L
     private const val CHUNK_BYTES = 256 * 1024
-    private const val MIN_SAMPLE_DURATION_MS = 10L
     private const val TARGET_STABLE_DURATION_MS = 250L
     private const val MIN_VALID_SAMPLES = 2
     private const val HIGH_CAPACITY_VERIFICATION_STREAMS = 3
@@ -155,72 +201,121 @@ object SpeedTestEngine {
         expectedDownloadKbps: Long? = null,
         expectedUploadKbps: Long? = null,
         verificationProfile: Boolean = false,
+        networkPath: SpeedTestNetworkPath = SpeedTestNetworkPath.ACTIVE_NETWORK,
         onProgress: (SpeedTestPhase) -> Unit = {},
-    ): SpeedTestResult =
-        withContext(Dispatchers.IO) {
-            val startedAt = System.currentTimeMillis()
-            Log.i(
-                TAG,
-                "Measurement begin verificationProfile=$verificationProfile " +
-                    "downloadTargetKbps=${expectedDownloadKbps ?: "unlimited"} " +
-                    "uploadTargetKbps=${expectedUploadKbps ?: "unlimited"}",
-            )
-            var firstError: String? = null
-            val testClient = buildTestClient(context)
-
-            val download = try {
-                onProgress(SpeedTestPhase.DOWNLOAD)
-                measurePhase(
-                    testClient,
-                    isUpload = false,
-                    expectedKbps = expectedDownloadKbps,
-                    verificationProfile = verificationProfile,
+    ): SpeedTestResult {
+        // One process-wide test at a time prevents parallel measurements competing for bandwidth.
+        measurementMutex.lock()
+        try {
+            return withContext(Dispatchers.IO) {
+                val startedAt = System.currentTimeMillis()
+                Log.i(
+                    TAG,
+                    "Measurement begin verificationProfile=$verificationProfile " +
+                        "downloadTargetKbps=${expectedDownloadKbps ?: "unlimited"} " +
+                        "uploadTargetKbps=${expectedUploadKbps ?: "unlimited"} networkPath=$networkPath",
                 )
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: Throwable) {
-                firstError = errorMessage(error)
-                Log.w(TAG, "Download failed: ${errorMessage(error)}", error)
-                null
-            }
+                val testClient = try {
+                    buildTestClient(context, networkPath)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    Log.w(TAG, "Unable to select requested network route $networkPath: ${errorMessage(error)}", error)
+                    return@withContext SpeedTestResult(
+                        downloadBps = null,
+                        uploadBps = null,
+                        durationMs = System.currentTimeMillis() - startedAt,
+                        error = errorMessage(error),
+                    )
+                }
+                try {
+                    val downloadOutcome = captureDirection(SpeedTestPhase.DOWNLOAD) {
+                        onProgress(SpeedTestPhase.DOWNLOAD)
+                        measurePhase(
+                            testClient,
+                            isUpload = false,
+                            expectedKbps = expectedDownloadKbps,
+                            verificationProfile = verificationProfile,
+                        )
+                    }
+                    val uploadOutcome = captureDirection(SpeedTestPhase.UPLOAD) {
+                        onProgress(SpeedTestPhase.UPLOAD)
+                        measurePhase(
+                            testClient,
+                            isUpload = true,
+                            expectedKbps = expectedUploadKbps,
+                            verificationProfile = verificationProfile,
+                        )
+                    }
 
-            val upload = try {
-                onProgress(SpeedTestPhase.UPLOAD)
-                measurePhase(
-                    testClient,
-                    isUpload = true,
-                    expectedKbps = expectedUploadKbps,
-                    verificationProfile = verificationProfile,
-                )
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: Throwable) {
-                firstError = firstError ?: errorMessage(error)
-                Log.w(TAG, "Upload failed: ${errorMessage(error)}", error)
-                null
+                    SpeedTestResult(
+                        downloadBps = downloadOutcome.measurement?.throughputBps,
+                        uploadBps = uploadOutcome.measurement?.throughputBps,
+                        durationMs = System.currentTimeMillis() - startedAt,
+                        error = downloadOutcome.error ?: uploadOutcome.error,
+                        uploadPayloadBytesWritten = uploadOutcome.measurement?.completedPayloadBytes ?: 0L,
+                    )
+                } finally {
+                    // This measurement owns an isolated connection pool; release it for every exit path.
+                    testClient.connectionPool.evictAll()
+                }
             }
-
-            SpeedTestResult(
-                downloadBps = download?.throughputBps,
-                uploadBps = upload?.throughputBps,
-                durationMs = System.currentTimeMillis() - startedAt,
-                error = firstError,
-                uploadPayloadBytesWritten = upload?.completedPayloadBytes ?: 0L,
-            )
+        } finally {
+            measurementMutex.unlock()
         }
+    }
+
+    internal suspend fun captureDirection(
+        phase: SpeedTestPhase,
+        action: suspend () -> PhaseMeasurement,
+    ): DirectionOutcome = try {
+        DirectionOutcome(action(), null)
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (error: Throwable) {
+        // Android's Log methods are not mocked in plain local JVM tests.
+        runCatching { Log.w(TAG, "${phase.name} failed independently: ${errorMessage(error)}", error) }
+        DirectionOutcome(null, errorMessage(error))
+    }
 
     private fun errorMessage(error: Throwable): String =
         error.message?.takeIf { it.isNotBlank() } ?: error.javaClass.simpleName
 
-    private fun executeMeasuredRequest(
+    @OptIn(InternalCoroutinesApi::class)
+    private suspend fun executeMeasuredRequest(
         client: OkHttpClient,
         request: Request,
         stage: String,
         requestedBytes: Long,
         startedNs: Long,
-    ): Response {
+    ): MeasuredResponse {
+        val call = client.newCall(request)
+        // Keep cancellation wired to the Call after response headers arrive and while
+        // the caller is still consuming the blocking response stream on Dispatchers.IO.
+        val parentJob = currentCoroutineContext()[Job]
+        val cancellationRegistration = parentJob?.invokeOnCompletion(
+            onCancelling = true,
+            invokeImmediately = true,
+        ) { cause ->
+            if (cause is CancellationException) call.cancel()
+        }
         try {
-            val response = client.newCall(request).execute()
+            val response = suspendCancellableCoroutine<Response> { continuation ->
+                continuation.invokeOnCancellation { call.cancel() }
+                call.enqueue(object : Callback {
+                    override fun onFailure(call: Call, error: IOException) {
+                        if (continuation.isActive) continuation.resumeWithException(error)
+                    }
+
+                    override fun onResponse(call: Call, response: Response) {
+                        if (continuation.isActive) {
+                            continuation.resume(response) { _ -> response.close() }
+                        } else {
+                            response.close()
+                        }
+                    }
+                })
+            }
             val contentType = response.header("Content-Type")?.substringBefore(';') ?: "none"
             val contentLength = response.header("Content-Length") ?: "unknown"
             Log.i(
@@ -230,25 +325,32 @@ object SpeedTestEngine {
                     "contentType=$contentType contentLength=$contentLength " +
                     "headersElapsedMs=${TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNs)}",
             )
-            return response
-        } catch (error: IOException) {
-            Log.w(
-                TAG,
-                "HTTP $stage request failed method=${request.method} host=${request.url.host} " +
-                    "path=${request.url.encodedPath} requestedBytes=$requestedBytes " +
-                    "elapsedMs=${TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNs)} " +
-                    "errorType=${error.javaClass.simpleName} error=${errorMessage(error)}",
-                error,
-            )
+            return MeasuredResponse(response, cancellationRegistration)
+        } catch (error: Throwable) {
+            cancellationRegistration?.dispose()
+            call.cancel()
+            if (error is IOException) {
+                Log.w(
+                    TAG,
+                    "HTTP $stage request failed method=${request.method} host=${request.url.host} " +
+                        "path=${request.url.encodedPath} requestedBytes=$requestedBytes " +
+                        "elapsedMs=${TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNs)} " +
+                        "errorType=${error.javaClass.simpleName} error=${errorMessage(error)}",
+                    error,
+                )
+            }
             throw error
         }
     }
+
 
     internal fun downloadResponseValidationError(
         contentType: String?,
         requestedBytes: Long,
         responseBytes: Long,
+        responseCode: Int = 200,
     ): String? {
+        if (responseCode !in 200..206) return "Unexpected Download HTTP status $responseCode; expected 200..206"
         if (requestedBytes <= 0L) return "Invalid requested Content-Length: $requestedBytes"
         val normalizedType = contentType?.substringBefore(';')?.trim()?.lowercase()
         if (normalizedType != "application/octet-stream") {
@@ -260,7 +362,22 @@ object SpeedTestEngine {
         return null
     }
 
-    private fun logHttpResponseError(stage: String, response: Response, requestedBytes: Long) {
+    internal fun downloadPayloadValidationError(requestedBytes: Long, actualBytes: Long): String? {
+        if (requestedBytes <= 0L) return "Invalid requested download size: $requestedBytes"
+        if (actualBytes <= 0L) return "Download empty: $actualBytes/$requestedBytes bytes"
+        if (actualBytes != requestedBytes) return "Download truncated: $actualBytes/$requestedBytes bytes"
+        return null
+    }
+
+    internal fun isRetryableSpeedTestFailure(error: Throwable): Boolean {
+        val message = generateSequence(error) { it.cause }.mapNotNull { it.message }.joinToString(" ")
+        val status = Regex("HTTP(?:\\s+status)?\\s+(\\d{3})", RegexOption.IGNORE_CASE)
+            .find(message)?.groupValues?.getOrNull(1)?.toIntOrNull()
+        if (status != null) return status == 408 || status == 429 || status in 500..599
+        return generateSequence(error) { it.cause }.any { it is IOException }
+    }
+
+    private fun logHttpResponseError(stage: String, response: MeasuredResponse, requestedBytes: Long) {
         if (!response.isSuccessful) {
             Log.w(
                 TAG,
@@ -325,16 +442,18 @@ object SpeedTestEngine {
         }
         val samples = ArrayList<Long>()
         var completedSampleBytes = 0L
+        var firstTransferStartedNs: Long? = null
+        var lastTransferCompletedNs: Long? = null
         var lastFailure: Throwable? = null
 
-        // Exclude warm-up from numerator and denominator, but include all completed sample
-        // payloads and real wall-clock gaps between requests to expose relay stalls.
-        val measurementStartedNs = System.nanoTime()
+        // Exclude setup before the first payload byte, but include gaps between successful
+        // samples when evaluating strict sustained throughput.
         for ((sizeIndex, sizeBytes) in requestSizes.withIndex()) {
             var measured: SampleMeasurement? = null
             var requestElapsedMs: Long? = null
 
-            for (attempt in 1..(if (verificationProfile) 1 else MAX_RETRIES)) {
+            val maxAttempts = if (verificationProfile) 2 else MAX_RETRIES + 1
+            for (attempt in 1..maxAttempts) {
                 if (verificationProfile &&
                     phaseBudgetExceeded(phaseStartedNs, System.nanoTime(), PHASE_TIMEOUT_MS)
                 ) {
@@ -375,16 +494,23 @@ object SpeedTestEngine {
                         TAG,
                         "${if (isUpload) "upload" else "download"} request ${sizeBytes}B attempt $attempt failed: ${errorMessage(error)}",
                     )
-                    if (attempt < MAX_RETRIES) delay(250L * attempt)
+                    if (attempt < maxAttempts && isRetryableSpeedTestFailure(error)) {
+                        delay((250L * attempt).coerceAtMost(1_000L))
+                    } else {
+                        break
+                    }
                 }
             }
 
             if (measured != null && measured.throughputBps > 0L) {
                 samples += measured.throughputBps
                 completedSampleBytes += measured.payloadBytesWritten
+                if (firstTransferStartedNs == null) firstTransferStartedNs = measured.transferStartedNanos
+                lastTransferCompletedNs = measured.transferCompletedNanos
                 Log.d(TAG, "Sample ${if (isUpload) "upload" else "download"} requestedBytes=$sizeBytes " +
                     "payloadBytesWritten=${measured.payloadBytesWritten} rateBps=${measured.throughputBps} " +
-                    "actualRequestMs=${requestElapsedMs ?: -1L}")
+                    "wallRequestMs=${requestElapsedMs ?: -1L} " +
+                    "transferMs=${TimeUnit.NANOSECONDS.toMillis((measured.transferCompletedNanos - measured.transferStartedNanos).coerceAtLeast(1L))}")
 
                 // Once a real request lasts long enough to amortize connection
                 // overhead, do not keep issuing large transfers needlessly.
@@ -423,7 +549,11 @@ object SpeedTestEngine {
                     ?: "Not enough valid throughput samples",
             )
         }
-        val measurementElapsedNs = (System.nanoTime() - measurementStartedNs).coerceAtLeast(1L)
+        val windowStartedNs = firstTransferStartedNs
+            ?: throw IOException("No completed $directionName transfer start timestamp")
+        val windowCompletedNs = lastTransferCompletedNs
+            ?: throw IOException("No completed $directionName transfer completion timestamp")
+        val measurementElapsedNs = (windowCompletedNs - windowStartedNs).coerceAtLeast(1L)
         val sampleMedianBps = percentile(samples, 0.50)
         val sustainedBps = verificationThroughputBps(completedSampleBytes, measurementElapsedNs)
         Log.i(
@@ -563,7 +693,6 @@ object SpeedTestEngine {
         // The limiter is device-wide: all parallel streams share the selected
         // aggregate rate. Each stream reports its completed request-body byte count.
         val perStreamTargetKbps = expectedKbpsPerStream(expectedKbps, parallelism)
-        val startedNs = System.nanoTime()
         val streamMeasurements = coroutineScope {
             chunks.map { chunkBytes ->
                 async(Dispatchers.IO) {
@@ -579,9 +708,11 @@ object SpeedTestEngine {
                 }
             }.awaitAll()
         }
-        val elapsedNs = (System.nanoTime() - startedNs).coerceAtLeast(1L)
-        val aggregateRate = bitsPerSecond(sizeBytes, elapsedNs)
+        val transferStartedNs = streamMeasurements.minOf { it.transferStartedNanos }
+        val transferCompletedNs = streamMeasurements.maxOf { it.transferCompletedNanos }
+        val elapsedNs = (transferCompletedNs - transferStartedNs).coerceAtLeast(1L)
         val payloadBytesWritten = streamMeasurements.sumOf { it.payloadBytesWritten }
+        val aggregateRate = bitsPerSecond(payloadBytesWritten, elapsedNs)
         Log.i(
             TAG,
             "Aggregate sample direction=${if (isUpload) "upload" else "download"} " +
@@ -589,7 +720,7 @@ object SpeedTestEngine {
                 "elapsedMs=${TimeUnit.NANOSECONDS.toMillis(elapsedNs)} " +
                 "aggregateBps=$aggregateRate perStreamBps=${streamMeasurements.joinToString(",") { it.throughputBps.toString() }}",
         )
-        return SampleMeasurement(aggregateRate, payloadBytesWritten)
+        return SampleMeasurement(aggregateRate, payloadBytesWritten, transferStartedNs, transferCompletedNs)
     }
 
     internal fun phaseBudgetExceeded(startedAtNanos: Long, nowNanos: Long, budgetMs: Long): Boolean =
@@ -664,7 +795,7 @@ object SpeedTestEngine {
         return (sizeBytes.toDouble() * 8_000.0 / bitsPerSecond.toDouble()).toLong()
     }
 
-    private fun warmup(client: OkHttpClient, isUpload: Boolean, warmupBytes: Long) {
+    private suspend fun warmup(client: OkHttpClient, isUpload: Boolean, warmupBytes: Long) {
         if (isUpload) {
             val body = FixedUploadBody(warmupBytes)
             val request = buildUploadRequest(warmupBytes, body)
@@ -684,7 +815,9 @@ object SpeedTestEngine {
                     throw IOException("Download warm-up HTTP ${response.code}")
                 }
                 val body = response.body ?: throw IOException("Download warm-up body unavailable")
-                downloadResponseValidationError(body.contentType()?.toString(), warmupBytes, body.contentLength())?.let { error ->
+                downloadResponseValidationError(
+                    body.contentType()?.toString(), warmupBytes, body.contentLength(), response.code,
+                )?.let { error ->
                     throw IOException("Download warm-up invalid response: $error")
                 }
                 body.byteStream().use { input ->
@@ -699,12 +832,16 @@ object SpeedTestEngine {
                         if (count <= 0) break
                         readTotal += count
                     }
+                    downloadPayloadValidationError(warmupBytes, readTotal)?.let { throw IOException(it) }
+                    if (body.contentLength() < 0L && input.read() != -1) {
+                        throw IOException("Download warm-up exceeded requested payload size $warmupBytes bytes")
+                    }
                 }
             }
         }
     }
 
-    private fun measureDownloadRequest(
+    private suspend fun measureDownloadRequest(
         client: OkHttpClient,
         sizeBytes: Long,
         expectedKbps: Long?,
@@ -715,20 +852,26 @@ object SpeedTestEngine {
         val requestClient = clientForMeasurementRequest(
             client, sizeBytes, expectedKbps, verificationProfile, remainingPhaseMs,
         )
-        val started = System.nanoTime()
-        executeMeasuredRequest(requestClient, request, "download", sizeBytes, started).use { response ->
+        val requestStartedNs = System.nanoTime()
+        var transferStartedNs = 0L
+        var transferCompletedNs = 0L
+        executeMeasuredRequest(requestClient, request, "download", sizeBytes, requestStartedNs).use { response ->
             logHttpResponseError("download", response, sizeBytes)
-            if (!response.isSuccessful) {
-                throw IOException("Download HTTP ${response.code}")
-            }
             val body = response.body ?: throw IOException("Download body unavailable")
-            downloadResponseValidationError(body.contentType()?.toString(), sizeBytes, body.contentLength())?.let { error ->
+            downloadResponseValidationError(
+                body.contentType()?.toString(), sizeBytes, body.contentLength(), response.code,
+            )?.let { error ->
                 Log.w(TAG, "Download response rejected host=${request.url.host} path=${request.url.encodedPath}: $error")
                 throw IOException(error)
             }
             body.byteStream().use { input ->
                 val buffer = ByteArray(CHUNK_BYTES)
-                var readTotal = 0L
+                val firstByte = input.read()
+                if (firstByte < 0) throw IOException("Download empty: 0/$sizeBytes bytes")
+                // Start after the first actual payload byte, excluding connection setup and TTFB.
+                transferStartedNs = System.nanoTime()
+                var readTotal = 1L
+                buffer[0] = firstByte.toByte()
                 while (readTotal < sizeBytes) {
                     val count = input.read(
                         buffer,
@@ -738,20 +881,18 @@ object SpeedTestEngine {
                     if (count <= 0) break
                     readTotal += count
                 }
-                if (readTotal != sizeBytes) {
-                    throw IOException("Download truncated: $readTotal/$sizeBytes bytes")
+                downloadPayloadValidationError(sizeBytes, readTotal)?.let { throw IOException(it) }
+                if (body.contentLength() < 0L && input.read() != -1) {
+                    throw IOException("Download exceeded requested payload size $sizeBytes bytes")
                 }
+                transferCompletedNs = System.nanoTime()
             }
         }
-        val elapsed = System.nanoTime() - started
-        val elapsedMs = TimeUnit.NANOSECONDS.toMillis(elapsed)
-        if (elapsedMs < MIN_SAMPLE_DURATION_MS) {
-            return SampleMeasurement(bitsPerSecond(sizeBytes, elapsed.coerceAtLeast(1L)), sizeBytes)
-        }
-        return SampleMeasurement(bitsPerSecond(sizeBytes, elapsed), sizeBytes)
+        val elapsed = (transferCompletedNs - transferStartedNs).coerceAtLeast(1L)
+        return SampleMeasurement(bitsPerSecond(sizeBytes, elapsed), sizeBytes, transferStartedNs, transferCompletedNs)
     }
 
-    private fun measureUploadRequest(
+    private suspend fun measureUploadRequest(
         client: OkHttpClient,
         sizeBytes: Long,
         expectedKbps: Long?,
@@ -766,8 +907,8 @@ object SpeedTestEngine {
         val requestClient = clientForMeasurementRequest(
             client, sizeBytes, expectedKbps, verificationProfile, remainingPhaseMs,
         )
-        val started = System.nanoTime()
-        executeMeasuredRequest(requestClient, request, "upload", sizeBytes, started).use { response ->
+        val requestStartedNs = System.nanoTime()
+        executeMeasuredRequest(requestClient, request, "upload", sizeBytes, requestStartedNs).use { response ->
             logHttpResponseError("upload", response, sizeBytes)
             if (!response.isSuccessful) {
                 throw IOException("Upload HTTP ${response.code}")
@@ -781,15 +922,16 @@ object SpeedTestEngine {
             throw IOException("Upload requestBodyEnd count mismatch: $payloadBytesWritten/$sizeBytes bytes")
         }
 
-        val elapsed = System.nanoTime() - started
-        val elapsedMs = TimeUnit.NANOSECONDS.toMillis(elapsed)
-        val rate = if (elapsedMs < MIN_SAMPLE_DURATION_MS) {
-            bitsPerSecond(sizeBytes, elapsed.coerceAtLeast(1L))
-        } else {
-            bitsPerSecond(sizeBytes, elapsed)
+        val transferStartedNs = bodyCounter.transferStartedNanos.get()
+        val transferCompletedNs = bodyCounter.transferCompletedNanos.get()
+        if (transferStartedNs <= 0L || transferCompletedNs <= transferStartedNs) {
+            throw IOException("Upload transfer timestamps unavailable: start=$transferStartedNs end=$transferCompletedNs")
         }
-        Log.d(TAG, "Upload requestBodyEnd payloadBytesWritten=$payloadBytesWritten requestedBytes=$sizeBytes")
-        return SampleMeasurement(rate, payloadBytesWritten)
+        val elapsed = transferCompletedNs - transferStartedNs
+        val rate = bitsPerSecond(payloadBytesWritten, elapsed)
+        Log.d(TAG, "Upload requestBodyEnd payloadBytesWritten=$payloadBytesWritten requestedBytes=$sizeBytes " +
+            "transferMs=${TimeUnit.NANOSECONDS.toMillis(elapsed)}")
+        return SampleMeasurement(rate, payloadBytesWritten, transferStartedNs, transferCompletedNs)
     }
 
     internal fun buildDownloadRequest(sizeBytes: Long): Request =
@@ -840,7 +982,7 @@ object SpeedTestEngine {
     private val dnsCache = java.util.concurrent.ConcurrentHashMap<String, CachedDnsEntry>()
     private val dnsCacheTtlNanos = TimeUnit.SECONDS.toNanos(60)
 
-    private fun buildTestClient(context: Context): OkHttpClient {
+    private fun buildTestClient(context: Context, networkPath: SpeedTestNetworkPath): OkHttpClient {
         val connectivity = context.getSystemService(ConnectivityManager::class.java)
         val activeNetwork = connectivity.activeNetwork
         val activeCapabilities = activeNetwork?.let(connectivity::getNetworkCapabilities)
@@ -849,6 +991,23 @@ object SpeedTestEngine {
             !activeDefaultIsVpn &&
             activeCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
         val physicalNetwork = findPhysicalNetwork(connectivity)
+        if (networkPath == SpeedTestNetworkPath.VPN && !activeDefaultIsVpn) {
+            throw IOException("VPN route requested, but Android's active default network is not VPN")
+        }
+        if (networkPath == SpeedTestNetworkPath.PHYSICAL_BASELINE && physicalNetwork == null) {
+            throw IOException("Physical baseline requested, but no usable physical network is available")
+        }
+        val effectivePath = when (networkPath) {
+            SpeedTestNetworkPath.ACTIVE_NETWORK -> if (activeDefaultIsVpn) "ACTIVE_VPN" else "ACTIVE_PHYSICAL_OR_DEFAULT"
+            SpeedTestNetworkPath.PHYSICAL_BASELINE -> "PHYSICAL_BASELINE"
+            SpeedTestNetworkPath.VPN -> "VPN_TUNNEL"
+        }
+        Log.i(
+            TAG,
+            "Network route selected requested=$networkPath effective=$effectivePath " +
+                "activeDefaultIsVpn=$activeDefaultIsVpn physicalNetworkAvailable=${physicalNetwork != null} " +
+                "socketBoundToPhysical=${networkPath == SpeedTestNetworkPath.PHYSICAL_BASELINE}",
+        )
 
         val dns = object : Dns {
             override fun lookup(hostname: String): List<java.net.InetAddress> {
@@ -898,7 +1057,12 @@ object SpeedTestEngine {
             }
         }
 
-        return createIsolatedMeasurementClient(client, dns)
+        val isolatedClient = createIsolatedMeasurementClient(client, dns)
+        return if (networkPath == SpeedTestNetworkPath.PHYSICAL_BASELINE) {
+            isolatedClient.newBuilder().socketFactory(physicalNetwork!!.socketFactory).build()
+        } else {
+            isolatedClient
+        }
     }
 
     /**

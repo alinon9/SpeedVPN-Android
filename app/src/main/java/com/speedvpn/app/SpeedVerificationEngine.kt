@@ -82,6 +82,7 @@ object SpeedVerificationEngine {
                     expectedDownloadKbps = planDownloadKbps,
                     expectedUploadKbps = planUploadKbps,
                     verificationProfile = true,
+                    networkPath = SpeedTestNetworkPath.PHYSICAL_BASELINE,
                 ) { phase ->
                     onProgress(if (phase == SpeedTestPhase.DOWNLOAD) "قياس Download للشبكة الأصلية…" else "قياس Upload للشبكة الأصلية…")
                 }
@@ -119,6 +120,7 @@ object SpeedVerificationEngine {
                             expectedDownloadKbps = planDownloadKbps,
                             expectedUploadKbps = planUploadKbps,
                             verificationProfile = true,
+                            networkPath = SpeedTestNetworkPath.VPN,
                         ) { phase ->
                             onProgress(if (phase == SpeedTestPhase.DOWNLOAD) "قياس Download عبر VPN…" else "قياس Upload عبر VPN…")
                         }
