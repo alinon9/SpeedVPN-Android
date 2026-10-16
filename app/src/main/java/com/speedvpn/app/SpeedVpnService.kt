@@ -254,7 +254,7 @@ class SpeedVpnService : VpnService() {
                 protectTcp = { protect(it) },
                 protectUdp = { protect(it) },
                 currentNetwork = { findUnderlyingNetwork() },
-                ipv6Enabled = true,
+                ipv6Enabled = compatibility.ipv6Enabled,
             ).also {
                 it.updateBlockedUids(
                     VpnApplicationPolicy.blockedUids(this@SpeedVpnService, currentBlockedPackages())
@@ -279,8 +279,9 @@ class SpeedVpnService : VpnService() {
         }
 
         val physicalNetwork = findUnderlyingNetwork()
-        // DNS is terminated inside the TUN by hev MapDNS. Physical DNS changes must not
-        // trigger a VPN generation rebuild because the VPN-facing resolver is fixed.
+        // Android's DNS endpoint is the synthetic MapDNS address inside TUN, not a
+        // physical resolver. DNS requests therefore stay in the tunnel and are handled
+        // by HEV MapDNS; do not route them to a physical DNS address.
         val dnsServers = listOf(InetAddress.getByName(MAP_DNS_V4))
 
         val pfd = try {
@@ -294,7 +295,9 @@ class SpeedVpnService : VpnService() {
                 // No public resolver is hard-coded.
                 .apply { dnsServers.forEach { addDnsServer(it) } }
                 .apply {
-                    // Capture IPv6 in TUN as well; otherwise blocked apps can bypass via IPv6.
+                    // Always capture IPv6 to prevent direct-route leakage. When IPv6
+                    // egress is disabled, the SOCKS relay rejects IPv6 destinations and
+                    // logs the block instead of allowing traffic to bypass the VPN.
                     addAddress(TUN_V6, 128)
                     addRoute("::", 0)
                 }
@@ -302,7 +305,8 @@ class SpeedVpnService : VpnService() {
                     // Do not install the VpnService application allow-list: omitted apps route outside TUN.
                     // All apps except SpeedVPN itself use TUN for UID-based firewalling.
                     addDisallowedApplication(packageName)
-                    log("VPN_TUN_POLICY mode=all-apps-except-self ipv4=0.0.0.0/0 ipv6=::/0 blockedPackages=" +
+                    log("VPN_TUN_POLICY mode=all-apps-except-self ipv4=0.0.0.0/0 ipv6=::/0 " +
+                        "ipv6Egress=\${if (compatibility.ipv6Enabled) "enabled" else "blocked"} blockedPackages=" +
                         currentBlockedPackages().sorted().joinToString(","))
                 }
             builder.establish()
@@ -780,13 +784,14 @@ class SpeedVpnService : VpnService() {
             if (remaining <= 0) break
             val socket = Socket()
             try {
+                protectSocketOrClose(socket, { candidate -> protect(candidate) }, "upstream reachability probe $ip")
                 network.bindSocket(socket)
-                if (!protect(socket)) continue
                 socket.soTimeout = remaining
                 socket.connect(InetSocketAddress(ip, UPSTREAM_PROBE_PORT), remaining)
                 return true
-            } catch (_: Throwable) {
-                // Try the redundant resolver address within the same deadline.
+            } catch (e: Exception) {
+                logE("Upstream reachability probe failed for $ip", e)
+                // Try the redundant probe address within the same absolute deadline.
             } finally { runCatching { socket.close() } }
         }
         return false
@@ -1140,6 +1145,7 @@ class SpeedVpnService : VpnService() {
     private fun cleanupLocked() {
         meter?.cancel(); meter = null
         healthMonitor?.cancel(); healthMonitor = null
+        quotaMonitor?.cancel(); quotaMonitor = null
         uidPolicyMonitor?.cancel(); uidPolicyMonitor = null
         val configFile = tunnelConfigFile
         tunnelConfigFile = null
@@ -1313,15 +1319,25 @@ class SpeedVpnService : VpnService() {
     override fun onRevoke() {
         log("VPN revoked by system/user")
         sessionId.incrementAndGet()
-        scope.launch { disconnect() }
+        reconnectAfterDisconnect = false
+        // Cleanup runs on the IO scope because Native shutdown may block. If Android
+        // destroys the service first, onDestroy's emergency path performs the same
+        // owner-checked teardown without closing a TUN FD still owned by Native.
+        scope.launch {
+            disconnect()
+            stopSelf()
+        }
     }
 
     override fun onDestroy() {
         destroying.set(true)
         sessionId.incrementAndGet()
         reconnectAfterDisconnect = false
+        // Stop every periodic coroutine before detaching resources for emergency teardown.
+        scope.cancel()
         meter?.cancel(); meter = null
         healthMonitor?.cancel(); healthMonitor = null
+        quotaMonitor?.cancel(); quotaMonitor = null
         uidPolicyMonitor?.cancel(); uidPolicyMonitor = null
 
         // Snapshot and detach this instance's resources on the main thread, then do
@@ -1386,7 +1402,6 @@ class SpeedVpnService : VpnService() {
                 )
             }
         }
-        scope.cancel()
         upstreamProbeDnsExecutor.shutdownNow()
         unregisterPhysicalNetworkCallback()
         super.onDestroy()
