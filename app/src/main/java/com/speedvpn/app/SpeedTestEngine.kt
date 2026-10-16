@@ -36,7 +36,7 @@ import okio.BufferedSink
 enum class SpeedTestPhase { DOWNLOAD, UPLOAD }
 
 /** Selects the socket route explicitly; ACTIVE_NETWORK preserves the public test's normal behavior. */
-internal enum class SpeedTestNetworkPath { ACTIVE_NETWORK, PHYSICAL_BASELINE, VPN }
+enum class SpeedTestNetworkPath { ACTIVE_NETWORK, PHYSICAL_BASELINE, VPN }
 
 /**
  * A peer may close its upload half immediately after consuming the declared
