@@ -122,6 +122,7 @@ class Socks5Server(
     private val protectUdp: (DatagramSocket) -> Boolean,
     private val currentNetwork: () -> Network?,
     private val ipv6Enabled: Boolean,
+    private val dnsIpv4Only: Boolean = false,
 ) {
     companion object {
         private const val MAX_SESSIONS = 80
@@ -220,7 +221,7 @@ class Socks5Server(
             if (current != null && encryptedDnsNetwork == network) {
                 current
             } else {
-                EncryptedDnsResolver(network, protectTcp, ipv6Enabled).also {
+                EncryptedDnsResolver(network, protectTcp, ipv6Enabled, dnsIpv4Only).also {
                     encryptedDnsNetwork = network
                     encryptedDnsResolver = it
                 }
