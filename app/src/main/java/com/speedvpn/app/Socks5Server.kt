@@ -799,10 +799,9 @@ class Socks5Server(
         var destinationWriteNs = 0L
         var destinationWriteInProgress = false
         try {
-            // Match relay read granularity to the current pacing bucket. A 16 KiB
-            // read requires hundreds of scheduler wakeups per second at high rates;
-            // larger reads reduce that overhead while staying inside the bucket's
-            // bounded burst window. The bucket can change while the pipe is active.
+            // Read no more than the current plan's 10 ms budget. A plan can
+            // change while a blocking read is in flight, so the bytes actually read
+            // are split again using the latest budget before each downstream write.
             val buf = ByteArray(256 * 1024)
             while (running && SpeedLimiter.isGenerationActive(generation)) {
                 destinationWriteInProgress = false
@@ -815,8 +814,7 @@ class Socks5Server(
                 )
                 sourceReadNs += System.nanoTime() - readStartedNs
                 // bytesRead is the payload actually returned by this blocking read.
-                // Never charge buf.size/readSize: those values are buffer capacity,
-                // not bytes received from the socket.
+                // Never charge buf.size/readSize: those values are capacity, not data.
                 val n = batch.bytesRead
                 if (n < 0) {
                     eof = true
@@ -825,28 +823,45 @@ class Socks5Server(
                 }
                 readCalls += batch.readCalls.toLong()
                 maxReadBytes = maxOf(maxReadBytes, n)
-                val limiterStartedNs = System.nanoTime()
-                val mayProceed = SpeedLimiter.acquire(bucket, n, generation)
-                limiterCallNs += System.nanoTime() - limiterStartedNs
-                if (!mayProceed) {
-                    exitReason = "limiter_or_session_inactive"
-                    break
+
+                var offset = 0
+                while (offset < n) {
+                    destinationWriteInProgress = false
+                    if (!running || !SpeedLimiter.isGenerationActive(generation)) {
+                        exitReason = "session_stopped"
+                        break
+                    }
+
+                    // Re-evaluate the current rate for every write chunk so a change
+                    // from Unlimited/high speed to a slow plan does not flush an old,
+                    // oversized TCP read in one burst or stall before forwarding it.
+                    val chunkSize = bucket.recommendedReadBytes().coerceAtMost(n - offset)
+                    val limiterStartedNs = System.nanoTime()
+                    val mayProceed = SpeedLimiter.acquire(bucket, chunkSize, generation)
+                    limiterCallNs += System.nanoTime() - limiterStartedNs
+                    if (!mayProceed) {
+                        exitReason = "limiter_or_session_inactive"
+                        break
+                    }
+                    if (!running || !SpeedLimiter.isGenerationActive(generation)) {
+                        exitReason = "session_stopped"
+                        break
+                    }
+
+                    val writeStartedNs = System.nanoTime()
+                    destinationWriteInProgress = true
+                    dst.write(buf, offset, chunkSize)
+                    destinationWriteInProgress = false
+                    writeCalls++
+                    val writeFinishedNs = System.nanoTime()
+                    destinationWriteNs += writeFinishedNs - writeStartedNs
+                    if (firstForwardedNs == 0L) firstForwardedNs = writeStartedNs
+                    lastForwardedNs = writeFinishedNs
+                    bucket.recordForwarded(chunkSize, generation)
+                    forwardedBytes += chunkSize.toLong()
+                    offset += chunkSize
                 }
-                if (!running || !SpeedLimiter.isGenerationActive(generation)) {
-                    exitReason = "session_stopped"
-                    break
-                }
-                val writeStartedNs = System.nanoTime()
-                destinationWriteInProgress = true
-                dst.write(buf, 0, n)
-                destinationWriteInProgress = false
-                writeCalls++
-                val writeFinishedNs = System.nanoTime()
-                destinationWriteNs += writeFinishedNs - writeStartedNs
-                if (firstForwardedNs == 0L) firstForwardedNs = writeStartedNs
-                lastForwardedNs = writeFinishedNs
-                bucket.recordForwarded(n, generation)
-                forwardedBytes += n.toLong()
+                if (offset < n) break
             }
             runCatching { dst.flush() }
         } catch (error: SocketException) {
