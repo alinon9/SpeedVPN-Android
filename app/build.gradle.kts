@@ -1,3 +1,5 @@
+import java.io.ByteArrayOutputStream
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -5,7 +7,7 @@ plugins {
 }
 
 
-private const val HEV_NATIVE_PIN = "d9dca26c7ad0e494492244f0309e80ee583e739e"
+val HEV_NATIVE_PIN = "d9dca26c7ad0e494492244f0309e80ee583e739e"
 
 // Prepare the native checkout as part of Gradle's task graph, not as an undocumented
 // one-time manual step. This always re-checks the pinned source and reviewed patches.
@@ -51,7 +53,7 @@ val verifyNativeSources = tasks.register("verifyNativeSources") {
             throw GradleException("Native source preparation incomplete; missing: " + missing.joinToString { it.relativeTo(projectDir).path })
         }
 
-        val headOutput = java.io.ByteArrayOutputStream()
+        val headOutput = ByteArrayOutputStream()
         exec {
             workingDir(rootProject.projectDir)
             commandLine("git", "-C", nativeDir.absolutePath, "rev-parse", "HEAD")
