@@ -183,6 +183,18 @@ task_io_yielder (HevTaskYieldType type, void *data)
 
     # JNI bridge: callback invocations are rate-limited and moved off the TUN thread in Kotlin.
     jni_text = jni_c.read_text()
+
+    # This native bridge owns a duplicated TUN fd and writes Android log messages.
+    # Keep these headers present even when the patch is rerun on an already-patched tree.
+    required_includes = ("#include <unistd.h>", "#include <android/log.h>")
+    missing_includes = [include for include in required_includes if include not in jni_text]
+    if missing_includes:
+        include_anchor = "static pthread_key_t current_jni_env;\\n"
+        if jni_text.count(include_anchor) != 1:
+            raise SystemExit("Refusing unsafe patch: native JNI include anchor is not unique")
+        include_block = "".join(f"{include}\\n" for include in missing_includes)
+        jni_text = jni_text.replace(include_anchor, include_block + include_anchor, 1)
+
     if BEGIN not in jni_text:
         jni_text = jni_text.replace(
             "static pthread_key_t current_jni_env;\n",
