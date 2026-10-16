@@ -807,6 +807,7 @@ class Socks5Server(
             .sortedBy { if (it.address.size == 4) 0 else 1 }
 
         if (candidates.isEmpty()) {
+            log("SOCKS destination rejected: no usable candidates under IPv6 policy ipv6Enabled=$ipv6Enabled")
             replyFailure(cout, 4)
             client.close()
             return
@@ -1187,7 +1188,11 @@ class Socks5Server(
                                     listOf(addr)
                                 }
                                 4 -> {
-                                    if (!acceptsUdpAddressType(4, ipv6Enabled) || bb.remaining() < 16) continue
+                                    if (!ipv6Enabled) {
+                                        log("SOCKS IPv6 UDP destination rejected because IPv6 relay support is disabled")
+                                        continue
+                                    }
+                                    if (bb.remaining() < 16) continue
                                     val addr = ByteArray(16).also { bb.get(it) }.let(InetAddress::getByAddress)
                                     listOf(addr)
                                 }

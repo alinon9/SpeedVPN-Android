@@ -294,19 +294,18 @@ class SpeedVpnService : VpnService() {
                 // No public resolver is hard-coded.
                 .apply { dnsServers.forEach { addDnsServer(it) } }
                 .apply {
-                    // Install the IPv6 address/route only when the relay and native tunnel
-                    // are configured to process IPv6. The disabled mode is explicit below.
-                    if (compatibility.ipv6Enabled) {
-                        addAddress(TUN_V6, 128)
-                        addRoute("::", 0)
-                    }
+                    // Never allow IPv6 to bypass the VPN when relay IPv6 is disabled.
+                    // Keep the route captured; the SOCKS relay then rejects IPv6 egress
+                    // explicitly rather than leaking those packets onto the physical network.
+                    addAddress(TUN_V6, 128)
+                    addRoute("::", 0)
                 }
                 .apply {
                     // Do not install the VpnService application allow-list: omitted apps route outside TUN.
                     // All apps except SpeedVPN itself use TUN for UID-based firewalling.
                     addDisallowedApplication(packageName)
-                    log("VPN_TUN_POLICY mode=all-apps-except-self ipv4=0.0.0.0/0 " +
-                        "ipv6=${if (compatibility.ipv6Enabled) "::/0" else "disabled-outside-tunnel"} blockedPackages=" +
+                    log("VPN_TUN_POLICY mode=all-apps-except-self ipv4=0.0.0.0/0 ipv6=::/0 " +
+                        "ipv6RelaySupport=${if (compatibility.ipv6Enabled) "enabled" else "disabled-fail-closed"} blockedPackages=" +
                         currentBlockedPackages().sorted().joinToString(","))
                 }
             builder.establish()
@@ -501,7 +500,8 @@ class SpeedVpnService : VpnService() {
             appendLine("tunnel:")
             appendLine("  mtu: ${compatibility.mtu}")
             appendLine("  ipv4: $TUN_V4")
-            if (compatibility.ipv6Enabled) appendLine("  ipv6: '$TUN_V6'")
+            // TUN always captures IPv6; disabled relay IPv6 is rejected rather than bypassed.
+            appendLine("  ipv6: '$TUN_V6'")
             appendLine("socks5:")
             appendLine("  port: ${relay.port}")
             appendLine("  address: 127.0.0.1")
