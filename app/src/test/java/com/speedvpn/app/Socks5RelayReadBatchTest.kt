@@ -188,11 +188,9 @@ class Socks5RelayReadBatchTest {
         val client = Socket()
         try {
             relay.start()
+            client.soTimeout = 1_000
             client.connect(InetSocketAddress("127.0.0.1", port), 1_000)
-            // Incomplete SOCKS greeting leaves a worker blocked in readFully().
-            client.getOutputStream().write(byteArrayOf(5, 1))
-            client.getOutputStream().flush()
-
+            // An idle client leaves a worker blocked while waiting for the first greeting byte.
             awaitCondition(2_000L) { relay.activeTcpSocketCount() > 0 }
             val startedAt = System.nanoTime()
             relay.stop()
@@ -200,6 +198,7 @@ class Socks5RelayReadBatchTest {
 
             assertTrue("Relay stop took too long: ${stopElapsedMs}ms", stopElapsedMs < 4_000L)
             assertEquals(0, relay.activeTcpSocketCount())
+            assertEquals("The active client must observe the accepted socket closing", -1, client.getInputStream().read())
 
             val replacement = ServerSocket()
             try {

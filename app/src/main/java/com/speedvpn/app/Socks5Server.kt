@@ -1417,12 +1417,15 @@ class Socks5Server(
 
         fun trimClosedFlows(nowMs: Long) {
             synchronized(lock) {
-                udpFlows.size(nowMs) // Purges expired flows.
+                // size() purges TTL entries and delivers closeFlow callbacks after the
+                // table lock is released. Those callbacks can re-enter this mux lock and
+                // remove map entries, so take the iterator only after purge has completed.
+                udpFlows.size(nowMs)
                 val iterator = bindings.entries.iterator()
                 while (iterator.hasNext()) {
                     val entry = iterator.next()
                     val binding = entry.value
-                    if (!binding.channel.isOpen || !udpFlows.contains(binding.flow.logicalKey, nowMs)) {
+                    if (!binding.channel.isOpen) {
                         closeBindingLocked(binding)
                         iterator.remove()
                     }
