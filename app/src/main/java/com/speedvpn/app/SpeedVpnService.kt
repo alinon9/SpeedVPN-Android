@@ -255,6 +255,7 @@ class SpeedVpnService : VpnService() {
                 protectUdp = { protect(it) },
                 currentNetwork = { findUnderlyingNetwork() },
                 ipv6Enabled = compatibility.ipv6Enabled,
+                dnsIpv4Only = compatibility.dnsIpv4Only,
             ).also {
                 it.updateBlockedUids(
                     VpnApplicationPolicy.blockedUids(this@SpeedVpnService, currentBlockedPackages())
@@ -827,12 +828,14 @@ class SpeedVpnService : VpnService() {
         } else {
             runCatching { oldRelay?.stop() }
             val fresh = runCatching {
+                val networkSettings = VpnSettings.read(this@SpeedVpnService)
                 Socks5Server(
                     generation = serviceGeneration,
                     protectTcp = { protect(it) },
                     protectUdp = { protect(it) },
                     currentNetwork = { findUnderlyingNetwork() },
-                    ipv6Enabled = VpnSettings.read(this@SpeedVpnService).ipv6Enabled,
+                    ipv6Enabled = networkSettings.ipv6Enabled,
+                    dnsIpv4Only = networkSettings.dnsIpv4Only,
                 ).also { it.start() }
             }.getOrNull() ?: run {
                 failLocked("SOCKS relay recovery failed")
