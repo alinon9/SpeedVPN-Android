@@ -93,7 +93,7 @@ object SpeedTestEngine {
     ) : Closeable {
         val code: Int get() = delegate.code
         val isSuccessful: Boolean get() = delegate.isSuccessful
-        val body: ResponseBody get() = delegate.body
+        val body: ResponseBody? get() = delegate.body
         val request: Request get() = delegate.request
         fun header(name: String): String? = delegate.header(name)
 
