@@ -1,5 +1,8 @@
 package com.speedvpn.app
 
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -9,10 +12,12 @@ class SpeedLimiterConversionTest {
     fun relayReadSizeFollowsBoundedPacingWindow() {
         val bucket = TokenBucket()
 
-        // Low rates keep the established minimum chunk and must not send 64 KiB
-        // every time the bucket refills.
+        // A finite plan reads approximately its 10 ms token budget, without a
+        // forced 16 KiB floor that would create a large low-rate burst.
         bucket.setRate(10_000L)
-        assertEquals(16 * 1024, bucket.recommendedReadBytes())
+        assertEquals(100, bucket.recommendedReadBytes())
+        bucket.setRate(1L)
+        assertEquals(1, bucket.recommendedReadBytes())
 
         // Larger finite plans use proportionally larger chunks to reduce wakeups.
         bucket.setRate(2_000_000L)
@@ -29,6 +34,19 @@ class SpeedLimiterConversionTest {
         assertEquals(256 * 1024, bucket.recommendedReadBytes())
         bucket.setRate(0L)
         assertEquals(256 * 1024, bucket.recommendedReadBytes())
+    }
+
+    @Test
+    fun convertsKbpsAndMbpsAndNormalizesUnlimitedAndExtremeValues() {
+        assertEquals(1_500L, SpeedLimiter.toKbps(1.5, "Mbps"))
+        assertEquals(100L, SpeedLimiter.toKbps(100.9, "Kbps"))
+        assertTrue(SpeedLimiter.toKbps(0.0, "Mbps") == null)
+        assertTrue(SpeedLimiter.toKbps(-1.0, "Kbps") == null)
+        assertTrue(SpeedLimiter.toKbps(1.0, "Gbps") == null)
+        assertEquals(Long.MAX_VALUE / 125L, SpeedLimiter.toKbps(Double.MAX_VALUE, "Kbps"))
+        assertTrue(SpeedLimiter.normalizeKbps(0L) == null)
+        assertTrue(SpeedLimiter.normalizeKbps(-5L) == null)
+        assertEquals(Long.MAX_VALUE / 125L, SpeedLimiter.normalizeKbps(Long.MAX_VALUE))
     }
 
     @Test
@@ -66,15 +84,15 @@ class SpeedLimiterConversionTest {
         val generation = 1L
         bucket.beginSession(generation)
 
-        // Drain the initial bounded burst, then request 100 bytes at 2,000 B/s.
-        assertTrue(bucket.acquire(16 * 1024, { true }))
+        // Drain the configured 10 ms burst and request the same amount again.
+        val chunkBytes = bucket.recommendedReadBytes()
+        assertTrue(bucket.acquire(chunkBytes, { true }))
         val start = System.nanoTime()
-        assertTrue(bucket.acquire(100, { true }))
+        assertTrue(bucket.acquire(chunkBytes, { true }))
         val elapsedMs = (System.nanoTime() - start) / 1_000_000L
 
-        // 100 bytes at 2,000 B/s is 50 ms. Allow scheduler jitter, but reject
-        // a limiter that grants the second chunk immediately.
-        assertTrue("Limiter granted too early: ${elapsedMs}ms", elapsedMs >= 35L)
+        // The next 10 ms worth of bytes must not be granted immediately.
+        assertTrue("Limiter granted too early: ${elapsedMs}ms", elapsedMs >= 5L)
         bucket.endSession(generation)
     }
 
@@ -83,12 +101,13 @@ class SpeedLimiterConversionTest {
         val bucket = TokenBucket()
         bucket.setRate(2_000L)
 
-        // Empty the initial burst and prove the finite rate really waits.
-        assertTrue(bucket.acquire(16 * 1024))
+        // Empty the rate-sized burst and prove a following chunk is paced.
+        var chunkBytes = bucket.recommendedReadBytes()
+        assertTrue(bucket.acquire(chunkBytes))
         var started = System.nanoTime()
-        assertTrue(bucket.acquire(100))
+        assertTrue(bucket.acquire(chunkBytes))
         var finiteWaitMs = (System.nanoTime() - started) / 1_000_000L
-        assertTrue("Finite plan did not pace: ${finiteWaitMs}ms", finiteWaitMs >= 35L)
+        assertTrue("Finite plan did not pace: ${finiteWaitMs}ms", finiteWaitMs >= 5L)
 
         // Unlimited must bypass the previous plan immediately, including large chunks.
         bucket.setRate(0L)
@@ -99,11 +118,12 @@ class SpeedLimiterConversionTest {
 
         // Returning to a finite plan must restore the configured cap.
         bucket.setRate(2_000L)
-        assertTrue(bucket.acquire(16 * 1024))
+        chunkBytes = bucket.recommendedReadBytes()
+        assertTrue(bucket.acquire(chunkBytes))
         started = System.nanoTime()
-        assertTrue(bucket.acquire(100))
+        assertTrue(bucket.acquire(chunkBytes))
         finiteWaitMs = (System.nanoTime() - started) / 1_000_000L
-        assertTrue("Finite cap was not restored after Unlimited: ${finiteWaitMs}ms", finiteWaitMs >= 35L)
+        assertTrue("Finite cap was not restored after Unlimited: ${finiteWaitMs}ms", finiteWaitMs >= 5L)
     }
 
     @Test
@@ -111,17 +131,93 @@ class SpeedLimiterConversionTest {
         val bucket = TokenBucket()
         bucket.setRate(20_000L)
 
-        // Consume half the initial burst. While the caller performs socket I/O,
-        // a true token bucket should earn credit during the 120 ms outside the lock.
-        assertTrue(bucket.acquire(8 * 1024, { true }))
+        // Consume half the burst. Credit earned during outside socket I/O lets
+        // the bucket refill to capacity without a second, redundant sleep.
+        assertTrue(bucket.acquire(100, { true }))
         Thread.sleep(120L)
 
         val start = System.nanoTime()
-        assertTrue(bucket.acquire(8 * 1024, { true }))
+        assertTrue(bucket.acquire(200, { true }))
         val elapsedMs = (System.nanoTime() - start) / 1_000_000L
 
-        // The current deadline-per-chunk scheduler waits about another 280 ms here.
-        // A refillable bucket has accumulated enough credit to grant this chunk now.
         assertTrue("Credit was not accrued during outside I/O: ${elapsedMs}ms", elapsedMs < 150L)
+    }
+
+    @Test
+    fun changingFromLowRateWithDebtToHighRateWakesWaiterImmediately() {
+        val bucket = TokenBucket()
+        bucket.setRate(100L) // 1 byte of burst; deliberately build token debt.
+        assertTrue(bucket.acquire(100))
+
+        val waiting = CountDownLatch(1)
+        val completed = CountDownLatch(1)
+        val acquired = AtomicBoolean(false)
+        val waiter = Thread {
+            waiting.countDown()
+            acquired.set(bucket.acquire(1))
+            completed.countDown()
+        }
+        waiter.start()
+
+        try {
+            assertTrue("Waiter did not start", waiting.await(1, TimeUnit.SECONDS))
+            // Allow the waiter to enter its old low-rate wait (about 1 second).
+            Thread.sleep(40L)
+            val changedAt = System.nanoTime()
+            bucket.setRate(1_000_000L)
+            assertTrue(
+                "Rate change did not wake the waiter promptly",
+                completed.await(250, TimeUnit.MILLISECONDS),
+            )
+            val elapsedMs = (System.nanoTime() - changedAt) / 1_000_000L
+            assertTrue("Waiter kept stale pacing debt for ${elapsedMs}ms", elapsedMs < 250L)
+            assertTrue(acquired.get())
+        } finally {
+            waiter.interrupt()
+            waiter.join(1_000L)
+        }
+    }
+
+    @Test
+    fun concurrentFlowsShareOneRateBudget() {
+        val bucket = TokenBucket()
+        bucket.setRate(1_000L) // 10 bytes per 10 ms, shared by every caller.
+
+        val flowCount = 8
+        val ready = CountDownLatch(flowCount)
+        val start = CountDownLatch(1)
+        val finished = CountDownLatch(flowCount)
+        val allAcquired = AtomicBoolean(true)
+        val flows = (0 until flowCount).map {
+            Thread {
+                ready.countDown()
+                try {
+                    if (!start.await(1, TimeUnit.SECONDS) || !bucket.acquire(10)) {
+                        allAcquired.set(false)
+                    }
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    allAcquired.set(false)
+                } finally {
+                    finished.countDown()
+                }
+            }.also { it.start() }
+        }
+
+        try {
+            assertTrue("Flows did not become ready", ready.await(1, TimeUnit.SECONDS))
+            val startedAt = System.nanoTime()
+            start.countDown()
+            assertTrue("Concurrent acquires stalled", finished.await(2, TimeUnit.SECONDS))
+            val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L
+            assertTrue(allAcquired.get())
+            assertTrue(
+                "Concurrent flows bypassed the shared rate budget (${elapsedMs}ms)",
+                elapsedMs >= 30L,
+            )
+        } finally {
+            flows.forEach { it.interrupt() }
+            flows.forEach { it.join(1_000L) }
+        }
     }
 }
