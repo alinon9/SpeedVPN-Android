@@ -1150,11 +1150,14 @@ class Socks5Server(
             val closeOnce = AtomicBoolean(false)
             val closeAll = {
                 if (closeOnce.compareAndSet(false, true)) {
-                    runCatching { mux.close() }
-                    activeUdpMuxes.remove(mux)
-                    runCatching { relaySocket.close() }
-                    runCatching { client.close() }
-                    untrack(relaySocket)
+                    try {
+                        closeResource("UDP mux during association teardown", mux::close)
+                    } finally {
+                        activeUdpMuxes.remove(mux)
+                        closeResource("UDP relay socket during association teardown", relaySocket::close)
+                        closeResource("UDP association control socket", client::close)
+                        untrack(relaySocket)
+                    }
                 }
             }
 
@@ -1246,25 +1249,30 @@ class Socks5Server(
                             udpFlows.touchSent(flow, System.currentTimeMillis())
                             mux.trimClosedFlows(System.currentTimeMillis())
                         }
-                    } catch (_: Exception) {
-                        // teardown
+                    } catch (e: Exception) {
+                        if (running && SpeedLimiter.isGenerationActive(generation)) {
+                            logE("SOCKS UDP relay receive loop failed", e)
+                        }
                     } finally {
                         closeAll()
                     }
                 }
 
                 while (cin.read() >= 0 && running && SpeedLimiter.isGenerationActive(generation)) { }
-            } catch (_: Exception) {
-                // teardown
+            } catch (e: Exception) {
+                if (running && SpeedLimiter.isGenerationActive(generation)) {
+                    logE("SOCKS UDP association control stream failed", e)
+                }
             } finally {
                 udpFlows.clear()
                 closeAll()
             }
-        } catch (_: Exception) {
-            runCatching { client.close() }
+        } catch (e: Exception) {
+            if (running) logE("Unable to establish SOCKS UDP association", e)
+            closeResource("failed SOCKS UDP association client", client::close)
         } finally {
             relay?.let {
-                runCatching { it.close() }
+                closeResource("SOCKS UDP relay socket", it::close)
                 untrack(it)
             }
             udpAssociations.release()
@@ -1445,8 +1453,15 @@ class Socks5Server(
                 bindings.clear()
             }
             selector.wakeup()
-            runCatching { worker.join(1_000) }
-            runCatching { selector.close() }
+            try {
+                worker.join(1_000)
+                if (worker.isAlive) logE("UDP mux worker did not stop within 1 second")
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                logE("Interrupted while waiting for UDP mux worker shutdown", e)
+            } finally {
+                closeResource("UDP mux selector", selector::close)
+            }
         }
 
         private fun createBindingLocked(flow: UdpFlow, remote: InetSocketAddress): UdpBinding {
@@ -1492,7 +1507,11 @@ class Socks5Server(
         }
 
         private fun closeBindingLocked(binding: UdpBinding) {
-            runCatching { binding.channel.keyFor(selector)?.cancel() }
+            try {
+                binding.channel.keyFor(selector)?.cancel()
+            } catch (e: Exception) {
+                logE("Unable to cancel UDP selector key during flow close", e)
+            }
             val socket = try {
                 binding.channel.socket()
             } catch (e: Exception) {
