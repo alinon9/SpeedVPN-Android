@@ -214,19 +214,36 @@ class Socks5Server(
     @Volatile private var encryptedDnsResolver: EncryptedDnsResolver? = null
 
     private fun encryptedResolver(network: Network): EncryptedDnsResolver {
+        if (!running) throw SocketException("SOCKS relay is stopping; DNS resolution refused")
         val cached = encryptedDnsResolver
         if (cached != null && encryptedDnsNetwork == network) return cached
         return synchronized(this) {
+            if (!running) throw SocketException("SOCKS relay is stopping; DNS resolution refused")
             val current = encryptedDnsResolver
             if (current != null && encryptedDnsNetwork == network) {
                 current
             } else {
-                EncryptedDnsResolver(network, protectTcp, ipv6Enabled, dnsIpv4Only).also {
-                    encryptedDnsNetwork = network
-                    encryptedDnsResolver = it
+                val replacement = EncryptedDnsResolver(network, protectTcp, ipv6Enabled, dnsIpv4Only)
+                if (!running) {
+                    replacement.close()
+                    throw SocketException("SOCKS relay stopped while creating DNS resolver")
                 }
+                encryptedDnsResolver = replacement
+                encryptedDnsNetwork = network
+                current?.close()
+                replacement
             }
         }
+    }
+
+    private fun closeEncryptedDnsResolver() {
+        val previous = synchronized(this) {
+            val resolver = encryptedDnsResolver
+            encryptedDnsResolver = null
+            encryptedDnsNetwork = null
+            resolver
+        }
+        previous?.close()
     }
 
     private val pool: ExecutorService = ThreadPoolExecutor(
@@ -306,6 +323,7 @@ class Socks5Server(
     fun stop() {
         running = false
         runCatching { server.close() }
+        closeEncryptedDnsResolver()
         acceptThread?.let { accept ->
             if (accept !== Thread.currentThread()) runCatching { accept.join(1_000) }
         }
@@ -326,8 +344,22 @@ class Socks5Server(
         pool.shutdownNow()
         probePool.shutdownNow()
         dnsPool.shutdownNow()
-        runCatching { pool.awaitTermination(3, TimeUnit.SECONDS) }
-        runCatching { probePool.awaitTermination(3, TimeUnit.SECONDS) }
+        val terminationDeadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
+        for (executor in listOf(pool, probePool, dnsPool)) {
+            val remainingNs = terminationDeadlineNs - System.nanoTime()
+            if (remainingNs > 0L) {
+                try {
+                    executor.awaitTermination(remainingNs, TimeUnit.NANOSECONDS)
+                } catch (interrupted: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    logE("Interrupted while stopping SOCKS worker pools", interrupted)
+                    break
+                }
+            }
+            if (!executor.isTerminated) {
+                logE("SOCKS worker pool did not terminate within the shared shutdown deadline")
+            }
+        }
         // Global pacing lifecycle is owned by SpeedVpnService's session generation.
         // A relay must not reset process-wide schedulers because an older relay can
         // outlive a newer VPN Service instance during asynchronous teardown.
@@ -646,6 +678,7 @@ class Socks5Server(
             runCatching { socket.close() }
             untrackUpstream(socket)
         }
+        closeEncryptedDnsResolver()
     }
 
     private fun handle(client: Socket) {
@@ -1206,11 +1239,16 @@ class Socks5Server(
                 }
 
                 while (cin.read() >= 0 && running && SpeedLimiter.isGenerationActive(generation)) { }
-            } catch (_: Exception) {
-                // teardown
+            } catch (e: Exception) {
+                if (running) logE("SOCKS UDP association terminated unexpectedly", e)
             } finally {
-                udpFlows.clear()
-                closeAll()
+                try {
+                    udpFlows.clear()
+                } finally {
+                    // Always close the mux/control/data sockets even if an eviction
+                    // callback reports a resource-cleanup failure.
+                    closeAll()
+                }
             }
         } catch (_: Exception) {
             runCatching { client.close() }
