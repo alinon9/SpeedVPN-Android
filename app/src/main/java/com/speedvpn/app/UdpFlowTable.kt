@@ -38,21 +38,40 @@ internal class UdpFlowTable(
 
     private fun <T> withEvictionNotifications(block: (MutableList<UdpFlow>) -> T): T {
         val evicted = ArrayList<UdpFlow>()
-        val result = synchronized(lock) { block(evicted) }
-        // Never call into UdpUpstreamMux while holding the table lock: mux operations
-        // can query this table while holding the mux lock. Attempt every close callback
-        // even if one cleanup fails, then rethrow the combined failure to the caller.
-        var callbackFailure: Throwable? = null
-        evicted.forEach { flow ->
-            try {
-                onFlowEvicted(flow)
-            } catch (failure: Throwable) {
-                val previous = callbackFailure
-                if (previous == null) callbackFailure = failure else previous.addSuppressed(failure)
+        var operationFailure: Throwable? = null
+        try {
+            // The monitor is released before finally invokes callbacks below.
+            return synchronized(lock) { block(evicted) }
+        } catch (failure: Throwable) {
+            operationFailure = failure
+            throw failure
+        } finally {
+            // Never call into UdpUpstreamMux while holding the table lock: mux operations
+            // can query this table while holding the mux lock. Attempt every close callback
+            // even if the table operation or an earlier cleanup failed.
+            var callbackFailure: Throwable? = null
+            evicted.forEach { flow ->
+                try {
+                    onFlowEvicted(flow)
+                } catch (failure: Throwable) {
+                    val previous = callbackFailure
+                    if (previous == null) {
+                        callbackFailure = failure
+                    } else if (previous !== failure) {
+                        previous.addSuppressed(failure)
+                    }
+                }
+            }
+            val cleanupFailure = callbackFailure
+            if (cleanupFailure != null) {
+                val originalFailure = operationFailure
+                if (originalFailure == null) {
+                    throw cleanupFailure
+                } else if (originalFailure !== cleanupFailure) {
+                    originalFailure.addSuppressed(cleanupFailure)
+                }
             }
         }
-        callbackFailure?.let { throw it }
-        return result
     }
 
     fun getOrCreate(
