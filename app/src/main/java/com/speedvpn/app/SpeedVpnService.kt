@@ -80,6 +80,33 @@ class SpeedVpnService : VpnService() {
         private val nativeOwnerGeneration = AtomicLong(0L)
         private val lastStartedRequestId = AtomicReference<String?>(null)
 
+        // Retain only the currently-live Service instance; CAS in onDestroy prevents
+        // an older instance from clearing a newer service generation.
+        private val activeServiceInstance = AtomicReference<SpeedVpnService?>(null)
+
+        fun apiRoutingRequiresProtection(): Boolean =
+            VpnRuntime.state.value.status in setOf(
+                VpnStatus.CONNECTING,
+                VpnStatus.CONNECTED,
+                VpnStatus.DISCONNECTING,
+            )
+
+        fun currentUnderlyingNetworkForApi(): Network? =
+            activeServiceInstance.get()?.findUnderlyingNetwork()
+
+        /**
+         * API / auth sockets bypass TUN while the VPN service is alive. If the
+         * runtime says traffic is routed through VPN but the service instance is
+         * missing, return false so callers fail closed rather than creating a loop.
+         */
+        fun protectApiSocket(socket: Socket): Boolean {
+            val service = activeServiceInstance.get()
+            if (service != null) {
+                return runCatching { service.protect(socket) }.getOrDefault(false)
+            }
+            return !apiRoutingRequiresProtection()
+        }
+
         fun start(ctx: Context, requestId: String? = null) =
             ContextCompat.startForegroundService(
                 ctx,
@@ -146,7 +173,6 @@ class SpeedVpnService : VpnService() {
     private var meter: Job? = null
     private var healthMonitor: Job? = null
     private var quotaMonitor: Job? = null
-    @Volatile private var uidDetectionPoc: UidDetectionPoc? = null
     @Volatile private var uidPolicyMonitor: Job? = null
     private val upstreamProbeDnsExecutor: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "vpn-upstream-dns").apply { isDaemon = true }
@@ -154,12 +180,13 @@ class SpeedVpnService : VpnService() {
 
     override fun onCreate() {
         super.onCreate()
-        UidPocDiagnostics.log(this, "SpeedVpnService.onCreate")
+        activeServiceInstance.set(this)
+        log("SpeedVpnService.onCreate")
         registerPhysicalNetworkCallback()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        UidPocDiagnostics.log(this, "SpeedVpnService.onStartCommand action=${intent?.action ?: "null"} startId=$startId")
+        log("SpeedVpnService.onStartCommand action=${intent?.action ?: "null"} startId=$startId")
         if (destroying.get()) return START_NOT_STICKY
 
         when (intent?.action) {
@@ -455,36 +482,12 @@ class SpeedVpnService : VpnService() {
                 if (current == previous) continue
                 previous = current
 
-                // Close relay sessions whose resolved owner is now blocked. Clear/re-register
-                // the native callback to invalidate cached non-blocked UID results; lookups
-                // still execute on the dedicated native worker, never on the TUN coroutine.
-                val callback = uidDetectionPoc
-                runCatching { callback?.updateBlockedPackages(current) }
-                    .onFailure { logE("Unable to refresh blocked UID policy", it) }
+                // Refresh policy state without crossing into native worker threads.
                 runCatching {
                     socks?.updateBlockedUids(VpnApplicationPolicy.blockedUids(this@SpeedVpnService, current))
                 }.onFailure { logE("Unable to refresh SOCKS blocked UIDs", it) }
                 runCatching { socks?.enforceBlockedPackages(current) }
                     .onFailure { logE("Unable to enforce changed app block-list", it) }
-                if (callback != null) {
-                    synchronized(processNativeLifecycleLock) {
-                        if (sessionIsCurrent(mySession) &&
-                            nativeOwnerGeneration.get() == nativeGeneration &&
-                            nativeGeneration > 0L
-                        ) {
-                            runCatching {
-                                check(TProxyService.TProxySetUidPocCallback(null)) {
-                                    "Unable to clear UID cache after app policy change"
-                                }
-                                check(TProxyService.TProxySetUidPocCallback(callback)) {
-                                    "Unable to re-register UID callback after app policy change"
-                                }
-                            }.onFailure {
-                                UidPocDiagnostics.error(this@SpeedVpnService, "UID policy cache refresh failed", it)
-                            }
-                        }
-                    }
-                }
                 log("UID_POLICY_CHANGED blockedPackages=" + current.sorted().joinToString(","))
             }
         }
@@ -1038,33 +1041,12 @@ class SpeedVpnService : VpnService() {
             SpeedLimiter.beginSession(newGeneration)
         }
         val started = runCatching {
-            val hookDisabled = getSharedPreferences(UidPocSettings.PREFS, MODE_PRIVATE)
-                .getBoolean(UidPocSettings.KEY_DISABLE_JNI_HOOK, false)
-            // App blocking must also be active in Release. The test preference may disable the hook only in Debug builds.
-            if (!BuildConfig.DEBUG || !hookDisabled) {
-                UidPocDiagnostics.log(this, "JNI_HOOK_REGISTER_BEGIN generation=$newGeneration mode=HOOK_ENABLED")
-                val diagnostic = uidDetectionPoc ?: UidDetectionPoc(this).also {
-                    uidDetectionPoc = it
-                }
-                val callbackRegistered = TProxyService.TProxySetUidPocCallback(diagnostic)
-                UidPocDiagnostics.log(this, "JNI_HOOK_REGISTER_RETURN registered=$callbackRegistered")
-                check(callbackRegistered) {
-                    "Unable to register temporary UID detection callback"
-                }
-            } else if (BuildConfig.DEBUG) {
-                UidPocDiagnostics.log(this, "JNI_HOOK_DISABLED generation=$newGeneration; continuing native start without Kotlin callback")
-                runCatching { TProxyService.TProxySetUidPocCallback(null) }
-                    .onFailure { UidPocDiagnostics.error(this, "Unable to clear UID POC callback in disabled mode", it) }
-                uidDetectionPoc?.close()
-                uidDetectionPoc = null
-            }
-            UidPocDiagnostics.log(this, "JNI_NATIVE_START_BEGIN generation=$newGeneration fd=${expectedTun.fd}")
+            log("JNI_NATIVE_START_BEGIN generation=${newGeneration} fd=${expectedTun.fd}")
             val nativeStarted = TProxyService.TProxyStartService(configPath, expectedTun.fd)
-            UidPocDiagnostics.log(this, "JNI_NATIVE_START_RETURN started=$nativeStarted")
+            log("JNI_NATIVE_START_RETURN started=$nativeStarted")
             nativeStarted
         }.getOrElse {
-            UidPocDiagnostics.error(this, "JNI/native startup raised a throwable", it)
-            logE("Native start threw an exception", it)
+            logE("JNI/native startup raised a throwable", it)
             false
         }
 
@@ -1073,10 +1055,6 @@ class SpeedVpnService : VpnService() {
             nativeOwnerGeneration.set(newGeneration)
             engineRunning = true
         } else {
-            runCatching { TProxyService.TProxySetUidPocCallback(null) }
-                .onFailure { logE("Unable to clear failed-start UID callback", it) }
-            uidDetectionPoc?.close()
-            uidDetectionPoc = null
             SpeedLimiter.endSession(newGeneration)
         }
         started
@@ -1101,11 +1079,6 @@ class SpeedVpnService : VpnService() {
                 if (endLimiterSession) SpeedLimiter.endSession(expectedGeneration)
                 return@synchronized false
             }
-
-            runCatching { TProxyService.TProxySetUidPocCallback(null) }
-                .onFailure { logE("Unable to clear UID callback", it) }
-            uidDetectionPoc?.close()
-            uidDetectionPoc = null
 
             val stopReported = runCatching { TProxyService.TProxyStopService() }
                 .onFailure { logE("Native stop threw for generation $expectedGeneration", it) }
@@ -1389,6 +1362,7 @@ class SpeedVpnService : VpnService() {
         scope.cancel()
         upstreamProbeDnsExecutor.shutdownNow()
         unregisterPhysicalNetworkCallback()
+        activeServiceInstance.compareAndSet(this, null)
         super.onDestroy()
     }
 }

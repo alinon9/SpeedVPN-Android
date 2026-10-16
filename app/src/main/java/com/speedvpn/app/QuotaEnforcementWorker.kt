@@ -35,10 +35,6 @@ internal object QuotaWorkScheduler {
     fun schedule(context: Context) {
         val request = androidx.work.PeriodicWorkRequestBuilder<QuotaEnforcementWorker>(
             15, java.util.concurrent.TimeUnit.MINUTES,
-        ).setConstraints(
-            androidx.work.Constraints.Builder()
-                .setRequiredNetworkType(androidx.work.NetworkType.CONNECTED)
-                .build()
         ).build()
 
         androidx.work.WorkManager.getInstance(context).enqueueUniquePeriodicWork(

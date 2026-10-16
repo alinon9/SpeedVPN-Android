@@ -22,6 +22,16 @@ case "$HEAD" in
 esac
 
 echo "OK - hev-socks5-tunnel pinned to $TAG ($HEAD)"
-python3 scripts/e2e/patch_hev_tcp_buffers.py "$DIR/third-part/lwip/src/ports/include/lwipopts.h"
-python3 scripts/e2e/patch_hev_tcp_buffers.py --check "$DIR/third-part/lwip/src/ports/include/lwipopts.h"
-python3 scripts/poc/uid_detection/patch_hev_uid_detection_poc.py "$DIR"
+TCP_SOURCE="$DIR/src/hev-socks5-session-tcp.c"
+LWIP_OPTS="$DIR/third-part/lwip/src/ports/include/lwipopts.h"
+test -s "$TCP_SOURCE"
+test -s "$LWIP_OPTS"
+python3 scripts/e2e/patch_hev_tcp_buffers.py "$LWIP_OPTS" --tcp-source "$TCP_SOURCE"
+python3 scripts/e2e/patch_hev_tcp_buffers.py "$LWIP_OPTS" --tcp-source "$TCP_SOURCE" --check
+
+# Production builds must never contain the experimental JNI UID upcall hook.
+if grep -R -nE 'SPEEDVPN_UID_POC_BEGIN|native_set_uid_poc_callback|TProxySetUidPocCallback|uid_poc_' "$DIR/src"; then
+  echo "ERROR - unsafe UID POC patch residue found in native sources" >&2
+  exit 1
+fi
+echo "OK - native TCP patches verified; UID POC hook absent"

@@ -3,6 +3,18 @@ package com.speedvpn.app
 import android.app.usage.NetworkStats
 import android.app.usage.NetworkStatsManager
 import android.content.Context
+import android.content.Intent
+import androidx.work.CoroutineWorker
+import androidx.work.ExistingPeriodicWorkPolicy
+import androidx.work.ExistingWorkPolicy
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.PeriodicWorkRequestBuilder
+import androidx.work.WorkManager
+import androidx.work.WorkerParameters
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.util.concurrent.TimeUnit
 import android.net.ConnectivityManager
 import java.util.Calendar
 import kotlin.math.max
@@ -125,42 +137,83 @@ internal object UsageCollector {
 }
 
 internal object UsageCollectionScheduler {
-    private const val REQUEST_CODE = 7302
+    private const val WORK_NAME = "usage_collection_daily"
+    private const val IMMEDIATE_WORK_NAME = "usage_collection_immediate"
+    private const val LEGACY_REQUEST_CODE = 7302
 
     fun schedule(context: Context) {
-        val alarmManager = context.getSystemService(android.app.AlarmManager::class.java) ?: return
-        val intent = android.content.Intent(context, UsageCollectionReceiver::class.java)
-        val pending = android.app.PendingIntent.getBroadcast(
-            context,
-            REQUEST_CODE,
-            intent,
-            android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE,
-        )
-        alarmManager.cancel(pending)
-        val calendar = Calendar.getInstance().apply {
+        cancelLegacyAlarm(context)
+        val nextRun = Calendar.getInstance().apply {
             add(Calendar.DAY_OF_YEAR, 1)
             set(Calendar.HOUR_OF_DAY, 0)
             set(Calendar.MINUTE, 5)
             set(Calendar.SECOND, 0)
             set(Calendar.MILLISECOND, 0)
         }
-        alarmManager.setInexactRepeating(
-            android.app.AlarmManager.RTC_WAKEUP,
-            calendar.timeInMillis,
-            android.app.AlarmManager.INTERVAL_DAY,
-            pending,
+        val initialDelay = (nextRun.timeInMillis - System.currentTimeMillis()).coerceAtLeast(0L)
+        val request = PeriodicWorkRequestBuilder<UsageCollectionWorker>(24, TimeUnit.HOURS)
+            .setInitialDelay(initialDelay, TimeUnit.MILLISECONDS)
+            .build()
+        WorkManager.getInstance(context.applicationContext).enqueueUniquePeriodicWork(
+            WORK_NAME,
+            ExistingPeriodicWorkPolicy.UPDATE,
+            request,
+        )
+    }
+
+    fun enqueueNow(context: Context) {
+        if (!SmartSettings.isStatsEnabled(context)) return
+        val request = OneTimeWorkRequestBuilder<UsageCollectionWorker>().build()
+        WorkManager.getInstance(context.applicationContext).enqueueUniqueWork(
+            IMMEDIATE_WORK_NAME,
+            ExistingWorkPolicy.KEEP,
+            request,
         )
     }
 
     fun cancel(context: Context) {
+        cancelLegacyAlarm(context)
+        val workManager = WorkManager.getInstance(context.applicationContext)
+        workManager.cancelUniqueWork(WORK_NAME)
+        workManager.cancelUniqueWork(IMMEDIATE_WORK_NAME)
+    }
+
+    private fun cancelLegacyAlarm(context: Context) {
         val alarmManager = context.getSystemService(android.app.AlarmManager::class.java) ?: return
         val pending = android.app.PendingIntent.getBroadcast(
             context,
-            REQUEST_CODE,
-            android.content.Intent(context, UsageCollectionReceiver::class.java),
+            LEGACY_REQUEST_CODE,
+            Intent(context, UsageCollectionReceiver::class.java),
             android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE,
         )
         alarmManager.cancel(pending)
+        pending.cancel()
+    }
+}
+
+internal class UsageCollectionWorker(
+    appContext: Context,
+    params: WorkerParameters,
+) : CoroutineWorker(appContext, params) {
+    override suspend fun doWork(): Result {
+        if (!SmartSettings.isStatsEnabled(applicationContext)) return Result.success()
+        return try {
+            withContext(Dispatchers.IO) {
+                UsageCollector.collectToday(applicationContext)
+            }
+            Result.success()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            DiagnosticsRepository.record(
+                applicationContext,
+                "WARN",
+                "UsageCollection",
+                "COLLECTION_WORKER_FAILED",
+                error.stackTraceToString(),
+            )
+            Result.retry()
+        }
     }
 }
 
