@@ -20,6 +20,7 @@ STATUS_UNLIMITED = "✅ لا يظهر سقف واضح"
 
 # Final CI states: verified passes or explicitly documented infrastructure limits.
 ACCEPTED_FINAL_STATES = {"PASS", "PASS_UNLIMITED", "ENV_LIMITED", "ENV_INSUFFICIENT"}
+STRICT_SWEEP_PASS_STATES = {"PASS", "PASS_UNLIMITED"}
 
 VALUE_TAGS = {
     f"verify_{direction}_{field}_value"
@@ -684,10 +685,13 @@ def validate_sweep(csv_path: str) -> int:
         _, _, _, _, result = check_metric(direction, values, expected)
         calculated, sep, reason = result.partition("|")
         recorded = row["classification"]
-        if calculated not in ACCEPTED_FINAL_STATES:
-            errors.append(f"{key}: strict measurement check failed: {reason or calculated}")
-        if recorded not in ACCEPTED_FINAL_STATES:
-            errors.append(f"{key}: recorded classification is {recorded}")
+        if calculated not in STRICT_SWEEP_PASS_STATES:
+            if calculated in {"ENV_LIMITED", "ENV_INSUFFICIENT"}:
+                errors.append(f"{key}: {calculated} is an environmental limitation, not a strict limiter pass")
+            else:
+                errors.append(f"{key}: strict measurement check failed: {reason or calculated}")
+        if recorded not in STRICT_SWEEP_PASS_STATES:
+            errors.append(f"{key}: recorded classification {recorded} cannot satisfy strict 38/38")
         if recorded != calculated:
             errors.append(f"{key}: recorded class {recorded} disagrees with strict class {calculated}")
         if status == "FAIL" and recorded != "FAIL":
