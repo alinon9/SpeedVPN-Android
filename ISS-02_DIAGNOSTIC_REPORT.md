@@ -19,8 +19,8 @@
 ### بعد الإصلاح
 
 - أضيفت `protectSocketOrClose` في [Socks5Server.kt](https://github.com/alinon9/SpeedVPN-Android/blob/fix/iss-02-socket-lifecycle/app/src/main/java/com/speedvpn/app/Socks5Server.kt#L83). إذا أعادت `protect` القيمة `false` أو رمت استثناءً، يُغلق المقبس ويُسجّل الخطأ ثم يُرفع الاستثناء؛ ولا يُسمح بمتابعة الربط أو الاتصال.
-- TCP الخارجي: [Socks5Server.kt](https://github.com/alinon9/SpeedVPN-Android/blob/fix/iss-02-socket-lifecycle/app/src/main/java/com/speedvpn/app/Socks5Server.kt#L827-L847).
-- UDP الخارجي: [Socks5Server.kt](https://github.com/alinon9/SpeedVPN-Android/blob/fix/iss-02-socket-lifecycle/app/src/main/java/com/speedvpn/app/Socks5Server.kt#L1459-L1499).
+- TCP الخارجي: [Socks5Server.kt](https://github.com/alinon9/SpeedVPN-Android/blob/fix/iss-02-socket-lifecycle/app/src/main/java/com/speedvpn/app/Socks5Server.kt#L834-L854).
+- UDP الخارجي: [Socks5Server.kt](https://github.com/alinon9/SpeedVPN-Android/blob/fix/iss-02-socket-lifecycle/app/src/main/java/com/speedvpn/app/Socks5Server.kt#L1459-L1503).
 - DNS المشفر: [EncryptedDnsResolver.kt](https://github.com/alinon9/SpeedVPN-Android/blob/fix/iss-02-socket-lifecycle/app/src/main/java/com/speedvpn/app/EncryptedDnsResolver.kt#L110-L131).
 - فحص الوصول الخارجي: [SpeedVpnService.kt](https://github.com/alinon9/SpeedVPN-Android/blob/fix/iss-02-socket-lifecycle/app/src/main/java/com/speedvpn/app/SpeedVpnService.kt#L786-L796).
 
@@ -34,7 +34,7 @@
 
 ### بعد الإصلاح
 
-- المصافحة وقراءة الطلب تبقيان ضمن مهلة 10 ثوانٍ: [Socks5Server.kt](https://github.com/alinon9/SpeedVPN-Android/blob/fix/iss-02-socket-lifecycle/app/src/main/java/com/speedvpn/app/Socks5Server.kt#L686-L738).
+- المصافحة وقراءة الطلب تبقيان ضمن مهلة 10 ثوانٍ: [Socks5Server.kt](https://github.com/alinon9/SpeedVPN-Android/blob/fix/iss-02-socket-lifecycle/app/src/main/java/com/speedvpn/app/Socks5Server.kt#L691-L744).
 - أضيفت `RELAY_READ_TIMEOUT_MS = 120_000`، وتُطبّق على طرف العميل وتدفق TCP الخارجي؛ وتبقى مهلة الاتصال محددة في `Socket.connect(..., remainingMs)`.
 - اتصالات `UDP ASSOCIATE` تترك اتصال التحكم المحلي مفتوحًا أثناء عمر الارتباط؛ هذا مقصود في البروتوكول. يُغلق هذا الاتصال عند إيقاف الخادم أو إغلاق العميل، ويُغلق مقبس استقبال UDP المحلي في مسار التنظيف.
 - يحتفظ الخادم بمقبض خيط القبول؛ ويغلق المقابس النشطة، ويلغي DNS المشفر، ويوقف مجمّعات العمال ضمن مهلة انتظار مشتركة لا تتجاوز 3 ثوانٍ، مع تسجيل الانقطاع أو انتهاء المهلة: [Socks5Server.kt](https://github.com/alinon9/SpeedVPN-Android/blob/fix/iss-02-socket-lifecycle/app/src/main/java/com/speedvpn/app/Socks5Server.kt#L323-L373).
