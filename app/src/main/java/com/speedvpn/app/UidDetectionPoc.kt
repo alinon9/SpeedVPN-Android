@@ -16,22 +16,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 
-/**
- * Normalize IPv4-mapped IPv6 socket endpoints before calling ConnectivityManager.
- * Android's owner-UID table may contain the IPv4 socket as an Inet4Address even
- * when the packet parser surfaced the same endpoint as ::ffff:a.b.c.d.
- */
-internal fun normalizeOwnerAddressBytes(address: ByteArray): ByteArray {
-    if (address.size != 16 ||
-        address.take(10).any { it != 0.toByte() } ||
-        address[10] != 0xff.toByte() ||
-        address[11] != 0xff.toByte()
-    ) {
-        return address.copyOf()
-    }
-    return address.copyOfRange(12, 16)
-}
-
 internal data class UidDetectionRecord(
     val id: Long,
     val timestampMillis: Long,
@@ -254,8 +238,8 @@ internal class UidDetectionPoc(
             return unresolvedUid()
         }
 
-                val localBytes = normalizeOwnerAddressBytes(srcAddress)
-        val remoteBytes = normalizeOwnerAddressBytes(dstAddress)
+        val localBytes = VpnApplicationPolicy.normalizeUidQueryAddressBytes(srcAddress)
+        val remoteBytes = VpnApplicationPolicy.normalizeUidQueryAddressBytes(dstAddress)
         if (localBytes.size != remoteBytes.size) {
             UidPocDiagnostics.log(service, "OWNER_UID_QUERY_SKIPPED id=$callId reason=ADDRESS_FAMILY_MISMATCH")
             return unresolvedUid()
