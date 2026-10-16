@@ -6,6 +6,7 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONObject
+import java.io.Closeable
 import java.io.IOException
 import java.net.InetAddress
 import java.net.InetSocketAddress
@@ -21,7 +22,7 @@ class EncryptedDnsResolver(
     private val protect: (Socket) -> Boolean,
     private val ipv6Enabled: Boolean,
     private val dnsIpv4Only: Boolean = false,
-) {
+) : Closeable {
     companion object {
         private const val DOH_HOST = "cloudflare-dns.com"
         private const val DOH_IP_V4 = "1.1.1.1"
@@ -39,6 +40,14 @@ class EncryptedDnsResolver(
         .writeTimeout(TIMEOUT_MS, TimeUnit.MILLISECONDS)
         .retryOnConnectionFailure(false)
         .build()
+
+    override fun close() {
+        // Cancel active OkHttp exchanges first, then evict idle connections and stop
+        // this resolver's dispatcher so an old physical Network cannot retain sockets.
+        client.dispatcher.cancelAll()
+        client.connectionPool.evictAll()
+        client.dispatcher.executorService.shutdownNow()
+    }
 
     fun resolve(host: String): List<InetAddress> {
         require(host.isNotBlank()) { "empty host" }
