@@ -19,6 +19,13 @@ import org.robolectric.RobolectricTestRunner
 @RunWith(RobolectricTestRunner::class)
 class Socks5ServerProtectionTest {
     @Test
+    fun dnsIpv4OnlyPreferenceDisablesAaaaQueriesWithoutChangingIpv6RoutePolicy() {
+        assertFalse(shouldQueryIpv6Dns(ipv6Enabled = true, dnsIpv4Only = true))
+        assertTrue(shouldQueryIpv6Dns(ipv6Enabled = true, dnsIpv4Only = false))
+        assertFalse(shouldQueryIpv6Dns(ipv6Enabled = false, dnsIpv4Only = false))
+    }
+
+    @Test
     fun protectFalseClosesTcpSocketBeforeAnyOutboundIo() {
         val socket = Socket()
         var protectCalls = 0
