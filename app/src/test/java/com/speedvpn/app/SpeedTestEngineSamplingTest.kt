@@ -48,7 +48,17 @@ class SpeedTestEngineSamplingTest {
     @Test
     fun permanentAuthorizationErrorsAreNotRetriedButTransientStatusesAre() {
         assertFalse(SpeedTestEngine.isRetryableSpeedTestFailure(IOException("Download HTTP 403")))
+        assertFalse(
+            SpeedTestEngine.isRetryableSpeedTestFailure(
+                IOException("Unexpected Download HTTP status 403; expected 200..206"),
+            ),
+        )
         assertTrue(SpeedTestEngine.isRetryableSpeedTestFailure(IOException("Download HTTP 429")))
+        assertTrue(
+            SpeedTestEngine.isRetryableSpeedTestFailure(
+                IOException("Unexpected Download HTTP status 429; expected 200..206"),
+            ),
+        )
         assertTrue(SpeedTestEngine.isRetryableSpeedTestFailure(IOException("Upload HTTP 503")))
         assertTrue(SpeedTestEngine.isRetryableSpeedTestFailure(IOException("socket reset")))
     }
