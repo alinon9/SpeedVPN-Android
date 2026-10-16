@@ -169,6 +169,16 @@ jobs:
             echo "Signing secrets were not available to this workflow."
           fi
 
+          # Release must package the same native ABI set as Debug.
+          TMP="$(mktemp -d)"
+          trap 'rm -rf "$TMP"' EXIT
+          unzip -q "$APK" 'lib/*/*.so' -d "$TMP"
+          for ABI in arm64-v8a armeabi-v7a x86_64; do
+            test -s "$TMP/lib/$ABI/libhev-socks5-tunnel.so"
+            echo "FOUND release lib/$ABI/libhev-socks5-tunnel.so"
+          done
+          unzip -l "$APK" 'lib/*/*.so'
+
       - name: Upload APKs
         if: ${{ always() }}
         uses: actions/upload-artifact@v7
