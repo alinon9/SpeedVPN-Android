@@ -8,6 +8,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import kotlinx.coroutines.CancellationException
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34])
@@ -78,6 +79,67 @@ class SpeedLimiterVerificationLockTest {
         SpeedLimiter.endVerification(6_000L, 4_000L)
 
         assertFalse(SpeedLimiter.routeVerificationTrafficThroughVpn)
+    }
+
+    @Test
+    fun originalPlanIsRestoredAfterVerificationFailureOrCancellation() {
+        assertTrue(SpeedLimiter.setLimitsKbps(7_000L, 3_000L))
+        val simulatedFailures: List<Throwable> = listOf(
+            IllegalStateException("simulated verification failure"),
+            CancellationException("simulated verification cancellation"),
+        )
+
+        simulatedFailures.forEach { failure ->
+            assertTrue(SpeedLimiter.beginVerification(null, null))
+            try {
+                SpeedLimiter.setVerificationLimits(1_200L, 900L)
+                throw failure
+            } catch (_: Throwable) {
+                // Emulate verify() failing/cancelling after changing the temporary plan.
+            } finally {
+                SpeedLimiter.setVerificationTrafficRoutingEnabled(false)
+                SpeedLimiter.endVerificationRestoringPreviousLimits()
+            }
+
+            assertEquals(7_000L * 125L, SpeedLimiter.download.bytesPerSec)
+            assertEquals(3_000L * 125L, SpeedLimiter.upload.bytesPerSec)
+            assertFalse(SpeedLimiter.verificationInProgress.value)
+            assertFalse(SpeedLimiter.routeVerificationTrafficThroughVpn)
+        }
+    }
+
+    @Test
+    fun verificationCounterWindowCountsOnlyTheAttributedUidAndResetsPerRun() {
+        val generation = 918_273L
+        val ownUid = 12_345
+        assertTrue(SpeedLimiter.beginVerification(null, null))
+        SpeedLimiter.beginSession(generation)
+        SpeedLimiter.setVerificationTrafficRoutingEnabled(true)
+
+        try {
+            assertTrue(SpeedLimiter.beginVerificationTrafficWindow(generation, ownUid))
+            val before = requireNotNull(SpeedLimiter.verificationTrafficSnapshot(generation))
+            SpeedLimiter.recordVerificationForwarded(SpeedLimiter.download, 800, generation, ownUid + 1)
+            SpeedLimiter.recordVerificationForwarded(SpeedLimiter.download, 400, generation, ownUid)
+            SpeedLimiter.recordVerificationForwarded(SpeedLimiter.upload, 600, generation, ownUid)
+
+            val after = requireNotNull(SpeedLimiter.verificationTrafficSnapshot(generation))
+            assertEquals(0L, before.downloadBytes)
+            assertEquals(400L, after.downloadBytes)
+            assertEquals(600L, after.uploadBytes)
+            assertFalse(SpeedLimiter.beginVerificationTrafficWindow(generation + 1L, ownUid))
+
+            SpeedLimiter.endVerificationTrafficWindow(generation)
+            assertTrue(SpeedLimiter.beginVerificationTrafficWindow(generation, ownUid))
+            val nextRun = requireNotNull(SpeedLimiter.verificationTrafficSnapshot(generation))
+            assertEquals(0L, nextRun.downloadBytes)
+            assertEquals(0L, nextRun.uploadBytes)
+        } finally {
+            SpeedLimiter.endVerificationTrafficWindow(generation)
+            SpeedLimiter.setVerificationTrafficRoutingEnabled(false)
+            SpeedLimiter.endVerification(null, null)
+            SpeedLimiter.endSession(generation)
+        }
     }
 
     @Test

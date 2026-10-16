@@ -299,11 +299,19 @@ class SpeedVpnService : VpnService() {
                     addRoute("::", 0)
                 }
                 .apply {
-                    // Do not install the VpnService application allow-list: omitted apps route outside TUN.
-                    // All apps except SpeedVPN itself use TUN for UID-based firewalling.
-                    addDisallowedApplication(packageName)
-                    log("VPN_TUN_POLICY mode=all-apps-except-self ipv4=0.0.0.0/0 ipv6=::/0 blockedPackages=" +
-                        currentBlockedPackages().sorted().joinToString(","))
+                    if (SpeedLimiter.routeVerificationTrafficThroughVpn) {
+                        // Verify Speed temporarily routes SpeedVPN's own UID through TUN.
+                        // Every relay-created upstream TCP/UDP socket must be protected
+                        // before connect/send, otherwise this would create a routing loop.
+                        log("VPN_TUN_POLICY mode=verification-includes-self ipv4=0.0.0.0/0 ipv6=::/0 blockedPackages=" +
+                            currentBlockedPackages().sorted().joinToString(","))
+                    } else {
+                        // Normal mode leaves SpeedVPN's own UID outside TUN; all other
+                        // applications remain covered by the UID-aware firewall.
+                        addDisallowedApplication(packageName)
+                        log("VPN_TUN_POLICY mode=all-apps-except-self ipv4=0.0.0.0/0 ipv6=::/0 blockedPackages=" +
+                            currentBlockedPackages().sorted().joinToString(","))
+                    }
                 }
             builder.establish()
         } catch (e: IllegalStateException) {
@@ -403,9 +411,16 @@ class SpeedVpnService : VpnService() {
 
     internal fun currentBlockedPackages(): Set<String> {
         val state = VpnAppControl.read(this)
+        val configuredQuotaPackages = runCatching {
+            UsageRepository.readQuotaPolicies(this).map { it.packageName }.toSet()
+        }.getOrDefault(emptySet())
         val quotaBlocked = VpnAppControl.quotaBlockedPackages(this)
-        val manualBlocked = if (state.firewallEnabled) state.blockedPackages else emptySet()
-        return (manualBlocked + quotaBlocked).toSet()
+        return VpnApplicationPolicy.effectiveBlockedPackages(
+            manualFirewallEnabled = state.firewallEnabled,
+            manuallyBlockedPackages = state.blockedPackages,
+            quotaBlockedPackages = quotaBlocked,
+            configuredQuotaPackages = configuredQuotaPackages,
+        )
     }
 
     internal fun recordDetectedFlow(
@@ -884,12 +899,24 @@ class SpeedVpnService : VpnService() {
             while (isActive && sessionId.get() == mySession) {
                 delay(5_000)
                 if (!sessionIsCurrent(mySession)) break
+                val quotaPolicies = try {
+                    UsageRepository.readQuotaPolicies(this@SpeedVpnService)
+                } catch (error: Exception) {
+                    logE("Unable to read configured quota policies", error)
+                    continue
+                }
+                if (quotaPolicies.isEmpty()) {
+                    val staleQuotaBlocks = VpnAppControl.quotaBlockedPackages(this@SpeedVpnService)
+                    if (staleQuotaBlocks.isNotEmpty()) {
+                        VpnAppControl.replaceQuotaBlockedPackages(this@SpeedVpnService, emptySet())
+                        log("Cleared stale quota blocks because no quota policies remain: " +
+                            staleQuotaBlocks.sorted().joinToString(","))
+                    }
+                    continue
+                }
                 if (SmartSettings.isStatsEnabled(this@SpeedVpnService) &&
                     AppTrafficManager.hasUsageAccess(this@SpeedVpnService)
                 ) {
-                    if (UsageRepository.readQuotaPolicies(this@SpeedVpnService).isEmpty()) {
-                        continue
-                    }
                     runCatching {
                         // Enforcement reads NetworkStatsManager directly for each
                         // configured UID. Do not run the heavier daily snapshot collector

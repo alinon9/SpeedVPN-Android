@@ -799,10 +799,9 @@ class Socks5Server(
         var destinationWriteNs = 0L
         var destinationWriteInProgress = false
         try {
-            // Match relay read granularity to the current pacing bucket. A 16 KiB
-            // read requires hundreds of scheduler wakeups per second at high rates;
-            // larger reads reduce that overhead while staying inside the bucket's
-            // bounded burst window. The bucket can change while the pipe is active.
+            // Read no more than the current plan's 10 ms budget. A plan can
+            // change while a blocking read is in flight, so the bytes actually read
+            // are split again using the latest budget before each downstream write.
             val buf = ByteArray(256 * 1024)
             while (running && SpeedLimiter.isGenerationActive(generation)) {
                 destinationWriteInProgress = false
@@ -814,6 +813,8 @@ class Socks5Server(
                     maxBytes = readSize,
                 )
                 sourceReadNs += System.nanoTime() - readStartedNs
+                // bytesRead is the payload actually returned by this blocking read.
+                // Never charge buf.size/readSize: those values are capacity, not data.
                 val n = batch.bytesRead
                 if (n < 0) {
                     eof = true
@@ -822,28 +823,52 @@ class Socks5Server(
                 }
                 readCalls += batch.readCalls.toLong()
                 maxReadBytes = maxOf(maxReadBytes, n)
-                val limiterStartedNs = System.nanoTime()
-                val mayProceed = SpeedLimiter.acquire(bucket, n, generation)
-                limiterCallNs += System.nanoTime() - limiterStartedNs
-                if (!mayProceed) {
-                    exitReason = "limiter_or_session_inactive"
-                    break
+
+                var offset = 0
+                while (offset < n) {
+                    destinationWriteInProgress = false
+                    if (!running || !SpeedLimiter.isGenerationActive(generation)) {
+                        exitReason = "session_stopped"
+                        break
+                    }
+
+                    // Re-evaluate the current rate for every write chunk so a change
+                    // from Unlimited/high speed to a slow plan does not flush an old,
+                    // oversized TCP read in one burst or stall before forwarding it.
+                    val chunkSize = bucket.recommendedReadBytes().coerceAtMost(n - offset)
+                    val limiterStartedNs = System.nanoTime()
+                    val mayProceed = SpeedLimiter.acquire(bucket, chunkSize, generation)
+                    limiterCallNs += System.nanoTime() - limiterStartedNs
+                    if (!mayProceed) {
+                        exitReason = "limiter_or_session_inactive"
+                        break
+                    }
+                    if (!running || !SpeedLimiter.isGenerationActive(generation)) {
+                        exitReason = "session_stopped"
+                        break
+                    }
+
+                    val writeStartedNs = System.nanoTime()
+                    destinationWriteInProgress = true
+                    dst.write(buf, offset, chunkSize)
+                    destinationWriteInProgress = false
+                    writeCalls++
+                    val writeFinishedNs = System.nanoTime()
+                    destinationWriteNs += writeFinishedNs - writeStartedNs
+                    if (firstForwardedNs == 0L) firstForwardedNs = writeStartedNs
+                    lastForwardedNs = writeFinishedNs
+                    bucket.recordForwarded(chunkSize, generation)
+                    // Only count successfully relayed bytes from the app UID owning this flow.
+                    SpeedLimiter.recordVerificationForwarded(
+                        bucket = bucket,
+                        n = chunkSize,
+                        generation = generation,
+                        ownerUid = upstreamTcpMetadata[flowSocket]?.uid,
+                    )
+                    forwardedBytes += chunkSize.toLong()
+                    offset += chunkSize
                 }
-                if (!running || !SpeedLimiter.isGenerationActive(generation)) {
-                    exitReason = "session_stopped"
-                    break
-                }
-                val writeStartedNs = System.nanoTime()
-                destinationWriteInProgress = true
-                dst.write(buf, 0, n)
-                destinationWriteInProgress = false
-                writeCalls++
-                val writeFinishedNs = System.nanoTime()
-                destinationWriteNs += writeFinishedNs - writeStartedNs
-                if (firstForwardedNs == 0L) firstForwardedNs = writeStartedNs
-                lastForwardedNs = writeFinishedNs
-                bucket.recordForwarded(n, generation)
-                forwardedBytes += n.toLong()
+                if (offset < n) break
             }
             runCatching { dst.flush() }
         } catch (error: SocketException) {
@@ -1063,6 +1088,8 @@ class Socks5Server(
                             udpFlows.advanceCandidateIfUnanswered(flow, now, UDP_CANDIDATE_FALLBACK_MS)
                             val addr = flow.candidates.getOrNull(flow.selectedIndex) ?: continue
 
+                            // UDP and QUIC share the same global upload bucket as TCP;
+                            // charge the parsed payload length, not the SOCKS header or buffer size.
                             if (!SpeedLimiter.acquire(SpeedLimiter.upload, payloadLen, generation)) break
                             if (!running || !SpeedLimiter.isGenerationActive(generation)) break
 
@@ -1341,6 +1368,8 @@ class Socks5Server(
                             val payload = ByteArray(count)
                             buffer.get(payload)
 
+                            // count is the actual upstream datagram payload length. UDP/QUIC
+                            // replies consume the same download bucket as TCP relay traffic.
                             if (!SpeedLimiter.acquire(SpeedLimiter.download, count, generation)) {
                                 continue
                             }

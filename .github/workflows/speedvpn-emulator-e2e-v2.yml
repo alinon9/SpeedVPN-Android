@@ -56,6 +56,11 @@ jobs:
       - name: Build debug APK
         run: ./gradlew :app:assembleDebug -PspeedTestBaseUrl=http://10.0.2.2:18765 --stacktrace --no-daemon
 
+      - name: Verify current-build native library hashes
+        run: |
+          set -euo pipefail
+          python3 scripts/e2e/verify_apk_native.py app/build/outputs/apk/debug/app-debug.apk --variant debug --native-build-root app/build/intermediates --output native-build-fingerprint.txt
+
       - name: Fingerprint measured APK
         run: |
           set -euo pipefail
@@ -419,17 +424,21 @@ jobs:
               ;;
             75)
               echo "sweep_status=ENV_INSUFFICIENT" >> "$GITHUB_OUTPUT"
-              echo "ACCEPTANCE_PASS: ENV_INSUFFICIENT — runner preflight could not establish required network headroom. APK build, JVM tests, app smoke test, and speed-test UI checks completed; the exhaustive speed sweep did not run, so no speed metrics are claimed." | tee -a "$GITHUB_STEP_SUMMARY"
+              echo "ENVIRONMENT_LIMITATION_NOT_PASS: ENV_INSUFFICIENT — runner preflight could not establish required network headroom. APK build, JVM tests, app smoke test, and speed-test UI checks completed; the exhaustive speed sweep did not run, so no speed metrics are claimed." | tee -a "$GITHUB_STEP_SUMMARY"
               ;;
             *)
-              echo "SPEED_SWEEP_ERROR: speed-limit-sweep.sh exited with code ${SWEEP_RC}; only exit 75 (ENV_INSUFFICIENT) is accepted as an environmental limitation." | tee -a "$GITHUB_STEP_SUMMARY"
+              echo "SPEED_SWEEP_ERROR: speed-limit-sweep.sh exited with code ${SWEEP_RC}; only exit 75 (ENV_INSUFFICIENT) is an environmental skip; it is not a passing speed-limit result." | tee -a "$GITHUB_STEP_SUMMARY"
               exit "$SWEEP_RC"
               ;;
           esac
 
       - name: Strict 38/38 speed-limiter gate
-        if: ${{ !cancelled() && steps.e2e.outputs.sweep_status != 'ENV_INSUFFICIENT' }}
+        if: ${{ always() && !cancelled() }}
         run: |
+          if [ "${{ steps.e2e.outputs.sweep_status }}" = "ENV_INSUFFICIENT" ]; then
+            echo "ENVIRONMENT_LIMITATION: preflight did not meet runner headroom; strict 38/38 acceptance is not claimed."
+            exit 1
+          fi
           set -euo pipefail
           test -s speed-limit-sweep-results.csv || { echo "Missing speed-limit-sweep-results.csv"; exit 1; }
           python3 scripts/e2e/verify_metrics.py validate-sweep speed-limit-sweep-results.csv

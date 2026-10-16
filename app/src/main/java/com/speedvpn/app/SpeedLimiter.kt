@@ -14,22 +14,58 @@ internal data class SessionCounter(
     val bytes: Long,
 )
 
+internal data class VerificationTrafficSnapshot(
+    val generation: Long,
+    val uid: Int,
+    val downloadBytes: Long,
+    val uploadBytes: Long,
+)
+
+private class VerificationTrafficWindow(
+    val generation: Long,
+    val uid: Int,
+) {
+    private val downloadBytes = AtomicLong(0L)
+    private val uploadBytes = AtomicLong(0L)
+
+    fun record(bucket: TokenBucket, n: Int) {
+        if (n <= 0) return
+        val counter = when {
+            bucket === SpeedLimiter.download -> downloadBytes
+            bucket === SpeedLimiter.upload -> uploadBytes
+            else -> return
+        }
+        val delta = n.toLong()
+        counter.updateAndGet { current ->
+            if (Long.MAX_VALUE - current < delta) Long.MAX_VALUE else current + delta
+        }
+    }
+
+    fun snapshot(): VerificationTrafficSnapshot = VerificationTrafficSnapshot(
+        generation = generation,
+        uid = uid,
+        downloadBytes = downloadBytes.get(),
+        uploadBytes = uploadBytes.get(),
+    )
+}
+
 /**
  * Global device-wide pacing limiter.
  *
  * Uses a monotonic-clock token bucket shared by all flows in each direction.
  * Tokens accrue while the relay is reading/writing sockets, so ordinary I/O
  * overhead is accounted for instead of being added on top of a full per-chunk
- * sleep. A bounded burst absorbs scheduler jitter; no waiter reserves future
- * tokens before those tokens are available.
+ * sleep. A small bounded burst absorbs scheduler jitter. Oversized datagrams
+ * reserve their actual byte cost as debt and wait for that budget before send.
  */
 class TokenBucket {
     companion object {
         private const val NANOS_PER_SECOND = 1_000_000_000.0
         private const val BURST_WINDOW_NS = 10_000_000L
-        // Preserve the relay's normal 16 KiB TCP read size as the minimum burst.
-        // At higher rates, permit at most 256 KiB of accumulated credit.
-        private const val MIN_BURST_BYTES = 16 * 1024
+        // Do not impose a fixed 16 KiB minimum: at low rates that creates a
+        // large first burst and lets each relay read overshoot its 10 ms budget.
+        // One byte is enough for the slowest supported finite rate.
+        private const val MIN_BURST_BYTES = 1
         private const val MAX_BURST_BYTES = 256 * 1024
     }
 
@@ -54,8 +90,9 @@ class TokenBucket {
             val newRate = max(0L, bytesPerSec)
             this.bytesPerSec = newRate
             capacityBytes = burstCapacity(newRate)
-            // Apply a changed rate immediately. One in-flight chunk can complete
-            // under the old schedule; subsequent acquires use the new token budget.
+            // Applying a plan clears accumulated debt and starts with only the new
+            // plan's bounded burst. signalAll wakes waiters so old-rate waits do not
+            // delay a plan change (Unlimited bypasses pacing on the next acquire).
             availableBytes = capacityBytes
             lastRefillNs = System.nanoTime()
             changed.signalAll()
@@ -64,15 +101,20 @@ class TokenBucket {
 
     /**
      * Wait until enough credit exists for this chunk, then debit it.
-     * A rate of zero means unlimited. Chunks larger than the bucket capacity
-     * are allowed once the bucket is full and create debt that must refill before
-     * the next chunk, so a large UDP datagram cannot wait forever.
+     * A rate of zero means unlimited. A datagram larger than bucket capacity
+     * cannot fit in the bucket, so its actual byte cost is debited as debt and
+     * this call waits for that debt to be earned before allowing the send.
      */
     fun acquire(n: Int, canProceed: () -> Boolean = { true }): Boolean {
         if (n <= 0) return canProceed()
 
         lock.lock()
         try {
+            // An oversized request reserves its real cost once. It remains here
+            // waiting while the shared bucket earns that debt back; later requests
+            // therefore cannot bypass the datagram's budget or wait forever for a
+            // token balance the bounded bucket can never hold.
+            var oversizedDebtReserved = false
             while (true) {
                 if (!canProceed()) return false
                 val rate = bytesPerSec
@@ -82,12 +124,30 @@ class TokenBucket {
                 refill(now, rate)
                 if (!canProceed()) return false
 
-                // For an oversized packet, a full bucket is the eligibility
-                // threshold. Debiting the full packet then accounts for its
-                // transmission time as token debt before another packet is sent.
+                if (oversizedDebtReserved) {
+                    if (availableBytes >= 0.0) return true
+                    val debtBytes = -availableBytes
+                    val waitNs = ceil(debtBytes * NANOS_PER_SECOND / rate.toDouble())
+                        .toLong()
+                        .coerceAtLeast(1L)
+                    try {
+                        // awaitNanos releases this lock; rate changes can clear debt
+                        // and wake this waiter immediately.
+                        changed.awaitNanos(waitNs)
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        return false
+                    }
+                    continue
+                }
+
                 val requiredBytes = min(n.toDouble(), capacityBytes)
                 if (availableBytes >= requiredBytes) {
                     availableBytes -= n.toDouble()
+                    if (n.toDouble() > capacityBytes && availableBytes < 0.0) {
+                        oversizedDebtReserved = true
+                        continue
+                    }
                     return true
                 }
 
@@ -96,10 +156,11 @@ class TokenBucket {
                     .toLong()
                     .coerceAtLeast(1L)
                 try {
+                    // Condition.awaitNanos releases this lock while blocked. Other
+                    // flows can take available credit, and setRate() can reset debt
+                    // and signal waiters without waiting for a sleeping thread.
                     changed.awaitNanos(waitNs)
                 } catch (_: InterruptedException) {
-                    // No reservation was made for this waiter, so returning cannot
-                    // leave phantom pacing debt behind for other flows.
                     Thread.currentThread().interrupt()
                     return false
                 }
@@ -111,11 +172,10 @@ class TokenBucket {
     }
 
     /**
-     * Chooses a relay read size close to the token bucket's bounded burst window.
-     *
-     * Small plans retain the 16 KiB minimum so a single read cannot create a
-     * large burst. Faster plans use larger reads to reduce per-chunk scheduler
-     * and lock overhead, up to the same 256 KiB maximum used by the bucket.
+     * Chooses a relay read size from the current rate's bounded 10 ms credit.
+     * There is deliberately no fixed minimum chunk: keeping small-plan reads small
+     * prevents the TCP relay from reading a much larger chunk than the plan allows.
+     * Faster plans use larger reads to reduce per-chunk scheduler/lock overhead.
      */
     internal fun recommendedReadBytes(): Int = lock.withLock {
         if (bytesPerSec <= 0L) {
@@ -207,6 +267,8 @@ object SpeedLimiter {
 
     private val verificationLock = Any()
     private var verificationLimits: Pair<Long?, Long?>? = null
+    private var verificationPreviousLimits: Pair<Long?, Long?>? = null
+    private val verificationTrafficWindow = AtomicReference<VerificationTrafficWindow?>(null)
     private var externalVpnCommandsInProgress = 0
     @Volatile
     private var verificationOwnPackageRoutingEnabled = false
@@ -230,6 +292,7 @@ object SpeedLimiter {
             upload.beginSession(generation)
             download.resetScheduler()
             upload.resetScheduler()
+            verificationTrafficWindow.set(null)
             activeSessionGeneration.set(generation)
         }
     }
@@ -253,6 +316,9 @@ object SpeedLimiter {
                 activeSessionGeneration.set(0L)
                 download.endSession(generation)
                 upload.endSession(generation)
+                verificationTrafficWindow.updateAndGet { current ->
+                    if (current?.generation == generation) null else current
+                }
                 download.resetScheduler()
                 upload.resetScheduler()
             }
@@ -280,14 +346,15 @@ object SpeedLimiter {
         }
         if (!normalized.isFinite() || normalized <= 0.0) return null
         // TokenBucket stores bytes/sec as Long. 1 Kbps == 125 bytes/sec.
-        return normalized.toLong().coerceAtMost(Long.MAX_VALUE / 125L).takeIf { it > 0L }
+        return normalizeKbps(normalized.toLong())
     }
 
+    /** Zero/null mean Unlimited; cap finite values before multiplying by 125. */
+    internal fun normalizeKbps(kbps: Long?): Long? =
+        kbps?.takeIf { it > 0L }?.coerceAtMost(Long.MAX_VALUE / 125L)
+
     private fun kbpsToBytesPerSec(kbps: Long?): Long =
-        kbps?.takeIf { it > 0L }
-            ?.coerceAtMost(Long.MAX_VALUE / 125L)
-            ?.times(125L)
-            ?: 0L
+        normalizeKbps(kbps)?.times(125L) ?: 0L
 
     /** Begins a verification and freezes the limiter at the requested rates. */
     fun beginVerification(downloadKbps: Long?, uploadKbps: Long?): Boolean =
@@ -295,6 +362,9 @@ object SpeedLimiter {
             if (verificationLimits != null || externalVpnCommandsInProgress > 0) {
                 false
             } else {
+                val current = VpnRuntime.state.value
+                verificationPreviousLimits = current.downloadLimitKbps to current.uploadLimitKbps
+                verificationTrafficWindow.set(null)
                 verificationLimits = downloadKbps to uploadKbps
                 verificationOwnPackageRoutingEnabled = false
                 verificationInProgress.value = true
@@ -323,16 +393,80 @@ object SpeedLimiter {
         synchronized(verificationLock) {
             check(verificationLimits != null || !enabled) { "No speed verification is active" }
             verificationOwnPackageRoutingEnabled = enabled
+            if (!enabled) verificationTrafficWindow.set(null)
         }
     }
 
-    /** Applies the selected plan and releases the verification lock. */
+    /**
+     * Starts an isolated relay-byte window for this verification's app UID.
+     * Only bytes whose originating flow has this exact UID can enter the window.
+     */
+    internal fun beginVerificationTrafficWindow(generation: Long, uid: Int): Boolean =
+        synchronized(verificationLock) {
+            if (
+                verificationLimits == null ||
+                !verificationOwnPackageRoutingEnabled ||
+                generation <= 0L ||
+                uid <= 0 ||
+                !isGenerationActive(generation) ||
+                verificationTrafficWindow.get() != null
+            ) {
+                false
+            } else {
+                verificationTrafficWindow.set(VerificationTrafficWindow(generation, uid))
+                true
+            }
+        }
+
+    internal fun verificationTrafficSnapshot(generation: Long): VerificationTrafficSnapshot? {
+        val window = verificationTrafficWindow.get() ?: return null
+        return if (window.generation == generation) window.snapshot() else null
+    }
+
+    internal fun endVerificationTrafficWindow(generation: Long) {
+        synchronized(verificationLock) {
+            verificationTrafficWindow.updateAndGet { current ->
+                if (current?.generation == generation) null else current
+            }
+        }
+    }
+
+    /** Called only after a successful relay write; rejects unknown or other-app UIDs. */
+    internal fun recordVerificationForwarded(
+        bucket: TokenBucket,
+        n: Int,
+        generation: Long,
+        ownerUid: Int?,
+    ) {
+        if (ownerUid == null || ownerUid <= 0 || !isGenerationActive(generation)) return
+        val window = verificationTrafficWindow.get() ?: return
+        if (window.generation != generation || window.uid != ownerUid) return
+        window.record(bucket, n)
+    }
+
+    /** Restores the rates that were active when verification acquired the limiter lock. */
+    fun endVerificationRestoringPreviousLimits() {
+        synchronized(verificationLock) {
+            val previous = verificationPreviousLimits ?: (null to null)
+            applyDownloadKbps(previous.first)
+            applyUploadKbps(previous.second)
+            verificationTrafficWindow.set(null)
+            verificationOwnPackageRoutingEnabled = false
+            verificationLimits = null
+            verificationPreviousLimits = null
+            verificationInProgress.value = false
+        }
+    }
+
+    /** Applies an explicit plan and releases the verification lock (mainly for callers/tests). */
     fun endVerification(downloadKbps: Long?, uploadKbps: Long?) {
         synchronized(verificationLock) {
             applyDownloadKbps(downloadKbps)
             applyUploadKbps(uploadKbps)
+            verificationTrafficWindow.set(null)
             verificationOwnPackageRoutingEnabled = false
             verificationLimits = null
+            verificationPreviousLimits = null
             verificationInProgress.value = false
         }
     }
@@ -385,14 +519,16 @@ object SpeedLimiter {
     }
 
     private fun applyDownloadKbps(kbps: Long?) {
-        download.setRate(kbpsToBytesPerSec(kbps))
-        VpnRuntime.update { it.copy(downloadLimitKbps = kbps) }
-        log("Download limit applied: ${kbps?.let { "$it Kbps" } ?: "unlimited"}")
+        val normalized = normalizeKbps(kbps)
+        download.setRate(kbpsToBytesPerSec(normalized))
+        VpnRuntime.update { it.copy(downloadLimitKbps = normalized) }
+        log("Download limit applied: ${normalized?.let { "$it Kbps" } ?: "unlimited"}")
     }
 
     private fun applyUploadKbps(kbps: Long?) {
-        upload.setRate(kbpsToBytesPerSec(kbps))
-        VpnRuntime.update { it.copy(uploadLimitKbps = kbps) }
-        log("Upload limit applied: ${kbps?.let { "$it Kbps" } ?: "unlimited"}")
+        val normalized = normalizeKbps(kbps)
+        upload.setRate(kbpsToBytesPerSec(normalized))
+        VpnRuntime.update { it.copy(uploadLimitKbps = normalized) }
+        log("Upload limit applied: ${normalized?.let { "$it Kbps" } ?: "unlimited"}")
     }
 }

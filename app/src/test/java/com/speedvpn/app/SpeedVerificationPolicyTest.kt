@@ -100,6 +100,30 @@ class SpeedVerificationPolicyTest {
     }
 
     @Test
+    fun zeroRelayCountersCannotProducePass() {
+        val match = SpeedVerificationPolicy.evaluate(
+            planKbps = 1_000L,
+            baselineBps = 2_000_000L,
+            vpnBps = 1_000_000L,
+        )
+        assertEquals(SpeedVerificationStatus.MATCH, match.status)
+
+        val rejected = SpeedVerificationEngine.withRelayEvidence(
+            evaluation = match,
+            measuredBps = match.vpnBps,
+            relayBytes = 0L,
+            minimumRequiredBytes = 1_000L,
+            direction = "Download",
+        )
+
+        assertEquals(SpeedVerificationStatus.NOT_VERIFIABLE, rejected.status)
+        assertEquals(
+            SpeedVerificationStatus.NOT_VERIFIABLE,
+            SpeedVerificationPolicy.overall(rejected, match),
+        )
+    }
+
+    @Test
     fun failedVpnMeasurementsPreserveSuccessfulPhysicalBaselineByDirection() {
         val baseline = SpeedTestResult(
             downloadBps = 101_860_000L,

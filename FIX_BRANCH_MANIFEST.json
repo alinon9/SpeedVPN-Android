@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "integration_branch": "fix/integrated-all-stages-hardening-20261016",
+  "base_commit": "6bfc2108589bfd950322d89b73314b18f82c530b",
+  "source_pull_requests": [
+    {
+      "number": 36,
+      "branch": "fix/uid-policy-fail-open-phase1-20261016",
+      "head_sha": "0c5f820adc5703b84e5ccf075e653aa3308081f9",
+      "order": 1
+    },
+    {
+      "number": 37,
+      "branch": "fix/speed-limiter-accuracy-udp-shared-20261016",
+      "head_sha": "8f704b7f969807bdec77d2219d0ab6b416d9be27",
+      "order": 2
+    },
+    {
+      "number": 38,
+      "branch": "fix/speed-test-engine-reliability",
+      "head_sha": "8bfa79e58fa69f585ffcaf0707f2ba3fa2a2b9f9",
+      "order": 3
+    },
+    {
+      "number": 39,
+      "branch": "fix/verify-speed-tun-routing-evidence-20261016",
+      "head_sha": "9f52456656f3a3728ff69f2284c3228711f5184d",
+      "order": 4
+    },
+    {
+      "number": 40,
+      "branch": "fix/verify-speed-ci-473",
+      "head_sha": "dc5fc0de1ca76af1b36e0ab10333f06656f1d13e",
+      "order": 5
+    }
+  ],
+  "integration_note": "The integrated branch contains manually integrated commits for these fixes; the script below validates source refs and records the ordered manifest. It does not perform blind merges because the five PRs share overlapping files."
+}
