@@ -2,6 +2,7 @@ package com.speedvpn.app
 
 import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.nio.channels.DatagramChannel
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
@@ -40,12 +41,24 @@ class UdpFlowTableTest {
     }
 
     @Test
-    fun flowExpiresByTtlAndNotifiesResourceOwner() {
+    fun flowExpiresByTtlAndClosesItsAssociatedChannel() {
+        val channel = DatagramChannel.open()
+        val resources = ConcurrentHashMap<String, DatagramChannel>()
+        resources["host:test"] = channel
         val evicted = ConcurrentHashMap.newKeySet<String>()
-        val table = UdpFlowTable(maxFlows = 2, ttlMs = 1000, onFlowEvicted = { evicted.add(it.logicalKey) })
+        val table = UdpFlowTable(
+            maxFlows = 2,
+            ttlMs = 1000,
+            onFlowEvicted = { flow ->
+                evicted.add(flow.logicalKey)
+                resources.remove(flow.logicalKey)?.close()
+            },
+        )
         table.getOrCreate("host:test", 443, InetSocketAddress("10.0.0.2", 50000), listOf(a), 0)
         assertNull(table.findByDestination(a, 443, 2001))
-        assertTrue("TTL eviction must notify the owner so its UDP channel is closed", "host:test" in evicted)
+        assertTrue("expired flow must notify the resource owner", "host:test" in evicted)
+        assertTrue("the channel associated with an expired flow must be closed", !channel.isOpen)
+        assertTrue(resources.isEmpty())
     }
 
     @Test
@@ -142,21 +155,28 @@ class UdpFlowTableTest {
     fun ttlEvictionUnderConcurrentLookupsClosesEachExpiredFlowExactlyOnce() {
         val closedFlowKeys = ConcurrentHashMap.newKeySet<String>()
         val duplicateClose = AtomicBoolean(false)
+        val channels = ArrayList<DatagramChannel>()
+        val resources = ConcurrentHashMap<String, DatagramChannel>()
         val table = UdpFlowTable(
             maxFlows = 64,
             ttlMs = 100,
             onFlowEvicted = { flow ->
                 if (!closedFlowKeys.add(flow.logicalKey)) duplicateClose.set(true)
+                resources.remove(flow.logicalKey)?.close()
             },
         )
         repeat(64) { index ->
+            val key = "expired-$index"
             table.getOrCreate(
-                "expired-$index",
+                key,
                 443,
                 InetSocketAddress("10.0.0.2", 20_000 + index),
                 listOf(a),
                 10,
             )
+            val channel = DatagramChannel.open()
+            channels.add(channel)
+            resources[key] = channel
         }
 
         val pool = Executors.newFixedThreadPool(8)
@@ -185,6 +205,8 @@ class UdpFlowTableTest {
         assertEquals("all TTL-expired flow resources must be closed", 64, closedFlowKeys.size)
         assertTrue(closedFlowKeys.containsAll((0 until 64).map { "expired-$it" }))
         assertTrue("a flow must never be closed twice", !duplicateClose.get())
+        assertTrue("all channels associated with TTL-expired flows must be closed", channels.all { !it.isOpen })
+        assertTrue("evicted channel registry must be empty", resources.isEmpty())
         assertEquals(0, table.size(2_000))
     }
 
@@ -194,13 +216,30 @@ class UdpFlowTableTest {
         val createdFlowKeys = ConcurrentHashMap.newKeySet<String>()
         val duplicateClose = AtomicBoolean(false)
         val timestamp = AtomicLong(0L)
+        val associatedChannels = ArrayList<DatagramChannel>()
+        val resources = ConcurrentHashMap<String, DatagramChannel>()
         val table = UdpFlowTable(
             maxFlows = 24,
             ttlMs = Long.MAX_VALUE / 4,
             onFlowEvicted = { flow ->
                 if (!closedFlowKeys.add(flow.logicalKey)) duplicateClose.set(true)
+                resources.remove(flow.logicalKey)?.close()
             },
         )
+        repeat(24) { index ->
+            val key = "seed-$index"
+            table.getOrCreate(
+                key,
+                443,
+                InetSocketAddress("10.0.0.2", 40_000 + index),
+                listOf(a),
+                timestamp.incrementAndGet(),
+            )
+            val channel = DatagramChannel.open()
+            associatedChannels.add(channel)
+            resources[key] = channel
+            createdFlowKeys.add(key)
+        }
         val pool = Executors.newFixedThreadPool(8)
         val gate = CountDownLatch(1)
         try {
@@ -234,6 +273,8 @@ class UdpFlowTableTest {
         assertEquals("every created flow must be closed exactly once", createdFlowKeys.size, closedFlowKeys.size)
         assertTrue(closedFlowKeys.containsAll(createdFlowKeys))
         assertTrue("capacity/clear must not close one flow twice", !duplicateClose.get())
+        assertTrue("channels associated with evicted or cleared flows must be closed", associatedChannels.all { !it.isOpen })
+        assertTrue("resource registry must be empty after clear", resources.isEmpty())
     }
 
     @Test
