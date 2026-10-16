@@ -144,24 +144,38 @@ class SpeedLimiterConversionTest {
     }
 
     @Test
+    fun oversizedUdpPayloadWaitsForItsTransmissionBudget() {
+        val bucket = TokenBucket()
+        bucket.setRate(1_000L) // 10 bytes of burst capacity at 1,000 bytes/second.
+
+        val started = System.nanoTime()
+        assertTrue(bucket.acquire(100))
+        val elapsedMs = (System.nanoTime() - started) / 1_000_000L
+
+        // Only the first 10 bytes fit the burst. The remaining 90 bytes must be
+        // paced before acquire returns, not sent as an unrestricted initial spike.
+        assertTrue("Oversized payload was forwarded too early: ${elapsedMs}ms", elapsedMs >= 50L)
+        assertTrue("Oversized payload waited too long: ${elapsedMs}ms", elapsedMs < 500L)
+    }
+
+    @Test
     fun changingFromLowRateWithDebtToHighRateWakesWaiterImmediately() {
         val bucket = TokenBucket()
-        bucket.setRate(100L) // 1 byte of burst; deliberately build token debt.
-        assertTrue(bucket.acquire(100))
+        bucket.setRate(100L) // 1 byte of burst at 100 bytes/second.
 
         val waiting = CountDownLatch(1)
         val completed = CountDownLatch(1)
         val acquired = AtomicBoolean(false)
         val waiter = Thread {
             waiting.countDown()
-            acquired.set(bucket.acquire(1))
+            // A 100-byte reservation creates debt and waits for its budget.
+            acquired.set(bucket.acquire(100))
             completed.countDown()
         }
         waiter.start()
 
         try {
             assertTrue("Waiter did not start", waiting.await(1, TimeUnit.SECONDS))
-            // Allow the waiter to enter its old low-rate wait (about 1 second).
             Thread.sleep(40L)
             val changedAt = System.nanoTime()
             bucket.setRate(1_000_000L)
