@@ -256,7 +256,17 @@ class SpeedVpnService : VpnService() {
     }
 
     private suspend fun connect() {
-        while (!destroying.get() && lifecycleCommandState.shouldDeferConnect()) delay(25)
+        // Bound each waiter so a permanently unconfirmed native stop cannot accumulate
+        // 40 wakeups/second for an unbounded time. A queued start is retried by the
+        // teardown owner when it eventually releases its token.
+        val deadline = SystemClock.elapsedRealtime() + 15_000L
+        while (!destroying.get() && lifecycleCommandState.shouldDeferConnect()) {
+            if (SystemClock.elapsedRealtime() >= deadline) {
+                logE("CONNECT deferred: previous VPN teardown is still pending")
+                return
+            }
+            delay(100)
+        }
         if (destroying.get()) return
         connectSerialized()
     }
