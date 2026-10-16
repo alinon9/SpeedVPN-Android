@@ -14,6 +14,41 @@ internal data class SessionCounter(
     val bytes: Long,
 )
 
+internal data class VerificationTrafficSnapshot(
+    val generation: Long,
+    val uid: Int,
+    val downloadBytes: Long,
+    val uploadBytes: Long,
+)
+
+private class VerificationTrafficWindow(
+    val generation: Long,
+    val uid: Int,
+) {
+    private val downloadBytes = AtomicLong(0L)
+    private val uploadBytes = AtomicLong(0L)
+
+    fun record(bucket: TokenBucket, n: Int) {
+        if (n <= 0) return
+        val counter = when {
+            bucket === SpeedLimiter.download -> downloadBytes
+            bucket === SpeedLimiter.upload -> uploadBytes
+            else -> return
+        }
+        val delta = n.toLong()
+        counter.updateAndGet { current ->
+            if (Long.MAX_VALUE - current < delta) Long.MAX_VALUE else current + delta
+        }
+    }
+
+    fun snapshot(): VerificationTrafficSnapshot = VerificationTrafficSnapshot(
+        generation = generation,
+        uid = uid,
+        downloadBytes = downloadBytes.get(),
+        uploadBytes = uploadBytes.get(),
+    )
+}
+
 /**
  * Global device-wide pacing limiter.
  *
@@ -207,6 +242,8 @@ object SpeedLimiter {
 
     private val verificationLock = Any()
     private var verificationLimits: Pair<Long?, Long?>? = null
+    private var verificationPreviousLimits: Pair<Long?, Long?>? = null
+    private val verificationTrafficWindow = AtomicReference<VerificationTrafficWindow?>(null)
     private var externalVpnCommandsInProgress = 0
     @Volatile
     private var verificationOwnPackageRoutingEnabled = false
@@ -230,6 +267,7 @@ object SpeedLimiter {
             upload.beginSession(generation)
             download.resetScheduler()
             upload.resetScheduler()
+            verificationTrafficWindow.set(null)
             activeSessionGeneration.set(generation)
         }
     }
@@ -253,6 +291,9 @@ object SpeedLimiter {
                 activeSessionGeneration.set(0L)
                 download.endSession(generation)
                 upload.endSession(generation)
+                verificationTrafficWindow.updateAndGet { current ->
+                    if (current?.generation == generation) null else current
+                }
                 download.resetScheduler()
                 upload.resetScheduler()
             }
@@ -295,6 +336,9 @@ object SpeedLimiter {
             if (verificationLimits != null || externalVpnCommandsInProgress > 0) {
                 false
             } else {
+                val current = VpnRuntime.state.value
+                verificationPreviousLimits = current.downloadLimitKbps to current.uploadLimitKbps
+                verificationTrafficWindow.set(null)
                 verificationLimits = downloadKbps to uploadKbps
                 verificationOwnPackageRoutingEnabled = false
                 verificationInProgress.value = true
@@ -323,16 +367,80 @@ object SpeedLimiter {
         synchronized(verificationLock) {
             check(verificationLimits != null || !enabled) { "No speed verification is active" }
             verificationOwnPackageRoutingEnabled = enabled
+            if (!enabled) verificationTrafficWindow.set(null)
         }
     }
 
-    /** Applies the selected plan and releases the verification lock. */
+    /**
+     * Starts an isolated relay-byte window for this verification's app UID.
+     * Only bytes whose originating flow has this exact UID can enter the window.
+     */
+    internal fun beginVerificationTrafficWindow(generation: Long, uid: Int): Boolean =
+        synchronized(verificationLock) {
+            if (
+                verificationLimits == null ||
+                !verificationOwnPackageRoutingEnabled ||
+                generation <= 0L ||
+                uid <= 0 ||
+                !isGenerationActive(generation) ||
+                verificationTrafficWindow.get() != null
+            ) {
+                false
+            } else {
+                verificationTrafficWindow.set(VerificationTrafficWindow(generation, uid))
+                true
+            }
+        }
+
+    internal fun verificationTrafficSnapshot(generation: Long): VerificationTrafficSnapshot? {
+        val window = verificationTrafficWindow.get() ?: return null
+        return if (window.generation == generation) window.snapshot() else null
+    }
+
+    internal fun endVerificationTrafficWindow(generation: Long) {
+        synchronized(verificationLock) {
+            verificationTrafficWindow.updateAndGet { current ->
+                if (current?.generation == generation) null else current
+            }
+        }
+    }
+
+    /** Called only after a successful relay write; rejects unknown or other-app UIDs. */
+    internal fun recordVerificationForwarded(
+        bucket: TokenBucket,
+        n: Int,
+        generation: Long,
+        ownerUid: Int?,
+    ) {
+        if (ownerUid == null || ownerUid <= 0 || !isGenerationActive(generation)) return
+        val window = verificationTrafficWindow.get() ?: return
+        if (window.generation != generation || window.uid != ownerUid) return
+        window.record(bucket, n)
+    }
+
+    /** Restores the rates that were active when verification acquired the limiter lock. */
+    fun endVerificationRestoringPreviousLimits() {
+        synchronized(verificationLock) {
+            val previous = verificationPreviousLimits ?: (null to null)
+            applyDownloadKbps(previous.first)
+            applyUploadKbps(previous.second)
+            verificationTrafficWindow.set(null)
+            verificationOwnPackageRoutingEnabled = false
+            verificationLimits = null
+            verificationPreviousLimits = null
+            verificationInProgress.value = false
+        }
+    }
+
+    /** Applies an explicit plan and releases the verification lock (mainly for callers/tests). */
     fun endVerification(downloadKbps: Long?, uploadKbps: Long?) {
         synchronized(verificationLock) {
             applyDownloadKbps(downloadKbps)
             applyUploadKbps(uploadKbps)
+            verificationTrafficWindow.set(null)
             verificationOwnPackageRoutingEnabled = false
             verificationLimits = null
+            verificationPreviousLimits = null
             verificationInProgress.value = false
         }
     }
