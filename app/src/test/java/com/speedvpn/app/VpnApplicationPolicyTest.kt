@@ -137,7 +137,7 @@ class VpnApplicationPolicyTest {
 
         assertArrayEquals(
             byteArrayOf(192.toByte(), 0, 2, 10),
-            normalizeOwnerAddressBytes(mapped),
+            VpnApplicationPolicy.normalizeUidQueryAddressBytes(mapped),
         )
     }
 }
