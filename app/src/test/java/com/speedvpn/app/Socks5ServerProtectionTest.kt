@@ -36,6 +36,18 @@ class Socks5ServerProtectionTest {
     }
 
     @Test
+    fun thrownProtectFailureAlsoClosesSocketAndPropagatesError() {
+        val socket = Socket()
+        val failure = assertThrows(SocketException::class.java) {
+            protectSocketOrClose(socket, {
+                throw SocketException("simulated protect exception")
+            }, "unit TCP socket")
+        }
+        assertTrue(socket.isClosed)
+        assertTrue(failure.message.orEmpty().contains("simulated protect exception"))
+    }
+
+    @Test
     fun protectFalseClosesDatagramChannelAndItsSocketImmediately() {
         val channel = DatagramChannel.open()
         val socket = channel.socket()
@@ -82,8 +94,10 @@ class Socks5ServerProtectionTest {
             }
             assertTrue("active SOCKS client must be released by stop()", closedByServer)
 
-            ServerSocket(port, 1, InetAddress.getByName("127.0.0.1")).use {
-                assertTrue("listening port must be reusable after stop()", it.isBound)
+            ServerSocket().use { replacement ->
+                replacement.reuseAddress = true
+                replacement.bind(InetSocketAddress(InetAddress.getByName("127.0.0.1"), port))
+                assertTrue("listening port must be reusable after stop()", replacement.isBound)
             }
 
             val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
