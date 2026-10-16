@@ -267,6 +267,33 @@ object SpeedVerificationEngine {
                                 restorationError = restorationError
                                     ?: "تعذر تعطيل توجيه التحقق: ${error.message ?: error.javaClass.simpleName}"
                             }
+
+                        // Recovery path: if any earlier cleanup operation threw, rebuild
+                        // the tunnel to the state that existed before verification instead
+                        // of releasing the verification lock with a possibly stale TUN policy.
+                        runCatching {
+                            if (initiallyConnected) {
+                                if (!stopForVerificationRestore(context)) {
+                                    throw IllegalStateException("تعذر إيقاف نفق التحقق أثناء الاستعادة الاحتياطية.")
+                                }
+                                SpeedVpnService.start(context)
+                                if (!waitForStatus(VpnStatus.CONNECTED)) {
+                                    throw IllegalStateException("تعذر إعادة اتصال VPN السابق أثناء الاستعادة الاحتياطية.")
+                                }
+                            } else if (
+                                VpnRuntime.state.value.status != VpnStatus.DISCONNECTED ||
+                                !SpeedVpnService.isNativeTunnelStopped()
+                            ) {
+                                SpeedVpnService.stop(context)
+                                if (!waitForStatus(VpnStatus.DISCONNECTED) || !SpeedVpnService.isNativeTunnelStopped()) {
+                                    throw IllegalStateException("تعذر فصل نفق التحقق أثناء الاستعادة الاحتياطية.")
+                                }
+                            }
+                        }.onFailure { error ->
+                            restorationError = restorationError
+                                ?: "فشلت استعادة حالة VPN الاحتياطية: ${error.message ?: error.javaClass.simpleName}"
+                        }
+
                         runCatching { SpeedLimiter.endVerificationRestoringPreviousLimits() }
                             .onFailure { error ->
                                 restorationError = restorationError
