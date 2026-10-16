@@ -44,20 +44,23 @@ jobs:
           ./gradlew --version
 
       - name: Fetch pinned native tunnel
-        run: bash ./setup.sh
+        run: bash ./setup.sh 2>&1 | tee native-setup.log
+
+      - name: Test native TCP patcher
+        run: python3 -m pytest -q scripts/e2e/tests/test_hev_tcp_buffer_patch.py
 
       - name: Verify native pin
         run: |
           test "$(git -C app/src/main/jni/hev-socks5-tunnel rev-parse HEAD)" = "d9dca26c7ad0e494492244f0309e80ee583e739e"
 
       - name: Run unit tests
-        run: ./gradlew :app:testDebugUnitTest --stacktrace --no-daemon
+        run: ./gradlew :app:testDebugUnitTest --stacktrace --no-daemon 2>&1 | tee unit-tests.log
 
       - name: Run lint
-        run: ./gradlew :app:lintDebug --stacktrace --no-daemon
+        run: ./gradlew :app:lintDebug --stacktrace --no-daemon 2>&1 | tee lint.log
 
       - name: Build debug APK
-        run: ./gradlew :app:assembleDebug --stacktrace --no-daemon
+        run: ./gradlew :app:assembleDebug --stacktrace --no-daemon 2>&1 | tee debug-build.log
 
       - name: Upload debug APK for emulator
         uses: actions/upload-artifact@v7
@@ -85,7 +88,7 @@ jobs:
             printf "%s" "${RELEASE_KEYSTORE_BASE64}" | base64 -d > "$RELEASE_KEYSTORE_PATH"
             chmod 600 "$RELEASE_KEYSTORE_PATH"
             test -s "$RELEASE_KEYSTORE_PATH"
-            ./gradlew :app:assembleRelease --stacktrace --no-daemon
+            ./gradlew :app:assembleRelease --stacktrace --no-daemon 2>&1 | tee release-build.log
           else
             echo "Release signing inputs missing: ${missing[*]}"
             echo "Building unsigned release for CI validation only."
@@ -160,7 +163,7 @@ jobs:
           if-no-files-found: error
 
       - name: Build deterministic fixture debug APK
-        run: ./gradlew :app:assembleDebug -PspeedTestBaseUrl=http://10.0.2.2:18765 --rerun-tasks --stacktrace --no-daemon
+        run: ./gradlew :app:assembleDebug -PspeedTestBaseUrl=http://10.0.2.2:18765 --rerun-tasks --stacktrace --no-daemon 2>&1 | tee fixture-build.log
 
       - name: Upload fixture debug APK for Verify Speed
         uses: actions/upload-artifact@v7
@@ -168,6 +171,53 @@ jobs:
           name: speedvpn-debug-fixture-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+
+      - name: Collect native build evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p build-evidence
+          {
+            echo "commit=$(git rev-parse HEAD)"
+            echo "pinned_native_commit=$(git -C app/src/main/jni/hev-socks5-tunnel rev-parse HEAD 2>/dev/null || echo unavailable)"
+            echo "expected_native_commit=d9dca26c7ad0e494492244f0309e80ee583e739e"
+            echo "supported_abis=arm64-v8a,armeabi-v7a,x86_64"
+            echo "java_version:"
+            java -version 2>&1
+            echo "gradle_version:"
+            ./gradlew --version 2>&1 | head -n 12
+          } > build-evidence/build-summary.txt
+
+          : > build-evidence/native-library-inventory.txt
+          while IFS= read -r APK; do
+            [ -s "$APK" ] || continue
+            echo "APK=$APK" | tee -a build-evidence/native-library-inventory.txt
+            unzip -l "$APK" 'lib/*/*.so' >> build-evidence/native-library-inventory.txt || true
+            TMP="$(mktemp -d)"
+            unzip -q "$APK" 'lib/*/*.so' -d "$TMP" 2>/dev/null || true
+            for ABI in arm64-v8a armeabi-v7a x86_64; do
+              if [ -f "$TMP/lib/$ABI/libhev-socks5-tunnel.so" ]; then
+                echo "FOUND $ABI/libhev-socks5-tunnel.so" | tee -a build-evidence/native-library-inventory.txt
+              else
+                echo "MISSING $ABI/libhev-socks5-tunnel.so" | tee -a build-evidence/native-library-inventory.txt
+              fi
+            done
+            rm -rf "$TMP"
+            echo "sha256=$(sha256sum "$APK" | cut -d' ' -f1)" >> build-evidence/native-library-inventory.txt
+            echo >> build-evidence/native-library-inventory.txt
+          done < <(find app/build/outputs/apk -type f -name '*.apk' -print 2>/dev/null | sort)
+
+          for LOG in native-setup.log unit-tests.log lint.log debug-build.log release-build.log fixture-build.log; do
+            if [ -s "$LOG" ]; then cp "$LOG" "build-evidence/$LOG"; fi
+          done
+
+      - name: Upload native build evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: speedvpn-native-build-evidence
+          path: build-evidence/
+          if-no-files-found: warn
 
   emulator-smoke-test:
     needs: build-apk
