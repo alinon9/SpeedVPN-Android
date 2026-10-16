@@ -3,6 +3,12 @@ package com.speedvpn.app
 import android.content.Context
 import android.util.Log
 
+/** SharedPreferences contract retained for Debug-only hook diagnostics. */
+internal object UidPocSettings {
+    const val PREFS = "uid_detection_poc_settings"
+    const val KEY_DISABLE_JNI_HOOK = "disable_jni_hook"
+}
+
 /**
  * Lightweight compatibility facade for legacy call sites retained in the VPN
  * service and UID resolver. The POC-only persistent file logger, crash reports,
