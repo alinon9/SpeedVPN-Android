@@ -661,6 +661,22 @@ class MainActivity : ComponentActivity() {
                     lifecycleScope.launch(Dispatchers.IO) { UsageCollector.collectToday(this@MainActivity) }
                 } else UsageCollectionScheduler.cancel(this@MainActivity)
             }
+            if (!usageAccessState.value) {
+                OutlinedButton(
+                    onClick = {
+                        runCatching { startActivity(AppTrafficManager.usageAccessIntent()) }
+                    },
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("منح صلاحية إحصاءات التطبيقات", fontSize = 11.sp) }
+            } else {
+                Text(
+                    "صلاحية Usage Access مفعّلة",
+                    color = Green,
+                    fontSize = 10.sp,
+                )
+            }
+
             SettingSwitch("نافذة السرعة العائمة", "تعمل كتحكم عام أو حسب التطبيق الذي فتحت منها", overlayEnabled) {
                 if (it && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this@MainActivity)) {
                     runCatching { startActivity(android.content.Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, android.net.Uri.parse("package:$packageName"))) }
@@ -712,7 +728,7 @@ class MainActivity : ComponentActivity() {
             Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(18.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            ScreenTitle("الإعدادات", "التوافق، البيانات، النافذة العائمة والحساب")
+            ScreenTitle("الإعدادات", "التوافق، البيانات، جدار التطبيقات، النافذة العائمة والحساب")
             CompatibilitySettingsCard()
             SmartControlsCard()
             AppFirewallSettingsCard()
