@@ -24,3 +24,4 @@ esac
 echo "OK - hev-socks5-tunnel pinned to $TAG ($HEAD)"
 python3 scripts/e2e/patch_hev_tcp_buffers.py "$DIR/third-part/lwip/src/ports/include/lwipopts.h"
 python3 scripts/e2e/patch_hev_tcp_buffers.py --check "$DIR/third-part/lwip/src/ports/include/lwipopts.h"
+python3 scripts/patch_hev_uid_blocking.py "$DIR"
