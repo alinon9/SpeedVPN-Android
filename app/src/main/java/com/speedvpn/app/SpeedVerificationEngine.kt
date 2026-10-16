@@ -210,6 +210,16 @@ object SpeedVerificationEngine {
                 }
             }
         } catch (cancelled: CancellationException) {
+            // Preserve an explicit NOT_VERIFIABLE record before propagating cancellation.
+            // The NonCancellable finalizer restores VPN/limiter state and persists this
+            // outcome, so a lifecycle cancellation does not silently erase the run.
+            result = unavailable(
+                started,
+                "تم إلغاء التحقق قبل اكتمال القياس.",
+                planDownloadKbps,
+                planUploadKbps,
+                baseline,
+            )
             throw cancelled
         } catch (t: Throwable) {
             Log.e(TAG, "Verification failed: ${t.message ?: t.javaClass.simpleName}", t)
