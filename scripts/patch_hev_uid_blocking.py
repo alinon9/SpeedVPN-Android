@@ -211,9 +211,6 @@ task_io_yielder (HevTaskYieldType type, void *data)
             + "static pthread_t app_uid_block_worker_thread;\n"
             + "static int app_uid_block_worker_started = 0, app_uid_block_worker_ready = 0, app_uid_block_worker_stop_requested = 0;\n"
             + "static volatile unsigned long long app_uid_block_next_request_id = 0;\n"
-            + "static volatile unsigned long long app_uid_block_packets = 0, app_uid_block_cache_hits = 0, app_uid_block_cache_misses = 0;\n"
-            + "static volatile unsigned long long app_uid_block_pending_hits = 0, app_uid_block_unique_requests = 0, app_uid_block_jni_lookups = 0;\n"
-            + "static volatile unsigned long long app_uid_block_queue_full = 0, app_uid_block_lookup_failures = 0, app_uid_block_dropped_packets = 0;\n"
             + END + "\n",
             1,
         )
@@ -442,36 +439,6 @@ app_uid_block_store_result_locked (const app_uid_block_flow_key *key, int uid, i
         ? APP_BLOCK_ACTION_BLOCK : APP_BLOCK_ACTION_ALLOW;
     entry->drop_logged = 0;
     entry->updated_ms = now;
-    if (entry->action == APP_BLOCK_ACTION_BLOCK) {
-        __android_log_print (ANDROID_LOG_WARN, "SpeedVPN-APP_BLOCK-JNI",
-            "UID_POLICY_RESULT uid=%d action=BLOCK packetBlocking=IMPLEMENTED",
-            uid);
-    } else {
-        __android_log_print (ANDROID_LOG_INFO, "SpeedVPN-APP_BLOCK-JNI",
-            "UID_POLICY_RESULT uid=%d action=ALLOW hookMode=HOOK_BLOCKING packetBlocking=IMPLEMENTED",
-            uid);
-    }
-}
-
-static void
-app_uid_block_log_metrics (unsigned long long packet_count)
-{
-    unsigned long long hits, misses, pending, lookups, full, failures, unique, drops;
-    double hit_rate;
-    if (packet_count == 0 || packet_count % 1000ULL != 0)
-        return;
-    hits = __sync_add_and_fetch (&app_uid_block_cache_hits, 0ULL);
-    misses = __sync_add_and_fetch (&app_uid_block_cache_misses, 0ULL);
-    pending = __sync_add_and_fetch (&app_uid_block_pending_hits, 0ULL);
-    lookups = __sync_add_and_fetch (&app_uid_block_jni_lookups, 0ULL);
-    full = __sync_add_and_fetch (&app_uid_block_queue_full, 0ULL);
-    failures = __sync_add_and_fetch (&app_uid_block_lookup_failures, 0ULL);
-    unique = __sync_add_and_fetch (&app_uid_block_unique_requests, 0ULL);
-    drops = __sync_add_and_fetch (&app_uid_block_dropped_packets, 0ULL);
-    hit_rate = (hits + misses) == 0 ? 0.0 : (100.0 * (double) hits / (double) (hits + misses));
-    __android_log_print (ANDROID_LOG_INFO, "SpeedVPN-APP_BLOCK-JNI",
-        "PACKETS=%llu CACHE_HITS=%llu CACHE_MISSES=%llu PENDING_HITS=%llu UNIQUE_LOOKUPS=%llu JNI_LOOKUPS=%llu HIT_RATE=%.2f%% QUEUE_FULL=%llu LOOKUP_FAILS=%llu DROPPED_PACKETS=%llu",
-        packet_count, hits, misses, pending, unique, lookups, hit_rate, full, failures, drops);
 }
 
 static void *
@@ -531,7 +498,6 @@ app_uid_block_worker_main (void *unused)
                 (*env)->ExceptionDescribe (env);
                 (*env)->ExceptionClear (env);
             } else if (src_array && dst_array) {
-                __sync_add_and_fetch (&app_uid_block_jni_lookups, 1ULL);
                 packed_result = (*env)->CallLongMethod (env, app_uid_block_callback, app_uid_block_method,
                     (jint) request.protocol, src_array, (jint) request.src_port,
                     dst_array, (jint) request.dst_port);
@@ -562,7 +528,6 @@ app_uid_block_worker_main (void *unused)
         if (dst_array) (*env)->DeleteLocalRef (env, dst_array);
 
         if (!call_ok || uid < 0)
-            __sync_add_and_fetch (&app_uid_block_lookup_failures, 1ULL);
 
         pthread_mutex_lock (&app_uid_block_mutex);
         app_uid_block_store_result_locked (&request.key, call_ok ? (int) uid : -1,
@@ -715,7 +680,7 @@ hev_jni_app_uid_block_packet (int protocol,
 {
     app_uid_block_flow_key key;
     app_uid_block_request request;
-    unsigned long long now, packet_count;
+    unsigned long long now;
     int found = 0, slot, should_drop = 0;
     char src_text[64], dst_text[64], tuple_text[200];
 
@@ -742,18 +707,14 @@ hev_jni_app_uid_block_packet (int protocol,
         pthread_mutex_unlock (&app_uid_block_mutex);
         return 0;
     }
-    packet_count = __sync_add_and_fetch (&app_uid_block_packets, 1ULL);
     now = app_uid_block_now_ms ();
     slot = app_uid_block_find_slot_locked (&key, now, &found);
     if (found) {
         app_uid_block_cache_entry *entry = &app_uid_block_cache[slot];
         if (entry->uid == APP_BLOCK_UID_PENDING) {
-            __sync_add_and_fetch (&app_uid_block_pending_hits, 1ULL);
         } else {
-            __sync_add_and_fetch (&app_uid_block_cache_hits, 1ULL);
             if (entry->uid >= 0 && entry->action == APP_BLOCK_ACTION_BLOCK) {
                 should_drop = 1;
-                __sync_add_and_fetch (&app_uid_block_dropped_packets, 1ULL);
                 if (!entry->drop_logged) {
                     entry->drop_logged = 1;
                     app_uid_block_format_address (src, src_len, src_text, sizeof (src_text));
@@ -771,18 +732,15 @@ hev_jni_app_uid_block_packet (int protocol,
             }
         }
         pthread_mutex_unlock (&app_uid_block_mutex);
-        app_uid_block_log_metrics (packet_count);
         return should_drop;
     }
 
-    __sync_add_and_fetch (&app_uid_block_cache_misses, 1ULL);
     if (slot < 0 || app_uid_block_active_flows >= APP_BLOCK_MAX_FLOWS) {
         app_uid_block_evict_oldest_locked ();
         slot = app_uid_block_find_slot_locked (&key, now, &found);
     }
     if (app_uid_block_queue_count >= APP_BLOCK_QUEUE_CAPACITY) {
         /* Briefly negative-cache overload so every packet does not retry the full queue. */
-        __sync_add_and_fetch (&app_uid_block_queue_full, 1ULL);
         if (slot >= 0) {
             if (!found)
                 app_uid_block_active_flows++;
@@ -795,7 +753,6 @@ hev_jni_app_uid_block_packet (int protocol,
             app_uid_block_cache[slot].request_id = 0;
         }
         pthread_mutex_unlock (&app_uid_block_mutex);
-        app_uid_block_log_metrics (packet_count);
         return 0;
     }
     if (slot >= 0) {
@@ -812,13 +769,10 @@ hev_jni_app_uid_block_packet (int protocol,
         app_uid_block_queue[app_uid_block_queue_tail] = request;
         app_uid_block_queue_tail = (app_uid_block_queue_tail + 1u) % APP_BLOCK_QUEUE_CAPACITY;
         app_uid_block_queue_count++;
-        __sync_add_and_fetch (&app_uid_block_unique_requests, 1ULL);
         pthread_cond_signal (&app_uid_block_condition);
     } else {
-        __sync_add_and_fetch (&app_uid_block_queue_full, 1ULL);
     }
     pthread_mutex_unlock (&app_uid_block_mutex);
-    app_uid_block_log_metrics (packet_count);
     return 0;
 }
 /* SPEEDVPN_APP_BLOCK_END */
