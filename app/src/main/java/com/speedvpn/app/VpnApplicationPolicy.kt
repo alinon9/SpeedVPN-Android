@@ -17,8 +17,7 @@ internal object VpnApplicationPolicy {
         }.toSet()
     }
 
-    // Kept for source compatibility with existing tests/tools. The service does not
-    // use this result for routing; it routes all apps through TUN instead.
+    // Retained for non-firewall callers; firewall routing is enforced by UID policy in TUN.
     fun allowedPackages(
         launchablePackages: Iterable<String>,
         blockedPackages: Set<String>,
