@@ -994,7 +994,10 @@ class MainActivity : ComponentActivity() {
         }
 
         Column(
-            Modifier.fillMaxSize().padding(horizontal = 18.dp, vertical = 14.dp),
+            Modifier.fillMaxSize()
+                .semantics { testTagsAsResourceId = true }
+                .testTag("apps_screen")
+                .padding(horizontal = 18.dp, vertical = 14.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             ScreenTitle(
@@ -1033,7 +1036,9 @@ class MainActivity : ComponentActivity() {
                 }
                 else -> {
                     LazyColumn(
-                        modifier = Modifier.weight(1f).fillMaxWidth().testTag("apps_list"),
+                        modifier = Modifier.weight(1f).fillMaxWidth()
+                            .semantics { contentDescription = "قائمة التطبيقات" }
+                            .testTag("apps_list"),
                         contentPadding = PaddingValues(bottom = 12.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
