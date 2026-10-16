@@ -15,12 +15,19 @@ object SpeedVerificationStore {
             JSONArray(prefs.getString(KEY_HISTORY, "[]"))
         }.getOrElse { JSONArray() }
 
+        // Verify saves the finalized result from its NonCancellable finalizer. Make
+        // repeated saves of the same run idempotent to prevent duplicate history.
+        val newest = current.optJSONObject(0)
+        if (newest != null && newest.optLong("startedAtMillis") == result.startedAtMillis) return
+
         val next = JSONArray()
         next.put(toJson(result))
         for (index in 0 until current.length().coerceAtMost(MAX_HISTORY - 1)) {
             current.optJSONObject(index)?.let { next.put(it) }
         }
-        prefs.edit().putString(KEY_HISTORY, next.toString()).apply()
+        check(prefs.edit().putString(KEY_HISTORY, next.toString()).commit()) {
+            "Failed to persist speed verification history"
+        }
     }
 
     fun loadRecent(context: Context, limit: Int = 8): List<SpeedVerificationResult> {
