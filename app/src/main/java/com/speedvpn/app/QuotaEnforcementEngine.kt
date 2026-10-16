@@ -87,14 +87,20 @@ internal object QuotaEnforcementEngine {
         nowMillis: Long = System.currentTimeMillis(),
         restart: (Context) -> Unit = SpeedVpnService::restartForSettings,
     ): Boolean {
-        // Remove persisted blocks for packages whose quota was deleted or disabled
-        // before comparing effective state. If policy loading fails, do not erase state
-        // based on an incomplete read.
+        // Snapshot the effective persisted state BEFORE pruning it. Pruning is a durable
+        // cleanup, but it must not hide a removed block from the comparison below: the
+        // native/VpnService per-app policy may still contain that package until VPN restart.
+        val previouslyBlocked = VpnAppControl.quotaBlockedPackages(context)
+
+        // Remove persisted blocks for packages whose quota was deleted or disabled.
+        // If policy loading fails, do not erase state based on an incomplete read.
         val staleRemoved = prunePersistedQuotaBlocks(context)
         val evaluated = evaluateBlockedPackages(context, nowMillis)
-        val current = VpnAppControl.quotaBlockedPackages(context)
+        val current = previouslyBlocked
         if (evaluated == current) return staleRemoved
 
+        // Apply the new durable block set even when pruning already changed storage. The
+        // before-prune snapshot above is the state the running VPN must be reconciled with.
         VpnAppControl.replaceQuotaBlockedPackages(context, evaluated)
 
         evaluated.minus(current).forEach { packageName ->
