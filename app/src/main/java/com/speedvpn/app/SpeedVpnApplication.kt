@@ -9,14 +9,14 @@ import android.util.Log
 class SpeedVpnApplication : Application() {
     private fun logHistoricalProcessExitReasons() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
-            UidPocDiagnostics.log(this, "EXIT_INFO_UNAVAILABLE reason=API_BELOW_30")
+            Log.d("SpeedVPN", "EXIT_INFO_UNAVAILABLE reason=API_BELOW_30")
             return
         }
         runCatching {
             val manager = getSystemService(ActivityManager::class.java)
             val exits = manager.getHistoricalProcessExitReasons(packageName, 0, 5)
             if (exits.isEmpty()) {
-                Log.e("UidDetectionPOC", "EXIT_INFO: no historical process exit entries returned")
+                Log.e("SpeedVPN", "EXIT_INFO: no historical process exit entries returned")
             }
             exits.forEachIndexed { index, info ->
                 val reasonName = when (info.reason) {
@@ -38,22 +38,20 @@ class SpeedVpnApplication : Application() {
                 val line = "EXIT[$index]: reason=${info.reason}($reasonName) status=${info.status} " +
                     "description=${info.description} process=${info.processName} timestamp=${info.timestamp} " +
                     "importance=${info.importance} pss=${info.pss} rss=${info.rss}"
-                Log.e("UidDetectionPOC", line)
-                UidPocDiagnostics.log(this, line)
+                Log.e("SpeedVPN", line)
             }
         }.onFailure {
-            Log.e("UidDetectionPOC", "Unable to read historical process exit reasons", it)
-            UidPocDiagnostics.error(this, "Unable to read historical process exit reasons", it)
+            Log.e("SpeedVPN", "Unable to read historical process exit reasons", it)
         }
     }
 
     override fun onCreate() {
         super.onCreate()
         logHistoricalProcessExitReasons()
-        UidPocDiagnostics.log(this, "Application.onCreate; API=${Build.VERSION.SDK_INT}; package=$packageName")
+        Log.d("SpeedVPN", "Application.onCreate; API=${Build.VERSION.SDK_INT}; package=$packageName")
         val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
-            UidPocDiagnostics.recordCrash(this, thread, throwable)
+            Log.e("SpeedVPN", "Uncaught exception on thread=${thread.name}", throwable)
             runCatching {
                 DiagnosticsRepository.record(
                     this,
@@ -65,12 +63,12 @@ class SpeedVpnApplication : Application() {
             }
             defaultHandler?.uncaughtException(thread, throwable) ?: Process.killProcess(Process.myPid())
         }
-        UidPocDiagnostics.log(this, "Default uncaught-exception handler installed")
+        Log.d("SpeedVPN", "Default uncaught-exception handler installed")
         if (SmartSettings.isStatsEnabled(this)) {
             runCatching {
                 UsageCollectionScheduler.schedule(this)
                 QuotaWorkScheduler.schedule(this)
-            }.onFailure { UidPocDiagnostics.error(this, "Unable to schedule application workers", it) }
+            }.onFailure { Log.e("SpeedVPN", "Unable to schedule application workers", it) }
         }
     }
 }
