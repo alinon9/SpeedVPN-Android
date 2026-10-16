@@ -858,6 +858,13 @@ class Socks5Server(
                     if (firstForwardedNs == 0L) firstForwardedNs = writeStartedNs
                     lastForwardedNs = writeFinishedNs
                     bucket.recordForwarded(chunkSize, generation)
+                    // Only count successfully relayed bytes from the app UID owning this flow.
+                    SpeedLimiter.recordVerificationForwarded(
+                        bucket = bucket,
+                        n = chunkSize,
+                        generation = generation,
+                        ownerUid = upstreamTcpMetadata[flowSocket]?.uid,
+                    )
                     forwardedBytes += chunkSize.toLong()
                     offset += chunkSize
                 }
