@@ -102,7 +102,9 @@ object SpeedVerificationEngine {
                     // startup and again after CONNECTED because the service restores saved
                     // preferences during startup and those may lag a recent UI selection.
                     SpeedLimiter.setVerificationLimits(planDownloadKbps, planUploadKbps)
+                    SpeedTestEngine.evictConnectionPoolForRouteChange()
                     SpeedLimiter.setVerificationTrafficRoutingEnabled(true)
+                    SpeedTestEngine.evictConnectionPoolForRouteChange()
                     verifierTunnelRouteEnabled = true
 
                     Log.i(TAG, "Stage=start-verification-vpn")
