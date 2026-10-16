@@ -11,8 +11,6 @@ import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.IBinder
-import android.os.Handler
-import android.os.Looper
 import android.provider.Settings
 import android.view.Gravity
 import android.view.MotionEvent
@@ -26,6 +24,15 @@ import android.widget.TextView
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.Locale
 import kotlin.math.max
 
@@ -47,7 +54,18 @@ internal class SpeedOverlayService : Service() {
                 putExtra(EXTRA_TARGET_PACKAGE, packageName)
                 putExtra(EXTRA_TARGET_LABEL, label)
             }
-            ContextCompat.startForegroundService(context, intent)
+            runCatching { ContextCompat.startForegroundService(context, intent) }
+                .onFailure { error ->
+                    runCatching {
+                        DiagnosticsRepository.record(
+                            context.applicationContext,
+                            "WARN",
+                            "SpeedOverlay",
+                            "FOREGROUND_START_REJECTED",
+                            error.stackTraceToString(),
+                        )
+                    }
+                }
         }
 
         fun stop(context: Context) {
@@ -64,30 +82,35 @@ internal class SpeedOverlayService : Service() {
     private var uploadReserved: TextView? = null
     private var targetPackage: String? = null
     private var targetLabel: String = "التحكم العام"
-    private val mainHandler = Handler(Looper.getMainLooper())
-    private val refreshTask = object : Runnable {
-        override fun run() {
-            refresh()
-            if (root != null) mainHandler.postDelayed(this, 1000L)
-        }
-    }
+    private val overlayScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var refreshJob: Job? = null
+    private data class OverlaySnapshot(
+        val downloadLimitKbps: Long?,
+        val uploadLimitKbps: Long?,
+        val downloadBps: Long,
+        val uploadBps: Long,
+        val controlsEnabled: Boolean,
+    )
     private val increments = listOf(1L, 10L, 25L, 50L, 75L, 100L, 130L, 250L, 500L, 750L, 950L, 1_000L, 2_000L, 3_000L, 4_000L, 5_000L, 9_000L, 10_000L, 11_000L, 100_000L).map { it * 8L }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
-            SmartSettings.setOverlayEnabled(this, false)
-            stopSelf()
-            return START_NOT_STICKY
-        }
+        if (!ensureOverlayPermission()) return START_NOT_STICKY
         targetPackage = intent?.getStringExtra(EXTRA_TARGET_PACKAGE)
         targetLabel = intent?.getStringExtra(EXTRA_TARGET_LABEL) ?: if (targetPackage == null) "التحكم العام" else targetPackage!!
-        startForegroundCompat()
+
+        try {
+            startForegroundCompat()
+        } catch (error: RuntimeException) {
+            recordOverlayFailure("FOREGROUND_PROMOTION_FAILED", error)
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
+
         if (root == null) addOverlay()
-        refresh()
-        mainHandler.removeCallbacks(refreshTask)
-        mainHandler.post(refreshTask)
+        if (root == null) return START_NOT_STICKY
+        startRefreshLoop()
         return START_STICKY
     }
 
@@ -111,6 +134,7 @@ internal class SpeedOverlayService : Service() {
     }
 
     private fun addOverlay() {
+        if (!ensureOverlayPermission()) return
         wm = getSystemService(WindowManager::class.java)
         val dm = resources.displayMetrics
         val width = dp(206)
@@ -174,7 +198,7 @@ internal class SpeedOverlayService : Service() {
         val params = WindowManager.LayoutParams(
             width, height,
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
             PixelFormat.TRANSLUCENT,
         ).apply {
             gravity = Gravity.TOP or Gravity.END
@@ -184,7 +208,7 @@ internal class SpeedOverlayService : Service() {
 
         runCatching { wm.addView(parent, params) }.onFailure {
             root = null
-            DiagnosticsRepository.record(this, "ERROR", "SpeedOverlay", "OVERLAY_ATTACH_FAILED", it.message ?: "unable to attach overlay")
+            recordOverlayFailure("OVERLAY_ATTACH_FAILED", it)
             stopSelf()
         }
     }
@@ -304,15 +328,85 @@ internal class SpeedOverlayService : Service() {
         refresh()
     }
 
+    private suspend fun readSnapshot(): OverlaySnapshot? = withContext(Dispatchers.IO) {
+        runCatching {
+            val (dl, ul) = current()
+            val runtime = VpnRuntime.state.value
+            OverlaySnapshot(
+                downloadLimitKbps = dl,
+                uploadLimitKbps = ul,
+                downloadBps = runtime.downloadBps,
+                uploadBps = runtime.uploadBps,
+                controlsEnabled = !SpeedLimiter.verificationInProgress.value,
+            )
+        }.onFailure { recordOverlayFailure("REFRESH_SNAPSHOT_FAILED", it) }.getOrNull()
+    }
+
+    private fun startRefreshLoop() {
+        refreshJob?.cancel()
+        refreshJob = overlayScope.launch {
+            while (isActive) {
+                val snapshot = readSnapshot()
+                val keepRunning = withContext(Dispatchers.Main.immediate) {
+                    if (!ensureOverlayPermission() || root == null) {
+                        false
+                    } else {
+                        snapshot?.let(::renderSnapshot)
+                        true
+                    }
+                }
+                if (!keepRunning) return@launch
+                // Delayed background polling is intentionally not an animation and
+                // never spins or posts a recurring runnable onto the main looper.
+                delay(1_500L)
+            }
+        }
+    }
+
     private fun refresh() {
-        val (dl, ul) = current()
-        val runtime = VpnRuntime.state.value
-        setSpeedControlsEnabled(!SpeedLimiter.verificationInProgress.value)
+        if (!ensureOverlayPermission() || root == null) return
+        overlayScope.launch {
+            val snapshot = readSnapshot() ?: return@launch
+            withContext(Dispatchers.Main.immediate) {
+                if (ensureOverlayPermission() && root != null) renderSnapshot(snapshot)
+            }
+        }
+    }
+
+    private fun renderSnapshot(snapshot: OverlaySnapshot) {
+        setSpeedControlsEnabled(snapshot.controlsEnabled)
         title?.text = "SpeedVPN • ${if (targetPackage == null) "عام" else targetLabel}"
-        downloadValue?.text = "↓ VPN ${formatBitRate(runtime.downloadBps)}"
-        downloadReserved?.text = "محجوز: ${formatRate(dl)}"
-        uploadValue?.text = "↑ VPN ${formatBitRate(runtime.uploadBps)}"
-        uploadReserved?.text = "محجوز: ${formatRate(ul)}"
+        downloadValue?.text = "↓ VPN ${formatBitRate(snapshot.downloadBps)}"
+        downloadReserved?.text = "محجوز: ${formatRate(snapshot.downloadLimitKbps)}"
+        uploadValue?.text = "↑ VPN ${formatBitRate(snapshot.uploadBps)}"
+        uploadReserved?.text = "محجوز: ${formatRate(snapshot.uploadLimitKbps)}"
+    }
+
+    private fun hasOverlayPermission(): Boolean =
+        Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(this)
+
+    private fun ensureOverlayPermission(): Boolean {
+        if (hasOverlayPermission()) return true
+        SmartSettings.setOverlayEnabled(this, false)
+        refreshJob?.cancel()
+        root?.let { view ->
+            if (::wm.isInitialized) runCatching { wm.removeViewImmediate(view) }
+        }
+        root = null
+        stopSelf()
+        return false
+    }
+
+    private fun recordOverlayFailure(event: String, error: Throwable) {
+        runCatching {
+            DiagnosticsRepository.record(
+                applicationContext,
+                "WARN",
+                "SpeedOverlay",
+                event,
+                error.stackTraceToString(),
+            )
+        }
     }
 
     private fun setSpeedControlsEnabled(enabled: Boolean) {
@@ -356,7 +450,24 @@ internal class SpeedOverlayService : Service() {
             val p = params ?: return false
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> { downX = event.rawX; downY = event.rawY; initialX = p.x; initialY = p.y; moved = false; return true }
-                MotionEvent.ACTION_MOVE -> { val dx = (downX - event.rawX).toInt(); val dy = (event.rawY - downY).toInt(); if (kotlin.math.abs(dx) > 4 || kotlin.math.abs(dy) > 4) moved = true; p.x = max(0, initialX + dx); p.y = max(0, initialY + dy); runCatching { wm.updateViewLayout(v, p) }; return true }
+                MotionEvent.ACTION_MOVE -> {
+                    if (!ensureOverlayPermission()) return false
+                    val dx = (downX - event.rawX).toInt()
+                    val dy = (event.rawY - downY).toInt()
+                    if (kotlin.math.abs(dx) > 4 || kotlin.math.abs(dy) > 4) moved = true
+                    p.x = max(0, initialX + dx)
+                    p.y = max(0, initialY + dy)
+                    runCatching { wm.updateViewLayout(v, p) }.onFailure { error ->
+                        if (!hasOverlayPermission()) {
+                            ensureOverlayPermission()
+                        } else {
+                            recordOverlayFailure("OVERLAY_LAYOUT_UPDATE_FAILED", error)
+                            root = null
+                            stopSelf()
+                        }
+                    }
+                    return true
+                }
                 MotionEvent.ACTION_UP -> return moved
             }
             return false
@@ -364,8 +475,14 @@ internal class SpeedOverlayService : Service() {
     }
 
     override fun onDestroy() {
-        mainHandler.removeCallbacks(refreshTask)
-        root?.let { view -> runCatching { wm.removeView(view) } }
+        refreshJob?.cancel()
+        overlayScope.cancel()
+        root?.let { view ->
+            if (::wm.isInitialized) {
+                runCatching { wm.removeViewImmediate(view) }
+                    .onFailure { recordOverlayFailure("OVERLAY_DETACH_FAILED", it) }
+            }
+        }
         root = null
         super.onDestroy()
     }

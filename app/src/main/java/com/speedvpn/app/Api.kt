@@ -1,10 +1,12 @@
 package com.speedvpn.app
 
 import android.content.Context
+import android.net.Network
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import okhttp3.Dns
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -17,6 +19,12 @@ import java.security.KeyStore
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.Socket
+import java.net.SocketException
+import java.net.UnknownHostException
+import javax.net.SocketFactory
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
@@ -24,7 +32,86 @@ import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
 private val JSON = "application/json".toMediaType()
-val http: OkHttpClient = OkHttpClient.Builder().callTimeout(20, TimeUnit.SECONDS).build()
+
+private const val API_CONNECT_TIMEOUT_MS = 8_000
+
+/**
+ * Resolve API hostnames on the physical network when a VPN is active, then protect
+ * every transport socket before connect(). If the VPN is routing traffic but its
+ * service/network is unavailable, fail closed instead of feeding API traffic back
+ * into the TUN.
+ */
+private class VpnAwareApiDns : Dns {
+    override fun lookup(hostname: String): List<InetAddress> {
+        val network = SpeedVpnService.currentUnderlyingNetworkForApi()
+        if (network != null) {
+            return try {
+                network.getAllByName(hostname).toList()
+            } catch (error: Exception) {
+                if (SpeedVpnService.apiRoutingRequiresProtection()) {
+                    throw UnknownHostException("Unable to resolve $hostname on the VPN's underlying network").also {
+                        it.initCause(error)
+                    }
+                }
+                Dns.SYSTEM.lookup(hostname)
+            }
+        }
+
+        if (SpeedVpnService.apiRoutingRequiresProtection()) {
+            throw UnknownHostException("VPN is active but no underlying network is available for $hostname")
+        }
+        return Dns.SYSTEM.lookup(hostname)
+    }
+}
+
+private class VpnAwareApiSocketFactory : SocketFactory() {
+    private fun newProtectedSocket(): Socket {
+        val socket = Socket()
+        try {
+            if (!SpeedVpnService.protectApiSocket(socket)) {
+                throw SocketException("API socket protection failed while VPN routing is active")
+            }
+            return socket
+        } catch (error: Throwable) {
+            runCatching { socket.close() }
+            throw error
+        }
+    }
+
+    private fun connect(
+        socket: Socket,
+        address: InetSocketAddress,
+        localAddress: InetSocketAddress? = null,
+    ): Socket {
+        try {
+            if (localAddress != null) socket.bind(localAddress)
+            socket.connect(address, API_CONNECT_TIMEOUT_MS)
+            return socket
+        } catch (error: Throwable) {
+            runCatching { socket.close() }
+            throw error
+        }
+    }
+
+    override fun createSocket(): Socket = newProtectedSocket()
+    override fun createSocket(host: String, port: Int): Socket =
+        connect(newProtectedSocket(), InetSocketAddress(host, port))
+    override fun createSocket(host: String, port: Int, localHost: InetAddress, localPort: Int): Socket =
+        connect(newProtectedSocket(), InetSocketAddress(host, port), InetSocketAddress(localHost, localPort))
+    override fun createSocket(host: InetAddress, port: Int): Socket =
+        connect(newProtectedSocket(), InetSocketAddress(host, port))
+    override fun createSocket(address: InetAddress, port: Int, localAddress: InetAddress, localPort: Int): Socket =
+        connect(newProtectedSocket(), InetSocketAddress(address, port), InetSocketAddress(localAddress, localPort))
+}
+
+val http: OkHttpClient = OkHttpClient.Builder()
+    .dns(VpnAwareApiDns())
+    .socketFactory(VpnAwareApiSocketFactory())
+    .connectTimeout(API_CONNECT_TIMEOUT_MS.toLong(), TimeUnit.MILLISECONDS)
+    .readTimeout(10, TimeUnit.SECONDS)
+    .writeTimeout(10, TimeUnit.SECONDS)
+    .callTimeout(20, TimeUnit.SECONDS)
+    .build()
 
 class ApiException(val code: Int, msg: String) : Exception(msg)
 
