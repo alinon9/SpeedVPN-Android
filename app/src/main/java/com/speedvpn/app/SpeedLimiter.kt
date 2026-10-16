@@ -20,8 +20,8 @@ internal data class SessionCounter(
  * Uses a monotonic-clock token bucket shared by all flows in each direction.
  * Tokens accrue while the relay is reading/writing sockets, so ordinary I/O
  * overhead is accounted for instead of being added on top of a full per-chunk
- * sleep. A bounded burst absorbs scheduler jitter; no waiter reserves future
- * tokens before those tokens are available.
+ * sleep. A small bounded burst absorbs scheduler jitter. Oversized datagrams
+ * reserve their actual byte cost as debt and wait for that budget before send.
  */
 class TokenBucket {
     companion object {
@@ -66,15 +66,20 @@ class TokenBucket {
 
     /**
      * Wait until enough credit exists for this chunk, then debit it.
-     * A rate of zero means unlimited. Chunks larger than the bucket capacity
-     * are allowed once the bucket is full and create debt that must refill before
-     * the next chunk, so a large UDP datagram cannot wait forever.
+     * A rate of zero means unlimited. A datagram larger than bucket capacity
+     * cannot fit in the bucket, so its actual byte cost is debited as debt and
+     * this call waits for that debt to be earned before allowing the send.
      */
     fun acquire(n: Int, canProceed: () -> Boolean = { true }): Boolean {
         if (n <= 0) return canProceed()
 
         lock.lock()
         try {
+            // An oversized request reserves its real cost once. It remains here
+            // waiting while the shared bucket earns that debt back; later requests
+            // therefore cannot bypass the datagram's budget or wait forever for a
+            // token balance the bounded bucket can never hold.
+            var oversizedDebtReserved = false
             while (true) {
                 if (!canProceed()) return false
                 val rate = bytesPerSec
@@ -84,12 +89,30 @@ class TokenBucket {
                 refill(now, rate)
                 if (!canProceed()) return false
 
-                // For an oversized packet, a full bucket is the eligibility
-                // threshold. Debiting the full packet then accounts for its
-                // transmission time as token debt before another packet is sent.
+                if (oversizedDebtReserved) {
+                    if (availableBytes >= 0.0) return true
+                    val debtBytes = -availableBytes
+                    val waitNs = ceil(debtBytes * NANOS_PER_SECOND / rate.toDouble())
+                        .toLong()
+                        .coerceAtLeast(1L)
+                    try {
+                        // awaitNanos releases this lock; rate changes can clear debt
+                        // and wake this waiter immediately.
+                        changed.awaitNanos(waitNs)
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        return false
+                    }
+                    continue
+                }
+
                 val requiredBytes = min(n.toDouble(), capacityBytes)
                 if (availableBytes >= requiredBytes) {
                     availableBytes -= n.toDouble()
+                    if (n.toDouble() > capacityBytes && availableBytes < 0.0) {
+                        oversizedDebtReserved = true
+                        continue
+                    }
                     return true
                 }
 
@@ -103,8 +126,6 @@ class TokenBucket {
                     // and signal waiters without waiting for a sleeping thread.
                     changed.awaitNanos(waitNs)
                 } catch (_: InterruptedException) {
-                    // No reservation was made for this waiter, so returning cannot
-                    // leave phantom pacing debt behind for other flows.
                     Thread.currentThread().interrupt()
                     return false
                 }
