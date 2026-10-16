@@ -5,6 +5,7 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.util.Log
+import java.io.Closeable
 import java.io.IOException
 import java.net.SocketException
 import java.util.concurrent.TimeUnit
@@ -14,9 +15,13 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.DisposableHandle
+import kotlinx.coroutines.InternalCoroutinesApi
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -31,6 +36,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import okhttp3.Response
+import okhttp3.ResponseBody
 import okio.BufferedSink
 
 enum class SpeedTestPhase { DOWNLOAD, UPLOAD }
@@ -79,6 +85,23 @@ object SpeedTestEngine {
     )
     internal data class PhaseMeasurement(val throughputBps: Long, val completedPayloadBytes: Long)
     internal data class DirectionOutcome(val measurement: PhaseMeasurement?, val error: String?)
+
+    /** Keeps the active Call cancellable until the response body has been fully consumed. */
+    private class MeasuredResponse(
+        private val delegate: Response,
+        private val cancellationRegistration: DisposableHandle?,
+    ) : Closeable {
+        val code: Int get() = delegate.code
+        val isSuccessful: Boolean get() = delegate.isSuccessful
+        val body: ResponseBody get() = delegate.body
+        val request: Request get() = delegate.request
+        fun header(name: String): String? = delegate.header(name)
+
+        override fun close() {
+            cancellationRegistration?.dispose()
+            delegate.close()
+        }
+    }
 
     private val measurementMutex = Mutex()
 
@@ -192,7 +215,19 @@ object SpeedTestEngine {
                         "downloadTargetKbps=${expectedDownloadKbps ?: "unlimited"} " +
                         "uploadTargetKbps=${expectedUploadKbps ?: "unlimited"} networkPath=$networkPath",
                 )
-                val testClient = buildTestClient(context, networkPath)
+                val testClient = try {
+                    buildTestClient(context, networkPath)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    Log.w(TAG, "Unable to select requested network route $networkPath: ${errorMessage(error)}", error)
+                    return@withContext SpeedTestResult(
+                        downloadBps = null,
+                        uploadBps = null,
+                        durationMs = System.currentTimeMillis() - startedAt,
+                        error = errorMessage(error),
+                    )
+                }
                 try {
                     val downloadOutcome = captureDirection(SpeedTestPhase.DOWNLOAD) {
                         onProgress(SpeedTestPhase.DOWNLOAD)
@@ -246,16 +281,26 @@ object SpeedTestEngine {
     private fun errorMessage(error: Throwable): String =
         error.message?.takeIf { it.isNotBlank() } ?: error.javaClass.simpleName
 
+    @OptIn(InternalCoroutinesApi::class)
     private suspend fun executeMeasuredRequest(
         client: OkHttpClient,
         request: Request,
         stage: String,
         requestedBytes: Long,
         startedNs: Long,
-    ): Response {
+    ): MeasuredResponse {
+        val call = client.newCall(request)
+        // Keep cancellation wired to the Call after response headers arrive and while
+        // the caller is still consuming the blocking response stream on Dispatchers.IO.
+        val parentJob = currentCoroutineContext()[Job]
+        val cancellationRegistration = parentJob?.invokeOnCompletion(
+            onCancelling = true,
+            invokeImmediately = true,
+        ) { cause ->
+            if (cause is CancellationException) call.cancel()
+        }
         try {
             val response = suspendCancellableCoroutine<Response> { continuation ->
-                val call = client.newCall(request)
                 continuation.invokeOnCancellation { call.cancel() }
                 call.enqueue(object : Callback {
                     override fun onFailure(call: Call, error: IOException) {
@@ -280,19 +325,24 @@ object SpeedTestEngine {
                     "contentType=$contentType contentLength=$contentLength " +
                     "headersElapsedMs=${TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNs)}",
             )
-            return response
-        } catch (error: IOException) {
-            Log.w(
-                TAG,
-                "HTTP $stage request failed method=${request.method} host=${request.url.host} " +
-                    "path=${request.url.encodedPath} requestedBytes=$requestedBytes " +
-                    "elapsedMs=${TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNs)} " +
-                    "errorType=${error.javaClass.simpleName} error=${errorMessage(error)}",
-                error,
-            )
+            return MeasuredResponse(response, cancellationRegistration)
+        } catch (error: Throwable) {
+            cancellationRegistration?.dispose()
+            call.cancel()
+            if (error is IOException) {
+                Log.w(
+                    TAG,
+                    "HTTP $stage request failed method=${request.method} host=${request.url.host} " +
+                        "path=${request.url.encodedPath} requestedBytes=$requestedBytes " +
+                        "elapsedMs=${TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNs)} " +
+                        "errorType=${error.javaClass.simpleName} error=${errorMessage(error)}",
+                    error,
+                )
+            }
             throw error
         }
     }
+
 
     internal fun downloadResponseValidationError(
         contentType: String?,
@@ -321,13 +371,13 @@ object SpeedTestEngine {
 
     internal fun isRetryableSpeedTestFailure(error: Throwable): Boolean {
         val message = generateSequence(error) { it.cause }.mapNotNull { it.message }.joinToString(" ")
-        val status = Regex("HTTP\\s+(\\d{3})", RegexOption.IGNORE_CASE)
+        val status = Regex("HTTP(?:\\s+status)?\\s+(\\d{3})", RegexOption.IGNORE_CASE)
             .find(message)?.groupValues?.getOrNull(1)?.toIntOrNull()
         if (status != null) return status == 408 || status == 429 || status in 500..599
         return generateSequence(error) { it.cause }.any { it is IOException }
     }
 
-    private fun logHttpResponseError(stage: String, response: Response, requestedBytes: Long) {
+    private fun logHttpResponseError(stage: String, response: MeasuredResponse, requestedBytes: Long) {
         if (!response.isSuccessful) {
             Log.w(
                 TAG,
