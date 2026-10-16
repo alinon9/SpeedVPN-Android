@@ -1300,8 +1300,11 @@ class SpeedVpnService : VpnService() {
                 return
             }
             thread(name = "speedvpn-native-stop-retry", isDaemon = true) {
-                repeat(20) {
-                    Thread.sleep(100)
+                var attempts = 0
+                while (true) {
+                    // Fast retries first, then a low-frequency retry that deliberately
+                    // keeps this worker's strong references to the TUN FD/relay alive.
+                    Thread.sleep(if (attempts++ < 20) 100 else 1_000)
                     if (stopNative(generation)) {
                         runCatching { pfd?.close() }
                         runCatching { relay?.stop() }
@@ -1323,8 +1326,10 @@ class SpeedVpnService : VpnService() {
                         markResourceCleanupFinished()
                         return@thread
                     }
+                    if (attempts == 20) {
+                        logE("Native generation $generation is still live/unknown; retaining its TUN resources and retrying once per second")
+                    }
                 }
-                logE("Native generation $generation did not stop after retries; resources retained to avoid TUN use-after-close")
             }
             return
         }
@@ -1503,14 +1508,13 @@ class SpeedVpnService : VpnService() {
                 if (generation > 0L) {
                     var stopped = stopNative(generation)
                     var attempts = 0
-                    while (!stopped && attempts++ < 20) {
-                        Thread.sleep(100)
+                    while (!stopped) {
+                        Thread.sleep(if (attempts++ < 20) 100 else 1_000)
                         val ownerNow = synchronized(processNativeLifecycleLock) { nativeOwnerGeneration.get() }
                         stopped = if (ownerNow != generation) true else stopNative(generation)
-                    }
-                    if (!stopped) {
-                        logE("Emergency native cleanup could not stop generation $generation; TUN FD retained")
-                        return@thread
+                        if (!stopped && attempts == 20) {
+                            logE("Emergency native cleanup still unconfirmed; keeping TUN FD reachable and retrying once per second")
+                        }
                     }
                 }
                 runCatching { pfd?.close() }
