@@ -8,6 +8,7 @@ import android.os.Build
 import android.provider.Settings
 import java.util.Locale
 import android.os.Bundle
+import android.widget.ImageView
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -21,6 +22,8 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -34,6 +37,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
@@ -638,6 +642,15 @@ class MainActivity : ComponentActivity() {
                     if (it) UsageCollectionScheduler.schedule(this@MainActivity) else UsageCollectionScheduler.cancel(this@MainActivity)
                     lifecycleScope.launch(Dispatchers.IO) { if (it) UsageCollector.collectToday(this@MainActivity) }
                 }
+                if (!usageAccessState.value) {
+                    Button(
+                        onClick = { startActivity(AppTrafficManager.usageAccessIntent()) },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp),
+                    ) { Text("السماح بإحصاءات التطبيقات", fontSize = 11.sp) }
+                } else {
+                    Text("وصول إحصاءات التطبيقات مفعّل", color = Green, fontSize = 10.sp)
+                }
             }
         }
     }
@@ -668,6 +681,38 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+
+    @Composable
+    private fun AppFirewallSettingsCard() {
+        val savedSettings = remember { VpnAppControl.read(this@MainActivity) }
+        var firewallEnabled by remember { mutableStateOf(savedSettings.firewallEnabled) }
+        var blockedPackages by remember { mutableStateOf(savedSettings.blockedPackages) }
+
+        GlassCard {
+            SectionLabel("جدار التطبيقات", "إعداد عام للحظر على مستوى التطبيقات")
+            SettingSwitch(
+                "تفعيل جدار التطبيقات",
+                "الحظر الفعلي يحتاج Always-on VPN + Lockdown",
+                firewallEnabled,
+            ) { enabled ->
+                firewallEnabled = enabled
+                saveAppControlSettings(VpnAppControlSettings(enabled, blockedPackages))
+            }
+            if (firewallEnabled) {
+                Text(
+                    "فعّل Always-on VPN وBlock connections without VPN من إعدادات Android حتى يصبح الحظر فعليًا.",
+                    color = Amber,
+                    fontSize = 10.sp,
+                )
+                OutlinedButton(
+                    onClick = { runCatching { startActivity(AppTrafficManager.vpnSettingsIntent()) } },
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("فتح إعدادات VPN", fontSize = 11.sp) }
+            }
+        }
+    }
+
     @Composable
     private fun SettingsScreen(s: Snapshot, signedIn: Boolean, onLink: () -> Unit, onSignOut: () -> Unit) {
         Column(
@@ -677,6 +722,7 @@ class MainActivity : ComponentActivity() {
             ScreenTitle("الإعدادات", "التوافق، البيانات، النافذة العائمة والحساب")
             CompatibilitySettingsCard()
             SmartControlsCard()
+            AppFirewallSettingsCard()
             AccountCard(signedIn, onLink, onSignOut)
             DiagnosticsCard(s)
         }
@@ -874,7 +920,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    @Composable
+@Composable
     private fun AppsScreen(s: Snapshot) {
         val usageAccess = usageAccessState.value
         val catalogRefreshVersion = appCatalogRefreshTrigger.value
@@ -882,7 +928,6 @@ class MainActivity : ComponentActivity() {
         var firewallEnabled by remember { mutableStateOf(VpnAppControl.read(this@MainActivity).firewallEnabled) }
         var blockedPackages by remember { mutableStateOf(VpnAppControl.read(this@MainActivity).blockedPackages) }
         var apps by remember { mutableStateOf<List<AppTrafficUsage>>(emptyList()) }
-        var policies by remember { mutableStateOf<Map<String, AppPolicy>>(emptyMap()) }
         var quotaPolicies by remember { mutableStateOf<Map<String, List<AppQuotaPolicy>>>(emptyMap()) }
         var appQuery by remember { mutableStateOf("") }
         var editingLimitApp by remember { mutableStateOf<AppTrafficUsage?>(null) }
@@ -901,9 +946,8 @@ class MainActivity : ComponentActivity() {
                 emptyList()
             }
 
-            // Publish the complete installed-app list before collecting usage statistics.
-            // The catalog and usage refresh share one coroutine so an initial empty catalog
-            // can never overwrite the freshly loaded list.
+            // Keep app discovery and usage refresh separate: the installed-app list must
+            // appear even when Android usage access has not been granted.
             apps = withContext(Dispatchers.IO) {
                 installedApps.map { app ->
                     AppTrafficUsage(
@@ -913,7 +957,7 @@ class MainActivity : ComponentActivity() {
                         downloadBytes = 0L,
                         uploadBytes = 0L,
                     )
-                }
+                }.sortedBy { it.label.lowercase(Locale.getDefault()) }
             }
             isLoadingAppCatalog = false
 
@@ -933,13 +977,7 @@ class MainActivity : ComponentActivity() {
                             downloadBytes = row?.downloadBytes ?: 0L,
                             uploadBytes = row?.uploadBytes ?: 0L,
                         )
-                    }.sortedWith(
-                        compareByDescending<AppTrafficUsage> { it.totalBytes }
-                            .thenBy { it.label.lowercase(java.util.Locale.getDefault()) }
-                    )
-                }
-                policies = withContext(Dispatchers.IO) {
-                    UsageRepository.readPolicies(this@MainActivity).associateBy { it.packageName }
+                    }.sortedBy { it.label.lowercase(Locale.getDefault()) }
                 }
                 quotaPolicies = withContext(Dispatchers.IO) {
                     UsageRepository.readQuotaPolicyMap(this@MainActivity)
@@ -949,109 +987,120 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        val shownApps = apps.filter { app ->
+            appQuery.isBlank() ||
+                app.label.contains(appQuery, ignoreCase = true) ||
+                app.packageName.contains(appQuery, ignoreCase = true)
+        }
+
         Column(
-            Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(18.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+            Modifier.fillMaxSize().padding(horizontal = 18.dp, vertical = 14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            ScreenTitle("التطبيقات", "حظر، حدود بيانات، سرعة خاصة، ونسبة الاستهلاك")
+            ScreenTitle(
+                "التطبيقات",
+                "ابحث عن تطبيق لإدارة الحظر وحدود البيانات والسرعة الخاصة به",
+            )
+            OutlinedTextField(
+                value = appQuery,
+                onValueChange = { appQuery = it },
+                singleLine = true,
+                label = { Text("بحث عن تطبيق") },
+                modifier = Modifier.fillMaxWidth().testTag("apps_search"),
+            )
 
-            GlassCard {
-                SectionLabel("إحصاءات الإنترنت", "يوميًا لكل تطبيق مع إجمالي أسبوعي وشهري")
-                SettingSwitch("جمع الإحصاءات", "تسجيل استهلاك التطبيقات محليًا", statsEnabled) {
-                    statsEnabled = it
-                    SmartSettings.setStatsEnabled(this@MainActivity, it)
-                    if (it) {
-                        UsageCollectionScheduler.schedule(this@MainActivity)
-                        lifecycleScope.launch(Dispatchers.IO) { UsageCollector.collectToday(this@MainActivity) }
-                    } else UsageCollectionScheduler.cancel(this@MainActivity)
+            when {
+                isLoadingAppCatalog -> {
+                    Box(
+                        Modifier.weight(1f).fillMaxWidth(),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text("جارٍ تحميل التطبيقات المثبّتة...", color = TextSecondary, fontSize = 12.sp)
+                    }
                 }
-                if (!usageAccess) {
-                    Button(
-                        onClick = { startActivity(AppTrafficManager.usageAccessIntent()) },
-                        shape = RoundedCornerShape(12.dp),
-                        modifier = Modifier.fillMaxWidth(),
-                    ) { Text("السماح بإحصاءات التطبيقات", fontSize = 11.sp) }
-                } else {
-                    Text("وصول NetworkStatsManager مفعّل", color = Green, fontSize = 10.sp)
-                }
-            }
-
-            GlassCard {
-                SectionLabel("جدار التطبيقات", "الحظر اليدوي وحد استخدام التطبيق يعملان كحالتين مستقلتين")
-                SettingSwitch("تفعيل جدار التطبيقات", "الحظر الفعلي يحتاج Always-on VPN + Lockdown", firewallEnabled) {
-                    firewallEnabled = it
-                    saveAppControlSettings(VpnAppControlSettings(it, blockedPackages))
-                }
-                if (firewallEnabled) {
-                    Text("فعّل Always-on VPN وBlock connections without VPN من إعدادات Android حتى يصبح الحظر فعليًا.", color = Amber, fontSize = 10.sp)
-                    OutlinedButton(
-                        onClick = { runCatching { startActivity(AppTrafficManager.vpnSettingsIntent()) } },
-                        shape = RoundedCornerShape(12.dp),
-                        modifier = Modifier.fillMaxWidth(),
-                    ) { Text("فتح إعدادات VPN", fontSize = 11.sp) }
-                }
-            }
-
-            GlassCard {
-                SectionLabel("قائمة التطبيقات", "النسبة محسوبة من إجمالي استهلاك التطبيقات المعروضة")
-                OutlinedTextField(
-                    value = appQuery,
-                    onValueChange = { appQuery = it },
-                    singleLine = true,
-                    label = { Text("بحث عن تطبيق") },
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                val totalConsumption = apps.sumOf { it.totalBytes.coerceAtLeast(0L) }
-                val shownApps = apps.filter {
-                    appQuery.isBlank() || it.label.contains(appQuery, true) || it.packageName.contains(appQuery, true)
-                }
-                if (isLoadingAppCatalog) {
-                    Text("جارٍ تحميل التطبيقات المثبّتة...", color = TextSecondary, fontSize = 11.sp)
-                } else if (shownApps.isEmpty()) {
+                shownApps.isEmpty() -> {
                     val emptyMessage = if (appQuery.isBlank()) {
                         "لم يتم العثور على تطبيقات مثبّتة قابلة للتشغيل."
                     } else {
                         "لا توجد تطبيقات تطابق البحث."
                     }
-                    Text(emptyMessage, color = TextSecondary, fontSize = 11.sp)
-                } else {
-                    shownApps.forEach { app ->
-                        val policy = policies[app.packageName]
-                        val appQuotas = quotaPolicies[app.packageName].orEmpty()
-                        val dailyQuota = appQuotas.firstOrNull { it.quotaType == QuotaType.DAILY }
-                        val weeklyQuota = appQuotas.firstOrNull { it.quotaType == QuotaType.WEEKLY }
-                        val monthlyQuota = appQuotas.firstOrNull { it.quotaType == QuotaType.MONTHLY }
-                        val limit = dailyQuota?.limitBytes ?: policy?.dailyLimitBytes
-                        val used = app.totalBytes
-                        val remaining = limit?.let { (it - used).coerceAtLeast(0L) }
-                        Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Column(Modifier.weight(1f)) {
-                                Text(app.label, color = TextPrimary, fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
-                                Text(
-                                    "↓ ${formatDataBytes(app.downloadBytes)} • ↑ ${formatDataBytes(app.uploadBytes)} • ${formatDataBytes(used)} • ${usagePercent(used, totalConsumption)}%",
-                                    color = TextSecondary,
-                                    fontSize = 9.sp,
-                                )
-                                if (limit != null) {
-                                    Text(
-                                        "حد استخدام التطبيق اليومي ${formatDataBytes(limit)} • المتبقي ${formatDataBytes(remaining ?: 0L)}",
-                                        color = if ((remaining ?: 0L) == 0L) Color(0xFFFF7D88) else Amber,
-                                        fontSize = 9.sp,
-                                    )
-                                }
-                                if (weeklyQuota != null || monthlyQuota != null) {
-                                    Text(
-                                        "استخدام التطبيق — أسبوعي: ${weeklyQuota?.let { formatDataBytes(it.limitBytes) } ?: "—"} • شهري: ${monthlyQuota?.let { formatDataBytes(it.limitBytes) } ?: "—"}",
-                                        color = TextSecondary,
-                                        fontSize = 9.sp,
-                                    )
-                                }
+                    Box(
+                        Modifier.weight(1f).fillMaxWidth(),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(emptyMessage, color = TextSecondary, fontSize = 12.sp, textAlign = TextAlign.Center)
+                    }
+                }
+                else -> {
+                    LazyColumn(
+                        modifier = Modifier.weight(1f).fillMaxWidth().testTag("apps_list"),
+                        contentPadding = PaddingValues(bottom = 12.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        items(items = shownApps, key = { it.packageName }) { app ->
+                            val appIcon = remember(app.packageName) {
+                                runCatching { packageManager.getApplicationIcon(app.packageName) }.getOrNull()
                             }
-                            Column(horizontalAlignment = Alignment.End) {
-                                Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
-                                    TextButton(onClick = { editingLimitApp = app }) { Text("حد", color = Amber, fontSize = 10.sp) }
-                                    TextButton(onClick = { editingSpeedApp = app }) { Text("سرعة", color = Blue, fontSize = 10.sp) }
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(14.dp))
+                                    .background(Surface)
+                                    .border(1.dp, StrokeColor, RoundedCornerShape(14.dp))
+                                    .padding(horizontal = 10.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            ) {
+                                if (appIcon != null) {
+                                    AndroidView(
+                                        factory = { context ->
+                                            ImageView(context).apply { scaleType = ImageView.ScaleType.FIT_CENTER }
+                                        },
+                                        update = { imageView ->
+                                            imageView.setImageDrawable(appIcon)
+                                            imageView.contentDescription = "أيقونة ${app.label}"
+                                        },
+                                        modifier = Modifier
+                                            .size(40.dp)
+                                            .semantics { contentDescription = "أيقونة ${app.label}" },
+                                    )
+                                } else {
+                                    Box(
+                                        Modifier
+                                            .size(40.dp)
+                                            .clip(CircleShape)
+                                            .background(Blue.copy(alpha = 0.12f)),
+                                        contentAlignment = Alignment.Center,
+                                    ) {
+                                        Text(app.label.take(1).uppercase(Locale.getDefault()), color = Blue, fontWeight = FontWeight.Bold)
+                                    }
                                 }
+
+                                Column(
+                                    modifier = Modifier.weight(1f),
+                                    verticalArrangement = Arrangement.spacedBy(2.dp),
+                                ) {
+                                    Text(
+                                        app.label,
+                                        color = TextPrimary,
+                                        fontWeight = FontWeight.SemiBold,
+                                        fontSize = 12.sp,
+                                        maxLines = 1,
+                                    )
+                                    Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                                        TextButton(
+                                            onClick = { editingLimitApp = app },
+                                            contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
+                                            modifier = Modifier.height(30.dp),
+                                        ) { Text("حد", color = Amber, fontSize = 10.sp) }
+                                        TextButton(
+                                            onClick = { editingSpeedApp = app },
+                                            contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
+                                            modifier = Modifier.height(30.dp),
+                                        ) { Text("سرعة", color = Blue, fontSize = 10.sp) }
+                                    }
+                                }
+
                                 Switch(
                                     checked = app.packageName in blockedPackages,
                                     onCheckedChange = { blocked ->
@@ -1061,12 +1110,17 @@ class MainActivity : ComponentActivity() {
                                         blockedPackages = next
                                         saveAppControlSettings(VpnAppControlSettings(firewallEnabled, next))
                                     },
+                                    modifier = Modifier.semantics {
+                                        contentDescription = if (app.packageName in blockedPackages) {
+                                            "إلغاء حظر ${app.label}"
+                                        } else {
+                                            "حظر ${app.label}"
+                                        }
+                                    },
                                 )
                             }
                         }
                     }
-                    Text("المعروض: ${shownApps.size} من ${apps.size}", color = TextSecondary, fontSize = 9.sp)
-                    Text("التطبيقات تظهر مباشرة، والبحث بالأعلى لتصفية القائمة. عند تعديل الحد يتم تحديث الاستهلاك وإعادة تقييم الحظر فورًا.", color = TextSecondary, fontSize = 9.sp)
                 }
             }
         }
@@ -1084,7 +1138,6 @@ class MainActivity : ComponentActivity() {
                             UsageRepository.setQuotaPolicy(this@MainActivity, app.packageName, app.label, app.uid, quotaType, bytes)
                         }
                         UsageCollector.collectToday(this@MainActivity)
-                        policies = UsageRepository.readPolicies(this@MainActivity).associateBy { it.packageName }
                         quotaPolicies = UsageRepository.readQuotaPolicyMap(this@MainActivity)
                         if (statsEnabled && usageAccess) {
                             val installed = AppTrafficManager.installedLaunchableApps(this@MainActivity)
@@ -1099,10 +1152,7 @@ class MainActivity : ComponentActivity() {
                                     row?.downloadBytes ?: 0L,
                                     row?.uploadBytes ?: 0L,
                                 )
-                            }.sortedWith(
-                                compareByDescending<AppTrafficUsage> { it.totalBytes }
-                                    .thenBy { it.label.lowercase(java.util.Locale.getDefault()) }
-                            )
+                            }.sortedBy { it.label.lowercase(Locale.getDefault()) }
                         }
                     }
                     editingLimitApp = null
