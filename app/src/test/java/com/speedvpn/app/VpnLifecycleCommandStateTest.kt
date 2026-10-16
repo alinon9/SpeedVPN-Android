@@ -34,6 +34,16 @@ class VpnLifecycleCommandStateTest {
     }
 
     @Test
+    fun missingStaleTokenCannotReleasePendingStop() {
+        val state = VpnLifecycleCommandState()
+        val activeToken = state.requestStop()
+        assertFalse(state.finishStop(null))
+        assertTrue(state.shouldDeferConnect())
+        assertFalse(state.finishStop(activeToken))
+        assertFalse(state.shouldDeferConnect())
+    }
+
+    @Test
     fun cleanStopDoesNotRequestReconnect() {
         val state = VpnLifecycleCommandState()
         val token = state.requestStop()

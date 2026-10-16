@@ -209,18 +209,22 @@ class SpeedVpnService : VpnService() {
                     restartAfterStop = true,
                 )
                 reconnectAfterDisconnect = true
+                val stopToken = lifecycleStopToken
                 sessionId.incrementAndGet()
                 goForeground()
-                scope.launch { disconnect() }
+                scope.launch { disconnect(stopToken = stopToken) }
             }
             ACTION_STOP -> {
                 val expectedGeneration = intent?.getLongExtra(EXTRA_EXPECTED_GENERATION, 0L) ?: 0L
                 val activeGeneration = activeServiceGeneration.get()
-                if (expectedGeneration <= 0L || expectedGeneration == activeGeneration) {
+                val stopToken = if (expectedGeneration <= 0L || expectedGeneration == activeGeneration) {
                     lifecycleStopToken = lifecycleCommandState.requestStop(existingToken = lifecycleStopToken)
                     sessionId.incrementAndGet()
+                    lifecycleStopToken
+                } else {
+                    null
                 }
-                scope.launch { disconnect(expectedGeneration.takeIf { it > 0L }) }
+                scope.launch { disconnect(expectedGeneration.takeIf { it > 0L }, stopToken) }
             }
             else -> {
                 lifecycleCommandState.requestStart()
@@ -506,12 +510,22 @@ class SpeedVpnService : VpnService() {
         return false
     }
 
+    private fun finishSpecificLifecycleStopAndReconnect(token: Long?): Boolean {
+        if (token == null) return false
+        val ownsToken = lifecycleStopToken == token
+        val queuedStart = lifecycleCommandState.finishStop(token)
+        if (!ownsToken) return queuedStart
+        lifecycleStopToken = null
+        val explicitRestart = reconnectAfterDisconnect
+        reconnectAfterDisconnect = false
+        return queuedStart || explicitRestart
+    }
+
     private fun finishLifecycleStopAndReconnect(): Boolean {
         val token = lifecycleStopToken
-        lifecycleStopToken = null
-        // Releasing this instance's stop token must never clear another Service
-        // instance's pending teardown gate.
-        val queuedStart = lifecycleCommandState.finishStop(token)
+        val queuedStart = finishSpecificLifecycleStopAndReconnect(token)
+        // A CONNECT observed during DISCONNECTING may request an internal restart
+        // without its own STOP token; preserve that legacy reconnect behavior.
         val explicitRestart = reconnectAfterDisconnect
         reconnectAfterDisconnect = false
         return queuedStart || explicitRestart
@@ -1357,7 +1371,10 @@ class SpeedVpnService : VpnService() {
         stopSelf()
     }
 
-    private suspend fun disconnect(expectedGeneration: Long? = null) = stateMutex.withLock {
+    private suspend fun disconnect(
+        expectedGeneration: Long? = null,
+        stopToken: Long? = null,
+    ) = stateMutex.withLock {
         val generation = serviceGeneration
         if (expectedGeneration != null) {
             val activeGeneration = synchronized(processNativeLifecycleLock) {
@@ -1365,7 +1382,7 @@ class SpeedVpnService : VpnService() {
             }
             if (generation != expectedGeneration || activeGeneration != expectedGeneration) {
                 log("Ignoring stale stop request for generation $expectedGeneration (current=$activeGeneration)")
-                val shouldReconnect = finishLifecycleStopAndReconnect()
+                val shouldReconnect = finishSpecificLifecycleStopAndReconnect(stopToken)
                 if (shouldReconnect) {
                     activeServiceInstance.get()?.let { next ->
                         if (!next.destroying.get()) next.scope.launch { next.connect() }
@@ -1388,7 +1405,7 @@ class SpeedVpnService : VpnService() {
         }
 
         if (!hadResources) {
-            val shouldReconnect = finishLifecycleStopAndReconnect()
+            val shouldReconnect = finishSpecificLifecycleStopAndReconnect(stopToken)
             val released = synchronized(processNativeLifecycleLock) {
                 activeServiceGeneration.compareAndSet(generation, 0L)
             }
@@ -1411,7 +1428,7 @@ class SpeedVpnService : VpnService() {
         }
 
         cleanupLocked()
-        val shouldReconnect = finishLifecycleStopAndReconnect()
+        val shouldReconnect = finishSpecificLifecycleStopAndReconnect(stopToken)
         val released = synchronized(processNativeLifecycleLock) {
             activeServiceGeneration.compareAndSet(generation, 0L)
         }
@@ -1442,8 +1459,9 @@ class SpeedVpnService : VpnService() {
     override fun onRevoke() {
         log("VPN revoked by system/user")
         lifecycleStopToken = lifecycleCommandState.requestStop(existingToken = lifecycleStopToken)
+        val stopToken = lifecycleStopToken
         sessionId.incrementAndGet()
-        scope.launch { disconnect() }
+        scope.launch { disconnect(stopToken = stopToken) }
     }
 
     override fun onDestroy() {
