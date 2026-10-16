@@ -291,8 +291,8 @@ class SpeedVpnService : VpnService() {
                 .setUnderlyingNetworks(physicalNetwork?.let { arrayOf(it) } ?: emptyArray())
                 .addAddress(TUN_V4, 32)
                 .addRoute("0.0.0.0", 0)
-                // Feed Android the actual DNS servers from the current physical link.
-                // No public resolver is hard-coded.
+                // Feed Android the synthetic MapDNS endpoint inside the TUN.
+                // HEV intercepts this address; no physical resolver is installed here.
                 .apply { dnsServers.forEach { addDnsServer(it) } }
                 .apply {
                     // Always capture IPv6 to prevent direct-route leakage. When IPv6
@@ -306,7 +306,7 @@ class SpeedVpnService : VpnService() {
                     // All apps except SpeedVPN itself use TUN for UID-based firewalling.
                     addDisallowedApplication(packageName)
                     log("VPN_TUN_POLICY mode=all-apps-except-self ipv4=0.0.0.0/0 ipv6=::/0 " +
-                        "ipv6Egress=\${if (compatibility.ipv6Enabled) "enabled" else "blocked"} blockedPackages=" +
+                        "ipv6Egress=${if (compatibility.ipv6Enabled) "enabled" else "blocked"} blockedPackages=" +
                         currentBlockedPackages().sorted().joinToString(","))
                 }
             builder.establish()
