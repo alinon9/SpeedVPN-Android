@@ -843,6 +843,15 @@ class Socks5Server(
                 if (firstForwardedNs == 0L) firstForwardedNs = writeStartedNs
                 lastForwardedNs = writeFinishedNs
                 bucket.recordForwarded(n, generation)
+                // Count verification evidence only for a successfully written relay
+                // chunk whose originating TUN flow has been attributed to our own UID.
+                // A browser/background flow to the same relay cannot satisfy this test.
+                SpeedLimiter.recordVerificationForwarded(
+                    bucket = bucket,
+                    n = n,
+                    generation = generation,
+                    ownerUid = upstreamTcpMetadata[flowSocket]?.uid,
+                )
                 forwardedBytes += n.toLong()
             }
             runCatching { dst.flush() }
