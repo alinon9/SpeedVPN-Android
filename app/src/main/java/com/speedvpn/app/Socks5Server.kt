@@ -2,6 +2,8 @@ package com.speedvpn.app
 
 import android.net.Network
 import android.util.Base64
+import android.util.Log
+import java.io.Closeable
 import java.io.DataInputStream
 import java.io.InputStream
 import java.io.OutputStream
@@ -73,6 +75,41 @@ internal fun readRelayBatch(
 }
 
 /**
+ * Enforces the Android VpnService routing invariant: an outbound socket must never
+ * be bound, connected, or used unless protect() explicitly returned true.
+ * A false return and thrown protection failures both close the socket before
+ * propagating an error to the caller.
+ */
+internal fun <T : Closeable> protectSocketOrClose(
+    socket: T,
+    protect: (T) -> Boolean,
+    description: String,
+) {
+    val error = try {
+        if (protect(socket)) return
+        SocketException("$description: VpnService.protect(socket) returned false; outbound I/O refused")
+    } catch (failure: Throwable) {
+        closeRejectedSocket(socket, failure, description)
+        throw failure
+    }
+    closeRejectedSocket(socket, error, description)
+    throw error
+}
+
+private fun closeRejectedSocket(socket: Closeable, error: Throwable, description: String) {
+    try {
+        socket.close()
+    } catch (closeError: Throwable) {
+        error.addSuppressed(closeError)
+    }
+    Log.e(
+        "SpeedVPN-SocketProtection",
+        "PROTECT_FAILED description=$description; socket closed before network bind/connect to prevent routing loop",
+        error,
+    )
+}
+
+/**
  * Local SOCKS5 relay used by the native tun2socks engine.
  *
  * Security: a fresh random username/password is generated per VPN session and
@@ -93,6 +130,8 @@ class Socks5Server(
         // than 3. UDP still uses two workers plus its control handler.
         private const val MAX_WORKERS = 192
         private const val HANDSHAKE_TIMEOUT_MS = 10_000
+        // Reclaim TCP relay workers when a peer/network silently disappears.
+        private const val RELAY_READ_TIMEOUT_MS = 120_000
         private const val UDP_BUFFER_SIZE = 65_535
         private const val MAX_UDP_ASSOCIATIONS = 24
         private const val UDP_DNS_WORKERS = 4
@@ -138,6 +177,7 @@ class Socks5Server(
     val password: String = randomToken(32)
 
     @Volatile private var running = true
+    @Volatile private var acceptThread: Thread? = null
 
     private val openTcp = Collections.newSetFromMap(ConcurrentHashMap<Socket, Boolean>())
     private val openUdp = Collections.newSetFromMap(ConcurrentHashMap<DatagramSocket, Boolean>())
@@ -215,7 +255,7 @@ class Socks5Server(
     )
 
     fun start() {
-        thread(name = "socks-accept", isDaemon = true) {
+        acceptThread = thread(name = "socks-accept", isDaemon = true) {
             while (running) {
                 val client = try {
                     server.accept()
@@ -234,6 +274,15 @@ class Socks5Server(
                     continue
                 }
                 track(client)
+                // stop() can race between the first running check and registration.
+                // Re-check after tracking so a socket accepted during shutdown cannot escape
+                // the stop() snapshot or retain its session permit.
+                if (!running) {
+                    untrack(client)
+                    runCatching { client.close() }
+                    if (!isHealthProbe) sessions.release()
+                    break
+                }
                 val executor = if (isHealthProbe) probePool else pool
                 try {
                     executor.execute {
@@ -256,6 +305,9 @@ class Socks5Server(
     fun stop() {
         running = false
         runCatching { server.close() }
+        acceptThread?.let { accept ->
+            if (accept !== Thread.currentThread()) runCatching { accept.join(1_000) }
+        }
         openTcp.toList().forEach { runCatching { it.close() } }
         openUdp.toList().forEach { runCatching { it.close() } }
         openTcp.clear()
@@ -331,11 +383,28 @@ class Socks5Server(
         }
     }
 
-    private fun track(socket: Socket): Socket = socket.also { openTcp.add(it) }
+    private fun track(socket: Socket): Socket {
+        if (!running) {
+            runCatching { socket.close() }
+            return socket
+        }
+        openTcp.add(socket)
+        if (!running && openTcp.remove(socket)) runCatching { socket.close() }
+        return socket
+    }
     private fun untrack(socket: Socket) { openTcp.remove(socket) }
     private fun trackUpstream(socket: Socket, endpoint: String? = null): Socket {
+        if (!running) {
+            runCatching { socket.close() }
+            throw SocketException("SOCKS relay is stopping; refusing new upstream TCP socket")
+        }
         upstreamTcp.add(socket)
-        openTcp.add(socket)
+        track(socket)
+        if (!running || socket.isClosed) {
+            untrackUpstream(socket)
+            runCatching { socket.close() }
+            throw SocketException("SOCKS relay stopped while registering upstream TCP socket")
+        }
         if (endpoint != null) {
             val owner = flowOwnersByEndpoint[endpoint]
             val metadata = FlowOwnerMetadata(endpoint).also {
@@ -354,10 +423,34 @@ class Socks5Server(
         openTcp.remove(socket)
         upstreamTcpMetadata.remove(socket)
     }
-    private fun track(socket: DatagramSocket): DatagramSocket = socket.also { openUdp.add(it) }
+    private fun track(socket: DatagramSocket): DatagramSocket {
+        if (!running) {
+            runCatching { socket.close() }
+            return socket
+        }
+        openUdp.add(socket)
+        if (!running && openUdp.remove(socket)) runCatching { socket.close() }
+        return socket
+    }
     private fun untrack(socket: DatagramSocket) { openUdp.remove(socket) }
-    private fun trackUpstream(socket: DatagramSocket): DatagramSocket = socket.also { upstreamUdp.add(it); openUdp.add(it) }
-    private fun untrackUpstream(socket: DatagramSocket) { upstreamUdp.remove(socket); openUdp.remove(socket) }
+    private fun trackUpstream(socket: DatagramSocket): DatagramSocket {
+        if (!running) {
+            runCatching { socket.close() }
+            throw SocketException("SOCKS relay is stopping; refusing new upstream UDP socket")
+        }
+        upstreamUdp.add(socket)
+        track(socket)
+        if (!running || socket.isClosed) {
+            untrackUpstream(socket)
+            runCatching { socket.close() }
+            throw SocketException("SOCKS relay stopped while registering upstream UDP socket")
+        }
+        return socket
+    }
+    private fun untrackUpstream(socket: DatagramSocket) {
+        upstreamUdp.remove(socket)
+        openUdp.remove(socket)
+    }
 
     internal fun updateBlockedUids(uids: Set<Int>) {
         val normalized = uids.filter { it > 0 }.toSet()
@@ -590,9 +683,8 @@ class Socks5Server(
             out.flush()
             if (!authOk) return
 
-            // Long-lived relays should not inherit the handshake timeout.
-            client.soTimeout = 0
-
+            // Keep the handshake timeout active until the complete SOCKS request is read.
+            // The TCP relay switches to a separate finite idle/read timeout below.
             if (input.readUnsignedByte() != 5) return
             val cmd = input.readUnsignedByte()
             if (input.readUnsignedByte() != 0) return // RSV
@@ -600,8 +692,16 @@ class Socks5Server(
             val port = input.readUnsignedShort()
 
             when (cmd) {
-                1 -> connect(client, input, out, host, port)
-                3 -> udpAssociate(client, input, out)
+                1 -> {
+                    client.soTimeout = RELAY_READ_TIMEOUT_MS
+                    connect(client, input, out, host, port)
+                }
+                3 -> {
+                    // The UDP ASSOCIATE control connection is intentionally held open
+                    // until the client closes it; stop() closes it through openTcp.
+                    client.soTimeout = 0
+                    udpAssociate(client, input, out)
+                }
                 else -> {
                     out.write(byteArrayOf(5, 7, 0, 1, 0, 0, 0, 0, 0, 0))
                     out.flush()
@@ -687,12 +787,13 @@ class Socks5Server(
             val endpoint = endpointKey(IPPROTO_TCP, addr, port)
             if (endpoint in blockedDestinations) continue
             val socket = Socket()
-            trackUpstream(socket, endpoint)
             try {
                 val network = currentNetwork() ?: throw UnknownHostException("No physical network available")
+                trackUpstream(socket, endpoint)
+                protectSocketOrClose(socket, protectTcp, "SOCKS TCP upstream $addr:$port")
                 network.bindSocket(socket)
-                if (!protectTcp(socket)) throw SocketException("VPN socket protection failed")
                 socket.connect(InetSocketAddress(addr, port), remainingMs)
+                socket.soTimeout = RELAY_READ_TIMEOUT_MS
                 if (endpoint in blockedDestinations) {
                     throw SocketException("connection blocked by app policy")
                 }
@@ -980,12 +1081,23 @@ class Socks5Server(
             cout.flush()
 
             val clientAddr = AtomicReference<InetAddress?>(null)
-            val udpFlows = UdpFlowTable(maxFlows = 256, ttlMs = UDP_FLOW_TTL_MS)
-            val mux = UdpUpstreamMux(
+            lateinit var mux: UdpUpstreamMux
+            val udpFlows = UdpFlowTable(
+                maxFlows = 256,
+                ttlMs = UDP_FLOW_TTL_MS,
+                onFlowEvicted = { evictedFlow -> mux.closeFlow(evictedFlow) },
+            )
+            mux = UdpUpstreamMux(
                 relaySocket = relaySocket,
                 udpFlows = udpFlows,
                 clientAddr = clientAddr,
-            ).also { activeUdpMuxes.add(it) }
+            )
+            activeUdpMuxes.add(mux)
+            if (!running) {
+                mux.close()
+                activeUdpMuxes.remove(mux)
+                throw SocketException("SOCKS relay stopped while creating UDP association")
+            }
             val closeOnce = AtomicBoolean(false)
             val closeAll = {
                 if (closeOnce.compareAndSet(false, true)) {
@@ -1027,7 +1139,11 @@ class Socks5Server(
                                     listOf(addr)
                                 }
                                 4 -> {
-                                    if (!acceptsUdpAddressType(4, ipv6Enabled) || bb.remaining() < 16) continue
+                                    if (!ipv6Enabled) {
+                                        log("IPV6_UDP_EGRESS_BLOCKED reason=ipv6_disabled")
+                                        continue
+                                    }
+                                    if (bb.remaining() < 16) continue
                                     val addr = ByteArray(16).also { bb.get(it) }.let(InetAddress::getByAddress)
                                     listOf(addr)
                                 }
@@ -1220,10 +1336,11 @@ class Socks5Server(
 
             val remote = InetSocketAddress(address, port)
             synchronized(lock) {
+                if (!udpFlows.isCurrent(flow, System.currentTimeMillis())) return false
                 var binding = bindings[flow.logicalKey]
                     ?.takeUnless { !it.channel.isOpen }
 
-                if (binding != null && binding.remote != remote) {
+                if (binding != null && (binding.flow !== flow || binding.remote != remote)) {
                     // Never retarget a live channel. Cancel/close the old binding first
                     // and publish a new immutable binding for the selected candidate.
                     if (bindings[flow.logicalKey] === binding) bindings.remove(flow.logicalKey)
@@ -1232,8 +1349,12 @@ class Socks5Server(
                 }
 
                 if (binding == null) {
-                    binding = runCatching { createBindingLocked(flow, remote) }.getOrNull()
-                        ?: return false
+                    binding = try {
+                        createBindingLocked(flow, remote)
+                    } catch (e: Exception) {
+                        logE("SOCKS UDP upstream binding creation failed for $remote", e)
+                        return false
+                    }
                 }
 
                 val activeBinding = binding
@@ -1248,14 +1369,26 @@ class Socks5Server(
             }
         }
 
+        fun closeFlow(flow: UdpFlow) {
+            synchronized(lock) {
+                val binding = bindings[flow.logicalKey]
+                // A logical key may be reused after eviction. Never close a newer
+                // binding when a delayed eviction notification arrives.
+                if (binding != null && binding.flow === flow) {
+                    bindings.remove(flow.logicalKey)
+                    closeBindingLocked(binding)
+                }
+            }
+        }
+
         fun trimClosedFlows(nowMs: Long) {
             synchronized(lock) {
-                udpFlows.size(nowMs) // Purges expired flows.
+                udpFlows.size(nowMs) // Purges expired flows and closes their bindings.
                 val iterator = bindings.entries.iterator()
                 while (iterator.hasNext()) {
                     val entry = iterator.next()
                     val binding = entry.value
-                    if (!binding.channel.isOpen || !udpFlows.contains(binding.flow.logicalKey, nowMs)) {
+                    if (!binding.channel.isOpen || !udpFlows.isCurrent(binding.flow, nowMs)) {
                         closeBindingLocked(binding)
                         iterator.remove()
                     }
@@ -1275,18 +1408,19 @@ class Socks5Server(
         }
 
         private fun createBindingLocked(flow: UdpFlow, remote: InetSocketAddress): UdpBinding {
+            if (!running || !runningMux.get()) {
+                throw SocketException("SOCKS relay is stopping; refusing new upstream UDP socket")
+            }
             val network = currentNetwork()
                 ?: throw UnknownHostException("No physical network available")
             val channel = DatagramChannel.open()
             val socket = channel.socket()
             try {
+                protectSocketOrClose(socket, protectUdp, "SOCKS UDP upstream $remote")
                 socket.receiveBufferSize = 64 * 1024
                 socket.sendBufferSize = 64 * 1024
                 network.bindSocket(socket)
                 socket.bind(InetSocketAddress(0))
-                if (!protectUdp(socket)) {
-                    throw SocketException("VPN UDP socket protection failed")
-                }
                 channel.configureBlocking(false)
                 channel.connect(remote)
                 val endpoint = endpointKey(IPPROTO_UDP, remote.address, remote.port)
@@ -1305,6 +1439,9 @@ class Socks5Server(
                     channel.register(selector, SelectionKey.OP_READ, binding)
                 }
                 trackUpstream(socket)
+                if (!running || !runningMux.get() || !udpFlows.isCurrent(flow, System.currentTimeMillis())) {
+                    throw SocketException("SOCKS UDP flow expired or relay stopped during socket setup")
+                }
                 bindings[flow.logicalKey] = binding
                 return binding
             } catch (e: Exception) {
