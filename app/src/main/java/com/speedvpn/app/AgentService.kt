@@ -40,7 +40,27 @@ class AgentService : Service() {
         const val STATE_PENDING = "PENDING"
         const val STATE_SENT = "SENT"
 
-        fun start(ctx: Context) = ContextCompat.startForegroundService(ctx, Intent(ctx, AgentService::class.java))
+        fun start(ctx: Context) {
+            try {
+                ContextCompat.startForegroundService(ctx, Intent(ctx, AgentService::class.java))
+            } catch (error: IllegalStateException) {
+                recordStartFailure(ctx, error)
+            } catch (error: SecurityException) {
+                recordStartFailure(ctx, error)
+            }
+        }
+
+        private fun recordStartFailure(context: Context, error: Exception) {
+            runCatching {
+                DiagnosticsRepository.record(
+                    context.applicationContext,
+                    "WARN",
+                    "AgentService",
+                    "FOREGROUND_START_REJECTED",
+                    error.javaClass.simpleName + ": " + (error.message ?: "Foreground start rejected"),
+                )
+            }.onFailure { Log.w(TAG, "Unable to record rejected AgentService start", it) }
+        }
         fun stop(ctx: Context) = ctx.stopService(Intent(ctx, AgentService::class.java))
     }
 
@@ -58,12 +78,18 @@ class AgentService : Service() {
             nm.createNotificationChannel(NotificationChannel("alerts", "Important alerts", NotificationManager.IMPORTANCE_HIGH))
         }
         val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
-        ServiceCompat.startForeground(
-            this, 2,
-            NotificationCompat.Builder(this, "agent").setSmallIcon(android.R.drawable.stat_notify_sync)
-                .setContentTitle("SpeedVPN").setContentText("متصل بلوحة التحكم").setContentIntent(open).build(),
-            if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0,
-        )
+        try {
+            ServiceCompat.startForeground(
+                this, 2,
+                NotificationCompat.Builder(this, "agent").setSmallIcon(android.R.drawable.stat_notify_sync)
+                    .setContentTitle("SpeedVPN").setContentText("متصل بلوحة التحكم").setContentIntent(open).build(),
+                if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0,
+            )
+        } catch (error: RuntimeException) {
+            recordStartFailure(this, error)
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
         if (!started) {
             started = true
             api = Api(this)

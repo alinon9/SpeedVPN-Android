@@ -80,6 +80,33 @@ class SpeedVpnService : VpnService() {
         private val nativeOwnerGeneration = AtomicLong(0L)
         private val lastStartedRequestId = AtomicReference<String?>(null)
 
+        // Retain only the currently-live Service instance; CAS in onDestroy prevents
+        // an older instance from clearing a newer service generation.
+        private val activeServiceInstance = AtomicReference<SpeedVpnService?>(null)
+
+        fun apiRoutingRequiresProtection(): Boolean =
+            VpnRuntime.state.value.status in setOf(
+                VpnStatus.CONNECTING,
+                VpnStatus.CONNECTED,
+                VpnStatus.DISCONNECTING,
+            )
+
+        fun currentUnderlyingNetworkForApi(): Network? =
+            activeServiceInstance.get()?.findUnderlyingNetwork()
+
+        /**
+         * API / auth sockets bypass TUN while the VPN service is alive. If the
+         * runtime says traffic is routed through VPN but the service instance is
+         * missing, return false so callers fail closed rather than creating a loop.
+         */
+        fun protectApiSocket(socket: Socket): Boolean {
+            val service = activeServiceInstance.get()
+            if (service != null) {
+                return runCatching { service.protect(socket) }.getOrDefault(false)
+            }
+            return !apiRoutingRequiresProtection()
+        }
+
         fun start(ctx: Context, requestId: String? = null) =
             ContextCompat.startForegroundService(
                 ctx,
@@ -154,6 +181,7 @@ class SpeedVpnService : VpnService() {
 
     override fun onCreate() {
         super.onCreate()
+        activeServiceInstance.set(this)
         UidPocDiagnostics.log(this, "SpeedVpnService.onCreate")
         registerPhysicalNetworkCallback()
     }
@@ -1389,6 +1417,7 @@ class SpeedVpnService : VpnService() {
         scope.cancel()
         upstreamProbeDnsExecutor.shutdownNow()
         unregisterPhysicalNetworkCallback()
+        activeServiceInstance.compareAndSet(this, null)
         super.onDestroy()
     }
 }
