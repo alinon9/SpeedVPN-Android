@@ -403,9 +403,16 @@ class SpeedVpnService : VpnService() {
 
     internal fun currentBlockedPackages(): Set<String> {
         val state = VpnAppControl.read(this)
+        val configuredQuotaPackages = runCatching {
+            UsageRepository.readQuotaPolicies(this).map { it.packageName }.toSet()
+        }.getOrDefault(emptySet())
         val quotaBlocked = VpnAppControl.quotaBlockedPackages(this)
-        val manualBlocked = if (state.firewallEnabled) state.blockedPackages else emptySet()
-        return (manualBlocked + quotaBlocked).toSet()
+        return VpnApplicationPolicy.effectiveBlockedPackages(
+            manualFirewallEnabled = state.firewallEnabled,
+            manuallyBlockedPackages = state.blockedPackages,
+            quotaBlockedPackages = quotaBlocked,
+            configuredQuotaPackages = configuredQuotaPackages,
+        )
     }
 
     internal fun recordDetectedFlow(
@@ -884,12 +891,24 @@ class SpeedVpnService : VpnService() {
             while (isActive && sessionId.get() == mySession) {
                 delay(5_000)
                 if (!sessionIsCurrent(mySession)) break
+                val quotaPolicies = try {
+                    UsageRepository.readQuotaPolicies(this@SpeedVpnService)
+                } catch (error: Exception) {
+                    logE("Unable to read configured quota policies", error)
+                    continue
+                }
+                if (quotaPolicies.isEmpty()) {
+                    val staleQuotaBlocks = VpnAppControl.quotaBlockedPackages(this@SpeedVpnService)
+                    if (staleQuotaBlocks.isNotEmpty()) {
+                        VpnAppControl.replaceQuotaBlockedPackages(this@SpeedVpnService, emptySet())
+                        log("Cleared stale quota blocks because no quota policies remain: " +
+                            staleQuotaBlocks.sorted().joinToString(","))
+                    }
+                    continue
+                }
                 if (SmartSettings.isStatsEnabled(this@SpeedVpnService) &&
                     AppTrafficManager.hasUsageAccess(this@SpeedVpnService)
                 ) {
-                    if (UsageRepository.readQuotaPolicies(this@SpeedVpnService).isEmpty()) {
-                        continue
-                    }
                     runCatching {
                         // Enforcement reads NetworkStatsManager directly for each
                         // configured UID. Do not run the heavier daily snapshot collector
