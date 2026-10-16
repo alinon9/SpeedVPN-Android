@@ -196,6 +196,14 @@ object SpeedTestEngine {
         )
     }
 
+    /**
+     * Discard idle OkHttp connections before a verification route switch. A reused
+     * connection may have been established while the process used the physical route.
+     */
+    internal fun evictConnectionPoolForRouteChange() {
+        client.connectionPool.evictAll()
+    }
+
     suspend fun measure(
         context: Context,
         expectedDownloadKbps: Long? = null,
@@ -209,6 +217,11 @@ object SpeedTestEngine {
         try {
             return withContext(Dispatchers.IO) {
                 val startedAt = System.currentTimeMillis()
+                if (networkPath == SpeedTestNetworkPath.VPN && SpeedLimiter.routeVerificationTrafficThroughVpn) {
+                    // Evict the base pool before constructing an isolated per-measurement
+                    // client. This prevents route changes from inheriting an idle physical socket.
+                    client.connectionPool.evictAll()
+                }
                 Log.i(
                     TAG,
                     "Measurement begin verificationProfile=$verificationProfile " +
