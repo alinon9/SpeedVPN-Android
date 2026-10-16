@@ -3,6 +3,7 @@ package com.speedvpn.app
 import android.content.Context
 import android.net.VpnService
 import android.util.Log
+import java.io.IOException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
@@ -15,6 +16,12 @@ data class SpeedVerificationResult(
     val upload: SpeedMetricVerification,
     val overallStatus: SpeedVerificationStatus,
     val note: String? = null,
+)
+
+private data class VerificationRelayMeasurement(
+    val result: SpeedTestResult,
+    val downloadRelayBytes: Long,
+    val uploadRelayBytes: Long,
 )
 
 object SpeedVerificationEngine {
@@ -109,24 +116,26 @@ object SpeedVerificationEngine {
                                 "ownUidRouted=${SpeedLimiter.routeVerificationTrafficThroughVpn}",
                         )
 
-                        // Capture relay-forwarded bytes around the actual VPN measurement.
-                        // UI status alone cannot prove that the probe traversed the limiter.
-                        val relayDownloadBefore = SpeedLimiter.download.total.get()
-                        val relayUploadBefore = SpeedLimiter.upload.total.get()
-                        onProgress("قياس Download عبر VPN…")
-                        vpn = SpeedTestEngine.measure(
+                        // A dedicated, UID-attributed window is required: lifetime relay
+                        // counters include unrelated application traffic and cannot prove this
+                        // probe passed through the limiter.
+                        val relayMeasurement = measureThroughVerificationRelay(
                             context = context,
-                            expectedDownloadKbps = planDownloadKbps,
-                            expectedUploadKbps = planUploadKbps,
-                            verificationProfile = true,
-                        ) { phase ->
-                            onProgress(if (phase == SpeedTestPhase.DOWNLOAD) "قياس Download عبر VPN…" else "قياس Upload عبر VPN…")
-                        }
-
-                        val relayDownloadBytes =
-                            (SpeedLimiter.download.total.get() - relayDownloadBefore).coerceAtLeast(0L)
-                        val relayUploadBytes =
-                            (SpeedLimiter.upload.total.get() - relayUploadBefore).coerceAtLeast(0L)
+                            planDownloadKbps = planDownloadKbps,
+                            planUploadKbps = planUploadKbps,
+                            onPhaseProgress = { phase ->
+                                onProgress(
+                                    if (phase == SpeedTestPhase.DOWNLOAD) {
+                                        "قياس Download عبر VPN…"
+                                    } else {
+                                        "قياس Upload عبر VPN…"
+                                    },
+                                )
+                            },
+                        )
+                        vpn = relayMeasurement.result
+                        val relayDownloadBytes = relayMeasurement.downloadRelayBytes
+                        val relayUploadBytes = relayMeasurement.uploadRelayBytes
                         val minimumDownloadBytes =
                             SpeedTestEngine.minimumRequiredSampleBytes(planDownloadKbps, verificationProfile = true)
                         val minimumUploadBytes =
@@ -161,33 +170,30 @@ object SpeedVerificationEngine {
                                 baselineBps = baseline.uploadBps,
                                 vpnBps = vpn.uploadBps,
                             )
-                            val download = if (
-                                vpn.downloadBps != null && relayDownloadBytes < minimumDownloadBytes
+                            val download = withRelayEvidence(
+                                evaluation = downloadEvaluation,
+                                measuredBps = vpn.downloadBps,
+                                relayBytes = relayDownloadBytes,
+                                minimumRequiredBytes = minimumDownloadBytes,
+                                direction = "Download",
+                            )
+                            val upload = if (
+                                vpn.uploadBps != null && uploadPayloadBytesWritten < minimumUploadBytes
                             ) {
-                                downloadEvaluation.copy(
+                                uploadEvaluation.copy(
                                     status = SpeedVerificationStatus.NOT_VERIFIABLE,
                                     accuracyPercent = null,
-                                    reason = "لم يثبت مرور بيانات قياس Download عبر مرحّل VPN: " +
-                                        relayDownloadBytes + "/" + minimumDownloadBytes + " بايت.",
+                                    reason = "لم تكتمل كتابة حمولة Upload عبر OkHttp: " +
+                                        uploadPayloadBytesWritten + "/" + minimumUploadBytes + " بايت.",
                                 )
                             } else {
-                                downloadEvaluation
-                            }
-                            val upload = when {
-                                vpn.uploadBps != null && uploadPayloadBytesWritten < minimumUploadBytes ->
-                                    uploadEvaluation.copy(
-                                        status = SpeedVerificationStatus.NOT_VERIFIABLE,
-                                        accuracyPercent = null,
-                                        reason = "لم تكتمل كتابة حمولة Upload عبر OkHttp: " +
-                                            uploadPayloadBytesWritten + "/" + minimumUploadBytes + " بايت.",
-                                    )
-                                vpn.uploadBps != null && relayUploadBytes <= 0L ->
-                                    uploadEvaluation.copy(
-                                        status = SpeedVerificationStatus.NOT_VERIFIABLE,
-                                        accuracyPercent = null,
-                                        reason = "لم تُرصد بايتات Upload عبر مرحّل VPN (relay=0).",
-                                    )
-                                else -> uploadEvaluation
+                                withRelayEvidence(
+                                    evaluation = uploadEvaluation,
+                                    measuredBps = vpn.uploadBps,
+                                    relayBytes = relayUploadBytes,
+                                    minimumRequiredBytes = minimumUploadBytes,
+                                    direction = "Upload",
+                                )
                             }
 
                             result = SpeedVerificationResult(
@@ -232,7 +238,7 @@ object SpeedVerificationEngine {
                         }
                         // Keep external limit updates locked until the original
                         // VPN has been rebuilt with its normal application policy.
-                        SpeedLimiter.endVerification(planDownloadKbps, planUploadKbps)
+                        SpeedLimiter.endVerificationRestoringPreviousLimits()
                         verificationLockActive = false
                     } else {
                         SpeedLimiter.setVerificationTrafficRoutingEnabled(false)
@@ -249,16 +255,23 @@ object SpeedVerificationEngine {
                                 restorationError = "تعذر فصل VPN بعد انتهاء التحقق."
                             }
                         }
-                        SpeedLimiter.endVerification(planDownloadKbps, planUploadKbps)
+                        SpeedLimiter.endVerificationRestoringPreviousLimits()
                         verificationLockActive = false
                     }
                 } catch (error: Exception) {
                     restorationError = restorationError ?: "تعذر استعادة حالة VPN: ${error.message ?: error.javaClass.simpleName}"
                 } finally {
                     if (verificationLockActive) {
-                        SpeedLimiter.setVerificationTrafficRoutingEnabled(false)
-                        // Null is explicit Unlimited.
-                        SpeedLimiter.endVerification(planDownloadKbps, planUploadKbps)
+                        runCatching { SpeedLimiter.setVerificationTrafficRoutingEnabled(false) }
+                            .onFailure { error ->
+                                restorationError = restorationError
+                                    ?: "تعذر تعطيل توجيه التحقق: ${error.message ?: error.javaClass.simpleName}"
+                            }
+                        runCatching { SpeedLimiter.endVerificationRestoringPreviousLimits() }
+                            .onFailure { error ->
+                                restorationError = restorationError
+                                    ?: "تعذر استعادة خطة محدّد السرعة الأصلية: ${error.message ?: error.javaClass.simpleName}"
+                            }
                         verificationLockActive = false
                     }
                 }
@@ -267,9 +280,80 @@ object SpeedVerificationEngine {
                     val measured = result ?: unavailable(started, "تعذر إكمال قياس السرعة.", planDownloadKbps, planUploadKbps, baseline)
                     result = withRestorationFailure(measured, restorationError!!)
                 }
+                // Persist only the finalized verdict, after restoration failures have
+                // downgraded any provisional PASS/MATCH result. NonCancellable protects
+                // this write from caller cancellation while the final state is committed.
+                result?.let { finalized ->
+                    runCatching { SpeedVerificationStore.save(context, finalized) }
+                        .onFailure { Log.e(TAG, "Could not persist verification result", it) }
+                }
             }
         }
         return result ?: unavailable(started, "تعذر إكمال التحقق.", planDownloadKbps, planUploadKbps, baseline)
+    }
+
+    internal fun withRelayEvidence(
+        evaluation: SpeedMetricVerification,
+        measuredBps: Long?,
+        relayBytes: Long,
+        minimumRequiredBytes: Long,
+        direction: String,
+    ): SpeedMetricVerification {
+        if (measuredBps == null) return evaluation
+        if (minimumRequiredBytes >= 0L && relayBytes >= minimumRequiredBytes) return evaluation
+        return evaluation.copy(
+            status = SpeedVerificationStatus.NOT_VERIFIABLE,
+            accuracyPercent = null,
+            reason = listOfNotNull(
+                evaluation.reason,
+                "لم يثبت مرور حمولة $direction الكافية عبر Socks5Server/SpeedLimiter: " +
+                    "${relayBytes.coerceAtLeast(0L)}/$minimumRequiredBytes بايت.",
+            ).joinToString(" • "),
+        )
+    }
+
+    private suspend fun measureThroughVerificationRelay(
+        context: Context,
+        planDownloadKbps: Long?,
+        planUploadKbps: Long?,
+        onPhaseProgress: (SpeedTestPhase) -> Unit,
+    ): VerificationRelayMeasurement {
+        val generation = SpeedVpnService.currentGeneration()
+        check(generation > 0L && VpnRuntime.state.value.status == VpnStatus.CONNECTED) {
+            "VPN is not connected while starting the verification counter window"
+        }
+        check(SpeedLimiter.routeVerificationTrafficThroughVpn) {
+            "SpeedVPN own UID is excluded from the verification TUN route"
+        }
+        check(SpeedLimiter.beginVerificationTrafficWindow(generation, context.applicationInfo.uid)) {
+            "Could not acquire an isolated verification relay-counter window"
+        }
+
+        val before = SpeedLimiter.verificationTrafficSnapshot(generation)
+        var after: VerificationTrafficSnapshot? = null
+        val measured = try {
+            checkNotNull(before) { "Verification relay-counter window disappeared before measurement" }
+            SpeedTestEngine.measure(
+                context = context,
+                expectedDownloadKbps = planDownloadKbps,
+                expectedUploadKbps = planUploadKbps,
+                verificationProfile = true,
+            ) { phase -> onPhaseProgress(phase) }
+        } finally {
+            after = SpeedLimiter.verificationTrafficSnapshot(generation)
+            SpeedLimiter.endVerificationTrafficWindow(generation)
+        }
+
+        val startSnapshot = before ?: throw IOException("Missing initial verification relay-counter snapshot")
+        val endSnapshot = after ?: throw IOException("Missing final verification relay-counter snapshot")
+        if (startSnapshot.uid != context.applicationInfo.uid || endSnapshot.uid != startSnapshot.uid) {
+            throw IOException("Verification relay counters were not attributed to SpeedVPN's UID")
+        }
+        return VerificationRelayMeasurement(
+            result = measured,
+            downloadRelayBytes = (endSnapshot.downloadBytes - startSnapshot.downloadBytes).coerceAtLeast(0L),
+            uploadRelayBytes = (endSnapshot.uploadBytes - startSnapshot.uploadBytes).coerceAtLeast(0L),
+        )
     }
 
     internal fun withRestorationFailure(result: SpeedVerificationResult, error: String): SpeedVerificationResult {
