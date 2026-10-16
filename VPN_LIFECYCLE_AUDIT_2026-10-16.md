@@ -6,7 +6,7 @@ Changes are isolated on `fix/vpn-lifecycle-socket-protection-20261016`, based on
 ## Repairs
 - Protect outbound TCP, UDP, DoH, and upstream health-probe sockets before binding them to the selected physical `Network`; fail closed if protection fails.
 - Require native stop confirmation and completion of detached-resource cleanup before a new TUN is established.
-- Invalidate in-flight START work on STOP and queue START requests that arrive during teardown.
+- Invalidate in-flight START work on STOP and queue START requests that arrive during teardown. Per-stop tokens keep an old Service instance from releasing another instance's stop gate.
 - Reap idle UDP flows on selector timeouts and close their per-flow channels, even without further client traffic.
 - On network change, close TCP/UDP egress sockets, invalidate UDP mux bindings, and cancel/evict the previous encrypted-DNS client's connections.
 - Add unit tests for protection order, UDP table clear/expiry, and 10 repeated STOP/START gate interleavings.
