@@ -34,12 +34,5 @@ git show-ref --verify --quiet "refs/heads/$TARGET_BRANCH" || {
   exit 3
 }
 
-for row in $(python3 - "$MANIFEST" <<'PY'
-import json, sys
-for x in sorted(json.load(open(sys.argv[1]))["source_pull_requests"], key=lambda x:x["order"]):
-    print(x["number"], x["branch"], x["head_sha"])
-PY
-); do :; done
-
 echo "Manifest validated. Review PR #36-#40 and their overlap before creating merge commits."
 echo "Current target: $(git -C . rev-parse "$TARGET_BRANCH")"
