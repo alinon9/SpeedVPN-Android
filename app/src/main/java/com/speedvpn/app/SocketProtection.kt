@@ -28,11 +28,32 @@ private fun protectSocketOrClose(
     } else {
         "VpnService.protect() threw ${protectionError.javaClass.simpleName}"
     }
-    onFailure("SOCKET_PROTECTION_FAILED socket=$description reason=$reason; closing before bind/connect/send", protectionError)
+    var closeFailure: Exception? = null
     try {
         close()
     } catch (closeError: Exception) {
-        onFailure("SOCKET_CLOSE_FAILED socket=$description after protection rejection", closeError)
+        closeFailure = closeError
+    }
+    // Close first: logging must never leave a rejected socket alive.
+    try {
+        onFailure("SOCKET_PROTECTION_FAILED socket=$description reason=$reason; closing before bind/connect/send", protectionError)
+    } catch (loggingError: Exception) {
+        try {
+            logE("Unable to log socket protection failure for $description", loggingError)
+        } catch (_: Exception) {
+            // Socket is already closed; do not let logger failures reopen the data path.
+        }
+    }
+    closeFailure?.let { closeError ->
+        try {
+            onFailure("SOCKET_CLOSE_FAILED socket=$description after protection rejection", closeError)
+        } catch (loggingError: Exception) {
+            try {
+                logE("Unable to log socket-close failure for $description", loggingError)
+            } catch (_: Exception) {
+                // Preserve fail-closed behavior even if diagnostics are unavailable.
+            }
+        }
     }
     return false
 }

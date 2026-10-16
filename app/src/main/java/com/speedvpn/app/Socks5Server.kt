@@ -727,10 +727,11 @@ class Socks5Server(
             out.flush()
             if (!authOk) return
 
-            // Long-lived relays should not inherit the handshake timeout.
-            // Command parsing can stay idle until the client sends its request. TCP
-            // relay sessions get a bounded read timeout after CONNECT is accepted.
-            client.soTimeout = 0
+            // Bound the post-authentication command request too; an authenticated
+            // client must not pin a worker forever without sending CONNECT/UDP ASSOCIATE.
+            // CONNECT switches to RELAY_READ_TIMEOUT_MS after its upstream is ready.
+            // UDP ASSOCIATE explicitly restores timeout=0 for its long-lived control pipe.
+            client.soTimeout = HANDSHAKE_TIMEOUT_MS
 
             if (input.readUnsignedByte() != 5) return
             val cmd = input.readUnsignedByte()
@@ -1116,6 +1117,9 @@ class Socks5Server(
                 throw UnknownHostException("No physical network available")
             }
 
+            // The UDP ASSOCIATE control stream is intentionally long-lived; unlike
+            // command parsing, idleness here is valid until the client or service closes.
+            client.soTimeout = 0
             val relayPort = relaySocket.localPort
             cout.write(
                 byteArrayOf(
