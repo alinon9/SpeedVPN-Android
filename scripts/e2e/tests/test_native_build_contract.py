@@ -35,6 +35,20 @@ class NativeBuildContractTests(unittest.TestCase):
         self.assertFalse((ROOT / "app/src/main/java/com/speedvpn/app/UidDetectionPoc.kt").exists())
         self.assertFalse((ROOT / "app/src/main/java/com/speedvpn/app/UidPocCompatibility.kt").exists())
 
+        production_sources = list((ROOT / "app/src/main/java").rglob("*.kt"))
+        production_sources += list((ROOT / "app/src/main/java").rglob("*.java"))
+        forbidden_references = (
+            "UidDetectionPoc",
+            "UidPocCompatibility",
+            "UidPocDiagnostics",
+            "UidPocSettings",
+            "TProxySetUidPocCallback",
+        )
+        for source in production_sources:
+            contents = source.read_text(encoding="utf-8")
+            for marker in forbidden_references:
+                self.assertNotIn(marker, contents, f"POC reference {marker} remains in {source}")
+
     def test_release_build_uses_jni_keep_rules(self) -> None:
         gradle = (ROOT / "app/build.gradle.kts").read_text(encoding="utf-8")
         rules = (ROOT / "app/proguard-rules.pro").read_text(encoding="utf-8")
