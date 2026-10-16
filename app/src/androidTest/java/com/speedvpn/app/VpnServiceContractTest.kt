@@ -90,6 +90,10 @@ class VpnServiceContractTest {
                 "Could not reap a previous stopped native worker",
                 TProxyService.TProxyStopService(),
             )
+            // /proc/self/fd is available to the app process on Android. Permit two
+            // framework/runtime descriptors for lazy initialization, but repeated
+            // native start/stop cycles must not grow the descriptor count per cycle.
+            val baselineFdCount = File("/proc/self/fd").list()?.size
 
             repeat(8) { cycle ->
                 socket = DatagramSocket()
@@ -156,6 +160,15 @@ class VpnServiceContractTest {
                 tunPfd = null
                 socket!!.close()
                 socket = null
+            }
+
+            val finalFdCount = File("/proc/self/fd").list()?.size
+            if (baselineFdCount != null && finalFdCount != null) {
+                assertTrue(
+                    "Native lifecycle leaked file descriptors across eight cycles: " +
+                        "baseline=$baselineFdCount final=$finalFdCount",
+                    finalFdCount <= baselineFdCount + 2,
+                )
             }
         } finally {
             if (nativeMayOwnTunFd || tunPfd != null) {
