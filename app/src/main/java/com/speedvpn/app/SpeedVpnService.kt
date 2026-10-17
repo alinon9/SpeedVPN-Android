@@ -455,14 +455,45 @@ class SpeedVpnService : VpnService() {
                 if (!sessionIsCurrent(mySession)) break
                 val current = runCatching { currentBlockedPackages() }.getOrElse { previous }
                 if (current == previous) continue
+                val previousPackages = previous
                 previous = current
 
-                // Publish the Kotlin snapshot first; Native atomically switches enforcement
-                // and flushes cached ALLOW decisions without unregistering its callback.
                 val callback = uidDetectionPoc
                 val currentBlockedUids = VpnApplicationPolicy.blockedUids(this@SpeedVpnService, current)
+                val previousBlockedUids = VpnApplicationPolicy.blockedUids(this@SpeedVpnService, previousPackages)
+                val fenceTransition = currentBlockedUids.isNotEmpty() || previousBlockedUids.isNotEmpty()
+
+                // Fence the transition before publishing the new package snapshot. This clears
+                // old ALLOW decisions and causes all new flows to be dropped while no resolver
+                // callback is registered, avoiding a cache/callback gap during policy changes.
+                if (fenceTransition) {
+                    runCatching {
+                        check(TProxyService.TProxySetUidPocPolicyEnabled(true)) {
+                            "Unable to enable native policy transition fence"
+                        }
+                        check(TProxyService.TProxySetUidPocCallback(null)) {
+                            "Unable to pause UID resolver during policy transition"
+                        }
+                    }.onFailure {
+                        UidPocDiagnostics.error(this@SpeedVpnService, "Unable to fence UID policy transition", it)
+                        logE("Unable to fence UID policy transition", it)
+                    }
+                }
+
                 runCatching { callback?.updateBlockedPackages(current) }
                     .onFailure { logE("Unable to refresh blocked UID policy", it) }
+
+                if (fenceTransition && callback != null) {
+                    runCatching {
+                        check(TProxyService.TProxySetUidPocCallback(callback)) {
+                            "Unable to restore UID resolver after policy transition"
+                        }
+                    }.onFailure {
+                        UidPocDiagnostics.error(this@SpeedVpnService, "Unable to restore UID resolver", it)
+                        logE("Unable to restore UID resolver", it)
+                    }
+                }
+
                 runCatching {
                     check(TProxyService.TProxySetUidPocPolicyEnabled(currentBlockedUids.isNotEmpty())) {
                         "Unable to apply native UID policy"
