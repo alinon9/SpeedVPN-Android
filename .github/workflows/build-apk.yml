@@ -50,6 +50,25 @@ jobs:
         run: |
           test "$(git -C app/src/main/jni/hev-socks5-tunnel rev-parse HEAD)" = "d9dca26c7ad0e494492244f0309e80ee583e739e"
 
+      - name: Package updated project source ZIP
+        run: |
+          set -euo pipefail
+          SOURCE_ZIP="$RUNNER_TEMP/SpeedVPN-Android-quota-fix-source.zip"
+          zip -qr "$SOURCE_ZIP" . \
+            -x ".git/*" "*/.git/*" "*/.git" \
+               ".gradle/*" "*/.gradle/*" "*/build/*" \
+               "*/.idea/*" "*/local.properties" \
+               "*/captures/*" "*/.externalNativeBuild/*"
+          test -s "$SOURCE_ZIP"
+          ls -lh "$SOURCE_ZIP"
+
+      - name: Upload updated project source ZIP
+        uses: actions/upload-artifact@v7
+        with:
+          name: SpeedVPN-Android-quota-fix-source
+          path: ${{ runner.temp }}/SpeedVPN-Android-quota-fix-source.zip
+          if-no-files-found: error
+          retention-days: 30
       - name: Run unit tests
         run: ./gradlew :app:testDebugUnitTest --stacktrace --no-daemon
 

@@ -79,12 +79,19 @@ internal fun readRelayBatch(
  * passed to hev through tunnel.yml. This prevents unrelated localhost clients
  * from using the relay as an unrestricted egress proxy.
  */
-class Socks5Server(
+class Socks5Server internal constructor(
     private val generation: Long,
     private val protectTcp: (Socket) -> Boolean,
     private val protectUdp: (DatagramSocket) -> Boolean,
     private val currentNetwork: () -> Network?,
     private val ipv6Enabled: Boolean,
+    private val accountQuotaBytes: (
+        packages: Set<String>,
+        uid: Int?,
+        direction: QuotaTrafficDirection,
+        requestedBytes: Int,
+    ) -> QuotaTrafficDecision = { _, _, _, requestedBytes -> QuotaTrafficDecision(requestedBytes) },
+    private val onQuotaExceeded: (Set<String>) -> Unit = {},
 ) {
     companion object {
         private const val MAX_SESSIONS = 80
@@ -916,17 +923,52 @@ class Socks5Server(
                     exitReason = "session_or_policy_stopped"
                     break
                 }
-                val writeStartedNs = System.nanoTime()
-                destinationWriteInProgress = true
-                dst.write(buf, 0, n)
-                destinationWriteInProgress = false
-                writeCalls++
-                val writeFinishedNs = System.nanoTime()
-                destinationWriteNs += writeFinishedNs - writeStartedNs
-                if (firstForwardedNs == 0L) firstForwardedNs = writeStartedNs
-                lastForwardedNs = writeFinishedNs
-                bucket.recordForwarded(n, generation)
-                forwardedBytes += n.toLong()
+                // Account at the relay boundary and never write beyond the remaining quota.
+                // flowSocket is the physical upstream socket for both directions.
+                val owner = upstreamTcpMetadata[flowSocket]
+                val direction = if (bucket === SpeedLimiter.download) {
+                    QuotaTrafficDirection.DOWNLOAD
+                } else {
+                    QuotaTrafficDirection.UPLOAD
+                }
+                val quotaDecision = if (owner == null) {
+                    QuotaTrafficDecision(n)
+                } else {
+                    try {
+                        accountQuotaBytes(owner.packages, owner.uid, direction, n)
+                    } catch (error: Exception) {
+                        logE("Quota accounting failed; dropping this relay chunk flowId=$flowId", error)
+                        exitReason = "quota_accounting_failed"
+                        QuotaTrafficDecision(0)
+                    }
+                }
+                val allowedBytes = quotaDecision.allowedBytes.coerceIn(0, n)
+                if (allowedBytes > 0) {
+                    val writeStartedNs = System.nanoTime()
+                    destinationWriteInProgress = true
+                    dst.write(buf, 0, allowedBytes)
+                    destinationWriteInProgress = false
+                    writeCalls++
+                    val writeFinishedNs = System.nanoTime()
+                    destinationWriteNs += writeFinishedNs - writeStartedNs
+                    if (firstForwardedNs == 0L) firstForwardedNs = writeStartedNs
+                    lastForwardedNs = writeFinishedNs
+                    bucket.recordForwarded(allowedBytes, generation)
+                    forwardedBytes += allowedBytes.toLong()
+                }
+
+                if (quotaDecision.exhaustedPackages.isNotEmpty()) {
+                    exitReason = "quota_exhausted"
+                    runCatching { onQuotaExceeded(quotaDecision.exhaustedPackages) }
+                        .onFailure { logE("Immediate quota block callback failed", it) }
+                    closeBoth()
+                    break
+                }
+                if (allowedBytes < n) {
+                    if (exitReason != "quota_accounting_failed") exitReason = "quota_accounting_failed"
+                    closeBoth()
+                    break
+                }
             }
             runCatching { dst.flush() }
         } catch (error: SocketException) {
@@ -1314,13 +1356,12 @@ class Socks5Server(
             if (isDestinationBlocked(IPPROTO_UDP, address, port)) return false
 
             val remote = InetSocketAddress(address, port)
-            synchronized(lock) {
+            var exceededPackages: Set<String> = emptySet()
+            val sent = synchronized(lock) {
                 var binding = bindings[flow.logicalKey]
                     ?.takeUnless { !it.channel.isOpen }
 
                 if (binding != null && binding.remote != remote) {
-                    // Never retarget a live channel. Cancel/close the old binding first
-                    // and publish a new immutable binding for the selected candidate.
                     if (bindings[flow.logicalKey] === binding) bindings.remove(flow.logicalKey)
                     closeBindingLocked(binding)
                     binding = null
@@ -1328,11 +1369,32 @@ class Socks5Server(
 
                 if (binding == null) {
                     binding = runCatching { createBindingLocked(flow, remote) }.getOrNull()
-                        ?: return false
+                        ?: return@synchronized false
                 }
 
                 val activeBinding = binding
-                return runCatching {
+                val decision = try {
+                    if (activeBinding.uid != null || activeBinding.packages.isNotEmpty()) {
+                        accountQuotaBytes(
+                            activeBinding.packages,
+                            activeBinding.uid,
+                            QuotaTrafficDirection.UPLOAD,
+                            length,
+                        )
+                    } else {
+                        QuotaTrafficDecision(length)
+                    }
+                } catch (error: Exception) {
+                    logE("Quota accounting failed; dropping UDP upload datagram", error)
+                    return@synchronized false
+                }
+                exceededPackages = decision.exhaustedPackages
+                if (decision.allowedBytes < length) {
+                    // UDP payloads are atomic: do not emit a malformed partial datagram.
+                    return@synchronized false
+                }
+
+                runCatching {
                     val written = activeBinding.channel.write(ByteBuffer.wrap(data, offset, length))
                     written == length
                 }.getOrElse {
@@ -1341,6 +1403,11 @@ class Socks5Server(
                     false
                 }
             }
+            if (exceededPackages.isNotEmpty()) {
+                runCatching { onQuotaExceeded(exceededPackages) }
+                    .onFailure { logE("Immediate quota block callback failed for UDP upload", it) }
+            }
+            return sent
         }
 
         fun trimClosedFlows(nowMs: Long) {
@@ -1443,6 +1510,30 @@ class Socks5Server(
                             }
                             if (!running || !SpeedLimiter.isGenerationActive(generation)) continue
 
+                            val quotaDecision = try {
+                                if (binding.uid != null || binding.packages.isNotEmpty()) {
+                                    accountQuotaBytes(
+                                        binding.packages,
+                                        binding.uid,
+                                        QuotaTrafficDirection.DOWNLOAD,
+                                        count,
+                                    )
+                                } else {
+                                    QuotaTrafficDecision(count)
+                                }
+                            } catch (error: Exception) {
+                                logE("Quota accounting failed; dropping UDP download datagram", error)
+                                continue
+                            }
+                            if (quotaDecision.allowedBytes < count) {
+                                if (quotaDecision.exhaustedPackages.isNotEmpty()) {
+                                    runCatching { onQuotaExceeded(quotaDecision.exhaustedPackages) }
+                                        .onFailure { logE("Immediate quota block callback failed for UDP download", it) }
+                                }
+                                // Drop the full datagram when only a prefix remains in quota.
+                                continue
+                            }
+
                             // Candidate fallback may replace this binding while the
                             // selector still has a queued event. Serialize the final
                             // ownership check with candidate replacement and relay send.
@@ -1471,7 +1562,13 @@ class Socks5Server(
                                     delivered = true
                                 }
                             }
-                            if (delivered) SpeedLimiter.download.recordForwarded(count, generation)
+                            if (delivered) {
+                                SpeedLimiter.download.recordForwarded(count, generation)
+                                if (quotaDecision.exhaustedPackages.isNotEmpty()) {
+                                    runCatching { onQuotaExceeded(quotaDecision.exhaustedPackages) }
+                                        .onFailure { logE("Immediate quota block callback failed for UDP download", it) }
+                                }
+                            }
                         } catch (_: Exception) {
                             synchronized(lock) {
                                 bindings.remove(binding.flow.logicalKey)

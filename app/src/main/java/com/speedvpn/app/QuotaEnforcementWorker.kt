@@ -10,7 +10,6 @@ internal class QuotaEnforcementWorker(
     params: WorkerParameters,
 ) : CoroutineWorker(appContext, params) {
     override suspend fun doWork(): Result {
-        if (!SmartSettings.isStatsEnabled(applicationContext)) return Result.success()
         return try {
             QuotaEnforcementEngine.enforce(applicationContext)
             Result.success()
@@ -33,12 +32,9 @@ internal object QuotaWorkScheduler {
     private const val WORK_NAME = "quota_enforcement_optimizer"
 
     fun schedule(context: Context) {
+        // Enforcement reads durable local counters and also needs to run while offline.
         val request = androidx.work.PeriodicWorkRequestBuilder<QuotaEnforcementWorker>(
             15, java.util.concurrent.TimeUnit.MINUTES,
-        ).setConstraints(
-            androidx.work.Constraints.Builder()
-                .setRequiredNetworkType(androidx.work.NetworkType.CONNECTED)
-                .build()
         ).build()
 
         androidx.work.WorkManager.getInstance(context).enqueueUniquePeriodicWork(
