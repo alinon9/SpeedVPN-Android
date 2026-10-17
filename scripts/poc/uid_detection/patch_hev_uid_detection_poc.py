@@ -173,7 +173,7 @@ uid_poc_report_packet (const struct pbuf *buf)
             return 0;
         ip_header_len = (ip[0] & 0x0f) * 4;
         if (ip_header_len < 20 || ip_header_len > sizeof (ip) ||
-            total < ip_header_len + 8 ||
+            total < ip_header_len ||
             pbuf_copy_partial (buf, ip, ip_header_len, 0) != ip_header_len)
             return 0;
         fragment_field = ((unsigned int) ip[6] << 8) | ip[7];
@@ -461,7 +461,7 @@ __attribute__((constructor)) static void native_poc_crash_init (void)
             + "#define UID_POC_FLOW_IDLE_MS 30000ULL\n"
             + "#define UID_POC_NEGATIVE_CACHE_MS 750ULL\n"
             + "#define UID_POC_PENDING_TIMEOUT_MS 10000ULL\n"
-            + "#define UID_POC_DECISION_TIMEOUT_MS 250ULL\n"
+            + "#define UID_POC_DECISION_TIMEOUT_MS 50ULL\n"
             + "typedef struct { int protocol; int addr_len; unsigned char a[16]; unsigned char b[16]; unsigned short port_a; unsigned short port_b; } uid_poc_flow_key;\n"
             + "typedef struct { int state; uid_poc_flow_key key; int uid; int action; int drop_logged; unsigned long long updated_ms; unsigned long long request_id; } uid_poc_cache_entry;\n"
             + "typedef struct { uid_poc_flow_key key; int protocol; int src_len; unsigned char src[16]; int src_port; int dst_len; unsigned char dst[16]; int dst_port; unsigned long long request_id; } uid_poc_request;\n"
@@ -755,19 +755,11 @@ uid_poc_wait_for_decision_locked (const uid_poc_flow_key *key,
 
         wait_result = pthread_cond_timedwait (&uid_poc_condition, &uid_poc_mutex, &deadline);
         if (wait_result != 0) {
-            /* Cache a deny on timeout so the same flow cannot fall back to an allow. */
-            slot = uid_poc_find_slot_locked (key, uid_poc_now_ms (), &found);
-            if (slot >= 0 && found &&
-                uid_poc_cache[slot].uid == UID_POC_UID_PENDING &&
-                uid_poc_cache[slot].request_id == request_id) {
-                uid_poc_cache[slot].uid = -1;
-                uid_poc_cache[slot].action = UID_POC_ACTION_BLOCK;
-                uid_poc_cache[slot].updated_ms = uid_poc_now_ms ();
-                *should_drop = 1;
-                __android_log_print (ANDROID_LOG_WARN, "SpeedVPN-POC-JNI",
-                    "UID_DECISION_TIMEOUT protocol=%d action=DROP", key->protocol);
-                return 1;
-            }
+            /* Drop this packet but keep the pending lookup alive. A late result may safely
+             * allow an unblocked app; future packets remain fail-closed until that result. */
+            __android_log_print (ANDROID_LOG_WARN, "SpeedVPN-POC-JNI",
+                "UID_DECISION_TIMEOUT protocol=%d action=DROP pending_lookup_retained=1",
+                key->protocol);
             return 0;
         }
     }
