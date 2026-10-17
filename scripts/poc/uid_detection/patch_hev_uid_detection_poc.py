@@ -124,7 +124,16 @@ def main() -> None:
     root = Path(sys.argv[1]).resolve()
     tunnel_c = root / "src/hev-socks5-tunnel.c"
     jni_c = root / "src/hev-jni.c"
-    for required in (tunnel_c, jni_c):
+    session_c = root / "src/hev-socks5-session.c"
+    session_h = root / "src/hev-socks5-session.h"
+    session_tcp_c = root / "src/hev-socks5-session-tcp.c"
+    session_tcp_h = root / "src/hev-socks5-session-tcp.h"
+    session_udp_c = root / "src/hev-socks5-session-udp.c"
+    session_udp_h = root / "src/hev-socks5-session-udp.h"
+    for required in (
+        tunnel_c, jni_c, session_c, session_h,
+        session_tcp_c, session_tcp_h, session_udp_c, session_udp_h,
+    ):
         if not required.is_file():
             raise SystemExit(f"Missing pinned hev source file: {required}")
 
@@ -256,7 +265,56 @@ uid_poc_report_packet (const struct pbuf *buf)
     return hev_jni_uid_poc_packet (protocol, src, src_len, src_port,
                                    dst, src_len, dst_port);
 }
- /* SPEEDVPN_UID_POC_END */
+/* Resolve the cached UID for one exact original app tuple. HEV calls this when it
+ * creates a TCP session or a per-flow UDP association, then passes the UID to SOCKS5
+ * as username#UID. A bounded wait lets the first-packet Android callback finish. */
+int
+hev_jni_uid_poc_resolve_uid (int protocol,
+                             const unsigned char *src, int src_len, int src_port,
+                             const unsigned char *dst, int dst_len, int dst_port)
+{
+    uid_poc_flow_key key;
+    struct timespec deadline;
+    int found = 0, slot, result_uid = -1;
+
+    if (!src || !dst || src_len != dst_len ||
+        (src_len != 4 && src_len != 16) ||
+        (protocol != 6 && protocol != 17) ||
+        src_port < 0 || src_port > 65535 ||
+        dst_port < 0 || dst_port > 65535)
+        return -1;
+
+    uid_poc_make_key (&key, protocol, src, src_len, src_port, dst, dst_len, dst_port);
+    if (clock_gettime (CLOCK_REALTIME, &deadline) != 0)
+        return -1;
+    deadline.tv_nsec += 1000L * 1000000L;
+    deadline.tv_sec += deadline.tv_nsec / 1000000000L;
+    deadline.tv_nsec %= 1000000000L;
+
+    pthread_mutex_lock (&uid_poc_mutex);
+    for (;;) {
+        uid_poc_cache_entry *entry;
+        int wait_result;
+
+        slot = uid_poc_find_slot_locked (&key, uid_poc_now_ms (), &found);
+        if (slot < 0 || !found)
+            break;
+        entry = &uid_poc_cache[slot];
+        if (entry->uid != UID_POC_UID_PENDING) {
+            if (entry->uid >= 0 && entry->action != UID_POC_ACTION_BLOCK)
+                result_uid = entry->uid;
+            break;
+        }
+
+        wait_result = pthread_cond_timedwait (&uid_poc_condition, &uid_poc_mutex, &deadline);
+        if (wait_result != 0)
+            break;
+    }
+    pthread_mutex_unlock (&uid_poc_mutex);
+    return result_uid;
+}
+
+/* SPEEDVPN_UID_POC_END */
 #else
 #define uid_poc_report_packet(buf) 0
 #endif
@@ -712,6 +770,7 @@ uid_poc_store_result_locked (const uid_poc_flow_key *key, int uid, int action,
         ? UID_POC_ACTION_BLOCK : UID_POC_ACTION_ALLOW;
     entry->drop_logged = 0;
     entry->updated_ms = now;
+    pthread_cond_broadcast (&uid_poc_condition);
     if (entry->action == UID_POC_ACTION_BLOCK) {
         __android_log_print (ANDROID_LOG_WARN, "SpeedVPN-POC-JNI",
             "UID_POLICY_RESULT uid=%d action=BLOCK packetBlocking=IMPLEMENTED",
@@ -1206,6 +1265,7 @@ native_is_running (JNIEnv *env, jobject thiz)
         "DetachCurrentThread (java_vm)",
         "UID_WORKER_READY stack=1048576",
         "uid_poc_store_result_locked",
+        "hev_jni_uid_poc_resolve_uid",
         "native_set_uid_poc_policy_enabled",
         "UID_POC_DECISION_TIMEOUT_MS",
         "pthread_cond_timedwait (&uid_poc_condition",
@@ -1268,7 +1328,251 @@ native_is_running (JNIEnv *env, jobject thiz)
     jni_text = inject_native_start_step_logs(jni_text)
     jni_c.write_text(jni_text)
 
-    print("OK - temporary UID detection POC hook and native STEP 1-6 logging applied")
+
+    # Carry native-resolved ownership through the HEV SOCKS5 session authentication. The UID
+    # cache is keyed by the original 5-tuple; destination-only association is not authoritative.
+    session_h_text = session_h.read_text()
+    session_h_text = replace_text_once(
+        session_h_text,
+        "#define HEV_SOCKS5_SESSION(p)",
+        "#include <lwip/ip_addr.h>\n\n#define HEV_SOCKS5_SESSION(p)",
+        "session IP address type include",
+    )
+    session_h_text = replace_text_once(
+        session_h_text,
+        "    HevSocks5Session *self;\n};",
+        "    HevSocks5Session *self;\n    int uid; /* Exact UID captured from the native 5-tuple cache, or -1. */\n};",
+        "session UID storage",
+    )
+    session_h_text = replace_text_once(
+        session_h_text,
+        "    HevListNode *(*get_node) (HevSocks5Session *self);\n};",
+        "    HevListNode *(*get_node) (HevSocks5Session *self);\n    int (*get_uid) (HevSocks5Session *self);\n};",
+        "session UID interface",
+    )
+    session_h_text = replace_text_once(
+        session_h_text,
+        "void hev_socks5_session_terminate (HevSocks5Session *self);\n",
+        "void hev_socks5_session_terminate (HevSocks5Session *self);\n"
+        "int hev_socks5_session_resolve_uid (int protocol, const ip_addr_t *src_ip, u16_t src_port,\n"
+        "                                    const ip_addr_t *dst_ip, u16_t dst_port);\n",
+        "session UID resolver declaration",
+    )
+    session_h.write_text(session_h_text)
+
+    session_c_text = session_c.read_text()
+    session_uid_helper = r'''#include <stdio.h>
+#ifdef __ANDROID__
+extern int hev_jni_uid_poc_resolve_uid (int protocol,
+                                        const unsigned char *src, int src_len, int src_port,
+                                        const unsigned char *dst, int dst_len, int dst_port);
+#endif
+
+static int
+hev_socks5_session_copy_ip (const ip_addr_t *addr, unsigned char *out)
+{
+    int i;
+    if (!addr || !out)
+        return 0;
+    if (addr->type == IPADDR_TYPE_V4) {
+        for (i = 0; i < 4; i++)
+            out[i] = ip4_addr_get_byte (ip_2_ip4 (addr), i);
+        return 4;
+    }
+    if (addr->type == IPADDR_TYPE_V6) {
+        for (i = 0; i < 16; i++)
+            out[i] = ip6_addr_get_byte (ip_2_ip6 (addr), i);
+        return 16;
+    }
+    return 0;
+}
+
+int
+hev_socks5_session_resolve_uid (int protocol,
+                                const ip_addr_t *src_ip, u16_t src_port,
+                                const ip_addr_t *dst_ip, u16_t dst_port)
+{
+#ifdef __ANDROID__
+    unsigned char src[16], dst[16];
+    int src_len, dst_len;
+    src_len = hev_socks5_session_copy_ip (src_ip, src);
+    dst_len = hev_socks5_session_copy_ip (dst_ip, dst);
+    if (src_len == 0 || src_len != dst_len)
+        return -1;
+    return hev_jni_uid_poc_resolve_uid (protocol, src, src_len, (int) src_port,
+                                        dst, dst_len, (int) dst_port);
+#else
+    (void) protocol;
+    (void) src_ip;
+    (void) src_port;
+    (void) dst_ip;
+    (void) dst_port;
+    return -1;
+#endif
+}
+
+'''
+    session_c_text = replace_text_once(
+        session_c_text,
+        '#include "hev-socks5-session.h"\n',
+        '#include "hev-socks5-session.h"\n\n' + session_uid_helper,
+        "session UID resolver implementation",
+    )
+    session_c_text = replace_text_once(
+        session_c_text,
+        "    HevConfigServer *srv;\n    int res;\n",
+        "    HevConfigServer *srv;\n    char flow_username[256];\n"
+        "    const char *auth_username;\n    int flow_uid;\n    int res;\n",
+        "per-session SOCKS auth locals",
+    )
+    session_c_text = replace_text_once(
+        session_c_text,
+        "    srv = hev_config_get_socks5_server ();\n\n    res = hev_socks5_client_connect",
+        "    srv = hev_config_get_socks5_server ();\n"
+        "    iface = HEV_OBJECT_GET_IFACE (self, HEV_SOCKS5_SESSION_TYPE);\n"
+        "    flow_uid = iface && iface->get_uid ? iface->get_uid (self) : -1;\n"
+        "    auth_username = srv->user;\n\n"
+        "    res = hev_socks5_client_connect",
+        "resolve session UID before SOCKS auth",
+    )
+    session_c_text = replace_text_once(
+        session_c_text,
+        "    if (srv->user && srv->pass) {\n"
+        "        hev_socks5_client_set_auth (HEV_SOCKS5_CLIENT (self), srv->user,\n"
+        "                                    srv->pass);\n"
+        "        LOG_D (\"%p socks5 client auth %s:%s\", self, srv->user, srv->pass);\n"
+        "    }",
+        "    if (srv->user && srv->pass) {\n"
+        "        if (flow_uid >= 0) {\n"
+        "            (void) snprintf (flow_username, sizeof (flow_username), \"%s#%d\",\n"
+        "                             srv->user, flow_uid);\n"
+        "            auth_username = flow_username;\n"
+        "        }\n"
+        "        hev_socks5_client_set_auth (HEV_SOCKS5_CLIENT (self), auth_username,\n"
+        "                                    srv->pass);\n"
+        "        LOG_D (\"%p socks5 client auth uid=%d\", self, flow_uid);\n"
+        "    }",
+        "per-session UID in SOCKS username",
+    )
+    session_c.write_text(session_c_text)
+
+    session_tcp_c_text = session_tcp_c.read_text()
+    session_tcp_c_text = replace_text_once(
+        session_tcp_c_text,
+        "int\nhev_socks5_session_tcp_construct (HevSocks5SessionTCP *self,",
+        "static int\nhev_socks5_session_tcp_get_uid (HevSocks5Session *base)\n"
+        "{\n    HevSocks5SessionTCP *self = HEV_SOCKS5_SESSION_TCP (base);\n"
+        "    return self->data.uid;\n}\n\n"
+        "int\nhev_socks5_session_tcp_construct (HevSocks5SessionTCP *self,",
+        "TCP UID accessor",
+    )
+    session_tcp_c_text = replace_text_once(
+        session_tcp_c_text,
+        "    self->data.self = self;\n\n    return 0;",
+        "    self->data.self = self;\n"
+        "    self->data.uid = hev_socks5_session_resolve_uid (6, &pcb->remote_ip,\n"
+        "        pcb->remote_port, &pcb->local_ip, pcb->local_port);\n\n    return 0;",
+        "capture TCP flow UID",
+    )
+    session_tcp_c_text = replace_text_once(
+        session_tcp_c_text,
+        "        siptr->get_node = hev_socks5_session_tcp_get_node;\n",
+        "        siptr->get_node = hev_socks5_session_tcp_get_node;\n"
+        "        siptr->get_uid = hev_socks5_session_tcp_get_uid;\n",
+        "register TCP UID accessor",
+    )
+    session_tcp_c.write_text(session_tcp_c_text)
+
+    session_udp_h_text = session_udp_h.read_text()
+    session_udp_h_text = replace_text_once(
+        session_udp_h_text,
+        "int hev_socks5_session_udp_construct (HevSocks5SessionUDP *self,\n"
+        "                                      struct udp_pcb *pcb, HevTaskMutex *mutex);",
+        "int hev_socks5_session_udp_construct (HevSocks5SessionUDP *self,\n"
+        "                                      struct udp_pcb *pcb, const ip_addr_t *src_ip,\n"
+        "                                      u16_t src_port, HevTaskMutex *mutex);",
+        "UDP constructor UID parameters",
+    )
+    session_udp_h_text = replace_text_once(
+        session_udp_h_text,
+        "HevSocks5SessionUDP *hev_socks5_session_udp_new (struct udp_pcb *pcb,\n"
+        "                                                 HevTaskMutex *mutex);",
+        "HevSocks5SessionUDP *hev_socks5_session_udp_new (struct udp_pcb *pcb,\n"
+        "                                                 const ip_addr_t *src_ip,\n"
+        "                                                 u16_t src_port, HevTaskMutex *mutex);",
+        "UDP factory UID parameters",
+    )
+    session_udp_h.write_text(session_udp_h_text)
+
+    session_udp_c_text = session_udp_c.read_text()
+    session_udp_c_text = replace_text_once(
+        session_udp_c_text,
+        "hev_socks5_session_udp_construct (HevSocks5SessionUDP *self,\n"
+        "                                  struct udp_pcb *pcb, HevTaskMutex *mutex)",
+        "hev_socks5_session_udp_construct (HevSocks5SessionUDP *self,\n"
+        "                                  struct udp_pcb *pcb, const ip_addr_t *src_ip,\n"
+        "                                  u16_t src_port, HevTaskMutex *mutex)",
+        "UDP constructor UID parameters",
+    )
+    session_udp_c_text = replace_text_once(
+        session_udp_c_text,
+        "hev_socks5_session_udp_construct (self, pcb, mutex)",
+        "hev_socks5_session_udp_construct (self, pcb, src_ip, src_port, mutex)",
+        "pass UDP source tuple",
+    )
+    session_udp_c_text = replace_text_once(
+        session_udp_c_text,
+        "hev_socks5_session_udp_new (struct udp_pcb *pcb, HevTaskMutex *mutex)",
+        "hev_socks5_session_udp_new (struct udp_pcb *pcb, const ip_addr_t *src_ip,\n"
+        "                            u16_t src_port, HevTaskMutex *mutex)",
+        "UDP factory UID parameters",
+    )
+    session_udp_c_text = replace_text_once(
+        session_udp_c_text,
+        "static HevListNode *\nhev_socks5_session_udp_get_node (HevSocks5Session *base)",
+        "static int\nhev_socks5_session_udp_get_uid (HevSocks5Session *base)\n"
+        "{\n    HevSocks5SessionUDP *self = HEV_SOCKS5_SESSION_UDP (base);\n"
+        "    return self->data.uid;\n}\n\n"
+        "static HevListNode *\nhev_socks5_session_udp_get_node (HevSocks5Session *base)",
+        "UDP UID accessor",
+    )
+    session_udp_c_text = replace_text_once(
+        session_udp_c_text,
+        "    self->data.self = self;\n\n    return 0;",
+        "    self->data.self = self;\n"
+        "    self->data.uid = hev_socks5_session_resolve_uid (17, src_ip, src_port,\n"
+        "        &pcb->local_ip, pcb->local_port);\n\n    return 0;",
+        "capture UDP flow UID",
+    )
+    session_udp_c_text = replace_text_once(
+        session_udp_c_text,
+        "        siptr->get_node = hev_socks5_session_udp_get_node;\n",
+        "        siptr->get_node = hev_socks5_session_udp_get_node;\n"
+        "        siptr->get_uid = hev_socks5_session_udp_get_uid;\n",
+        "register UDP UID accessor",
+    )
+    session_udp_c.write_text(session_udp_c_text)
+
+    tunnel_text = tunnel_c.read_text()
+    tunnel_text = replace_text_once(
+        tunnel_text,
+        "udp = hev_socks5_session_udp_new (pcb, &mutex);",
+        "udp = hev_socks5_session_udp_new (pcb, addr, port, &mutex);",
+        "pass original UDP tuple into session",
+    )
+    tunnel_c.write_text(tunnel_text)
+
+    # Refuse a broken generated native patch before Gradle builds an APK.
+    for source_path, marker in (
+        (session_c, "hev_socks5_session_resolve_uid"),
+        (session_tcp_c, "self->data.uid = hev_socks5_session_resolve_uid (6"),
+        (session_udp_c, "self->data.uid = hev_socks5_session_resolve_uid (17"),
+        (tunnel_c, "hev_socks5_session_udp_new (pcb, addr, port, &mutex)"),
+    ):
+        if marker not in source_path.read_text():
+            raise SystemExit(f"Refusing incomplete per-session UID bridge: missing {marker}")
+
+    print("OK - per-session UID propagation, UID detection hook, and native diagnostics applied")
 
 
 if __name__ == "__main__":
