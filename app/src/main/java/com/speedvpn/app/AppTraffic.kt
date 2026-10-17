@@ -198,6 +198,8 @@ data class VpnAppControlSettings(
 )
 
 object VpnAppControl {
+    private val quotaBlockLock = Any()
+
     const val PREFS = "app_control"
     const val FIREWALL_ENABLED = "firewall_enabled"
     const val BLOCKED_PACKAGES = "blocked_packages"
@@ -240,17 +242,34 @@ object VpnAppControl {
             .getStringSet(QUOTA_BLOCKED_PACKAGES, emptySet()).orEmpty().toSet()
 
     fun setQuotaBlocked(context: Context, packageName: String, blocked: Boolean) {
-        val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val set = p.getStringSet(QUOTA_BLOCKED_PACKAGES, emptySet()).orEmpty().toMutableSet()
-        if (blocked) set.add(packageName) else set.remove(packageName)
-        p.edit().putStringSet(QUOTA_BLOCKED_PACKAGES, set).commit()
+        synchronized(quotaBlockLock) {
+            val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            val set = p.getStringSet(QUOTA_BLOCKED_PACKAGES, emptySet()).orEmpty().toMutableSet()
+            if (blocked) set.add(packageName) else set.remove(packageName)
+            p.edit().putStringSet(QUOTA_BLOCKED_PACKAGES, set).commit()
+        }
     }
 
+    /** Atomically merges newly exhausted packages and returns just the newly added blocks. */
+    fun addQuotaBlockedPackages(context: Context, packages: Set<String>): Set<String> =
+        synchronized(quotaBlockLock) {
+            val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            val current = p.getStringSet(QUOTA_BLOCKED_PACKAGES, emptySet()).orEmpty().toSet()
+            val next = current + packages
+            val added = next - current
+            if (added.isNotEmpty()) {
+                p.edit().putStringSet(QUOTA_BLOCKED_PACKAGES, next).commit()
+            }
+            added
+        }
+
     fun replaceQuotaBlockedPackages(context: Context, packages: Set<String>) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .edit()
-            .putStringSet(QUOTA_BLOCKED_PACKAGES, packages.toSet())
-            .commit()
+        synchronized(quotaBlockLock) {
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .putStringSet(QUOTA_BLOCKED_PACKAGES, packages.toSet())
+                .commit()
+        }
     }
 }
 
