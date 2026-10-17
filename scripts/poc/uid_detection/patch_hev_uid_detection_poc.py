@@ -173,18 +173,22 @@ uid_poc_report_packet (const struct pbuf *buf)
             return 0;
         ip_header_len = (ip[0] & 0x0f) * 4;
         if (ip_header_len < 20 || ip_header_len > sizeof (ip) ||
-            total < ip_header_len + 8 ||
+            total < ip_header_len ||
             pbuf_copy_partial (buf, ip, ip_header_len, 0) != ip_header_len)
             return 0;
         fragment_field = ((unsigned int) ip[6] << 8) | ip[7];
-        /* Non-initial IPv4 fragments do not contain the TCP/UDP ports. */
-        if (fragment_field & 0x1fff)
-            return 0;
         protocol = ip[9];
         src_len = 4;
         offset = ip_header_len;
         memcpy (src, ip + 12, 4);
         memcpy (dst, ip + 16, 4);
+        /* Portless fragments fail closed while the app UID policy is active. */
+        if (fragment_field & 0x1fff) {
+            if (protocol == 6 || protocol == 17)
+                return hev_jni_uid_poc_packet (protocol, src, src_len, -1,
+                                               dst, src_len, -1);
+            return 0;
+        }
     } else if (version == 6) {
         unsigned int extensions;
         if (total < 40 || pbuf_copy_partial (buf, ip, 40, 0) != 40)
@@ -212,9 +216,12 @@ uid_poc_report_packet (const struct pbuf *buf)
                     return 0;
                 next_header = ip[0];
                 fragment_offset = (((unsigned int) ip[2] << 8) | ip[3]) & 0xfff8u;
-                /* Non-initial IPv6 fragments do not contain the TCP/UDP ports. */
-                if (fragment_offset != 0)
-                    return 0;
+                /* Portless IPv6 fragments fail closed while UID enforcement is active. */
+                if (fragment_offset != 0) {
+                    int fragment_protocol = (next_header == 6 || next_header == 17) ? (int) next_header : 17;
+                    return hev_jni_uid_poc_packet (fragment_protocol, src, src_len, -1,
+                                                   dst, src_len, -1);
+                }
                 extension_length = 8;
             } else if (protocol == 51) {
                 if (total < offset + 2 ||
@@ -454,6 +461,7 @@ __attribute__((constructor)) static void native_poc_crash_init (void)
             + "#define UID_POC_FLOW_IDLE_MS 30000ULL\n"
             + "#define UID_POC_NEGATIVE_CACHE_MS 750ULL\n"
             + "#define UID_POC_PENDING_TIMEOUT_MS 10000ULL\n"
+            + "#define UID_POC_DECISION_TIMEOUT_MS 50ULL\n"
             + "typedef struct { int protocol; int addr_len; unsigned char a[16]; unsigned char b[16]; unsigned short port_a; unsigned short port_b; } uid_poc_flow_key;\n"
             + "typedef struct { int state; uid_poc_flow_key key; int uid; int action; int drop_logged; unsigned long long updated_ms; unsigned long long request_id; } uid_poc_cache_entry;\n"
             + "typedef struct { uid_poc_flow_key key; int protocol; int src_len; unsigned char src[16]; int src_port; int dst_len; unsigned char dst[16]; int dst_port; unsigned long long request_id; } uid_poc_request;\n"
@@ -467,6 +475,7 @@ __attribute__((constructor)) static void native_poc_crash_init (void)
             + "static unsigned int uid_poc_active_flows = 0;\n"
             + "static pthread_t uid_poc_worker_thread;\n"
             + "static int uid_poc_worker_started = 0, uid_poc_worker_ready = 0, uid_poc_worker_stop_requested = 0;\n"
+            + "static int uid_poc_policy_active = 0;\n"
             + "static volatile unsigned long long uid_poc_next_request_id = 0;\n"
             + "static volatile unsigned long long uid_poc_packets = 0, uid_poc_cache_hits = 0, uid_poc_cache_misses = 0;\n"
             + "static volatile unsigned long long uid_poc_pending_hits = 0, uid_poc_unique_requests = 0, uid_poc_jni_lookups = 0;\n"
@@ -477,7 +486,8 @@ __attribute__((constructor)) static void native_poc_crash_init (void)
         jni_text = jni_text.replace(
             "static jlongArray native_get_stats (JNIEnv *env, jobject thiz);\n",
             "static jlongArray native_get_stats (JNIEnv *env, jobject thiz);\n"
-            "static jboolean native_set_uid_poc_callback (JNIEnv *env, jobject thiz, jobject callback);\n",
+            "static jboolean native_set_uid_poc_callback (JNIEnv *env, jobject thiz, jobject callback);\n"
+            "static jboolean native_set_uid_poc_policy_enabled (JNIEnv *env, jobject thiz, jboolean enabled);\n",
             1,
         )
         anchor = '    { "TProxyGetStats", "()[J", (void *)native_get_stats },\n'
@@ -485,7 +495,9 @@ __attribute__((constructor)) static void native_poc_crash_init (void)
             raise SystemExit("Refusing unsafe patch: JNI method table anchor is not unique")
         jni_text = jni_text.replace(
             anchor,
-            anchor + '    { "TProxySetUidPocCallback", "(Ljava/lang/Object;)Z", (void *)native_set_uid_poc_callback },\n',
+            anchor +
+                '    { "TProxySetUidPocCallback", "(Ljava/lang/Object;)Z", (void *)native_set_uid_poc_callback },\n' +
+                '    { "TProxySetUidPocPolicyEnabled", "(Z)Z", (void *)native_set_uid_poc_policy_enabled },\n',
             1,
         )
         fn_anchor = "static jboolean\nnative_is_running (JNIEnv *env, jobject thiz)\n"
@@ -611,11 +623,11 @@ uid_poc_entry_expired (const uid_poc_cache_entry *entry, unsigned long long now)
     unsigned long long age = now >= entry->updated_ms ? now - entry->updated_ms : 0;
     if (entry->uid == UID_POC_UID_PENDING)
         return age > UID_POC_PENDING_TIMEOUT_MS;
+    /* DROP entries, including unresolved owners, remain cached while the flow is active. */
+    if (entry->action == UID_POC_ACTION_BLOCK)
+        return age > UID_POC_FLOW_IDLE_MS;
     if (entry->uid < 0)
         return age > UID_POC_NEGATIVE_CACHE_MS;
-    /* A confirmed DROP flow is pinned until the callback/session is reset. */
-    if (entry->action == UID_POC_ACTION_BLOCK)
-        return 0;
     return age > UID_POC_FLOW_IDLE_MS;
 }
 
@@ -695,7 +707,8 @@ uid_poc_store_result_locked (const uid_poc_flow_key *key, int uid, int action,
     if (entry->uid != UID_POC_UID_PENDING || entry->request_id != request_id)
         return;
     entry->uid = uid;
-    entry->action = (uid >= 0 && action == UID_POC_ACTION_BLOCK)
+    /* A BLOCK decision may intentionally have UID=-1 when attribution fails. */
+    entry->action = action == UID_POC_ACTION_BLOCK
         ? UID_POC_ACTION_BLOCK : UID_POC_ACTION_ALLOW;
     entry->drop_logged = 0;
     entry->updated_ms = now;
@@ -707,6 +720,48 @@ uid_poc_store_result_locked (const uid_poc_flow_key *key, int uid, int action,
         __android_log_print (ANDROID_LOG_INFO, "SpeedVPN-POC-JNI",
             "UID_POLICY_RESULT uid=%d action=ALLOW hookMode=HOOK_BLOCKING packetBlocking=IMPLEMENTED",
             uid);
+    }
+}
+
+/* Caller holds uid_poc_mutex. Wait only for a bounded first-packet UID decision. */
+static int
+uid_poc_wait_for_decision_locked (const uid_poc_flow_key *key,
+                                  unsigned long long request_id,
+                                  int *should_drop)
+{
+    struct timespec deadline;
+    if (!should_drop || clock_gettime (CLOCK_REALTIME, &deadline) != 0)
+        return 0;
+
+    deadline.tv_nsec += (long) UID_POC_DECISION_TIMEOUT_MS * 1000000L;
+    deadline.tv_sec += deadline.tv_nsec / 1000000000L;
+    deadline.tv_nsec %= 1000000000L;
+
+    for (;;) {
+        int found = 0;
+        int slot = uid_poc_find_slot_locked (key, uid_poc_now_ms (), &found);
+        uid_poc_cache_entry *entry;
+        int wait_result;
+        if (slot < 0 || !found)
+            return 0;
+        entry = &uid_poc_cache[slot];
+        if (entry->request_id != request_id)
+            return 0;
+        if (entry->uid != UID_POC_UID_PENDING) {
+            *should_drop = entry->action == UID_POC_ACTION_BLOCK;
+            entry->updated_ms = uid_poc_now_ms ();
+            return 1;
+        }
+
+        wait_result = pthread_cond_timedwait (&uid_poc_condition, &uid_poc_mutex, &deadline);
+        if (wait_result != 0) {
+            /* Drop this packet but keep the pending lookup alive. A late result may safely
+             * allow an unblocked app; future packets remain fail-closed until that result. */
+            __android_log_print (ANDROID_LOG_WARN, "SpeedVPN-POC-JNI",
+                "UID_DECISION_TIMEOUT protocol=%d action=DROP pending_lookup_retained=1",
+                key->protocol);
+            return 0;
+        }
     }
 }
 
@@ -805,8 +860,6 @@ uid_poc_worker_main (void *unused)
                     uid = (jint) (packed_bits >> 32);
                     action = (packed_bits & 1ULL)
                         ? UID_POC_ACTION_BLOCK : UID_POC_ACTION_ALLOW;
-                    if (uid < 0)
-                        action = UID_POC_ACTION_ALLOW;
                     call_ok = 1;
                 }
             } else {
@@ -823,8 +876,10 @@ uid_poc_worker_main (void *unused)
 
         pthread_mutex_lock (&uid_poc_mutex);
         uid_poc_store_result_locked (&request.key, call_ok ? (int) uid : -1,
-                                     call_ok ? action : UID_POC_ACTION_ALLOW,
+                                     call_ok ? action :
+                                         (uid_poc_policy_active ? UID_POC_ACTION_BLOCK : UID_POC_ACTION_ALLOW),
                                      uid_poc_now_ms (), request.request_id);
+        pthread_cond_broadcast (&uid_poc_condition);
         pthread_mutex_unlock (&uid_poc_mutex);
     }
 
@@ -962,9 +1017,25 @@ native_set_uid_poc_callback (JNIEnv *env, jobject thiz, jobject callback)
     return JNI_TRUE;
 }
 
+static jboolean
+native_set_uid_poc_policy_enabled (JNIEnv *env, jobject thiz, jboolean enabled)
+{
+    (void) env;
+    (void) thiz;
+    pthread_mutex_lock (&uid_poc_mutex);
+    uid_poc_policy_active = enabled == JNI_TRUE;
+    /* Publish policy and flush cached ALLOW decisions in one critical section. */
+    uid_poc_reset_locked ();
+    pthread_cond_broadcast (&uid_poc_condition);
+    pthread_mutex_unlock (&uid_poc_mutex);
+    __android_log_print (ANDROID_LOG_INFO, "SpeedVPN-POC-JNI",
+        "UID_POLICY_ENFORCEMENT enabled=%d cache=FLUSHED", enabled == JNI_TRUE ? 1 : 0);
+    return JNI_TRUE;
+}
+
 /* Called for each candidate TCP/UDP packet by the HEV coroutine.
- * It does only a native cache lookup and bounded queue operation; JNI is worker-only.
- * Return 1 only when the known UID policy says to drop this packet. */
+ * With enforcement active, wait briefly for first-packet UID attribution; timeout drops.
+ * Return 1 when the decision denies the packet or cannot be resolved safely. */
 int
 hev_jni_uid_poc_packet (int protocol,
                         const unsigned char *src, int src_len, int src_port,
@@ -974,12 +1045,23 @@ hev_jni_uid_poc_packet (int protocol,
     uid_poc_request request;
     unsigned long long now, packet_count;
     int found = 0, slot, should_drop = 0;
+    unsigned long long request_id = 0;
     char src_text[64], dst_text[64], tuple_text[200];
 
     if (!src || !dst || src_len != dst_len ||
         (src_len != 4 && src_len != 16) ||
-        (protocol != 6 && protocol != 17) ||
-        src_port < 0 || src_port > 65535 || dst_port < 0 || dst_port > 65535)
+        (protocol != 6 && protocol != 17))
+        return 0;
+
+    /* Non-initial IP fragments have no socket ports. Deny them while UID policy is active. */
+    if (src_port < 0 || dst_port < 0) {
+        int deny_fragment;
+        pthread_mutex_lock (&uid_poc_mutex);
+        deny_fragment = uid_poc_policy_active;
+        pthread_mutex_unlock (&uid_poc_mutex);
+        return deny_fragment;
+    }
+    if (src_port > 65535 || dst_port > 65535)
         return 0;
 
     uid_poc_make_key (&key, protocol, src, src_len, src_port, dst, dst_len, dst_port);
@@ -996,8 +1078,11 @@ hev_jni_uid_poc_packet (int protocol,
     pthread_mutex_lock (&uid_poc_mutex);
     if (!uid_poc_worker_started || !uid_poc_worker_ready ||
         uid_poc_worker_stop_requested || !uid_poc_callback || !uid_poc_method) {
+        should_drop = uid_poc_policy_active;
+        if (should_drop)
+            __sync_add_and_fetch (&uid_poc_dropped_packets, 1ULL);
         pthread_mutex_unlock (&uid_poc_mutex);
-        return 0;
+        return should_drop;
     }
     packet_count = __sync_add_and_fetch (&uid_poc_packets, 1ULL);
     now = uid_poc_now_ms ();
@@ -1006,9 +1091,17 @@ hev_jni_uid_poc_packet (int protocol,
         uid_poc_cache_entry *entry = &uid_poc_cache[slot];
         if (entry->uid == UID_POC_UID_PENDING) {
             __sync_add_and_fetch (&uid_poc_pending_hits, 1ULL);
+            if (uid_poc_policy_active) {
+                request_id = entry->request_id;
+                if (!uid_poc_wait_for_decision_locked (&key, request_id, &should_drop)) {
+                    should_drop = 1;
+                    __sync_add_and_fetch (&uid_poc_dropped_packets, 1ULL);
+                }
+            }
         } else {
             __sync_add_and_fetch (&uid_poc_cache_hits, 1ULL);
-            if (entry->uid >= 0 && entry->action == UID_POC_ACTION_BLOCK) {
+            if (entry->action == UID_POC_ACTION_BLOCK) {
+                entry->updated_ms = now;
                 should_drop = 1;
                 __sync_add_and_fetch (&uid_poc_dropped_packets, 1ULL);
                 if (!entry->drop_logged) {
@@ -1038,27 +1131,31 @@ hev_jni_uid_poc_packet (int protocol,
         slot = uid_poc_find_slot_locked (&key, now, &found);
     }
     if (uid_poc_queue_count >= UID_POC_QUEUE_CAPACITY) {
-        /* Briefly negative-cache overload so every packet does not retry the full queue. */
+        /* Overloaded attribution fails closed while block enforcement is active. */
         __sync_add_and_fetch (&uid_poc_queue_full, 1ULL);
+        should_drop = uid_poc_policy_active;
         if (slot >= 0) {
             if (!found)
                 uid_poc_active_flows++;
             uid_poc_cache[slot].state = UID_POC_CACHE_USED;
             uid_poc_cache[slot].key = key;
             uid_poc_cache[slot].uid = -1;
-            uid_poc_cache[slot].action = UID_POC_ACTION_ALLOW;
+            uid_poc_cache[slot].action = should_drop ? UID_POC_ACTION_BLOCK : UID_POC_ACTION_ALLOW;
             uid_poc_cache[slot].drop_logged = 0;
             uid_poc_cache[slot].updated_ms = now;
             uid_poc_cache[slot].request_id = 0;
         }
+        if (should_drop)
+            __sync_add_and_fetch (&uid_poc_dropped_packets, 1ULL);
         pthread_mutex_unlock (&uid_poc_mutex);
         uid_poc_log_metrics (packet_count);
-        return 0;
+        return should_drop;
     }
     if (slot >= 0) {
         if (!found)
             uid_poc_active_flows++;
         request.request_id = __sync_add_and_fetch (&uid_poc_next_request_id, 1ULL);
+        request_id = request.request_id;
         uid_poc_cache[slot].state = UID_POC_CACHE_USED;
         uid_poc_cache[slot].key = key;
         uid_poc_cache[slot].uid = UID_POC_UID_PENDING;
@@ -1073,10 +1170,22 @@ hev_jni_uid_poc_packet (int protocol,
         pthread_cond_signal (&uid_poc_condition);
     } else {
         __sync_add_and_fetch (&uid_poc_queue_full, 1ULL);
+        should_drop = uid_poc_policy_active;
+    }
+    if (uid_poc_policy_active && request_id != 0) {
+        if (!uid_poc_wait_for_decision_locked (&key, request_id, &should_drop)) {
+            /* A timed-out or invalidated first lookup must not leak a packet. */
+            should_drop = 1;
+            __sync_add_and_fetch (&uid_poc_dropped_packets, 1ULL);
+        } else if (should_drop) {
+            __sync_add_and_fetch (&uid_poc_dropped_packets, 1ULL);
+        }
+    } else if (should_drop) {
+        __sync_add_and_fetch (&uid_poc_dropped_packets, 1ULL);
     }
     pthread_mutex_unlock (&uid_poc_mutex);
     uid_poc_log_metrics (packet_count);
-    return 0;
+    return should_drop;
 }
 /* SPEEDVPN_UID_POC_END */
 
@@ -1097,6 +1206,9 @@ native_is_running (JNIEnv *env, jobject thiz)
         "DetachCurrentThread (java_vm)",
         "UID_WORKER_READY stack=1048576",
         "uid_poc_store_result_locked",
+        "native_set_uid_poc_policy_enabled",
+        "UID_POC_DECISION_TIMEOUT_MS",
+        "pthread_cond_timedwait (&uid_poc_condition",
         "PACKET_DROPPED uid=%d tuple=%s",
         "if (uid_poc_report_packet (buf))",
     )

@@ -157,6 +157,8 @@ class Socks5Server(
     private val upstreamTcpMetadata = ConcurrentHashMap<Socket, FlowOwnerMetadata>()
     private val activeUdpMuxes = ConcurrentHashMap.newKeySet<UdpUpstreamMux>()
     @Volatile private var blockedUids: Set<Int> = emptySet()
+    // Policy changes invalidate accepted SOCKS sessions and asynchronous DNS work.
+    @Volatile private var policyEpoch: Long = 0L
     // User-domain DNS resolution is encrypted DoH. The bounded pool prevents
     // stalled encrypted lookups from building an unbounded backlog.
     private val dnsPool: ExecutorService = ThreadPoolExecutor(
@@ -228,6 +230,7 @@ class Socks5Server(
                 }
                 val sourcePort = (client.remoteSocketAddress as? InetSocketAddress)?.port
                 val isHealthProbe = sourcePort != null && probeSourcePorts.remove(sourcePort)
+                val acceptedPolicyEpoch = policyEpoch
 
                 if (!isHealthProbe && !sessions.tryAcquire()) {
                     runCatching { client.close() }
@@ -238,7 +241,7 @@ class Socks5Server(
                 try {
                     executor.execute {
                         try {
-                            handle(client)
+                            handle(client, acceptedPolicyEpoch)
                         } finally {
                             if (!isHealthProbe) sessions.release()
                         }
@@ -384,6 +387,43 @@ class Socks5Server(
         }
         activeUdpMuxes.toList().forEach { it.killConnectionsForBlockedUids(normalized) }
         log("BLOCKED_UID_CONNECTIONS_KILLED uidCount=${normalized.size} tcpClosed=$closedTcp")
+    }
+
+
+    /**
+     * SOCKS destination metadata may be ambiguous when two apps contact one endpoint.
+     * On any policy change, invalidate every prior relay and cancel pending DoH requests.
+     */
+    internal fun closeActiveSessionsForPolicyChange() {
+        val dnsResolver = synchronized(this) {
+            policyEpoch += 1L
+            flowOwnersByEndpoint.clear()
+            encryptedDnsNetwork = null
+            encryptedDnsResolver.also { encryptedDnsResolver = null }
+        }
+        val dnsCancelled = dnsResolver != null
+        runCatching { dnsResolver?.cancelPendingRequests() }
+
+        val tcpSockets = openTcp.toList()
+        val udpSockets = openUdp.toList()
+        val muxes = activeUdpMuxes.toList()
+        muxes.forEach { runCatching { it.close() } }
+        tcpSockets.forEach { socket ->
+            runCatching { socket.close() }
+            untrackUpstream(socket)
+            untrack(socket)
+        }
+        udpSockets.forEach { socket ->
+            runCatching { socket.close() }
+            untrackUpstream(socket)
+            untrack(socket)
+        }
+        activeUdpMuxes.removeAll(muxes.toSet())
+        blockedFlowTuples.clear()
+        val tcpCount = tcpSockets.size
+        val udpCount = udpSockets.size
+        val muxCount = muxes.size
+        log("APP_POLICY_SESSIONS_CLOSED epoch=$policyEpoch tcp=$tcpCount udp=$udpCount udpMuxes=$muxCount dnsCancelled=$dnsCancelled")
     }
 
     private fun endpointKey(protocol: Int, host: String, port: Int): String =
@@ -554,8 +594,9 @@ class Socks5Server(
         }
     }
 
-    private fun handle(client: Socket) {
+    private fun handle(client: Socket, expectedPolicyEpoch: Long) {
         try {
+            if (policyEpoch != expectedPolicyEpoch) return
             client.soTimeout = HANDSHAKE_TIMEOUT_MS
             client.tcpNoDelay = true
             val input = DataInputStream(client.getInputStream())
@@ -588,7 +629,7 @@ class Socks5Server(
                 MessageDigest.isEqual(passBytes, password.toByteArray(Charsets.UTF_8))
             out.write(byteArrayOf(1, if (authOk) 0 else 1))
             out.flush()
-            if (!authOk) return
+            if (!authOk || policyEpoch != expectedPolicyEpoch) return
 
             // Long-lived relays should not inherit the handshake timeout.
             client.soTimeout = 0
@@ -599,9 +640,10 @@ class Socks5Server(
             val host = readAddress(input)
             val port = input.readUnsignedShort()
 
+            if (policyEpoch != expectedPolicyEpoch) return
             when (cmd) {
-                1 -> connect(client, input, out, host, port)
-                3 -> udpAssociate(client, input, out)
+                1 -> connect(client, input, out, host, port, expectedPolicyEpoch)
+                3 -> udpAssociate(client, input, out, expectedPolicyEpoch)
                 else -> {
                     out.write(byteArrayOf(5, 7, 0, 1, 0, 0, 0, 0, 0, 0))
                     out.flush()
@@ -632,18 +674,33 @@ class Socks5Server(
         else -> throw IllegalArgumentException("bad atyp")
     }
 
-    private fun resolveAll(host: String, timeoutMs: Long): List<InetAddress> {
+    private fun resolveAll(
+        host: String,
+        timeoutMs: Long,
+        expectedPolicyEpoch: Long? = null,
+    ): List<InetAddress> {
+        fun policyStillAllowsDns(): Boolean = expectedPolicyEpoch == null || policyEpoch == expectedPolicyEpoch
+        if (!policyStillAllowsDns()) throw UnknownHostException("DNS cancelled by app policy change")
         val network = currentNetwork()
             ?: throw UnknownHostException("No physical network available for encrypted DNS resolution: $host")
         if (timeoutMs <= 0L) throw SocketTimeoutException("DNS deadline exceeded for $host")
 
         val future = dnsPool.submit<List<InetAddress>> {
-            encryptedResolver(network).resolve(host)
+            if (!policyStillAllowsDns()) throw UnknownHostException("DNS cancelled by app policy change")
+            val resolver = encryptedResolver(network)
+            if (!policyStillAllowsDns()) {
+                resolver.cancelPendingRequests()
+                throw UnknownHostException("DNS cancelled by app policy change")
+            }
+            resolver.resolve(host, ::policyStillAllowsDns)
         }
         return try {
             future.get(timeoutMs, TimeUnit.MILLISECONDS)
                 .filter { ipv6Enabled || it is java.net.Inet4Address }
-                .also { if (it.isEmpty()) throw UnknownHostException("No usable DNS address for $host") }
+                .also {
+                    if (!policyStillAllowsDns()) throw UnknownHostException("DNS cancelled by app policy change")
+                    if (it.isEmpty()) throw UnknownHostException("No usable DNS address for $host")
+                }
         } catch (e: TimeoutException) {
             future.cancel(true)
             throw SocketTimeoutException("Encrypted DNS timeout for $host")
@@ -653,19 +710,34 @@ class Socks5Server(
             throw UnknownHostException("Encrypted DNS failed for $host: ${e.cause?.message ?: e.message}")
         }
     }
-    private fun connect(client: Socket, cin: InputStream, cout: OutputStream, target: Any, port: Int) {
+    private fun connect(
+        client: Socket,
+        cin: InputStream,
+        cout: OutputStream,
+        target: Any,
+        port: Int,
+        expectedPolicyEpoch: Long,
+    ) {
+        if (policyEpoch != expectedPolicyEpoch) {
+            runCatching { client.close() }
+            return
+        }
         val deadlineNs = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(CONNECT_TIMEOUT_MS)
         val candidates = when (target) {
             is InetAddress -> listOf(target)
             is String -> {
                 val remainingMs = TimeUnit.NANOSECONDS.toMillis(deadlineNs - System.nanoTime())
-                resolveAll(target, remainingMs)
+                resolveAll(target, remainingMs, expectedPolicyEpoch)
             }
             else -> emptyList()
         }
             .filter { ipv6Enabled || it is java.net.Inet4Address }
             .sortedBy { if (it.address.size == 4) 0 else 1 }
 
+        if (policyEpoch != expectedPolicyEpoch) {
+            runCatching { client.close() }
+            return
+        }
         if (candidates.isEmpty()) {
             replyFailure(cout, 4)
             client.close()
@@ -679,6 +751,7 @@ class Socks5Server(
 
         var upstream: Socket? = null
         for (addr in candidates) {
+            if (policyEpoch != expectedPolicyEpoch) break
             val remainingMs = TimeUnit.NANOSECONDS.toMillis(deadlineNs - System.nanoTime())
                 .coerceAtMost(5_000L)
                 .toInt()
@@ -693,6 +766,7 @@ class Socks5Server(
                 network.bindSocket(socket)
                 if (!protectTcp(socket)) throw SocketException("VPN socket protection failed")
                 socket.connect(InetSocketAddress(addr, port), remainingMs)
+                if (policyEpoch != expectedPolicyEpoch) throw SocketException("Socket closed by app policy change")
                 if (endpoint in blockedDestinations) {
                     throw SocketException("connection blocked by app policy")
                 }
@@ -716,6 +790,12 @@ class Socks5Server(
             return
         }
 
+        if (policyEpoch != expectedPolicyEpoch) {
+            runCatching { remote.close() }
+            untrackUpstream(remote)
+            runCatching { client.close() }
+            return
+        }
         cout.write(byteArrayOf(5, 0, 0, 1, 0, 0, 0, 0, 0, 0))
         cout.flush()
 
@@ -743,6 +823,7 @@ class Socks5Server(
                     destination = client,
                     bucket = SpeedLimiter.download,
                     generation = generation,
+                    expectedPolicyEpoch = expectedPolicyEpoch,
                     other = remote,
                     remaining = remaining,
                     done = done,
@@ -756,6 +837,7 @@ class Socks5Server(
                 destination = remote,
                 bucket = SpeedLimiter.upload,
                 generation = generation,
+                expectedPolicyEpoch = expectedPolicyEpoch,
                 other = client,
                 remaining = remaining,
                 done = done,
@@ -776,6 +858,7 @@ class Socks5Server(
         destination: Socket,
         bucket: TokenBucket,
         generation: Long,
+        expectedPolicyEpoch: Long,
         other: Socket,
         remaining: AtomicInteger,
         done: CountDownLatch,
@@ -804,7 +887,7 @@ class Socks5Server(
             // larger reads reduce that overhead while staying inside the bucket's
             // bounded burst window. The bucket can change while the pipe is active.
             val buf = ByteArray(256 * 1024)
-            while (running && SpeedLimiter.isGenerationActive(generation)) {
+            while (running && policyEpoch == expectedPolicyEpoch && SpeedLimiter.isGenerationActive(generation)) {
                 destinationWriteInProgress = false
                 val readStartedNs = System.nanoTime()
                 val readSize = bucket.recommendedReadBytes().coerceAtMost(buf.size)
@@ -829,8 +912,8 @@ class Socks5Server(
                     exitReason = "limiter_or_session_inactive"
                     break
                 }
-                if (!running || !SpeedLimiter.isGenerationActive(generation)) {
-                    exitReason = "session_stopped"
+                if (!running || policyEpoch != expectedPolicyEpoch || !SpeedLimiter.isGenerationActive(generation)) {
+                    exitReason = "session_or_policy_stopped"
                     break
                 }
                 val writeStartedNs = System.nanoTime()
@@ -950,7 +1033,16 @@ class Socks5Server(
         }
     }
 
-    private fun udpAssociate(client: Socket, cin: InputStream, cout: OutputStream) {
+    private fun udpAssociate(
+        client: Socket,
+        cin: InputStream,
+        cout: OutputStream,
+        expectedPolicyEpoch: Long,
+    ) {
+        if (policyEpoch != expectedPolicyEpoch) {
+            runCatching { client.close() }
+            return
+        }
         if (!udpAssociations.tryAcquire()) {
             replyFailure(cout, 1)
             client.close()
@@ -985,6 +1077,7 @@ class Socks5Server(
                 relaySocket = relaySocket,
                 udpFlows = udpFlows,
                 clientAddr = clientAddr,
+                expectedPolicyEpoch = expectedPolicyEpoch,
             ).also { activeUdpMuxes.add(it) }
             val closeOnce = AtomicBoolean(false)
             val closeAll = {
@@ -1001,7 +1094,7 @@ class Socks5Server(
                 pool.execute {
                     val buf = ByteArray(UDP_BUFFER_SIZE)
                     try {
-                        while (running && SpeedLimiter.isGenerationActive(generation) && !relaySocket.isClosed) {
+                        while (running && policyEpoch == expectedPolicyEpoch && SpeedLimiter.isGenerationActive(generation) && !relaySocket.isClosed) {
                             val pkt = DatagramPacket(buf, buf.size)
                             relaySocket.receive(pkt)
                             val sender = pkt.address
@@ -1036,11 +1129,12 @@ class Socks5Server(
                                     val len = bb.get().toInt() and 0xff
                                     if (bb.remaining() < len) continue
                                     val host = ByteArray(len).also { bb.get(it) }.toString(Charsets.UTF_8)
-                                    runCatching { resolveAll(host, UDP_DNS_TIMEOUT_MS) }
+                                    runCatching { resolveAll(host, UDP_DNS_TIMEOUT_MS, expectedPolicyEpoch) }
                                         .getOrElse { emptyList() }
                                 }
                                 else -> continue
                             }
+                            if (policyEpoch != expectedPolicyEpoch) break
                             if (candidates.isEmpty() || bb.remaining() < 2) continue
 
                             val port = bb.short.toInt() and 0xffff
@@ -1088,7 +1182,7 @@ class Socks5Server(
                     }
                 }
 
-                while (cin.read() >= 0 && running && SpeedLimiter.isGenerationActive(generation)) { }
+                while (cin.read() >= 0 && running && policyEpoch == expectedPolicyEpoch && SpeedLimiter.isGenerationActive(generation)) { }
             } catch (_: Exception) {
                 // teardown
             } finally {
@@ -1132,6 +1226,7 @@ class Socks5Server(
         private val relaySocket: DatagramSocket,
         private val udpFlows: UdpFlowTable,
         private val clientAddr: AtomicReference<InetAddress?>,
+        private val expectedPolicyEpoch: Long,
     ) : AutoCloseable {
         private val selector = Selector.open()
         private val lock = Any()
@@ -1215,7 +1310,7 @@ class Socks5Server(
             offset: Int,
             length: Int,
         ): Boolean {
-            if (!runningMux.get() || !running || !SpeedLimiter.isGenerationActive(generation)) return false
+            if (!runningMux.get() || !running || policyEpoch != expectedPolicyEpoch || !SpeedLimiter.isGenerationActive(generation)) return false
             if (isDestinationBlocked(IPPROTO_UDP, address, port)) return false
 
             val remote = InetSocketAddress(address, port)
@@ -1275,6 +1370,7 @@ class Socks5Server(
         }
 
         private fun createBindingLocked(flow: UdpFlow, remote: InetSocketAddress): UdpBinding {
+            if (policyEpoch != expectedPolicyEpoch) throw SocketException("Socket closed by app policy change")
             val network = currentNetwork()
                 ?: throw UnknownHostException("No physical network available")
             val channel = DatagramChannel.open()
@@ -1287,6 +1383,7 @@ class Socks5Server(
                 if (!protectUdp(socket)) {
                     throw SocketException("VPN UDP socket protection failed")
                 }
+                if (policyEpoch != expectedPolicyEpoch) throw SocketException("Socket closed by app policy change")
                 channel.configureBlocking(false)
                 channel.connect(remote)
                 val endpoint = endpointKey(IPPROTO_UDP, remote.address, remote.port)
@@ -1323,7 +1420,7 @@ class Socks5Server(
         private fun runLoop() {
             val buffer = ByteBuffer.allocate(UDP_BUFFER_SIZE)
             try {
-                while (runningMux.get() && running && SpeedLimiter.isGenerationActive(generation)) {
+                while (runningMux.get() && running && policyEpoch == expectedPolicyEpoch && SpeedLimiter.isGenerationActive(generation)) {
                     selector.select(500)
                     val selected = selector.selectedKeys()
                     val iterator = selected.iterator()

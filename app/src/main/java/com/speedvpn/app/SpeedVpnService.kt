@@ -303,9 +303,11 @@ class SpeedVpnService : VpnService() {
                     addRoute("::", 0)
                 }
                 .apply {
-                    // Do not install the VpnService application allow-list: omitted apps route outside TUN.
-                    // All apps except SpeedVPN itself use TUN for UID-based firewalling.
-                    addDisallowedApplication(packageName)
+                    // Exempt only SpeedVPN itself to prevent a local proxy-routing loop.
+                    // Never add blocked target apps here: disallowed apps bypass the VPN.
+                    VpnApplicationPolicy.routingExemptPackages(packageName).forEach {
+                        addDisallowedApplication(it)
+                    }
                     log("VPN_TUN_POLICY mode=all-apps-except-self ipv4=0.0.0.0/0 ipv6=::/0 blockedPackages=" +
                         currentBlockedPackages().sorted().joinToString(","))
                 }
@@ -457,38 +459,62 @@ class SpeedVpnService : VpnService() {
                 if (!sessionIsCurrent(mySession)) break
                 val current = runCatching { currentBlockedPackages() }.getOrElse { previous }
                 if (current == previous) continue
+                val previousPackages = previous
                 previous = current
 
-                // Close relay sessions whose resolved owner is now blocked. Clear/re-register
-                // the native callback to invalidate cached non-blocked UID results; lookups
-                // still execute on the dedicated native worker, never on the TUN coroutine.
                 val callback = uidDetectionPoc
+                val currentBlockedUids = VpnApplicationPolicy.blockedUids(this@SpeedVpnService, current)
+                val previousBlockedUids = VpnApplicationPolicy.blockedUids(this@SpeedVpnService, previousPackages)
+                val fenceTransition = currentBlockedUids.isNotEmpty() || previousBlockedUids.isNotEmpty()
+
+                // Fence the transition before publishing the new package snapshot. This clears
+                // old ALLOW decisions and causes all new flows to be dropped while no resolver
+                // callback is registered, avoiding a cache/callback gap during policy changes.
+                if (fenceTransition) {
+                    runCatching {
+                        check(TProxyService.TProxySetUidPocPolicyEnabled(true)) {
+                            "Unable to enable native policy transition fence"
+                        }
+                        check(TProxyService.TProxySetUidPocCallback(null)) {
+                            "Unable to pause UID resolver during policy transition"
+                        }
+                    }.onFailure {
+                        UidPocDiagnostics.error(this@SpeedVpnService, "Unable to fence UID policy transition", it)
+                        logE("Unable to fence UID policy transition", it)
+                    }
+                }
+
                 runCatching { callback?.updateBlockedPackages(current) }
                     .onFailure { logE("Unable to refresh blocked UID policy", it) }
+
+                if (fenceTransition && callback != null) {
+                    runCatching {
+                        check(TProxyService.TProxySetUidPocCallback(callback)) {
+                            "Unable to restore UID resolver after policy transition"
+                        }
+                    }.onFailure {
+                        UidPocDiagnostics.error(this@SpeedVpnService, "Unable to restore UID resolver", it)
+                        logE("Unable to restore UID resolver", it)
+                    }
+                }
+
                 runCatching {
-                    socks?.updateBlockedUids(VpnApplicationPolicy.blockedUids(this@SpeedVpnService, current))
+                    check(TProxyService.TProxySetUidPocPolicyEnabled(currentBlockedUids.isNotEmpty())) {
+                        "Unable to apply native UID policy"
+                    }
+                }.onFailure {
+                    UidPocDiagnostics.error(this@SpeedVpnService, "Native UID policy update failed", it)
+                    logE("Unable to apply native UID policy", it)
+                }
+                runCatching {
+                    socks?.updateBlockedUids(currentBlockedUids)
                 }.onFailure { logE("Unable to refresh SOCKS blocked UIDs", it) }
                 runCatching { socks?.enforceBlockedPackages(current) }
                     .onFailure { logE("Unable to enforce changed app block-list", it) }
-                if (callback != null) {
-                    synchronized(processNativeLifecycleLock) {
-                        if (sessionIsCurrent(mySession) &&
-                            nativeOwnerGeneration.get() == nativeGeneration &&
-                            nativeGeneration > 0L
-                        ) {
-                            runCatching {
-                                check(TProxyService.TProxySetUidPocCallback(null)) {
-                                    "Unable to clear UID cache after app policy change"
-                                }
-                                check(TProxyService.TProxySetUidPocCallback(callback)) {
-                                    "Unable to re-register UID callback after app policy change"
-                                }
-                            }.onFailure {
-                                UidPocDiagnostics.error(this@SpeedVpnService, "UID policy cache refresh failed", it)
-                            }
-                        }
-                    }
-                }
+                // SOCKS endpoint ownership can be ambiguous across apps; invalidate old
+                // relays and pending DNS lookups so no unattributed session survives this change.
+                runCatching { socks?.closeActiveSessionsForPolicyChange() }
+                    .onFailure { logE("Unable to close stale SOCKS/DNS sessions", it) }
                 log("UID_POLICY_CHANGED blockedPackages=" + current.sorted().joinToString(","))
             }
         }
@@ -1061,6 +1087,10 @@ class SpeedVpnService : VpnService() {
                     .onFailure { UidPocDiagnostics.error(this, "Unable to clear UID POC callback in disabled mode", it) }
                 uidDetectionPoc?.close()
                 uidDetectionPoc = null
+            }
+            val initialBlockedUids = VpnApplicationPolicy.blockedUids(this, currentBlockedPackages())
+            check(TProxyService.TProxySetUidPocPolicyEnabled(initialBlockedUids.isNotEmpty())) {
+                "Unable to initialize native UID policy"
             }
             UidPocDiagnostics.log(this, "JNI_NATIVE_START_BEGIN generation=$newGeneration fd=${expectedTun.fd}")
             val nativeStarted = TProxyService.TProxyStartService(configPath, expectedTun.fd)

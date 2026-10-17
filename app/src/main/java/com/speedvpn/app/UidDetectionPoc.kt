@@ -139,7 +139,7 @@ internal class UidDetectionPoc(
     }
 
     internal fun isUidBlocked(uid: Int): Boolean =
-        uid > 0 && blockedUids.contains(uid)
+        VpnApplicationPolicy.shouldDropUid(uid, blockedUids)
 
     init {
         Log.i(TAG, "START Android API=${Build.VERSION.SDK_INT}; package=${service.packageName}")
@@ -186,7 +186,10 @@ internal class UidDetectionPoc(
         } catch (error: Throwable) {
             outcome = "throwable:${error.javaClass.simpleName}"
             reportException(protocol, source, srcPort, destination, dstPort, callId, error)
-            return encodeUidDecision(Process.INVALID_UID, false)
+            return encodeUidDecision(
+                Process.INVALID_UID,
+                VpnApplicationPolicy.shouldDropUnresolvedUid(blockPolicy.uids),
+            )
         } finally {
             UidPocDiagnostics.jniEvent(
                 service,
@@ -208,8 +211,14 @@ internal class UidDetectionPoc(
     private fun encodeUidDecision(uid: Int, shouldBlock: Boolean): Long =
         (uid.toLong() shl 32) or (if (shouldBlock) 1L else 0L)
 
-    private fun unresolvedUid(): UidResolution =
-        UidResolution(Process.INVALID_UID, "INVALID_UID", false)
+    private fun unresolvedUid(): UidResolution {
+        val shouldBlock = VpnApplicationPolicy.shouldDropUnresolvedUid(blockPolicy.uids)
+        return UidResolution(
+            Process.INVALID_UID,
+            if (shouldBlock) "UID_UNRESOLVED_FAIL_CLOSED" else "INVALID_UID",
+            shouldBlock,
+        )
+    }
 
     /** Runs only on the dedicated native UID worker, never on the TUN coroutine. */
     private fun resolveUid(
@@ -252,9 +261,14 @@ internal class UidDetectionPoc(
         val policyPackagesForUid = policy.packagesByUid[uid].orEmpty()
         val knownPackages = (packages + policyPackagesForUid).distinct().sorted()
         val blockedPackageMatches = knownPackages.filter { it in policy.packages }
-        val shouldBlock = uid != Process.INVALID_UID && uid in policy.uids
+        val shouldBlock = if (uid == Process.INVALID_UID) {
+            VpnApplicationPolicy.shouldDropUnresolvedUid(policy.uids)
+        } else {
+            VpnApplicationPolicy.shouldDropUid(uid, policy.uids)
+        }
         val targetMatch = blockedPackageMatches.joinToString(",").ifBlank { "-" }
         val verdict = when {
+            uid == Process.INVALID_UID && shouldBlock -> "UID_UNRESOLVED_FAIL_CLOSED"
             uid == Process.INVALID_UID -> "INVALID_UID"
             shouldBlock -> "BLOCKED_UID"
             else -> "UID_FOUND_OTHER_OR_UNLISTED"
@@ -262,7 +276,12 @@ internal class UidDetectionPoc(
         val action = if (shouldBlock) "BLOCK" else "ALLOW"
         UidDetectionPocResultStore.add(
             protocol, src, srcPort, dst, dstPort, uid, knownPackages,
-            if (uid == Process.INVALID_UID) "INVALID" else "MATCH",
+            when {
+                uid == Process.INVALID_UID && shouldBlock -> "BLOCKED_UNRESOLVED"
+                uid == Process.INVALID_UID -> "INVALID"
+                shouldBlock -> "BLOCKED"
+                else -> "MATCH"
+            },
             "resolverCall=$callId; targetMatch=$targetMatch; action=$action; thread=${Thread.currentThread().name}",
         )
         Log.i(

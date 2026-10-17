@@ -983,7 +983,7 @@ class MainActivity : ComponentActivity() {
                     saveAppControlSettings(VpnAppControlSettings(it, blockedPackages))
                 }
                 if (firewallEnabled) {
-                    Text("فعّل Always-on VPN وBlock connections without VPN من إعدادات Android حتى يصبح الحظر فعليًا.", color = Amber, fontSize = 10.sp)
+                    Text("تُطبّق قائمة الحظر أثناء اتصال VPN. لمنع الاتصال المباشر إذا توقفت خدمة VPN، فعّل Always-on VPN وBlock connections without VPN من إعدادات Android.", color = Amber, fontSize = 10.sp)
                     OutlinedButton(
                         onClick = { runCatching { startActivity(AppTrafficManager.vpnSettingsIntent()) } },
                         shape = RoundedCornerShape(12.dp),
