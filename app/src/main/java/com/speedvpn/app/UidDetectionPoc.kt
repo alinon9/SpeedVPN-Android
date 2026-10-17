@@ -262,7 +262,7 @@ internal class UidDetectionPoc(
         val knownPackages = (packages + policyPackagesForUid).distinct().sorted()
         val blockedPackageMatches = knownPackages.filter { it in policy.packages }
         val shouldBlock = if (uid == Process.INVALID_UID) {
-            VpnApplicationPolicy.shouldDropUnresolvedUid(policy.packages)
+            VpnApplicationPolicy.shouldDropUnresolvedUid(policy.uids)
         } else {
             VpnApplicationPolicy.shouldDropUid(uid, policy.uids)
         }
