@@ -9,6 +9,23 @@ import org.junit.Test
 
 class Socks5RelayReadBatchTest {
     @Test
+    fun lowRatePlanBoundsTcpRelayReadToOneKiB() {
+        val bytesPerSecond = SpeedLimiter.kbpsToBytesPerSec(
+            SpeedLimiter.kilobytesPerSecondToKbps(10L),
+        )
+        val bucket = TokenBucket().apply { setRate(bytesPerSecond) }
+        val payload = ByteArray(8 * 1024) { (it % 251).toByte() }
+        val source = SingleReadInputStream(payload, maxReadBytes = payload.size)
+        val buffer = ByteArray(256 * 1024)
+
+        val batch = readRelayBatch(source, buffer, bucket.recommendedReadBytes())
+
+        assertEquals(10_000L, bytesPerSecond)
+        assertEquals(1024, batch.bytesRead)
+        assertEquals(7 * 1024, source.remainingBytes())
+    }
+
+    @Test
     fun oneRelayIterationUsesOneBlockingReadWithoutPollingAvailable() {
         val payload = ByteArray(48 * 1024) { (it % 251).toByte() }
         val source = SingleReadInputStream(payload, maxReadBytes = 8 * 1024)
