@@ -248,6 +248,10 @@ class SpeedVpnService : VpnService() {
         }
 
         val compatibility = VpnSettings.read(this)
+        // Restore quota blocks before any application traffic enters the tunnel.
+        runCatching { QuotaEnforcementEngine.enforce(this@SpeedVpnService) }
+            .onFailure { logE("Startup quota recovery failed; retaining persisted block state", it) }
+
         val relay = try {
             Socks5Server(
                 generation = myServiceGeneration,
@@ -255,6 +259,26 @@ class SpeedVpnService : VpnService() {
                 protectUdp = { protect(it) },
                 currentNetwork = { findUnderlyingNetwork() },
                 ipv6Enabled = true,
+                accountQuotaBytes = { packages, uid, direction, bytes ->
+                    val resolvedPackages = if (packages.isNotEmpty()) {
+                        packages
+                    } else {
+                        uid?.takeIf { it > 0 }?.let { ownerUid ->
+                            runCatching { packageManager.getPackagesForUid(ownerUid)?.toSet().orEmpty() }
+                                .getOrDefault(emptySet())
+                        }.orEmpty()
+                    }
+                    QuotaEnforcementEngine.accountRelayBytes(
+                        context = this@SpeedVpnService,
+                        packageNames = resolvedPackages,
+                        uid = uid,
+                        direction = direction,
+                        requestedBytes = bytes,
+                    )
+                },
+                onQuotaExceeded = {
+                    enforceQuotaBlockImmediately(myServiceGeneration)
+                },
             ).also {
                 it.updateBlockedUids(
                     VpnApplicationPolicy.blockedUids(this@SpeedVpnService, currentBlockedPackages())
@@ -406,6 +430,46 @@ class SpeedVpnService : VpnService() {
         val quotaBlocked = VpnAppControl.quotaBlockedPackages(this)
         val manualBlocked = if (state.firewallEnabled) state.blockedPackages else emptySet()
         return (manualBlocked + quotaBlocked).toSet()
+    }
+
+    /**
+     * Applies a newly exhausted quota to the UID resolver and all live SOCKS sockets. This
+     * is invoked after the boundary-sized payload has been written, not by the periodic worker.
+     */
+    private fun enforceQuotaBlockImmediately(expectedGeneration: Long) {
+        val blocked = currentBlockedPackages()
+        val callback = uidDetectionPoc
+        runCatching { callback?.updateBlockedPackages(blocked) }
+            .onFailure { logE("Unable to update native quota block policy", it) }
+
+        val blockedUids = runCatching { VpnApplicationPolicy.blockedUids(this, blocked) }
+            .getOrDefault(emptySet())
+        runCatching { socks?.updateBlockedUids(blockedUids) }
+            .onFailure { logE("Unable to close quota-blocked UID sockets", it) }
+        runCatching { socks?.enforceBlockedPackages(blocked) }
+            .onFailure { logE("Unable to close quota-blocked package flows", it) }
+
+        if (callback != null) {
+            synchronized(processNativeLifecycleLock) {
+                if (serviceGeneration == expectedGeneration &&
+                    activeServiceGeneration.get() == expectedGeneration &&
+                    nativeGeneration == expectedGeneration &&
+                    nativeOwnerGeneration.get() == expectedGeneration
+                ) {
+                    runCatching {
+                        check(TProxyService.TProxySetUidPocCallback(null)) {
+                            "Unable to clear UID cache after quota exhaustion"
+                        }
+                        check(TProxyService.TProxySetUidPocCallback(callback)) {
+                            "Unable to refresh UID cache after quota exhaustion"
+                        }
+                    }.onFailure {
+                        UidPocDiagnostics.error(this, "Native UID policy refresh failed after quota exhaustion", it)
+                    }
+                }
+            }
+        }
+        log("QUOTA_EXHAUSTED_BLOCK_APPLIED packages=" + blocked.sorted().joinToString(","))
     }
 
     internal fun recordDetectedFlow(
@@ -884,27 +948,19 @@ class SpeedVpnService : VpnService() {
             while (isActive && sessionId.get() == mySession) {
                 delay(5_000)
                 if (!sessionIsCurrent(mySession)) break
-                if (SmartSettings.isStatsEnabled(this@SpeedVpnService) &&
-                    AppTrafficManager.hasUsageAccess(this@SpeedVpnService)
-                ) {
-                    if (UsageRepository.readQuotaPolicies(this@SpeedVpnService).isEmpty()) {
-                        continue
-                    }
-                    runCatching {
-                        // Enforcement reads NetworkStatsManager directly for each
-                        // configured UID. Do not run the heavier daily snapshot collector
-                        // here: that collector is for UI/reporting and can delay the
-                        // actual quota decision.
-                        QuotaEnforcementEngine.enforce(this@SpeedVpnService)
-                    }.onFailure {
-                        DiagnosticsRepository.record(
-                            this@SpeedVpnService,
-                            "WARN",
-                            "Quota",
-                            "FOREGROUND_QUOTA_CHECK_FAILED",
-                            it.message ?: "quota check failed",
-                        )
-                    }
+                if (UsageRepository.readQuotaPolicies(this@SpeedVpnService).isEmpty()) continue
+                runCatching {
+                    // Recovery and period rollover only. The data plane enforces every admitted
+                    // TCP/UDP payload chunk synchronously before forwarding it.
+                    QuotaEnforcementEngine.enforce(this@SpeedVpnService)
+                }.onFailure {
+                    DiagnosticsRepository.record(
+                        this@SpeedVpnService,
+                        "WARN",
+                        "Quota",
+                        "FOREGROUND_QUOTA_CHECK_FAILED",
+                        it.message ?: "quota check failed",
+                    )
                 }
             }
         }
