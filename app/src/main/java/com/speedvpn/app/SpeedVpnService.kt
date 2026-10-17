@@ -227,6 +227,10 @@ class SpeedVpnService : VpnService() {
         }
         if (tun != null || engineRunning) return@withLock
 
+        // A service/agent start can create the process before MainActivity loads preferences.
+        // During verification SpeedLimiter rejects these updates and keeps its temporary plan.
+        SpeedLimitStore.applyToLimiter(this)
+
         val mySession = sessionId.incrementAndGet()
         val myServiceGeneration = synchronized(processNativeLifecycleLock) {
             if (destroying.get()) return@withLock
