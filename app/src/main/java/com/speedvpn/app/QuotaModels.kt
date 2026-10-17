@@ -26,4 +26,6 @@ internal data class AppQuotaPolicy(
     val resetBehavior: ResetBehavior,
     val downloadBytes: Long = 0L,
     val uploadBytes: Long = 0L,
+    /** True once historical period usage has been seeded into the durable byte counters. */
+    val baselineInitialized: Boolean = false,
 )
