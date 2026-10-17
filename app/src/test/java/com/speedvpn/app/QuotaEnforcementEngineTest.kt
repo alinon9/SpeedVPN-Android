@@ -364,6 +364,31 @@ class QuotaEnforcementEngineTest {
     }
 
     @Test
+    fun editingQuotaLimitDoesNotResetBytesAlreadyCounted() {
+        val packageName = "com.example.editquota"
+        UsageRepository.setQuotaPolicy(
+            context, packageName, "Edit quota", 2022, QuotaType.DAILY, 1_000L,
+        )
+        val first = QuotaEnforcementEngine.accountRelayBytes(
+            context, setOf(packageName), 2022, QuotaTrafficDirection.UPLOAD, 300,
+        )
+        assertEquals(300, first.allowedBytes)
+
+        UsageRepository.setQuotaPolicy(
+            context, packageName, "Edit quota", 2022, QuotaType.DAILY, 1_500L,
+        )
+        val afterEdit = UsageRepository.readQuotaPolicies(context, packageName).single()
+        assertEquals(300L, afterEdit.usedBytes)
+        assertEquals(300L, afterEdit.uploadBytes)
+
+        val finalChunk = QuotaEnforcementEngine.accountRelayBytes(
+            context, setOf(packageName), 2022, QuotaTrafficDirection.DOWNLOAD, 1_300,
+        )
+        assertEquals(1_200, finalChunk.allowedBytes)
+        assertEquals(setOf(packageName), finalChunk.exhaustedPackages)
+    }
+
+    @Test
     fun quotaEnforcementDoesNotDependOnStatsToggleOrUsageAccess() = runBlocking {
         val packageName = "com.example.statsdisabled"
         UsageRepository.setQuotaPolicy(
