@@ -264,6 +264,12 @@ class SpeedVpnService : VpnService() {
                 currentNetwork = { findUnderlyingNetwork() },
                 ipv6Enabled = true,
                 accountQuotaBytes = ::accountQuotaBytesForRelay,
+                // A configured per-app quota requires exact owner attribution. Unknown UIDs
+                // can no longer pass through the relay unaccounted.
+                requireUidAttribution = {
+                    runCatching { UsageRepository.readQuotaPolicies(this@SpeedVpnService).isNotEmpty() }
+                        .getOrDefault(true)
+                },
                 onQuotaExceeded = {
                     enforceQuotaBlockImmediately(myServiceGeneration)
                 },
