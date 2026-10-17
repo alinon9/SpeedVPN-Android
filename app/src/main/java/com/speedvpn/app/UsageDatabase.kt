@@ -7,7 +7,7 @@ import android.database.sqlite.SQLiteOpenHelper
 import java.util.Calendar
 
 private const val USAGE_DB_NAME = "speedvpn_usage.db"
-private const val USAGE_DB_VERSION = 2
+private const val USAGE_DB_VERSION = 3
 
 internal data class AppPolicy(
     val packageName: String,
@@ -82,6 +82,8 @@ internal class UsageDbHelper(
                 period_start_millis INTEGER NOT NULL,
                 period_end_millis INTEGER NOT NULL,
                 used_bytes INTEGER NOT NULL DEFAULT 0 CHECK (used_bytes >= 0),
+                download_bytes INTEGER NOT NULL DEFAULT 0 CHECK (download_bytes >= 0),
+                upload_bytes INTEGER NOT NULL DEFAULT 0 CHECK (upload_bytes >= 0),
                 reset_behavior TEXT NOT NULL DEFAULT 'AUTO_RESET'
                     CHECK (reset_behavior IN ('AUTO_RESET', 'BLOCK_UNTIL_RESET')),
                 updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000),
@@ -109,6 +111,18 @@ internal class UsageDbHelper(
                     """.trimIndent(),
                     arrayOf(daily.startMillis, daily.endMillis, System.currentTimeMillis()),
                 )
+                db.setTransactionSuccessful()
+            } finally {
+                db.endTransaction()
+            }
+        }
+        // Version 2 stored only a combined quota counter. Add durable directional
+        // counters without resetting the pre-existing total.
+        if (oldVersion >= 2 && oldVersion < 3) {
+            db.beginTransaction()
+            try {
+                db.execSQL("ALTER TABLE app_quota_policy ADD COLUMN download_bytes INTEGER NOT NULL DEFAULT 0 CHECK (download_bytes >= 0)")
+                db.execSQL("ALTER TABLE app_quota_policy ADD COLUMN upload_bytes INTEGER NOT NULL DEFAULT 0 CHECK (upload_bytes >= 0)")
                 db.setTransactionSuccessful()
             } finally {
                 db.endTransaction()
@@ -261,6 +275,8 @@ internal object UsageRepository {
                 put("period_start_millis", periodStartMillis)
                 put("period_end_millis", periodEndMillis)
                 put("used_bytes", 0L)
+                put("download_bytes", 0L)
+                put("upload_bytes", 0L)
                 put("updated_at", System.currentTimeMillis())
             }
             return h.writableDatabase.update(
@@ -281,6 +297,7 @@ internal object UsageRepository {
                 arrayOf(
                     "package_name", "quota_type", "limit_bytes",
                     "period_start_millis", "period_end_millis", "used_bytes", "reset_behavior",
+                    "download_bytes", "upload_bytes",
                 ),
                 selection,
                 args,
@@ -301,10 +318,139 @@ internal object UsageRepository {
                                 periodEndMillis = c.getLong(4),
                                 usedBytes = c.getLong(5),
                                 resetBehavior = reset,
+                                downloadBytes = c.getLong(7),
+                                uploadBytes = c.getLong(8),
                             ),
                         )
                     }
                 }
+            }
+        }
+    }
+
+
+    /**
+     * Atomically reserves relay payload bytes against every current quota for the resolved
+     * owner packages. The DB transaction serializes concurrent TCP/UDP flows and persists
+     * directional counters before the relay forwards any admitted bytes.
+     */
+    fun reserveQuotaBytes(
+        context: Context,
+        packageNames: Set<String>,
+        direction: QuotaTrafficDirection,
+        requestedBytes: Int,
+        nowMillis: Long = System.currentTimeMillis(),
+    ): QuotaTrafficDecision {
+        val requested = requestedBytes.coerceAtLeast(0)
+        val packages = packageNames.filter { it.isNotBlank() }.toSet()
+        if (requested == 0 || packages.isEmpty()) return QuotaTrafficDecision(requested)
+
+        data class Counter(
+            val packageName: String,
+            val quotaType: QuotaType,
+            val limitBytes: Long,
+            val periodStartMillis: Long,
+            val usedBytes: Long,
+            val downloadBytes: Long,
+            val uploadBytes: Long,
+        )
+
+        return helper(context).use { h ->
+            val db = h.writableDatabase
+            db.beginTransaction()
+            try {
+                val placeholders = packages.joinToString(",") { "?" }
+                val sql = """
+                    SELECT package_name, quota_type, limit_bytes, period_start_millis,
+                           period_end_millis, used_bytes, download_bytes, upload_bytes
+                    FROM app_quota_policy
+                    WHERE package_name IN ($placeholders)
+                """.trimIndent()
+                val counters = db.rawQuery(sql, packages.toTypedArray()).use { c ->
+                    buildList {
+                        while (c.moveToNext()) {
+                            val packageName = c.getString(0)
+                            val type = runCatching { QuotaType.valueOf(c.getString(1)) }.getOrNull()
+                                ?: continue
+                            val limit = c.getLong(2)
+                            val period = QuotaPeriod.current(type, nowMillis)
+                            val stale = c.getLong(3) != period.startMillis ||
+                                c.getLong(4) != period.endMillis
+                            val used = if (stale) 0L else c.getLong(5)
+                            val download = if (stale) 0L else c.getLong(6)
+                            val upload = if (stale) 0L else c.getLong(7)
+
+                            if (stale) {
+                                db.update(
+                                    "app_quota_policy",
+                                    ContentValues().apply {
+                                        put("period_start_millis", period.startMillis)
+                                        put("period_end_millis", period.endMillis)
+                                        put("used_bytes", 0L)
+                                        put("download_bytes", 0L)
+                                        put("upload_bytes", 0L)
+                                        put("updated_at", nowMillis)
+                                    },
+                                    "package_name = ? AND quota_type = ?",
+                                    arrayOf(packageName, type.name),
+                                )
+                            }
+                            add(
+                                Counter(
+                                    packageName = packageName,
+                                    quotaType = type,
+                                    limitBytes = limit,
+                                    periodStartMillis = period.startMillis,
+                                    usedBytes = used,
+                                    downloadBytes = download,
+                                    uploadBytes = upload,
+                                ),
+                            )
+                        }
+                    }
+                }
+
+                val decision = if (counters.isEmpty()) {
+                    QuotaTrafficDecision(requested)
+                } else {
+                    val remaining = counters.minOf { (it.limitBytes - it.usedBytes).coerceAtLeast(0L) }
+                    val allowed = minOf(requested.toLong(), remaining).toInt()
+                    val newlyReached = counters
+                        .filter { it.usedBytes >= it.limitBytes || it.usedBytes + allowed.toLong() >= it.limitBytes }
+                        .map { it.packageName }
+                        .toSet()
+
+                    if (allowed > 0) {
+                        val delta = allowed.toLong()
+                        counters.forEach { counter ->
+                            val nextUsed = counter.usedBytes + delta
+                            val nextDownload = counter.downloadBytes +
+                                if (direction == QuotaTrafficDirection.DOWNLOAD) delta else 0L
+                            val nextUpload = counter.uploadBytes +
+                                if (direction == QuotaTrafficDirection.UPLOAD) delta else 0L
+                            db.update(
+                                "app_quota_policy",
+                                ContentValues().apply {
+                                    put("used_bytes", nextUsed)
+                                    put("download_bytes", nextDownload)
+                                    put("upload_bytes", nextUpload)
+                                    put("updated_at", nowMillis)
+                                },
+                                "package_name = ? AND quota_type = ? AND period_start_millis = ?",
+                                arrayOf(
+                                    counter.packageName,
+                                    counter.quotaType.name,
+                                    counter.periodStartMillis.toString(),
+                                ),
+                            )
+                        }
+                    }
+                    QuotaTrafficDecision(allowed, newlyReached)
+                }
+                db.setTransactionSuccessful()
+                decision
+            } finally {
+                db.endTransaction()
             }
         }
     }
