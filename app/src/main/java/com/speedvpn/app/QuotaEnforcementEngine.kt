@@ -6,13 +6,20 @@ import android.os.Looper
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
 internal object QuotaEnforcementEngine {
     // Serializes the durable quota decision with persistence of the package block set, so a
     // stale periodic evaluation cannot clear a block reached concurrently by a live relay.
     private val quotaStateLock = Any()
+    private val quotaBaselineDayByPackage = ConcurrentHashMap<String, Long>()
     private const val RESTART_THROTTLE_MS = 5_000L
+
+    /** Invalidated when a quota policy is created, removed, or reconfigured. */
+    internal fun invalidateQuotaBaselineCache(packageName: String) {
+        quotaBaselineDayByPackage.remove(packageName)
+    }
     private val lastRestartAtMillis = AtomicLong(Long.MIN_VALUE)
     private val restartPending = AtomicLong(0L)
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -53,7 +60,10 @@ internal object QuotaEnforcementEngine {
                     .getOrDefault(emptySet())
             }.orEmpty()
         }
-        initializeMissingQuotaBaselines(context, nowMillis, resolvedPackages)
+        val dayStart = QuotaPeriod.current(QuotaType.DAILY, nowMillis).startMillis
+        if (resolvedPackages.any { quotaBaselineDayByPackage[it] != dayStart }) {
+            initializeMissingQuotaBaselines(context, nowMillis, resolvedPackages)
+        }
         val decision = UsageRepository.reserveQuotaBytes(
             context = context,
             packageNames = resolvedPackages,
@@ -100,68 +110,103 @@ internal object QuotaEnforcementEngine {
         nowMillis: Long,
         packageNames: Set<String>?,
     ) {
-        val beforeReset = UsageRepository.readQuotaPolicies(context)
-        val resetPackages = beforeReset.filter { policy ->
+        val requestedPackages = packageNames?.filter { it.isNotBlank() }?.toSet()
+        if (requestedPackages != null && requestedPackages.isEmpty()) return
+
+        val beforeReset = if (requestedPackages == null) {
+            UsageRepository.readQuotaPolicies(context)
+        } else {
+            requestedPackages.flatMap { UsageRepository.readQuotaPolicies(context, it) }
+        }
+        val stalePolicies = beforeReset.filter { policy ->
             val current = QuotaPeriod.current(policy.quotaType, nowMillis)
-            policy.periodStartMillis != current.startMillis ||
-                policy.periodEndMillis != current.endMillis
-        }.map { it.packageName }.toSet()
-        QuotaResetEngine.resetExpiredPolicies(context, nowMillis)
+            policy.periodStartMillis != current.startMillis || policy.periodEndMillis != current.endMillis
+        }
+        val dayStart = QuotaPeriod.current(QuotaType.DAILY, nowMillis).startMillis
+
+        // Hot path: once each package is seeded for the current calendar day, avoid repeated
+        // NetworkStatsManager calls and policy-wide reads for every TCP buffer/UDP datagram.
+        if (stalePolicies.isEmpty() && beforeReset.all { it.baselineInitialized }) {
+            val packagesToMark = requestedPackages ?: beforeReset.map { it.packageName }.toSet()
+            packagesToMark.forEach { quotaBaselineDayByPackage[it] = dayStart }
+            return
+        }
+
+        if (stalePolicies.isNotEmpty()) {
+            if (requestedPackages == null) {
+                QuotaResetEngine.resetExpiredPolicies(context, nowMillis)
+            } else {
+                stalePolicies.forEach { policy ->
+                    val current = QuotaPeriod.current(policy.quotaType, nowMillis)
+                    UsageRepository.resetQuotaPeriod(
+                        context, policy.packageName, policy.quotaType,
+                        current.startMillis, current.endMillis,
+                    )
+                }
+            }
+        }
 
         val previousBlocks = VpnAppControl.quotaBlockedPackages(context)
         val appUids = UsageRepository.readPolicies(context).associate { it.packageName to it.uid }
-        UsageRepository.readQuotaPolicies(context)
-            .filter { !it.baselineInitialized && (packageNames == null || it.packageName in packageNames) }
-            .forEach { policy ->
-                val bounds = QuotaPeriod.current(policy.quotaType, nowMillis)
-                val uid = runCatching {
-                    context.packageManager.getApplicationInfo(
-                        policy.packageName,
-                        android.content.pm.PackageManager.MATCH_ALL,
-                    ).uid
-                }.getOrNull() ?: appUids[policy.packageName]
+        val policiesToSeed = if (requestedPackages == null) {
+            UsageRepository.readQuotaPolicies(context)
+        } else {
+            requestedPackages.flatMap { UsageRepository.readQuotaPolicies(context, it) }
+        }
+        val resetPolicyKeys = stalePolicies.map { it.packageName + "|" + it.quotaType.name }.toSet()
+        policiesToSeed.filter { !it.baselineInitialized }.forEach { policy ->
+            val bounds = QuotaPeriod.current(policy.quotaType, nowMillis)
+            val uid = runCatching {
+                context.packageManager.getApplicationInfo(
+                    policy.packageName, android.content.pm.PackageManager.MATCH_ALL,
+                ).uid
+            }.getOrNull() ?: appUids[policy.packageName]
 
-                val platform = uid?.let { appUid ->
-                    runCatching {
-                        AppTrafficManager.queryUidUsageBreakdown(
-                            context,
-                            appUid,
-                            bounds.startMillis,
-                            nowMillis,
-                        )
-                    }.getOrNull()
-                }
-                val startDate = formatDate(bounds.startMillis)
-                val endDate = formatDate(bounds.endMillis)
-                val snapshot = UsageRepository.sumDirectionalUsageInPeriod(
-                    context,
-                    policy.packageName,
-                    startDate,
-                    endDate,
-                )
-                val baseline = platform ?: snapshot
-
-                // A legacy build could persist a block from NetworkStats while used_bytes was
-                // still zero. When Usage Access is unavailable and no current-period policy reset
-                // explains the old block, keep it fail-closed rather than silently unblocking it.
-                val preserveUnknownLegacyBlock =
-                    platform == null &&
-                    policy.packageName in previousBlocks &&
-                    policy.packageName !in resetPackages
-                UsageRepository.initializeQuotaBaseline(
-                    context = context,
-                    policy = policy,
-                    counters = baseline,
-                    minimumUsedBytes = if (preserveUnknownLegacyBlock) {
-                        maxOf(policy.limitBytes, policy.usedBytes)
-                    } else {
-                        policy.usedBytes
-                    },
-                    nowMillis = nowMillis,
-                )
+            val platform = uid?.let { appUid ->
+                runCatching {
+                    AppTrafficManager.queryUidUsageBreakdown(context, appUid, bounds.startMillis, nowMillis)
+                }.getOrNull()
             }
-    }
+            val snapshot = UsageRepository.sumDirectionalUsageInPeriod(
+                context, policy.packageName, formatDate(bounds.startMillis), formatDate(bounds.endMillis),
+            )
+            val baseline = platform ?: snapshot
 
+            // Older builds could persist a block without persisting these new byte counters.
+            // Keep such a block fail-closed if history is unavailable, unless this policy just
+            // rolled into a new period and its prior-period block should expire.
+            val preserveUnknownLegacyBlock = platform == null &&
+                policy.packageName in previousBlocks &&
+                (policy.packageName + "|" + policy.quotaType.name) !in resetPolicyKeys
+            UsageRepository.initializeQuotaBaseline(
+                context = context,
+                policy = policy,
+                counters = baseline,
+                minimumUsedBytes = if (preserveUnknownLegacyBlock) maxOf(policy.limitBytes, policy.usedBytes)
+                    else policy.usedBytes,
+                nowMillis = nowMillis,
+            )
+        }
+
+        val finalPolicies = if (requestedPackages == null) {
+            UsageRepository.readQuotaPolicies(context)
+        } else {
+            requestedPackages.flatMap { UsageRepository.readQuotaPolicies(context, it) }
+        }
+        val packagesToMark = requestedPackages ?: finalPolicies.map { it.packageName }.toSet()
+        packagesToMark.forEach { packageName ->
+            val currentPolicies = finalPolicies.filter { it.packageName == packageName }
+            if (currentPolicies.all { policy ->
+                    val current = QuotaPeriod.current(policy.quotaType, nowMillis)
+                    policy.baselineInitialized && policy.periodStartMillis == current.startMillis &&
+                        policy.periodEndMillis == current.endMillis
+                }) {
+                quotaBaselineDayByPackage[packageName] = dayStart
+            } else {
+                quotaBaselineDayByPackage.remove(packageName)
+            }
+        }
+    }
     private fun formatDate(millis: Long): String =
         SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date(millis))
 
