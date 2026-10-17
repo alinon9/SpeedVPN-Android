@@ -265,55 +265,6 @@ uid_poc_report_packet (const struct pbuf *buf)
     return hev_jni_uid_poc_packet (protocol, src, src_len, src_port,
                                    dst, src_len, dst_port);
 }
-/* Resolve the cached UID for one exact original app tuple. HEV calls this when it
- * creates a TCP session or a per-flow UDP association, then passes the UID to SOCKS5
- * as username#UID. A bounded wait lets the first-packet Android callback finish. */
-int
-hev_jni_uid_poc_resolve_uid (int protocol,
-                             const unsigned char *src, int src_len, int src_port,
-                             const unsigned char *dst, int dst_len, int dst_port)
-{
-    uid_poc_flow_key key;
-    struct timespec deadline;
-    int found = 0, slot, result_uid = -1;
-
-    if (!src || !dst || src_len != dst_len ||
-        (src_len != 4 && src_len != 16) ||
-        (protocol != 6 && protocol != 17) ||
-        src_port < 0 || src_port > 65535 ||
-        dst_port < 0 || dst_port > 65535)
-        return -1;
-
-    uid_poc_make_key (&key, protocol, src, src_len, src_port, dst, dst_len, dst_port);
-    if (clock_gettime (CLOCK_REALTIME, &deadline) != 0)
-        return -1;
-    deadline.tv_nsec += 1000L * 1000000L;
-    deadline.tv_sec += deadline.tv_nsec / 1000000000L;
-    deadline.tv_nsec %= 1000000000L;
-
-    pthread_mutex_lock (&uid_poc_mutex);
-    for (;;) {
-        uid_poc_cache_entry *entry;
-        int wait_result;
-
-        slot = uid_poc_find_slot_locked (&key, uid_poc_now_ms (), &found);
-        if (slot < 0 || !found)
-            break;
-        entry = &uid_poc_cache[slot];
-        if (entry->uid != UID_POC_UID_PENDING) {
-            if (entry->uid >= 0 && entry->action != UID_POC_ACTION_BLOCK)
-                result_uid = entry->uid;
-            break;
-        }
-
-        wait_result = pthread_cond_timedwait (&uid_poc_condition, &uid_poc_mutex, &deadline);
-        if (wait_result != 0)
-            break;
-    }
-    pthread_mutex_unlock (&uid_poc_mutex);
-    return result_uid;
-}
-
 /* SPEEDVPN_UID_POC_END */
 #else
 #define uid_poc_report_packet(buf) 0
@@ -1245,6 +1196,55 @@ hev_jni_uid_poc_packet (int protocol,
     pthread_mutex_unlock (&uid_poc_mutex);
     uid_poc_log_metrics (packet_count);
     return should_drop;
+}
+
+/* Resolve the cached UID for one exact original app tuple. HEV calls this when it
+ * creates a TCP session or a per-flow UDP association, then passes the UID to SOCKS5
+ * as username#UID. A bounded wait lets the first-packet Android callback finish. */
+int
+hev_jni_uid_poc_resolve_uid (int protocol,
+                             const unsigned char *src, int src_len, int src_port,
+                             const unsigned char *dst, int dst_len, int dst_port)
+{
+    uid_poc_flow_key key;
+    struct timespec deadline;
+    int found = 0, slot, result_uid = -1;
+
+    if (!src || !dst || src_len != dst_len ||
+        (src_len != 4 && src_len != 16) ||
+        (protocol != 6 && protocol != 17) ||
+        src_port < 0 || src_port > 65535 ||
+        dst_port < 0 || dst_port > 65535)
+        return -1;
+
+    uid_poc_make_key (&key, protocol, src, src_len, src_port, dst, dst_len, dst_port);
+    if (clock_gettime (CLOCK_REALTIME, &deadline) != 0)
+        return -1;
+    deadline.tv_nsec += 1000L * 1000000L;
+    deadline.tv_sec += deadline.tv_nsec / 1000000000L;
+    deadline.tv_nsec %= 1000000000L;
+
+    pthread_mutex_lock (&uid_poc_mutex);
+    for (;;) {
+        uid_poc_cache_entry *entry;
+        int wait_result;
+
+        slot = uid_poc_find_slot_locked (&key, uid_poc_now_ms (), &found);
+        if (slot < 0 || !found)
+            break;
+        entry = &uid_poc_cache[slot];
+        if (entry->uid != UID_POC_UID_PENDING) {
+            if (entry->uid >= 0 && entry->action != UID_POC_ACTION_BLOCK)
+                result_uid = entry->uid;
+            break;
+        }
+
+        wait_result = pthread_cond_timedwait (&uid_poc_condition, &uid_poc_mutex, &deadline);
+        if (wait_result != 0)
+            break;
+    }
+    pthread_mutex_unlock (&uid_poc_mutex);
+    return result_uid;
 }
 /* SPEEDVPN_UID_POC_END */
 
