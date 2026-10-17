@@ -1380,8 +1380,8 @@ hev_socks5_session_copy_ip (const ip_addr_t *addr, unsigned char *out)
         return 4;
     }
     if (addr->type == IPADDR_TYPE_V6) {
-        for (i = 0; i < 16; i++)
-            out[i] = ip6_addr_get_byte (ip_2_ip6 (addr), i);
+        /* ip6_addr_t stores its four network-order words contiguously. */
+        memcpy (out, ip_2_ip6 (addr)->addr, 16);
         return 16;
     }
     return 0;
