@@ -87,8 +87,8 @@ private val TextPrimary = Color(0xFFF3F7FF)
 private val TextSecondary = Color(0xFF95A6C3)
 
 class MainActivity : ComponentActivity() {
-    // UI speeds are expressed as KB/s and converted to the backend's Kbps representation.
-    private fun kbpsFromKBps(value: Long): Long = value.coerceAtLeast(1L) * 8L
+    // UI speeds are expressed as KB/s; share the overflow-safe conversion with unit tests.
+    private fun kbpsFromKBps(value: Long): Long = SpeedLimiter.kilobytesPerSecondToKbps(value)
     private val slowPresets = listOf(
         "10 KB" to kbpsFromKBps(10),
         "25 KB" to kbpsFromKBps(25),
