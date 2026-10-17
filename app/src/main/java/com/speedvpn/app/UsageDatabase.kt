@@ -225,6 +225,11 @@ internal object UsageRepository {
             return
         }
         val bounds = QuotaPeriod.current(quotaType)
+        val existingPolicy = readQuotaPolicies(context, packageName)
+            .firstOrNull { it.quotaType == quotaType }
+            ?.takeIf {
+                it.periodStartMillis == bounds.startMillis && it.periodEndMillis == bounds.endMillis
+            }
         helper(context).use { h ->
             val values = ContentValues().apply {
                 put("package_name", packageName)
@@ -232,7 +237,11 @@ internal object UsageRepository {
                 put("limit_bytes", limitBytes)
                 put("period_start_millis", bounds.startMillis)
                 put("period_end_millis", bounds.endMillis)
-                put("used_bytes", 0L)
+                // Editing a quota must not erase bytes already consumed in the same period.
+                // A new policy (or a policy from an expired period) starts a fresh counter.
+                put("used_bytes", existingPolicy?.usedBytes ?: 0L)
+                put("download_bytes", existingPolicy?.downloadBytes ?: 0L)
+                put("upload_bytes", existingPolicy?.uploadBytes ?: 0L)
                 put("reset_behavior", resetBehavior.name)
                 put("updated_at", System.currentTimeMillis())
             }
