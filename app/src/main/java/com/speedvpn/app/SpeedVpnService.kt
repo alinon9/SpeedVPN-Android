@@ -259,23 +259,7 @@ class SpeedVpnService : VpnService() {
                 protectUdp = { protect(it) },
                 currentNetwork = { findUnderlyingNetwork() },
                 ipv6Enabled = true,
-                accountQuotaBytes = { packages, uid, direction, bytes ->
-                    val resolvedPackages = if (packages.isNotEmpty()) {
-                        packages
-                    } else {
-                        uid?.takeIf { it > 0 }?.let { ownerUid ->
-                            runCatching { packageManager.getPackagesForUid(ownerUid)?.toSet().orEmpty() }
-                                .getOrDefault(emptySet())
-                        }.orEmpty()
-                    }
-                    QuotaEnforcementEngine.accountRelayBytes(
-                        context = this@SpeedVpnService,
-                        packageNames = resolvedPackages,
-                        uid = uid,
-                        direction = direction,
-                        requestedBytes = bytes,
-                    )
-                },
+                accountQuotaBytes = ::accountQuotaBytesForRelay,
                 onQuotaExceeded = {
                     enforceQuotaBlockImmediately(myServiceGeneration)
                 },
@@ -430,6 +414,29 @@ class SpeedVpnService : VpnService() {
         val quotaBlocked = VpnAppControl.quotaBlockedPackages(this)
         val manualBlocked = if (state.firewallEnabled) state.blockedPackages else emptySet()
         return (manualBlocked + quotaBlocked).toSet()
+    }
+
+    private fun accountQuotaBytesForRelay(
+        packages: Set<String>,
+        uid: Int?,
+        direction: QuotaTrafficDirection,
+        bytes: Int,
+    ): QuotaTrafficDecision {
+        val resolvedPackages = if (packages.isNotEmpty()) {
+            packages
+        } else {
+            uid?.takeIf { it > 0 }?.let { ownerUid ->
+                runCatching { packageManager.getPackagesForUid(ownerUid)?.toSet().orEmpty() }
+                    .getOrDefault(emptySet())
+            }.orEmpty()
+        }
+        return QuotaEnforcementEngine.accountRelayBytes(
+            context = this,
+            packageNames = resolvedPackages,
+            uid = uid,
+            direction = direction,
+            requestedBytes = bytes,
+        )
     }
 
     /**
@@ -885,13 +892,18 @@ class SpeedVpnService : VpnService() {
             oldRelay
         } else {
             runCatching { oldRelay?.stop() }
+            val relayGeneration = serviceGeneration
             val fresh = runCatching {
                 Socks5Server(
-                    generation = serviceGeneration,
+                    generation = relayGeneration,
                     protectTcp = { protect(it) },
                     protectUdp = { protect(it) },
                     currentNetwork = { findUnderlyingNetwork() },
                     ipv6Enabled = VpnSettings.read(this@SpeedVpnService).ipv6Enabled,
+                    accountQuotaBytes = ::accountQuotaBytesForRelay,
+                    onQuotaExceeded = {
+                        enforceQuotaBlockImmediately(relayGeneration)
+                    },
                 ).also { it.start() }
             }.getOrNull() ?: run {
                 failLocked("SOCKS relay recovery failed")
