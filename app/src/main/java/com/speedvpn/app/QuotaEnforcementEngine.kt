@@ -3,9 +3,6 @@ package com.speedvpn.app
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 import java.util.concurrent.atomic.AtomicLong
 
 internal object QuotaEnforcementEngine {
@@ -33,50 +30,57 @@ internal object QuotaEnforcementEngine {
     }
 
     /**
-     * Evaluates every configured quota against Android UID/App Usage statistics.
-     * Lazy reset is performed first so a new period starts from clean policy state.
+     * Reserves bytes at the actual SOCKS relay boundary. The database serializes concurrent
+     * flows, and a caller may forward only the admitted prefix returned by this method.
+     */
+    fun accountRelayBytes(
+        context: Context,
+        packageNames: Set<String>,
+        uid: Int?,
+        direction: QuotaTrafficDirection,
+        requestedBytes: Int,
+        nowMillis: Long = System.currentTimeMillis(),
+    ): QuotaTrafficDecision {
+        val resolvedPackages = packageNames.filter { it.isNotBlank() }.toSet().ifEmpty {
+            uid?.takeIf { it > 0 }?.let { appUid ->
+                runCatching { context.packageManager.getPackagesForUid(appUid)?.toSet().orEmpty() }
+                    .getOrDefault(emptySet())
+            }.orEmpty()
+        }
+        val decision = UsageRepository.reserveQuotaBytes(
+            context = context,
+            packageNames = resolvedPackages,
+            direction = direction,
+            requestedBytes = requestedBytes,
+            nowMillis = nowMillis,
+        )
+        if (decision.exhaustedPackages.isNotEmpty()) {
+            VpnAppControl.addQuotaBlockedPackages(context, decision.exhaustedPackages).forEach { packageName ->
+                DiagnosticsRepository.record(
+                    context,
+                    "WARN",
+                    "DataLimit",
+                    "APP_QUOTA_REACHED",
+                    "$packageName reached its configured relay-byte quota; uid=" + (uid ?: -1),
+                )
+            }
+        }
+        return decision
+    }
+
+    /**
+     * Rebuilds the persistent block set from durable counters. Called on VPN startup and as a
+     * recovery/period-reset path; real-time enforcement no longer waits for this check.
      */
     fun evaluateBlockedPackages(
         context: Context,
         nowMillis: Long = System.currentTimeMillis(),
     ): Set<String> {
         QuotaResetEngine.resetExpiredPolicies(context, nowMillis)
-        val blocked = mutableSetOf<String>()
-
-        UsageRepository.readQuotaPolicies(context).forEach { policy ->
-            val bounds = QuotaPeriod.current(policy.quotaType, nowMillis)
-            val startDate = formatDate(bounds.startMillis)
-            // periodEndMillis is exclusive; daily_usage stores whole calendar dates.
-            // Use the last instant of the period so the next period's date is not counted.
-            val endDate = formatDate(bounds.endMillis - 1L)
-            val fallbackBytes = UsageRepository.sumUsageInPeriod(
-                context = context,
-                packageName = policy.packageName,
-                startDate = startDate,
-                endDate = endDate,
-            )
-            val liveBytes = runCatching {
-                val uid = context.packageManager
-                    .getApplicationInfo(policy.packageName, android.content.pm.PackageManager.MATCH_ALL)
-                    .uid
-                AppTrafficManager.queryUidUsage(
-                    context = context,
-                    uid = uid,
-                    startTimeMs = bounds.startMillis,
-                    endTimeMs = nowMillis,
-                )
-            }.getOrNull()
-
-            // Prefer the direct UID query for the decision. Keep the persisted
-            // snapshot as a conservative fallback when Usage Access is unavailable
-            // or the platform query fails.
-            val usedBytes = liveBytes ?: fallbackBytes
-            if (usedBytes >= policy.limitBytes) {
-                blocked += policy.packageName
-            }
-        }
-
-        return blocked
+        return UsageRepository.readQuotaPolicies(context)
+            .filter { policy -> policy.usedBytes >= policy.limitBytes }
+            .map { it.packageName }
+            .toSet()
     }
 
     /**
@@ -198,7 +202,4 @@ internal object QuotaEnforcementEngine {
             }
         }
     }
-
-    private fun formatDate(millis: Long): String =
-        SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date(millis))
 }
