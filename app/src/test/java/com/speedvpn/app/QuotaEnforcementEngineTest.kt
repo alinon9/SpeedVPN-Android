@@ -50,6 +50,7 @@ class QuotaEnforcementEngineTest {
             context,
             DailyUsageRow(date, packageName, "Over", 2001, 700L, 400L),
         )
+        UsageDatabaseTestSupport.setQuotaUsedBytes(context, packageName, QuotaType.DAILY, 1_100L)
 
         assertEquals(setOf(packageName), QuotaEnforcementEngine.evaluateBlockedPackages(context, now))
     }
@@ -65,6 +66,7 @@ class QuotaEnforcementEngineTest {
             context,
             DailyUsageRow(date(now), packageName, "Under", 2002, 600L, 300L),
         )
+        UsageDatabaseTestSupport.setQuotaUsedBytes(context, packageName, QuotaType.DAILY, 900L)
 
         assertEquals(emptySet<String>(), QuotaEnforcementEngine.evaluateBlockedPackages(context, now))
     }
@@ -101,6 +103,7 @@ class QuotaEnforcementEngineTest {
             context,
             DailyUsageRow(date(start + 86_400_000L), packageName, "Weekly", 2005, 700L, 300L),
         )
+        UsageDatabaseTestSupport.setQuotaUsedBytes(context, packageName, QuotaType.WEEKLY, 2_100L)
 
         assertEquals(setOf(packageName), QuotaEnforcementEngine.evaluateBlockedPackages(context, now))
     }
@@ -278,6 +281,7 @@ class QuotaEnforcementEngineTest {
             context,
             DailyUsageRow(date(now), packageName, "Idempotent", 2014, 700L, 400L),
         )
+        UsageDatabaseTestSupport.setQuotaUsedBytes(context, packageName, QuotaType.DAILY, 1_100L)
 
         assertEquals(
             true,
@@ -304,6 +308,7 @@ class QuotaEnforcementEngineTest {
             context,
             DailyUsageRow(date(now), packageName, "Worker", 2015, 700L, 400L),
         )
+        UsageDatabaseTestSupport.setQuotaUsedBytes(context, packageName, QuotaType.DAILY, 1_100L)
         context.getSharedPreferences("smart_settings", Context.MODE_PRIVATE)
             .edit().putBoolean("stats_enabled", true).commit()
 
@@ -330,6 +335,47 @@ class QuotaEnforcementEngineTest {
             setOf(packageName),
             VpnAppControl.quotaBlockedPackages(context),
         )
+    }
+
+    @Test
+    fun relayAccountingCountsBothDirectionsAndStopsAtTheExactQuotaBoundary() {
+        val packageName = "com.example.relayquota"
+        UsageRepository.setQuotaPolicy(
+            context, packageName, "Relay quota", 2020, QuotaType.DAILY, 1_000L,
+        )
+
+        val upload = QuotaEnforcementEngine.accountRelayBytes(
+            context, setOf(packageName), 2020, QuotaTrafficDirection.UPLOAD, 700,
+        )
+        assertEquals(700, upload.allowedBytes)
+        assertEquals(emptySet<String>(), upload.exhaustedPackages)
+
+        val download = QuotaEnforcementEngine.accountRelayBytes(
+            context, setOf(packageName), 2020, QuotaTrafficDirection.DOWNLOAD, 500,
+        )
+        assertEquals("Only the remaining quota bytes may pass", 300, download.allowedBytes)
+        assertEquals(setOf(packageName), download.exhaustedPackages)
+
+        val policy = UsageRepository.readQuotaPolicies(context, packageName).single()
+        assertEquals(1_000L, policy.usedBytes)
+        assertEquals(300L, policy.downloadBytes)
+        assertEquals(700L, policy.uploadBytes)
+        assertEquals(setOf(packageName), VpnAppControl.quotaBlockedPackages(context))
+    }
+
+    @Test
+    fun quotaEnforcementDoesNotDependOnStatsToggleOrUsageAccess() = runBlocking {
+        val packageName = "com.example.statsdisabled"
+        UsageRepository.setQuotaPolicy(
+            context, packageName, "Stats disabled", 2021, QuotaType.DAILY, 100L,
+        )
+        UsageDatabaseTestSupport.setQuotaUsedBytes(context, packageName, QuotaType.DAILY, 100L)
+        context.getSharedPreferences("smart_settings", Context.MODE_PRIVATE)
+            .edit().putBoolean("stats_enabled", false).commit()
+
+        val worker = TestListenableWorkerBuilder<QuotaEnforcementWorker>(context).build()
+        assertEquals(ListenableWorker.Result.success().toString(), worker.doWork().toString())
+        assertEquals(setOf(packageName), VpnAppControl.quotaBlockedPackages(context))
     }
 
     private object UsageDatabaseTestSupport {
