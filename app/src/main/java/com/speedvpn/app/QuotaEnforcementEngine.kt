@@ -3,6 +3,9 @@ package com.speedvpn.app
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.atomic.AtomicLong
 
 internal object QuotaEnforcementEngine {
@@ -50,6 +53,7 @@ internal object QuotaEnforcementEngine {
                     .getOrDefault(emptySet())
             }.orEmpty()
         }
+        initializeMissingQuotaBaselines(context, nowMillis, resolvedPackages)
         val decision = UsageRepository.reserveQuotaBytes(
             context = context,
             packageNames = resolvedPackages,
@@ -79,12 +83,87 @@ internal object QuotaEnforcementEngine {
         context: Context,
         nowMillis: Long = System.currentTimeMillis(),
     ): Set<String> {
-        QuotaResetEngine.resetExpiredPolicies(context, nowMillis)
+        initializeMissingQuotaBaselines(context, nowMillis, packageNames = null)
         return UsageRepository.readQuotaPolicies(context)
             .filter { policy -> policy.usedBytes >= policy.limitBytes }
             .map { it.packageName }
             .toSet()
     }
+
+    /**
+     * Seeds a migrated/new-period policy exactly once with usage that happened before the live
+     * SOCKS byte gate could count it. Android UID stats are preferred; the DB snapshot is the
+     * fallback. After this flag is set, all further usage comes from the transactional relay gate.
+     */
+    private fun initializeMissingQuotaBaselines(
+        context: Context,
+        nowMillis: Long,
+        packageNames: Set<String>?,
+    ) {
+        val beforeReset = UsageRepository.readQuotaPolicies(context)
+        val resetPackages = beforeReset.filter { policy ->
+            val current = QuotaPeriod.current(policy.quotaType, nowMillis)
+            policy.periodStartMillis != current.startMillis ||
+                policy.periodEndMillis != current.endMillis
+        }.map { it.packageName }.toSet()
+        QuotaResetEngine.resetExpiredPolicies(context, nowMillis)
+
+        val previousBlocks = VpnAppControl.quotaBlockedPackages(context)
+        val appUids = UsageRepository.readPolicies(context).associate { it.packageName to it.uid }
+        UsageRepository.readQuotaPolicies(context)
+            .filter { !it.baselineInitialized && (packageNames == null || it.packageName in packageNames) }
+            .forEach { policy ->
+                val bounds = QuotaPeriod.current(policy.quotaType, nowMillis)
+                val uid = runCatching {
+                    context.packageManager.getApplicationInfo(
+                        policy.packageName,
+                        android.content.pm.PackageManager.MATCH_ALL,
+                    ).uid
+                }.getOrNull() ?: appUids[policy.packageName]
+
+                val platform = uid?.let { appUid ->
+                    runCatching {
+                        AppTrafficManager.queryUidUsageBreakdown(
+                            context,
+                            appUid,
+                            bounds.startMillis,
+                            nowMillis,
+                        )
+                    }.getOrNull()
+                }
+                val startDate = formatDate(bounds.startMillis)
+                val endDate = formatDate(bounds.endMillis)
+                val snapshot = UsageRepository.sumDirectionalUsageInPeriod(
+                    context,
+                    policy.packageName,
+                    startDate,
+                    endDate,
+                )
+                val baseline = platform ?: snapshot
+
+                // A legacy build could persist a block from NetworkStats while used_bytes was
+                // still zero. When Usage Access is unavailable and no current-period policy reset
+                // explains the old block, keep it fail-closed rather than silently unblocking it.
+                val preserveUnknownLegacyBlock =
+                    platform == null &&
+                    policy.packageName in previousBlocks &&
+                    policy.packageName !in resetPackages
+                UsageRepository.initializeQuotaBaseline(
+                    context = context,
+                    policy = policy,
+                    counters = baseline,
+                    minimumUsedBytes = if (preserveUnknownLegacyBlock) {
+                        maxOf(policy.limitBytes, policy.usedBytes)
+                    } else {
+                        policy.usedBytes
+                    },
+                    nowMillis = nowMillis,
+                )
+            }
+    }
+
+    private fun formatDate(millis: Long): String =
+        SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date(millis))
 
     /**
      * Applies the evaluated quota block set and restarts the VPN only when it changed.
