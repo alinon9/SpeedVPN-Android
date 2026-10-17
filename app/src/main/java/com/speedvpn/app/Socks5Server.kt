@@ -91,6 +91,8 @@ class Socks5Server internal constructor(
         direction: QuotaTrafficDirection,
         requestedBytes: Int,
     ) -> QuotaTrafficDecision = { _, _, _, requestedBytes -> QuotaTrafficDecision(requestedBytes) },
+    /** Refuse ownerless data sessions while at least one per-app quota is configured. */
+    private val requireUidAttribution: () -> Boolean = { false },
     private val onQuotaExceeded: (Set<String>) -> Unit = {},
 ) {
     companion object {
@@ -343,19 +345,22 @@ class Socks5Server internal constructor(
 
     private fun track(socket: Socket): Socket = socket.also { openTcp.add(it) }
     private fun untrack(socket: Socket) { openTcp.remove(socket) }
-    private fun trackUpstream(socket: Socket, endpoint: String? = null): Socket {
+    private fun trackUpstream(
+        socket: Socket,
+        endpoint: String? = null,
+        sessionUid: Int? = null,
+    ): Socket {
         upstreamTcp.add(socket)
         openTcp.add(socket)
         if (endpoint != null) {
-            val owner = flowOwnersByEndpoint[endpoint]
-            val metadata = FlowOwnerMetadata(endpoint).also {
-                if (owner != null) {
-                    it.uid = owner.uid
-                    it.packages = owner.packages
-                    it.tuple = owner.tuple
-                }
-            }
-            upstreamTcpMetadata[socket] = metadata
+            // Ownership is attached by the per-session SOCKS username, never inferred from
+            // a destination shared by multiple apps.
+            upstreamTcpMetadata[socket] = FlowOwnerMetadata(
+                endpoint = endpoint,
+                uid = sessionUid,
+                packages = emptySet(),
+                tuple = sessionUid?.let { "SOCKS5_UID_AUTH:$it" } ?: "UID_UNRESOLVED",
+            )
         }
         return socket
     }
@@ -475,20 +480,10 @@ class Socks5Server internal constructor(
             }
         } ?: return
 
-        // Do not overwrite a known different UID when two apps contact the same endpoint.
-        // The native per-flow table remains authoritative if the SOCKS endpoint is ambiguous.
-        val ownerUid = owner.uid ?: return
-        val ownerPackages = owner.packages
-        val ownerTuple = owner.tuple
-        upstreamTcpMetadata.values
-            .filter { it.endpointKey == endpoint && it.uid == null }
-            .forEach {
-                it.uid = ownerUid
-                it.packages = ownerPackages
-                it.tuple = ownerTuple
-            }
-        activeUdpMuxes.toList().forEach {
-            it.recordFlowOwner(endpoint, ownerUid, ownerPackages, ownerTuple)
+        // This endpoint table is diagnostic/policy state only. Never copy its owner to
+        // live relays: two apps can contact the same destination concurrently.
+        if (owner.uid == null) {
+            log("APP_FLOW_ENDPOINT_AMBIGUOUS endpoint=$endpoint; relay ownership stays per-session")
         }
     }
 
@@ -504,6 +499,12 @@ class Socks5Server internal constructor(
         permanent: Boolean,
     ) {
         recordDetectedFlow(protocol, srcIp, srcPort, dstIp, dstPort, uid, packages)
+        if (!permanent) {
+            // An app blacklist is UID-scoped. Do not convert one blocked app's destination
+            // into a global endpoint block that also affects unblocked apps.
+            if (uid > 0 && uid in blockedUids) killConnectionsForBlockedUids(setOf(uid))
+            return
+        }
         val endpoint = endpointKey(protocol, dstIp, dstPort)
         val flowTuple = protocol.toString() + "|" + srcIp + ":" + srcPort + "->" +
             dstIp + ":" + dstPort + "|uid=" + uid
@@ -513,7 +514,7 @@ class Socks5Server internal constructor(
             uid = uid,
             flowTuple = flowTuple,
             policyPackages = policyBlockedPackages,
-            permanent = permanent,
+            permanent = true,
         )
     }
 
@@ -632,7 +633,23 @@ class Socks5Server internal constructor(
             val passBytes = ByteArray(pLen)
             input.readFully(passBytes)
 
-            val authOk = MessageDigest.isEqual(userBytes, username.toByteArray(Charsets.UTF_8)) &&
+            val suppliedUsername = userBytes.toString(Charsets.UTF_8)
+            val uidPrefix = "$username#"
+            val sessionUid = if (suppliedUsername.startsWith(uidPrefix)) {
+                suppliedUsername.removePrefix(uidPrefix).toIntOrNull()?.takeIf { it >= 0 }
+            } else {
+                null
+            }
+            val isHealthProbe = client.port in probeSourcePorts
+            val uidRequired = runCatching { requireUidAttribution() }.getOrDefault(true)
+            val expectedUsername = sessionUid?.let { "$username#$it" } ?: username
+            val usernameShapeValid = if (sessionUid != null) {
+                suppliedUsername == expectedUsername
+            } else {
+                suppliedUsername == username && (isHealthProbe || !uidRequired)
+            }
+            val authOk = usernameShapeValid &&
+                MessageDigest.isEqual(userBytes, expectedUsername.toByteArray(Charsets.UTF_8)) &&
                 MessageDigest.isEqual(passBytes, password.toByteArray(Charsets.UTF_8))
             out.write(byteArrayOf(1, if (authOk) 0 else 1))
             out.flush()
@@ -649,8 +666,8 @@ class Socks5Server internal constructor(
 
             if (policyEpoch != expectedPolicyEpoch) return
             when (cmd) {
-                1 -> connect(client, input, out, host, port, expectedPolicyEpoch)
-                3 -> udpAssociate(client, input, out, expectedPolicyEpoch)
+                1 -> connect(client, input, out, host, port, expectedPolicyEpoch, sessionUid)
+                3 -> udpAssociate(client, input, out, expectedPolicyEpoch, sessionUid)
                 else -> {
                     out.write(byteArrayOf(5, 7, 0, 1, 0, 0, 0, 0, 0, 0))
                     out.flush()
@@ -724,8 +741,14 @@ class Socks5Server internal constructor(
         target: Any,
         port: Int,
         expectedPolicyEpoch: Long,
+        sessionUid: Int?,
     ) {
         if (policyEpoch != expectedPolicyEpoch) {
+            runCatching { client.close() }
+            return
+        }
+        if (sessionUid != null && sessionUid in blockedUids) {
+            replyFailure(cout, 2)
             runCatching { client.close() }
             return
         }
@@ -767,7 +790,7 @@ class Socks5Server internal constructor(
             val endpoint = endpointKey(IPPROTO_TCP, addr, port)
             if (endpoint in blockedDestinations) continue
             val socket = Socket()
-            trackUpstream(socket, endpoint)
+            trackUpstream(socket, endpoint, sessionUid)
             try {
                 val network = currentNetwork() ?: throw UnknownHostException("No physical network available")
                 network.bindSocket(socket)
@@ -1080,8 +1103,14 @@ class Socks5Server internal constructor(
         cin: InputStream,
         cout: OutputStream,
         expectedPolicyEpoch: Long,
+        sessionUid: Int?,
     ) {
         if (policyEpoch != expectedPolicyEpoch) {
+            runCatching { client.close() }
+            return
+        }
+        if (sessionUid != null && sessionUid in blockedUids) {
+            replyFailure(cout, 2)
             runCatching { client.close() }
             return
         }
@@ -1120,6 +1149,7 @@ class Socks5Server internal constructor(
                 udpFlows = udpFlows,
                 clientAddr = clientAddr,
                 expectedPolicyEpoch = expectedPolicyEpoch,
+                sessionUid = sessionUid,
             ).also { activeUdpMuxes.add(it) }
             val closeOnce = AtomicBoolean(false)
             val closeAll = {
@@ -1269,6 +1299,7 @@ class Socks5Server internal constructor(
         private val udpFlows: UdpFlowTable,
         private val clientAddr: AtomicReference<InetAddress?>,
         private val expectedPolicyEpoch: Long,
+        private val sessionUid: Int?,
     ) : AutoCloseable {
         private val selector = Selector.open()
         private val lock = Any()
@@ -1276,16 +1307,6 @@ class Socks5Server internal constructor(
         private val runningMux = AtomicBoolean(true)
         private val worker = thread(name = "socks-udp-mux", isDaemon = true) {
             runLoop()
-        }
-
-        fun recordFlowOwner(endpoint: String, uid: Int?, packages: Set<String>, tuple: String) {
-            synchronized(lock) {
-                bindings.values.filter { it.endpointKey == endpoint }.forEach { binding ->
-                    binding.uid = uid
-                    binding.packages = packages
-                    binding.tuple = tuple
-                }
-            }
         }
 
         fun enforceBlockedPackages(blockedPackages: Set<String>) {
@@ -1454,15 +1475,14 @@ class Socks5Server internal constructor(
                 channel.configureBlocking(false)
                 channel.connect(remote)
                 val endpoint = endpointKey(IPPROTO_UDP, remote.address, remote.port)
-                val owner = flowOwnersByEndpoint[endpoint]
                 val binding = UdpBinding(
                     flow = flow,
                     channel = channel,
                     remote = remote,
                     endpointKey = endpoint,
-                    uid = owner?.uid,
-                    packages = owner?.packages.orEmpty(),
-                    tuple = owner?.tuple.orEmpty(),
+                    uid = sessionUid,
+                    packages = emptySet(),
+                    tuple = sessionUid?.let { "SOCKS5_UID_AUTH:$it" } ?: "UID_UNRESOLVED",
                 )
                 synchronized(selector) {
                     selector.wakeup()
