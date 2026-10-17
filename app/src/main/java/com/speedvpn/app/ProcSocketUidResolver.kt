@@ -33,12 +33,12 @@ internal object ProcSocketUidResolver {
             if (!file.isFile || !file.canRead()) return@forEach
             runCatching {
                 file.bufferedReader().useLines { lines ->
-                    lines.drop(1).forEach { line ->
+                    lines.drop(1).forEach rowLoop@ { line ->
                         val fields = line.trim().split(WHITESPACE)
-                        if (fields.size < 8) return@forEach
-                        val local = parseEndpoint(fields[1]) ?: return@forEach
-                        val remote = parseEndpoint(fields[2]) ?: return@forEach
-                        val uid = fields[7].toIntOrNull()?.takeIf { it >= 0 } ?: return@forEach
+                        if (fields.size < 8) return@rowLoop
+                        val local = parseEndpoint(fields[1]) ?: return@rowLoop
+                        val remote = parseEndpoint(fields[2]) ?: return@rowLoop
+                        val uid = fields[7].toIntOrNull()?.takeIf { it >= 0 } ?: return@rowLoop
 
                         val localAddressMatches =
                             sameAddress(local.address, srcAddress) ||
