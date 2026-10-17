@@ -17,8 +17,21 @@ internal object VpnApplicationPolicy {
         }.toSet()
     }
 
-    // Kept for source compatibility with existing tests/tools. The service does not
-    // use this result for routing; it routes all apps through TUN instead.
+    /**
+     * Only the VPN app itself is excluded from the VPN interface to avoid routing loops.
+     * Blocked apps must remain in TUN; disallowing them here creates a bypass.
+     */
+    fun routingExemptPackages(vpnPackageName: String): Set<String> = setOf(vpnPackageName)
+
+    /** True when a resolved owner belongs to the blocked UID set. */
+    fun shouldDropUid(uid: Int, blockedUids: Set<Int>): Boolean =
+        uid > 0 && uid in blockedUids
+
+    /** Never silently allow an unresolved owner while a block policy is active. */
+    fun shouldDropUnresolvedUid(blockedPackages: Set<String>): Boolean =
+        blockedPackages.isNotEmpty()
+
+    // Legacy helper retained for source compatibility; never use it to configure Builder.
     fun allowedPackages(
         launchablePackages: Iterable<String>,
         blockedPackages: Set<String>,
