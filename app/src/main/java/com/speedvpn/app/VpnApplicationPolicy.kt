@@ -27,9 +27,15 @@ internal object VpnApplicationPolicy {
     fun shouldDropUid(uid: Int, blockedUids: Set<Int>): Boolean =
         uid > 0 && uid in blockedUids
 
-    /** Never silently allow an unresolved owner while at least one installed UID is blocked. */
-    fun shouldDropUnresolvedUid(blockedUids: Set<Int>): Boolean =
-        blockedUids.isNotEmpty()
+    /**
+     * With a blacklist active, an unresolved flow is denied only after both the Android owner
+     * API and the procfs socket-table fallback have been attempted. Callers must not make this
+     * decision before fallback attribution has completed.
+     */
+    fun shouldDropUnresolvedUid(
+        blockedUids: Set<Int>,
+        attributionExhausted: Boolean = true,
+    ): Boolean = attributionExhausted && blockedUids.isNotEmpty()
 
     // Legacy helper retained for source compatibility; never use it to configure Builder.
     fun allowedPackages(
