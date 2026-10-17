@@ -79,7 +79,7 @@ internal fun readRelayBatch(
  * passed to hev through tunnel.yml. This prevents unrelated localhost clients
  * from using the relay as an unrestricted egress proxy.
  */
-class Socks5Server(
+class Socks5Server internal constructor(
     private val generation: Long,
     private val protectTcp: (Socket) -> Boolean,
     private val protectUdp: (DatagramSocket) -> Boolean,
