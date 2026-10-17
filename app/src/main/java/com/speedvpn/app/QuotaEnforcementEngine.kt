@@ -6,6 +6,9 @@ import android.os.Looper
 import java.util.concurrent.atomic.AtomicLong
 
 internal object QuotaEnforcementEngine {
+    // Serializes the durable quota decision with persistence of the package block set, so a
+    // stale periodic evaluation cannot clear a block reached concurrently by a live relay.
+    private val quotaStateLock = Any()
     private const val RESTART_THROTTLE_MS = 5_000L
     private val lastRestartAtMillis = AtomicLong(Long.MIN_VALUE)
     private val restartPending = AtomicLong(0L)
@@ -40,7 +43,7 @@ internal object QuotaEnforcementEngine {
         direction: QuotaTrafficDirection,
         requestedBytes: Int,
         nowMillis: Long = System.currentTimeMillis(),
-    ): QuotaTrafficDecision {
+    ): QuotaTrafficDecision = synchronized(quotaStateLock) {
         val resolvedPackages = packageNames.filter { it.isNotBlank() }.toSet().ifEmpty {
             uid?.takeIf { it > 0 }?.let { appUid ->
                 runCatching { context.packageManager.getPackagesForUid(appUid)?.toSet().orEmpty() }
@@ -65,7 +68,7 @@ internal object QuotaEnforcementEngine {
                 )
             }
         }
-        return decision
+        decision
     }
 
     /**
@@ -90,7 +93,7 @@ internal object QuotaEnforcementEngine {
         context: Context,
         nowMillis: Long = System.currentTimeMillis(),
         restart: (Context) -> Unit = SpeedVpnService::restartForSettings,
-    ): Boolean {
+    ): Boolean = synchronized(quotaStateLock) {
         val evaluated = evaluateBlockedPackages(context, nowMillis)
         val current = VpnAppControl.quotaBlockedPackages(context)
         if (evaluated == current) return false
