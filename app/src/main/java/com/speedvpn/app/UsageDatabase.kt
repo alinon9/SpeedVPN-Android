@@ -286,6 +286,7 @@ internal object UsageRepository {
                 )
             }
         }
+        QuotaEnforcementEngine.invalidateQuotaBaselineCache(packageName)
     }
 
     fun deleteQuotaPolicy(context: Context, packageName: String, quotaType: QuotaType) {
@@ -296,6 +297,7 @@ internal object UsageRepository {
                 arrayOf(packageName, quotaType.name),
             )
         }
+        QuotaEnforcementEngine.invalidateQuotaBaselineCache(packageName)
     }
 
     fun resetQuotaPeriod(
