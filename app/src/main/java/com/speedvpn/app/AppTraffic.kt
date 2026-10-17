@@ -18,6 +18,15 @@ import java.util.Locale
  * so this screen intentionally labels the values as session usage rather than
  * a packet-perfect live counter.
  */
+internal data class UidTrafficCounters(
+    val downloadBytes: Long,
+    val uploadBytes: Long,
+) {
+    val totalBytes: Long
+        get() = if (Long.MAX_VALUE - downloadBytes < uploadBytes) Long.MAX_VALUE
+        else downloadBytes + uploadBytes
+}
+
 data class AppTrafficUsage(
     val packageName: String,
     val label: String,
@@ -115,10 +124,19 @@ object AppTrafficManager {
         uid: Int,
         startTimeMs: Long,
         endTimeMs: Long = System.currentTimeMillis(),
-    ): Long? {
+    ): Long? = queryUidUsageBreakdown(context, uid, startTimeMs, endTimeMs)?.totalBytes
+
+    /** One-shot historical baseline for a quota period; live accounting stays in Socks5Server. */
+    internal fun queryUidUsageBreakdown(
+        context: Context,
+        uid: Int,
+        startTimeMs: Long,
+        endTimeMs: Long = System.currentTimeMillis(),
+    ): UidTrafficCounters? {
         if (uid < 0 || endTimeMs <= startTimeMs || !hasUsageAccess(context)) return null
         val manager = context.getSystemService(NetworkStatsManager::class.java) ?: return null
-        var total = 0L
+        var download = 0L
+        var upload = 0L
         var queried = false
         for (networkType in NETWORK_TYPES) {
             runCatching {
@@ -133,14 +151,15 @@ object AppTrafficManager {
                     val bucket = NetworkStats.Bucket()
                     while (stream.hasNextBucket()) {
                         stream.getNextBucket(bucket)
-                        total = safeAdd(total, safeAdd(bucket.rxBytes, bucket.txBytes))
+                        download = safeAdd(download, bucket.rxBytes)
+                        upload = safeAdd(upload, bucket.txBytes)
                     }
                 }
             }.onFailure {
                 log("UID quota query failed for uid=" + uid + " type=" + networkType + ": " + it.message)
             }
         }
-        return if (queried) total else null
+        return if (queried) UidTrafficCounters(download, upload) else null
     }
 
     fun querySessionUsage(context: Context, startTimeMs: Long, endTimeMs: Long = System.currentTimeMillis()): List<AppTrafficUsage> {
