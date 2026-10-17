@@ -206,6 +206,8 @@ object SpeedLimiter {
     val verificationInProgress = MutableStateFlow(false)
 
     private val verificationLock = Any()
+    // Tracks whether this process has loaded or accepted the user's normal speed plan.
+    private var normalLimitsInitialized = false
     private var verificationLimits: Pair<Long?, Long?>? = null
     private var externalVpnCommandsInProgress = 0
     @Volatile
@@ -296,6 +298,22 @@ object SpeedLimiter {
             ?.times(125L)
             ?: 0L
 
+    /**
+     * Restores persisted limits once per process without overwriting a live UI selection
+     * or a temporary verification plan. The paired update is atomic with normal setters.
+     */
+    fun initializeLimitsIfUnset(downloadKbps: Long?, uploadKbps: Long?): Boolean =
+        synchronized(verificationLock) {
+            if (normalLimitsInitialized || verificationLimits != null || externalVpnCommandsInProgress > 0) {
+                false
+            } else {
+                applyDownloadKbps(downloadKbps)
+                applyUploadKbps(uploadKbps)
+                normalLimitsInitialized = true
+                true
+            }
+        }
+
     /** Begins a verification and freezes the limiter at the requested rates. */
     fun beginVerification(downloadKbps: Long?, uploadKbps: Long?): Boolean =
         synchronized(verificationLock) {
@@ -338,6 +356,7 @@ object SpeedLimiter {
         synchronized(verificationLock) {
             applyDownloadKbps(downloadKbps)
             applyUploadKbps(uploadKbps)
+            normalLimitsInitialized = true
             verificationOwnPackageRoutingEnabled = false
             verificationLimits = null
             verificationInProgress.value = false
@@ -362,6 +381,7 @@ object SpeedLimiter {
         synchronized(verificationLock) {
             if (verificationLimits != null) return false
             applyDownloadKbps(kbps)
+            normalLimitsInitialized = true
             onApplied?.invoke()
             return true
         }
@@ -371,6 +391,7 @@ object SpeedLimiter {
         synchronized(verificationLock) {
             if (verificationLimits != null) return false
             applyUploadKbps(kbps)
+            normalLimitsInitialized = true
             onApplied?.invoke()
             return true
         }
@@ -386,6 +407,7 @@ object SpeedLimiter {
             if (verificationLimits != null) return false
             applyDownloadKbps(downloadKbps)
             applyUploadKbps(uploadKbps)
+            normalLimitsInitialized = true
             onApplied?.invoke()
             return true
         }
