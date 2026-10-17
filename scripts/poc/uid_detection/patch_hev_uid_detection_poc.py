@@ -177,14 +177,18 @@ uid_poc_report_packet (const struct pbuf *buf)
             pbuf_copy_partial (buf, ip, ip_header_len, 0) != ip_header_len)
             return 0;
         fragment_field = ((unsigned int) ip[6] << 8) | ip[7];
-        /* Non-initial IPv4 fragments do not contain the TCP/UDP ports. */
-        if (fragment_field & 0x1fff)
-            return 0;
         protocol = ip[9];
         src_len = 4;
         offset = ip_header_len;
         memcpy (src, ip + 12, 4);
         memcpy (dst, ip + 16, 4);
+        /* Portless fragments fail closed while the app UID policy is active. */
+        if (fragment_field & 0x1fff) {
+            if (protocol == 6 || protocol == 17)
+                return hev_jni_uid_poc_packet (protocol, src, src_len, -1,
+                                               dst, src_len, -1);
+            return 0;
+        }
     } else if (version == 6) {
         unsigned int extensions;
         if (total < 40 || pbuf_copy_partial (buf, ip, 40, 0) != 40)
@@ -212,9 +216,12 @@ uid_poc_report_packet (const struct pbuf *buf)
                     return 0;
                 next_header = ip[0];
                 fragment_offset = (((unsigned int) ip[2] << 8) | ip[3]) & 0xfff8u;
-                /* Non-initial IPv6 fragments do not contain the TCP/UDP ports. */
-                if (fragment_offset != 0)
-                    return 0;
+                /* Portless IPv6 fragments fail closed while UID enforcement is active. */
+                if (fragment_offset != 0) {
+                    int fragment_protocol = (next_header == 6 || next_header == 17) ? (int) next_header : 17;
+                    return hev_jni_uid_poc_packet (fragment_protocol, src, src_len, -1,
+                                                   dst, src_len, -1);
+                }
                 extension_length = 8;
             } else if (protocol == 51) {
                 if (total < offset + 2 ||
@@ -1051,8 +1058,18 @@ hev_jni_uid_poc_packet (int protocol,
 
     if (!src || !dst || src_len != dst_len ||
         (src_len != 4 && src_len != 16) ||
-        (protocol != 6 && protocol != 17) ||
-        src_port < 0 || src_port > 65535 || dst_port < 0 || dst_port > 65535)
+        (protocol != 6 && protocol != 17))
+        return 0;
+
+    /* Non-initial IP fragments have no socket ports. Deny them while UID policy is active. */
+    if (src_port < 0 || dst_port < 0) {
+        int deny_fragment;
+        pthread_mutex_lock (&uid_poc_mutex);
+        deny_fragment = uid_poc_policy_active;
+        pthread_mutex_unlock (&uid_poc_mutex);
+        return deny_fragment;
+    }
+    if (src_port > 65535 || dst_port > 65535)
         return 0;
 
     uid_poc_make_key (&key, protocol, src, src_len, src_port, dst, dst_len, dst_port);

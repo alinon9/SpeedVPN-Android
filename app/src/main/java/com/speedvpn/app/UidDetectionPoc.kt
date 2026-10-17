@@ -188,7 +188,7 @@ internal class UidDetectionPoc(
             reportException(protocol, source, srcPort, destination, dstPort, callId, error)
             return encodeUidDecision(
                 Process.INVALID_UID,
-                VpnApplicationPolicy.shouldDropUnresolvedUid(blockPolicy.packages),
+                VpnApplicationPolicy.shouldDropUnresolvedUid(blockPolicy.uids),
             )
         } finally {
             UidPocDiagnostics.jniEvent(
@@ -212,7 +212,7 @@ internal class UidDetectionPoc(
         (uid.toLong() shl 32) or (if (shouldBlock) 1L else 0L)
 
     private fun unresolvedUid(): UidResolution {
-        val shouldBlock = VpnApplicationPolicy.shouldDropUnresolvedUid(blockPolicy.packages)
+        val shouldBlock = VpnApplicationPolicy.shouldDropUnresolvedUid(blockPolicy.uids)
         return UidResolution(
             Process.INVALID_UID,
             if (shouldBlock) "UID_UNRESOLVED_FAIL_CLOSED" else "INVALID_UID",

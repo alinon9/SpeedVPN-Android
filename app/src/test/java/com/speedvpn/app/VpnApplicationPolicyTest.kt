@@ -27,8 +27,8 @@ class VpnApplicationPolicyTest {
     }
 
     @Test
-    fun unresolvedUidFailsClosedOnlyWhenABlockPolicyIsActive() {
-        assertTrue(VpnApplicationPolicy.shouldDropUnresolvedUid(setOf("com.example.blocked")))
+    fun unresolvedUidFailsClosedOnlyWhenAnInstalledBlockedUidExists() {
+        assertTrue(VpnApplicationPolicy.shouldDropUnresolvedUid(setOf(10_249)))
         assertFalse(VpnApplicationPolicy.shouldDropUnresolvedUid(emptySet()))
     }
 

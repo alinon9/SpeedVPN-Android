@@ -27,9 +27,9 @@ internal object VpnApplicationPolicy {
     fun shouldDropUid(uid: Int, blockedUids: Set<Int>): Boolean =
         uid > 0 && uid in blockedUids
 
-    /** Never silently allow an unresolved owner while a block policy is active. */
-    fun shouldDropUnresolvedUid(blockedPackages: Set<String>): Boolean =
-        blockedPackages.isNotEmpty()
+    /** Never silently allow an unresolved owner while at least one installed UID is blocked. */
+    fun shouldDropUnresolvedUid(blockedUids: Set<Int>): Boolean =
+        blockedUids.isNotEmpty()
 
     // Legacy helper retained for source compatibility; never use it to configure Builder.
     fun allowedPackages(

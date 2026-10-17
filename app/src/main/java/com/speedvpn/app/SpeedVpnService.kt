@@ -460,10 +460,11 @@ class SpeedVpnService : VpnService() {
                 // Publish the Kotlin snapshot first; Native atomically switches enforcement
                 // and flushes cached ALLOW decisions without unregistering its callback.
                 val callback = uidDetectionPoc
+                val currentBlockedUids = VpnApplicationPolicy.blockedUids(this@SpeedVpnService, current)
                 runCatching { callback?.updateBlockedPackages(current) }
                     .onFailure { logE("Unable to refresh blocked UID policy", it) }
                 runCatching {
-                    check(TProxyService.TProxySetUidPocPolicyEnabled(current.isNotEmpty())) {
+                    check(TProxyService.TProxySetUidPocPolicyEnabled(currentBlockedUids.isNotEmpty())) {
                         "Unable to apply native UID policy"
                     }
                 }.onFailure {
@@ -471,7 +472,7 @@ class SpeedVpnService : VpnService() {
                     logE("Unable to apply native UID policy", it)
                 }
                 runCatching {
-                    socks?.updateBlockedUids(VpnApplicationPolicy.blockedUids(this@SpeedVpnService, current))
+                    socks?.updateBlockedUids(currentBlockedUids)
                 }.onFailure { logE("Unable to refresh SOCKS blocked UIDs", it) }
                 runCatching { socks?.enforceBlockedPackages(current) }
                     .onFailure { logE("Unable to enforce changed app block-list", it) }
@@ -1052,7 +1053,8 @@ class SpeedVpnService : VpnService() {
                 uidDetectionPoc?.close()
                 uidDetectionPoc = null
             }
-            check(TProxyService.TProxySetUidPocPolicyEnabled(currentBlockedPackages().isNotEmpty())) {
+            val initialBlockedUids = VpnApplicationPolicy.blockedUids(this, currentBlockedPackages())
+            check(TProxyService.TProxySetUidPocPolicyEnabled(initialBlockedUids.isNotEmpty())) {
                 "Unable to initialize native UID policy"
             }
             UidPocDiagnostics.log(this, "JNI_NATIVE_START_BEGIN generation=$newGeneration fd=${expectedTun.fd}")
