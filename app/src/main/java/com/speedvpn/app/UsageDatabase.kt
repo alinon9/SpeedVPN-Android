@@ -7,7 +7,7 @@ import android.database.sqlite.SQLiteOpenHelper
 import java.util.Calendar
 
 private const val USAGE_DB_NAME = "speedvpn_usage.db"
-private const val USAGE_DB_VERSION = 3
+private const val USAGE_DB_VERSION = 4
 
 internal data class AppPolicy(
     val packageName: String,
@@ -84,6 +84,7 @@ internal class UsageDbHelper(
                 used_bytes INTEGER NOT NULL DEFAULT 0 CHECK (used_bytes >= 0),
                 download_bytes INTEGER NOT NULL DEFAULT 0 CHECK (download_bytes >= 0),
                 upload_bytes INTEGER NOT NULL DEFAULT 0 CHECK (upload_bytes >= 0),
+                baseline_initialized INTEGER NOT NULL DEFAULT 0 CHECK (baseline_initialized IN (0, 1)),
                 reset_behavior TEXT NOT NULL DEFAULT 'AUTO_RESET'
                     CHECK (reset_behavior IN ('AUTO_RESET', 'BLOCK_UNTIL_RESET')),
                 updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000),
@@ -123,6 +124,15 @@ internal class UsageDbHelper(
             try {
                 db.execSQL("ALTER TABLE app_quota_policy ADD COLUMN download_bytes INTEGER NOT NULL DEFAULT 0 CHECK (download_bytes >= 0)")
                 db.execSQL("ALTER TABLE app_quota_policy ADD COLUMN upload_bytes INTEGER NOT NULL DEFAULT 0 CHECK (upload_bytes >= 0)")
+                db.setTransactionSuccessful()
+            } finally {
+                db.endTransaction()
+            }
+        }
+        if (oldVersion >= 2 && oldVersion < 4) {
+            db.beginTransaction()
+            try {
+                db.execSQL("ALTER TABLE app_quota_policy ADD COLUMN baseline_initialized INTEGER NOT NULL DEFAULT 0 CHECK (baseline_initialized IN (0, 1))")
                 db.setTransactionSuccessful()
             } finally {
                 db.endTransaction()
@@ -224,12 +234,24 @@ internal object UsageRepository {
             }
             return
         }
-        val bounds = QuotaPeriod.current(quotaType)
+        val nowMillis = System.currentTimeMillis()
+        val bounds = QuotaPeriod.current(quotaType, nowMillis)
         val existingPolicy = readQuotaPolicies(context, packageName)
             .firstOrNull { it.quotaType == quotaType }
             ?.takeIf {
                 it.periodStartMillis == bounds.startMillis && it.periodEndMillis == bounds.endMillis
             }
+        val historical = if (existingPolicy == null) {
+            val startDate = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US)
+                .format(java.util.Date(bounds.startMillis))
+            val endDate = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US)
+                .format(java.util.Date(nowMillis))
+            runCatching {
+                AppTrafficManager.queryUidUsageBreakdown(context, uid, bounds.startMillis, nowMillis)
+            }.getOrNull() ?: sumDirectionalUsageInPeriod(context, packageName, startDate, endDate)
+        } else {
+            UidTrafficCounters(existingPolicy.downloadBytes, existingPolicy.uploadBytes)
+        }
         helper(context).use { h ->
             val values = ContentValues().apply {
                 put("package_name", packageName)
@@ -238,12 +260,16 @@ internal object UsageRepository {
                 put("period_start_millis", bounds.startMillis)
                 put("period_end_millis", bounds.endMillis)
                 // Editing a quota must not erase bytes already consumed in the same period.
-                // A new policy (or a policy from an expired period) starts a fresh counter.
-                put("used_bytes", existingPolicy?.usedBytes ?: 0L)
-                put("download_bytes", existingPolicy?.downloadBytes ?: 0L)
-                put("upload_bytes", existingPolicy?.uploadBytes ?: 0L)
+                // New or expired policies are seeded once from historical usage before live relay
+                // byte accounting takes over.
+                put("used_bytes", existingPolicy?.usedBytes ?: historical.totalBytes)
+                put("download_bytes", if (existingPolicy != null) existingPolicy.downloadBytes else historical.downloadBytes)
+                put("upload_bytes", if (existingPolicy != null) existingPolicy.uploadBytes else historical.uploadBytes)
+                put("baseline_initialized", if (existingPolicy != null) {
+                    if (existingPolicy.baselineInitialized) 1 else 0
+                } else 1)
                 put("reset_behavior", resetBehavior.name)
-                put("updated_at", System.currentTimeMillis())
+                put("updated_at", nowMillis)
             }
             h.writableDatabase.insertWithOnConflict(
                 "app_quota_policy",
@@ -286,6 +312,7 @@ internal object UsageRepository {
                 put("used_bytes", 0L)
                 put("download_bytes", 0L)
                 put("upload_bytes", 0L)
+                put("baseline_initialized", 0)
                 put("updated_at", System.currentTimeMillis())
             }
             return h.writableDatabase.update(
@@ -306,7 +333,7 @@ internal object UsageRepository {
                 arrayOf(
                     "package_name", "quota_type", "limit_bytes",
                     "period_start_millis", "period_end_millis", "used_bytes", "reset_behavior",
-                    "download_bytes", "upload_bytes",
+                    "download_bytes", "upload_bytes", "baseline_initialized",
                 ),
                 selection,
                 args,
@@ -329,6 +356,7 @@ internal object UsageRepository {
                                 resetBehavior = reset,
                                 downloadBytes = c.getLong(7),
                                 uploadBytes = c.getLong(8),
+                                baselineInitialized = c.getInt(9) != 0,
                             ),
                         )
                     }
@@ -398,6 +426,7 @@ internal object UsageRepository {
                                         put("used_bytes", 0L)
                                         put("download_bytes", 0L)
                                         put("upload_bytes", 0L)
+                                        put("baseline_initialized", 0)
                                         put("updated_at", nowMillis)
                                     },
                                     "package_name = ? AND quota_type = ?",
@@ -565,6 +594,65 @@ internal object UsageRepository {
                 arrayOf(startDate, endDate),
                 null, null, null,
             ).use { c -> if (c.moveToFirst() && !c.isNull(0)) c.getLong(0) else 0L }
+        }
+    }
+
+    fun sumDirectionalUsageInPeriod(
+        context: Context,
+        packageName: String,
+        startDate: String,
+        endDate: String,
+    ): UidTrafficCounters {
+        helper(context).use { h ->
+            return h.readableDatabase.query(
+                "daily_usage",
+                arrayOf("SUM(download_bytes)", "SUM(upload_bytes)"),
+                "package_name = ? AND date >= ? AND date <= ?",
+                arrayOf(packageName, startDate, endDate),
+                null,
+                null,
+                null,
+            ).use { c ->
+                if (c.moveToFirst()) {
+                    UidTrafficCounters(
+                        downloadBytes = if (c.isNull(0)) 0L else c.getLong(0),
+                        uploadBytes = if (c.isNull(1)) 0L else c.getLong(1),
+                    )
+                } else {
+                    UidTrafficCounters(0L, 0L)
+                }
+            }
+        }
+    }
+
+    /** Compare-and-set so a one-shot baseline is never applied twice to a concurrent relay. */
+    fun initializeQuotaBaseline(
+        context: Context,
+        policy: AppQuotaPolicy,
+        counters: UidTrafficCounters,
+        minimumUsedBytes: Long = 0L,
+        nowMillis: Long = System.currentTimeMillis(),
+    ): Boolean {
+        if (policy.baselineInitialized) return false
+        helper(context).use { h ->
+            return h.writableDatabase.update(
+                "app_quota_policy",
+                ContentValues().apply {
+                    put("used_bytes", maxOf(counters.totalBytes, minimumUsedBytes))
+                    put("download_bytes", counters.downloadBytes)
+                    put("upload_bytes", counters.uploadBytes)
+                    put("baseline_initialized", 1)
+                    put("updated_at", nowMillis)
+                },
+                "package_name = ? AND quota_type = ? AND period_start_millis = ? " +
+                    "AND period_end_millis = ? AND baseline_initialized = 0",
+                arrayOf(
+                    policy.packageName,
+                    policy.quotaType.name,
+                    policy.periodStartMillis.toString(),
+                    policy.periodEndMillis.toString(),
+                ),
+            ) == 1
         }
     }
 
