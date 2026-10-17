@@ -91,9 +91,9 @@ class Socks5Server internal constructor(
         direction: QuotaTrafficDirection,
         requestedBytes: Int,
     ) -> QuotaTrafficDecision = { _, _, _, requestedBytes -> QuotaTrafficDecision(requestedBytes) },
+    private val onQuotaExceeded: (Set<String>) -> Unit = {},
     /** Refuse ownerless data sessions while at least one per-app quota is configured. */
     private val requireUidAttribution: () -> Boolean = { false },
-    private val onQuotaExceeded: (Set<String>) -> Unit = {},
 ) {
     companion object {
         private const val MAX_SESSIONS = 80
@@ -356,7 +356,7 @@ class Socks5Server internal constructor(
             // Ownership is attached by the per-session SOCKS username, never inferred from
             // a destination shared by multiple apps.
             upstreamTcpMetadata[socket] = FlowOwnerMetadata(
-                endpoint = endpoint,
+                endpointKey = endpoint,
                 uid = sessionUid,
                 packages = emptySet(),
                 tuple = sessionUid?.let { "SOCKS5_UID_AUTH:$it" } ?: "UID_UNRESOLVED",
