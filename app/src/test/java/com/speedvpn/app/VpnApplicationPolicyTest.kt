@@ -7,14 +7,31 @@ import org.junit.Test
 
 class VpnApplicationPolicyTest {
     @Test
-    fun onlyTheVpnApplicationIsExemptedFromTunRouting() {
+    fun onlyTheVpnApplicationIsExemptedFromTunRoutingOutsideVerification() {
         assertEquals(
             setOf("com.speedvpn.app"),
-            VpnApplicationPolicy.routingExemptPackages("com.speedvpn.app"),
+            VpnApplicationPolicy.routingExemptPackages(
+                "com.speedvpn.app",
+                includeOwnPackageForVerification = false,
+            ),
         )
         assertFalse(
             "A blocked target app must remain routed through TUN",
-            "com.example.blocked" in VpnApplicationPolicy.routingExemptPackages("com.speedvpn.app"),
+            "com.example.blocked" in VpnApplicationPolicy.routingExemptPackages(
+                "com.speedvpn.app",
+                includeOwnPackageForVerification = false,
+            ),
+        )
+    }
+
+    @Test
+    fun ownPackageIsRoutedThroughTunDuringVerificationSoTheLimiterCanBeMeasured() {
+        assertEquals(
+            emptySet<String>(),
+            VpnApplicationPolicy.routingExemptPackages(
+                "com.speedvpn.app",
+                includeOwnPackageForVerification = true,
+            ),
         )
     }
 

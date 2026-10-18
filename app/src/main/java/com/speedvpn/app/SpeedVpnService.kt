@@ -319,11 +319,18 @@ class SpeedVpnService : VpnService() {
                 .apply {
                     // Exempt only SpeedVPN itself to prevent a local proxy-routing loop.
                     // Never add blocked target apps here: disallowed apps bypass the VPN.
-                    VpnApplicationPolicy.routingExemptPackages(packageName).forEach {
-                        addDisallowedApplication(it)
-                    }
-                    log("VPN_TUN_POLICY mode=all-apps-except-self ipv4=0.0.0.0/0 ipv6=::/0 blockedPackages=" +
-                        currentBlockedPackages().sorted().joinToString(","))
+                    val routingExemptPackages = VpnApplicationPolicy.routingExemptPackages(
+                        vpnPackageName = packageName,
+                        includeOwnPackageForVerification = SpeedLimiter.routeVerificationTrafficThroughVpn,
+                    )
+                    routingExemptPackages.forEach { addDisallowedApplication(it) }
+                    log(
+                        "VPN_TUN_POLICY mode=all-apps-except-self " +
+                            "verificationOwnUidRouted=${SpeedLimiter.routeVerificationTrafficThroughVpn} " +
+                            "routingExemptPackages=${routingExemptPackages.sorted().joinToString(",")} " +
+                            "ipv4=0.0.0.0/0 ipv6=::/0 blockedPackages=" +
+                            currentBlockedPackages().sorted().joinToString(","),
+                    )
                 }
             builder.establish()
         } catch (e: IllegalStateException) {

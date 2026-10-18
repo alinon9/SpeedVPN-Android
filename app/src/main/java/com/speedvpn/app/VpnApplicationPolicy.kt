@@ -18,10 +18,16 @@ internal object VpnApplicationPolicy {
     }
 
     /**
-     * Only the VPN app itself is excluded from the VPN interface to avoid routing loops.
-     * Blocked apps must remain in TUN; disallowing them here creates a bypass.
+     * Exclude the VPN app itself during normal operation to prevent a routing loop.
+     * For a speed-verification run, route the app's own HTTP probe through TUN so
+     * the measured traffic crosses the SOCKS relay and the configured token buckets.
+     * The relay protects its upstream sockets with VpnService.protect(), preventing loops.
+     * Blocked target apps are never added to this routing-exemption set.
      */
-    fun routingExemptPackages(vpnPackageName: String): Set<String> = setOf(vpnPackageName)
+    fun routingExemptPackages(
+        vpnPackageName: String,
+        includeOwnPackageForVerification: Boolean,
+    ): Set<String> = if (includeOwnPackageForVerification) emptySet() else setOf(vpnPackageName)
 
     /** True when a resolved owner belongs to the blocked UID set. */
     fun shouldDropUid(uid: Int, blockedUids: Set<Int>): Boolean =
