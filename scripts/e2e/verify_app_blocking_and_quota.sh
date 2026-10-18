@@ -38,7 +38,9 @@ control() {
   local id="$2"
   shift 2
   capture_logs
-  "${ADB[@]}" logcat -c
+  # Clearing logcat can fail transiently on emulator logd under network load.
+  # Every wait uses a unique E2E id, so stale entries cannot satisfy the assertion.
+  "${ADB[@]}" logcat -c >/dev/null 2>&1 || true
   "${ADB[@]}" shell am start -W -n "$CONTROL_ACTIVITY" \
     --es e2e_action "$action" --es e2e_id "$id" --es e2e_package "$BLOCKED_PACKAGE" "$@" >/dev/null
   wait_for_log "E2E_CONTROL id=$id" 40 | tee -a "$RESULTS"
@@ -52,7 +54,9 @@ probe() {
   local expected="$4"
   local component="$package/com.speedvpn.e2e.ProbeActivity"
   capture_logs
-  "${ADB[@]}" logcat -c
+  # Clearing logcat can fail transiently on emulator logd under network load.
+  # Every wait uses a unique E2E id, so stale entries cannot satisfy the assertion.
+  "${ADB[@]}" logcat -c >/dev/null 2>&1 || true
   "${ADB[@]}" shell am start -W -n "$component" --es probe_id "$id" --ei bytes "$bytes" >/dev/null
   local line
   line="$(wait_for_log "E2E_PROBE id=$id" 75)"
