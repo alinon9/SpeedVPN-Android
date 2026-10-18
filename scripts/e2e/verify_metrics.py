@@ -646,7 +646,7 @@ def validate_sweep(csv_path: str) -> int:
         if status != required_release_status:
             errors.append(f"{key}: release acceptance requires {required_release_status}; got {status}")
         if row.get("classification") != required_release_status:
-            errors.append(f"{key}: release acceptance requires classification {required_release_status}; got {row.get(\"classification\")}")
+            errors.append(f"{key}: release acceptance requires classification {required_release_status}; got {row.get('classification')}")
         allowed_statuses = ACCEPTED_FINAL_STATES | {"FAIL", "UNJUDGEABLE", "MEASUREMENT_ERROR", "CONFIGURATION_ERROR"}
         if status not in allowed_statuses:
             errors.append(f"CSV line {line}: invalid/missing status {status!r}")
