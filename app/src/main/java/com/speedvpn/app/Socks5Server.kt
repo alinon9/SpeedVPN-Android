@@ -119,6 +119,27 @@ class Socks5Server internal constructor(
             else -> false
         }
 
+        /**
+         * Health checks use the session's base username and carry no Android UID.
+         * They must remain allowed when configured app quotas require UID attribution.
+         * The accept loop consumes the source-port reservation, so the probe flag must
+         * be passed directly to the handler rather than re-read from that set.
+         */
+        internal fun usernameShapeAllowed(
+            suppliedUsername: String,
+            baseUsername: String,
+            sessionUid: Int?,
+            requireUidAttribution: Boolean,
+            isHealthProbe: Boolean,
+        ): Boolean {
+            val expectedUsername = sessionUid?.let { "$baseUsername#$it" } ?: baseUsername
+            return if (sessionUid != null) {
+                suppliedUsername == expectedUsername
+            } else {
+                suppliedUsername == baseUsername && (isHealthProbe || !requireUidAttribution)
+            }
+        }
+
         internal fun udpFlowKey(
             clientEndpoint: InetSocketAddress,
             candidates: List<InetAddress>,
@@ -250,7 +271,7 @@ class Socks5Server internal constructor(
                 try {
                     executor.execute {
                         try {
-                            handle(client, acceptedPolicyEpoch)
+                            handle(client, acceptedPolicyEpoch, isHealthProbe)
                         } finally {
                             if (!isHealthProbe) sessions.release()
                         }
@@ -602,7 +623,7 @@ class Socks5Server internal constructor(
         }
     }
 
-    private fun handle(client: Socket, expectedPolicyEpoch: Long) {
+    private fun handle(client: Socket, expectedPolicyEpoch: Long, isHealthProbe: Boolean) {
         try {
             if (policyEpoch != expectedPolicyEpoch) return
             client.soTimeout = HANDSHAKE_TIMEOUT_MS
@@ -640,17 +661,21 @@ class Socks5Server internal constructor(
             } else {
                 null
             }
-            val isHealthProbe = client.port in probeSourcePorts
             val uidRequired = runCatching { requireUidAttribution() }.getOrDefault(true)
             val expectedUsername = sessionUid?.let { "$username#$it" } ?: username
-            val usernameShapeValid = if (sessionUid != null) {
-                suppliedUsername == expectedUsername
-            } else {
-                suppliedUsername == username && (isHealthProbe || !uidRequired)
-            }
+            val usernameShapeValid = usernameShapeAllowed(
+                suppliedUsername = suppliedUsername,
+                baseUsername = username,
+                sessionUid = sessionUid,
+                requireUidAttribution = uidRequired,
+                isHealthProbe = isHealthProbe,
+            )
             val authOk = usernameShapeValid &&
                 MessageDigest.isEqual(userBytes, expectedUsername.toByteArray(Charsets.UTF_8)) &&
                 MessageDigest.isEqual(passBytes, password.toByteArray(Charsets.UTF_8))
+            if (isHealthProbe && !authOk) {
+                log("SOCKS_HEALTH_PROBE_AUTH_FAILED uidRequired=$uidRequired")
+            }
             out.write(byteArrayOf(1, if (authOk) 0 else 1))
             out.flush()
             if (!authOk || policyEpoch != expectedPolicyEpoch) return
