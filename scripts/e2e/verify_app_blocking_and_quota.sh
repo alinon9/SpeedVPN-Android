@@ -68,19 +68,19 @@ log "Installing two separate-UID HTTP probe apps."
 log "Resetting target policy."
 control reset_policy reset-before-block
 
-log "Enabling manual block for $BLOCKED_PACKAGE."
+log "Starting the actual VPN tunnel before changing the live app policy."
+line="$(control connect connect-before-block-test)"
+grep -Fq "result=PASS" <<< "$line"
+grep -Fq "vpn=CONNECTED" <<< "$line"
+
+log "Enabling manual block for $BLOCKED_PACKAGE while VPN is connected."
 line="$(control manual_block manual-block-on --ez e2e_enabled true)"
 grep -Fq "result=PASS" <<< "$line"
 grep -Fq "effectiveBlocked=true" <<< "$line"
 # The running service applies package changes from its one-second policy monitor.
 sleep 2
 
-log "Starting the actual VPN tunnel."
-line="$(control connect connect-before-block-test)"
-grep -Fq "result=PASS" <<< "$line"
-grep -Fq "vpn=CONNECTED" <<< "$line"
-
-log "Manual block must drop one UID and preserve another UID's network access."
+log "Live block must drop one UID and preserve another UID's network access."
 probe "$BLOCKED_PACKAGE" manual-block-drops 4096 FAIL
 probe "$ALLOWED_PACKAGE" allowed-during-manual-block 4096 PASS
 
