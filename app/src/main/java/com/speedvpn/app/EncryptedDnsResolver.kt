@@ -21,86 +21,144 @@ class EncryptedDnsResolver(
     private val protect: (Socket) -> Boolean,
     private val ipv6Enabled: Boolean,
 ) {
+    private data class DohProvider(val host: String, val ipv4: String)
+
     companion object {
-        private const val DOH_HOST = "cloudflare-dns.com"
-        private const val DOH_IP_V4 = "1.1.1.1"
+        // Keep independent providers. A failure or filtering of one endpoint must not
+        // make every hostname lookup fail when another encrypted resolver is reachable.
+        private val DOH_PROVIDERS = listOf(
+            DohProvider("cloudflare-dns.com", "1.1.1.1"),
+            DohProvider("dns.google", "8.8.8.8"),
+        )
         private const val TIMEOUT_MS = 3_000L
     }
 
     private val requestGeneration = AtomicLong(0L)
     private val activeCalls = ConcurrentHashMap.newKeySet<okhttp3.Call>()
-    private val client = OkHttpClient.Builder()
-        .dns(object : Dns {
-            override fun lookup(hostname: String): List<InetAddress> =
-                listOf(InetAddress.getByName(DOH_IP_V4))
-        })
-        .socketFactory(ProtectedNetworkSocketFactory(network, protect))
-        .connectTimeout(TIMEOUT_MS, TimeUnit.MILLISECONDS)
-        .readTimeout(TIMEOUT_MS, TimeUnit.MILLISECONDS)
-        .writeTimeout(TIMEOUT_MS, TimeUnit.MILLISECONDS)
-        .retryOnConnectionFailure(false)
-        .build()
+    private val clients: Map<DohProvider, OkHttpClient> =
+        DOH_PROVIDERS.associateWith(::createClient)
+
+    private fun createClient(provider: DohProvider): OkHttpClient =
+        OkHttpClient.Builder()
+            .dns(object : Dns {
+                override fun lookup(hostname: String): List<InetAddress> =
+                    // Use the known resolver address to avoid a recursive system DNS lookup.
+                    listOf(InetAddress.getByName(provider.ipv4))
+            })
+            .socketFactory(ProtectedNetworkSocketFactory(network, protect))
+            .connectTimeout(TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            .readTimeout(TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            .writeTimeout(TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            .retryOnConnectionFailure(false)
+            .build()
 
     fun resolve(host: String, isStillAllowed: () -> Boolean = { true }): List<InetAddress> {
         require(host.isNotBlank()) { "empty host" }
         if (isNumericAddress(host)) {
             return listOf(InetAddress.getByName(host)).filter { ipv6Enabled || it.address.size == 4 }
         }
-        if (!isStillAllowed()) throw IOException("Encrypted DNS request cancelled by app policy")
+        ensureRequestAllowed(requestGeneration.get(), isStillAllowed)
         val generation = requestGeneration.get()
-        val base = ("https://" + DOH_HOST).toHttpUrl().newBuilder()
-            .addPathSegment("dns-query")
-            .addQueryParameter("name", host)
-            .addQueryParameter("type", "A")
-            .build()
         val addresses = mutableListOf<InetAddress>()
-        query(base, addresses, 4, generation, isStillAllowed)
-        if (ipv6Enabled) {
-            query(base.newBuilder().setQueryParameter("type", "AAAA").build(), addresses, 6, generation, isStillAllowed)
+        val errors = mutableListOf<IOException>()
+        var successfulResponses = 0
+
+        // IPv4 and IPv6 are independent lookups. A failure or empty AAAA response must
+        // never discard an already usable A result. Try the secondary resolver for each
+        // family if the primary errors or returns no usable records.
+        val families = if (ipv6Enabled) listOf(4, 6) else listOf(4)
+        for (family in families) {
+            var familyHasAddress = false
+            for (provider in DOH_PROVIDERS) {
+                ensureRequestAllowed(generation, isStillAllowed)
+                val providerAddresses = mutableListOf<InetAddress>()
+                try {
+                    query(
+                        provider = provider,
+                        host = host,
+                        out = providerAddresses,
+                        family = family,
+                        generation = generation,
+                        isStillAllowed = isStillAllowed,
+                    )
+                    successfulResponses++
+                    if (providerAddresses.isNotEmpty()) {
+                        addresses.addAll(providerAddresses)
+                        familyHasAddress = true
+                        break
+                    }
+                } catch (error: IOException) {
+                    // Cancellation/policy changes are not resolver outages; propagate them
+                    // immediately rather than trying another server after the session ended.
+                    ensureRequestAllowed(generation, isStillAllowed)
+                    errors += IOException(
+                        "DoH provider ${provider.host} failed for ${if (family == 4) "A" else "AAAA"}: ${error.message}",
+                        error,
+                    )
+                }
+            }
+            // No answer for this family is acceptable if the other family has usable
+            // addresses. We deliberately do not turn optional AAAA failure into total failure.
+            if (!familyHasAddress) continue
         }
+
+        ensureRequestAllowed(generation, isStillAllowed)
+        if (addresses.isEmpty()) {
+            val failure = if (successfulResponses == 0 && errors.isNotEmpty()) {
+                IOException("All encrypted DNS providers failed for $host", errors.last())
+            } else {
+                IOException("Encrypted DNS returned no usable address for $host")
+            }
+            errors.dropLast(1).forEach(failure::addSuppressed)
+            throw failure
+        }
+        return addresses.distinctBy { it.hostAddress }.sortedBy { if (it.address.size == 4) 0 else 1 }
+    }
+
+    private fun ensureRequestAllowed(generation: Long, isStillAllowed: () -> Boolean) {
         if (generation != requestGeneration.get() || !isStillAllowed()) {
             throw IOException("Encrypted DNS request cancelled by app policy")
         }
-        if (addresses.isEmpty()) throw IOException("Encrypted DNS returned no usable address for $host")
-        return addresses.distinctBy { it.hostAddress }.sortedBy { if (it.address.size == 4) 0 else 1 }
     }
 
     /** Cancel DNS work after any app-policy change so it cannot outlive its relay session. */
     internal fun cancelPendingRequests() {
         requestGeneration.incrementAndGet()
         activeCalls.toList().forEach { call -> runCatching { call.cancel() } }
-        client.dispatcher.cancelAll()
-        client.connectionPool.evictAll()
+        clients.values.forEach { client ->
+            client.dispatcher.cancelAll()
+            client.connectionPool.evictAll()
+        }
     }
 
     private fun query(
-        url: okhttp3.HttpUrl,
+        provider: DohProvider,
+        host: String,
         out: MutableList<InetAddress>,
         family: Int,
         generation: Long,
         isStillAllowed: () -> Boolean,
     ) {
-        if (!isStillAllowed() || generation != requestGeneration.get()) {
-            throw IOException("Encrypted DNS request cancelled by app policy")
-        }
+        ensureRequestAllowed(generation, isStillAllowed)
+        val url = ("https://" + provider.host).toHttpUrl().newBuilder()
+            .addPathSegment("dns-query")
+            .addQueryParameter("name", host)
+            .addQueryParameter("type", if (family == 4) "A" else "AAAA")
+            .build()
         val request = Request.Builder()
             .url(url)
             .header("Accept", "application/dns-json")
             .get()
             .build()
+        val client = clients.getValue(provider)
         val call = client.newCall(request)
         activeCalls.add(call)
         try {
-            if (!isStillAllowed() || generation != requestGeneration.get()) {
-                call.cancel()
-                throw IOException("Encrypted DNS request cancelled by app policy")
-            }
+            ensureRequestAllowed(generation, isStillAllowed)
             call.execute().use { response ->
                 if (!response.isSuccessful) throw IOException("DoH HTTP " + response.code)
                 val json = JSONObject(response.body?.string().orEmpty())
-                if (generation != requestGeneration.get() || !isStillAllowed()) {
-                    throw IOException("Encrypted DNS request cancelled by app policy")
-                }
+                ensureRequestAllowed(generation, isStillAllowed)
                 if (json.optInt("Status", -1) != 0) {
                     throw IOException("DoH DNS status " + json.optInt("Status"))
                 }
