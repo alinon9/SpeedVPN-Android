@@ -702,6 +702,11 @@ class Socks5Server internal constructor(
             if ((isHealthProbe || isHealthProbeIdentity) && !authOk) {
                 log("SOCKS_HEALTH_PROBE_AUTH_FAILED uidRequired=$uidRequired reservationRecognized=$isHealthProbe")
             }
+            if (!authOk) {
+                logE("SOCKS_AUTH_REJECTED uidRequired=$uidRequired parsedUid=${sessionUid ?: "UNRESOLVED"} healthProbe=$isHealthProbeIdentity")
+            } else if (!isHealthProbeIdentity) {
+                log("SOCKS_AUTH_ACCEPTED uid=${sessionUid ?: "UNRESOLVED"} uidRequired=$uidRequired")
+            }
             out.write(byteArrayOf(1, if (authOk) 0 else 1))
             out.flush()
             if (!authOk || policyEpoch != expectedPolicyEpoch) return
@@ -1160,6 +1165,7 @@ class Socks5Server internal constructor(
             runCatching { client.close() }
             return
         }
+        log("SOCKS_UDP_ASSOC_START uid=${sessionUid ?: "UNRESOLVED"} blocked=${sessionUid != null && sessionUid in blockedUids} policyEpoch=$expectedPolicyEpoch")
         if (sessionUid != null && sessionUid in blockedUids) {
             replyFailure(cout, 2)
             runCatching { client.close() }
@@ -1192,6 +1198,7 @@ class Socks5Server internal constructor(
                 )
             )
             cout.flush()
+            log("SOCKS_UDP_ASSOC_READY uid=${sessionUid ?: "UNRESOLVED"} relayPort=$relayPort")
 
             val clientAddr = AtomicReference<InetAddress?>(null)
             val udpFlows = UdpFlowTable(maxFlows = 256, ttlMs = UDP_FLOW_TTL_MS)
@@ -1216,6 +1223,8 @@ class Socks5Server internal constructor(
             try {
                 pool.execute {
                     val buf = ByteArray(UDP_BUFFER_SIZE)
+                    var loggedClientDatagram = false
+                    var loggedForwardResult = false
                     try {
                         while (running && policyEpoch == expectedPolicyEpoch &&
                             SpeedLimiter.isGenerationActive(generation) && !relaySocket.isClosed &&
@@ -1223,6 +1232,10 @@ class Socks5Server internal constructor(
                         ) {
                             val pkt = DatagramPacket(buf, buf.size)
                             relaySocket.receive(pkt)
+                            if (!loggedClientDatagram) {
+                                log("SOCKS_UDP_CLIENT_DATAGRAM uid=${sessionUid ?: "UNRESOLVED"} bytes=${pkt.length} sender=${pkt.address.hostAddress}:${pkt.port}")
+                                loggedClientDatagram = true
+                            }
                             // A block may be installed while receive() is waiting. Re-check
                             // immediately after wake-up before parsing or forwarding the packet.
                             if (Socks5Server.isSessionUidBlocked(sessionUid, blockedUids)) break
@@ -1289,16 +1302,24 @@ class Socks5Server internal constructor(
                             if (!SpeedLimiter.acquire(SpeedLimiter.upload, payloadLen, generation)) break
                             if (!running || !SpeedLimiter.isGenerationActive(generation)) break
 
-                            if (!mux.send(
-                                    flow = flow,
-                                    address = addr,
-                                    port = port,
-                                    data = pkt.data,
-                                    offset = bb.position(),
-                                    length = payloadLen,
-                                )
-                            ) {
+                            val forwarded = mux.send(
+                                flow = flow,
+                                address = addr,
+                                port = port,
+                                data = pkt.data,
+                                offset = bb.position(),
+                                length = payloadLen,
+                            )
+                            if (!forwarded) {
+                                if (!loggedForwardResult) {
+                                    logE("SOCKS_UDP_FORWARD_REJECTED uid=${sessionUid ?: "UNRESOLVED"} dst=${addr.hostAddress}:$port bytes=$payloadLen")
+                                    loggedForwardResult = true
+                                }
                                 continue
+                            }
+                            if (!loggedForwardResult) {
+                                log("SOCKS_UDP_FORWARD_SENT uid=${sessionUid ?: "UNRESOLVED"} dst=${addr.hostAddress}:$port bytes=$payloadLen")
+                                loggedForwardResult = true
                             }
                             SpeedLimiter.upload.recordForwarded(payloadLen, generation)
                             udpFlows.touchSent(flow, System.currentTimeMillis())
@@ -1318,7 +1339,10 @@ class Socks5Server internal constructor(
                 udpFlows.clear()
                 closeAll()
             }
-        } catch (_: Exception) {
+        } catch (error: Exception) {
+            if (running && policyEpoch == expectedPolicyEpoch) {
+                logE("SOCKS_UDP_ASSOC_FAILED uid=${sessionUid ?: "UNRESOLVED"}", error)
+            }
             runCatching { client.close() }
         } finally {
             relay?.let {
@@ -1461,8 +1485,12 @@ class Socks5Server internal constructor(
                 }
 
                 if (binding == null) {
-                    binding = runCatching { createBindingLocked(flow, remote) }.getOrNull()
-                        ?: return@synchronized false
+                    binding = try {
+                        createBindingLocked(flow, remote)
+                    } catch (error: Exception) {
+                        logE("SOCKS_UDP_BINDING_CREATE_FAILED uid=${sessionUid ?: "UNRESOLVED"} remote=${address.hostAddress}:$port", error)
+                        return@synchronized false
+                    }
                 }
 
                 val activeBinding = binding
@@ -1484,6 +1512,7 @@ class Socks5Server internal constructor(
                 exceededPackages = decision.exhaustedPackages
                 if (decision.allowedBytes < length) {
                     // UDP payloads are atomic: do not emit a malformed partial datagram.
+                    log("SOCKS_UDP_QUOTA_DROP uid=${sessionUid ?: "UNRESOLVED"} requested=$length allowed=${decision.allowedBytes}")
                     return@synchronized false
                 }
 
@@ -1582,6 +1611,7 @@ class Socks5Server internal constructor(
 
         private fun runLoop() {
             val buffer = ByteBuffer.allocate(UDP_BUFFER_SIZE)
+            var loggedUdpReply = false
             try {
                 while (runningMux.get() && running && policyEpoch == expectedPolicyEpoch &&
                     SpeedLimiter.isGenerationActive(generation) &&
@@ -1601,6 +1631,10 @@ class Socks5Server internal constructor(
                             buffer.clear()
                             val count = binding.channel.read(buffer)
                             if (count <= 0) continue
+                            if (!loggedUdpReply) {
+                                log("SOCKS_UDP_UPSTREAM_REPLY uid=${binding.uid ?: "UNRESOLVED"} remote=${binding.remote.address.hostAddress}:${binding.remote.port} bytes=$count")
+                                loggedUdpReply = true
+                            }
                             buffer.flip()
                             val payload = ByteArray(count)
                             buffer.get(payload)
@@ -1669,7 +1703,10 @@ class Socks5Server internal constructor(
                                         .onFailure { logE("Immediate quota block callback failed for UDP download", it) }
                                 }
                             }
-                        } catch (_: Exception) {
+                        } catch (error: Exception) {
+                            if (runningMux.get() && running && policyEpoch == expectedPolicyEpoch) {
+                                logE("SOCKS_UDP_RESPONSE_RELAY_FAILED uid=${binding.uid ?: "UNRESOLVED"} remote=${binding.remote.address.hostAddress}:${binding.remote.port}", error)
+                            }
                             synchronized(lock) {
                                 bindings.remove(binding.flow.logicalKey)
                                 closeBindingLocked(binding)
