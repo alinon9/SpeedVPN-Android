@@ -85,6 +85,7 @@ class Socks5Server internal constructor(
     private val protectUdp: (DatagramSocket) -> Boolean,
     private val currentNetwork: () -> Network?,
     private val ipv6Enabled: Boolean,
+    private val dnsIpv4Only: Boolean = false,
     private val accountQuotaBytes: (
         packages: Set<String>,
         uid: Int?,
@@ -219,7 +220,7 @@ class Socks5Server internal constructor(
             if (current != null && encryptedDnsNetwork == network) {
                 current
             } else {
-                EncryptedDnsResolver(network, protectTcp, ipv6Enabled).also {
+                EncryptedDnsResolver(network, protectTcp, ipv6Enabled, dnsIpv4Only).also {
                     encryptedDnsNetwork = network
                     encryptedDnsResolver = it
                 }
