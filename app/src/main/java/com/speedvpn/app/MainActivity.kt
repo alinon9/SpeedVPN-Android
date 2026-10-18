@@ -518,12 +518,36 @@ class MainActivity : ComponentActivity() {
                             testBusy = true
                             lastTest = null
                             testProgress = "جاري بدء الفحص…"
-                            lastTest = SpeedTestEngine.measure(this@MainActivity) { phase ->
-                                val label = if (phase == SpeedTestPhase.DOWNLOAD) "جاري قياس Download…" else "جاري قياس Upload…"
-                                lifecycleScope.launch(Dispatchers.Main.immediate) { testProgress = label }
+                            val measurementStartedAt = android.os.SystemClock.elapsedRealtime()
+                            try {
+                                // Keep the busy label observable even when a local fixture or
+                                // a fast error completes before UIAutomator captures its first
+                                // hierarchy. SpeedTestEngine performs network IO on Dispatchers.IO.
+                                val result = SpeedTestEngine.measure(this@MainActivity) { phase ->
+                                    val label = if (phase == SpeedTestPhase.DOWNLOAD) "جاري قياس Download…" else "جاري قياس Upload…"
+                                    lifecycleScope.launch(Dispatchers.Main.immediate) {
+                                        if (testBusy) testProgress = label
+                                    }
+                                }
+                                lastTest = result
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (error: Exception) {
+                                lastTest = SpeedTestResult(
+                                    downloadBps = null,
+                                    uploadBps = null,
+                                    durationMs = android.os.SystemClock.elapsedRealtime() - measurementStartedAt,
+                                    error = error.message ?: error.javaClass.simpleName,
+                                )
+                            } finally {
+                                // Even a fast-fail retains a stable loading state for at least
+                                // three seconds from click; always update Compose on Main.
+                                val elapsed = android.os.SystemClock.elapsedRealtime() - measurementStartedAt
+                                val remaining = 3_000L - elapsed
+                                if (remaining > 0L) delay(remaining)
+                                testBusy = false
+                                testProgress = null
                             }
-                            testBusy = false
-                            testProgress = null
                         }
                     },
                     modifier = Modifier.fillMaxWidth(),
