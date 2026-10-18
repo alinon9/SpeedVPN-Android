@@ -9,14 +9,15 @@ import org.junit.Test
 
 class Socks5RelayReadBatchTest {
     @Test
-    fun healthProbeCanAuthenticateWithoutUidWhenQuotaRequiresAttribution() {
+    fun healthProbeIdentityAuthenticatesWithoutQuotaDatabaseLookup() {
+        val probeName = Socks5Server.healthProbeUsername("session-user")
+        assertEquals("session-user#health-probe", probeName)
         assertTrue(
             Socks5Server.usernameShapeAllowed(
-                suppliedUsername = "session-user",
+                suppliedUsername = probeName,
                 baseUsername = "session-user",
                 sessionUid = null,
                 requireUidAttribution = true,
-                isHealthProbe = true,
             ),
         )
     }
@@ -29,7 +30,6 @@ class Socks5RelayReadBatchTest {
                 baseUsername = "session-user",
                 sessionUid = null,
                 requireUidAttribution = true,
-                isHealthProbe = false,
             ),
         )
     }
@@ -42,7 +42,6 @@ class Socks5RelayReadBatchTest {
                 baseUsername = "session-user",
                 sessionUid = 10242,
                 requireUidAttribution = true,
-                isHealthProbe = false,
             ),
         )
         assertTrue(
@@ -51,9 +50,29 @@ class Socks5RelayReadBatchTest {
                 baseUsername = "session-user",
                 sessionUid = 10242,
                 requireUidAttribution = true,
-                isHealthProbe = false,
             ),
         )
+    }
+
+    @Test
+    fun baseUsernameCannotBypassUidlessQuotaAfterProbeReservationCollision() {
+        // A source-port reservation may choose the probe worker, but the base username
+        // alone must not authorize an ownerless app relay while per-app quotas exist.
+        assertTrue(
+            !Socks5Server.usernameShapeAllowed(
+                suppliedUsername = "session-user",
+                baseUsername = "session-user",
+                sessionUid = null,
+                requireUidAttribution = true,
+            ),
+        )
+    }
+
+    @Test
+    fun probeReservationExpiresInsteadOfMatchingLateSockets() {
+        assertTrue(Socks5Server.healthProbeReservationIsValid(20_000L, 19_999L))
+        assertTrue(!Socks5Server.healthProbeReservationIsValid(20_000L, 20_000L))
+        assertTrue(!Socks5Server.healthProbeReservationIsValid(null, 19_999L))
     }
 
     @Test

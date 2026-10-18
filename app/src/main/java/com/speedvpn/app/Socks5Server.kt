@@ -109,6 +109,7 @@ class Socks5Server internal constructor(
         private const val UDP_CANDIDATE_FALLBACK_MS = 750L
         private const val CONNECT_TIMEOUT_MS = 12_000L
         private const val UDP_DNS_TIMEOUT_MS = 3_000L
+        private val HEALTH_PROBE_RESERVATION_TTL_NANOS = TimeUnit.SECONDS.toNanos(5L)
 
         private const val IPPROTO_TCP = 6
         private const val IPPROTO_UDP = 17
@@ -119,25 +120,25 @@ class Socks5Server internal constructor(
             else -> false
         }
 
+        /** A health probe has a distinct authenticated identity, never a UID-less app identity. */
+        internal fun healthProbeUsername(baseUsername: String): String = "$baseUsername#health-probe"
+
+        internal fun healthProbeReservationIsValid(expiresAtNanos: Long?, nowNanos: Long): Boolean =
+            expiresAtNanos != null && nowNanos < expiresAtNanos
+
         /**
-         * Health checks use the session's base username and carry no Android UID.
-         * They must remain allowed when configured app quotas require UID attribution.
-         * The accept loop consumes the source-port reservation, so the probe flag must
-         * be passed directly to the handler rather than re-read from that set.
+         * Permit the special control identity without a UID, but never let a port reservation
+         * accidentally turn an ordinary UID-less app session into an unmetered session.
          */
         internal fun usernameShapeAllowed(
             suppliedUsername: String,
             baseUsername: String,
             sessionUid: Int?,
             requireUidAttribution: Boolean,
-            isHealthProbe: Boolean,
-        ): Boolean {
-            val expectedUsername = sessionUid?.let { "$baseUsername#$it" } ?: baseUsername
-            return if (sessionUid != null) {
-                suppliedUsername == expectedUsername
-            } else {
-                suppliedUsername == baseUsername && (isHealthProbe || !requireUidAttribution)
-            }
+        ): Boolean = when {
+            suppliedUsername == healthProbeUsername(baseUsername) -> true
+            sessionUid != null -> suppliedUsername == "$baseUsername#$sessionUid"
+            else -> suppliedUsername == baseUsername && !requireUidAttribution
         }
 
         internal fun udpFlowKey(
@@ -176,7 +177,9 @@ class Socks5Server internal constructor(
     // session table cannot make the health monitor report a false failure.
     private val sessions = Semaphore(MAX_SESSIONS, true)
     private val udpAssociations = Semaphore(MAX_UDP_ASSOCIATIONS, true)
-    private val probeSourcePorts = ConcurrentHashMap.newKeySet<Int>()
+    // Keep a short-lived reservation after the probe socket times out. The accept thread may
+    // be descheduled under load and must still recognize a just-accepted health socket.
+    private val probeSourcePorts = ConcurrentHashMap<Int, Long>()
     private val upstreamTcp = Collections.newSetFromMap(ConcurrentHashMap<Socket, Boolean>())
     private val upstreamUdp = Collections.newSetFromMap(ConcurrentHashMap<DatagramSocket, Boolean>())
     private val blockedDestinations = ConcurrentHashMap.newKeySet<String>()
@@ -259,7 +262,9 @@ class Socks5Server internal constructor(
                     break
                 }
                 val sourcePort = (client.remoteSocketAddress as? InetSocketAddress)?.port
-                val isHealthProbe = sourcePort != null && probeSourcePorts.remove(sourcePort)
+                val isHealthProbe = sourcePort?.let { port ->
+                    healthProbeReservationIsValid(probeSourcePorts.remove(port), System.nanoTime())
+                } == true
                 val acceptedPolicyEpoch = policyEpoch
 
                 if (!isHealthProbe && !sessions.tryAcquire()) {
@@ -322,10 +327,11 @@ class Socks5Server internal constructor(
             // Register a source-port reservation before connect(). The accept loop can
             // then recognize this in-process health check and bypass the user-session
             // semaphore even when MAX_SESSIONS is fully occupied.
+            pruneExpiredProbeReservations()
             socket.bind(InetSocketAddress("127.0.0.1", 0))
             sourcePort = (socket.localSocketAddress as? InetSocketAddress)?.port
             if (sourcePort == null) return false
-            probeSourcePorts.add(sourcePort)
+            probeSourcePorts[sourcePort] = System.nanoTime() + HEALTH_PROBE_RESERVATION_TTL_NANOS
 
             socket.soTimeout = timeoutMs
             socket.connect(InetSocketAddress("127.0.0.1", port), timeoutMs)
@@ -336,7 +342,7 @@ class Socks5Server internal constructor(
             out.flush()
             if (input.readUnsignedByte() != 5 || input.readUnsignedByte() != 2) return false
 
-            val ub = username.toByteArray(Charsets.UTF_8)
+            val ub = healthProbeUsername(username).toByteArray(Charsets.UTF_8)
             val pb = password.toByteArray(Charsets.UTF_8)
             out.write(byteArrayOf(1, ub.size.toByte()))
             out.write(ub)
@@ -359,8 +365,16 @@ class Socks5Server internal constructor(
         } catch (_: Exception) {
             false
         } finally {
-            sourcePort?.let(probeSourcePorts::remove)
+            // If connect failed, release the unused reservation. For a connected socket,
+            // let the accept loop consume it; removing it here races a delayed accept.
+            if (!socket.isConnected) sourcePort?.let(probeSourcePorts::remove)
             runCatching { socket.close() }
+        }
+    }
+
+    private fun pruneExpiredProbeReservations(nowNanos: Long = System.nanoTime()) {
+        probeSourcePorts.entries.forEach { entry ->
+            if (entry.value <= nowNanos) probeSourcePorts.remove(entry.key, entry.value)
         }
     }
 
@@ -655,26 +669,33 @@ class Socks5Server internal constructor(
             input.readFully(passBytes)
 
             val suppliedUsername = userBytes.toString(Charsets.UTF_8)
+            val isHealthProbeIdentity = suppliedUsername == healthProbeUsername(username)
             val uidPrefix = "$username#"
-            val sessionUid = if (suppliedUsername.startsWith(uidPrefix)) {
+            val sessionUid = if (isHealthProbeIdentity) null else if (suppliedUsername.startsWith(uidPrefix)) {
                 suppliedUsername.removePrefix(uidPrefix).toIntOrNull()?.takeIf { it >= 0 }
             } else {
                 null
             }
-            val uidRequired = runCatching { requireUidAttribution() }.getOrDefault(true)
-            val expectedUsername = sessionUid?.let { "$username#$it" } ?: username
+            // The authenticated control identity needs no database quota lookup. Avoid competing
+            // with per-chunk SQLite quota transactions during active traffic.
+            val uidRequired = if (isHealthProbeIdentity) false else
+                runCatching { requireUidAttribution() }.getOrDefault(true)
+            val expectedUsername = when {
+                isHealthProbeIdentity -> healthProbeUsername(username)
+                sessionUid != null -> "$username#$sessionUid"
+                else -> username
+            }
             val usernameShapeValid = usernameShapeAllowed(
                 suppliedUsername = suppliedUsername,
                 baseUsername = username,
                 sessionUid = sessionUid,
                 requireUidAttribution = uidRequired,
-                isHealthProbe = isHealthProbe,
             )
             val authOk = usernameShapeValid &&
                 MessageDigest.isEqual(userBytes, expectedUsername.toByteArray(Charsets.UTF_8)) &&
                 MessageDigest.isEqual(passBytes, password.toByteArray(Charsets.UTF_8))
-            if (isHealthProbe && !authOk) {
-                log("SOCKS_HEALTH_PROBE_AUTH_FAILED uidRequired=$uidRequired")
+            if ((isHealthProbe || isHealthProbeIdentity) && !authOk) {
+                log("SOCKS_HEALTH_PROBE_AUTH_FAILED uidRequired=$uidRequired reservationRecognized=$isHealthProbe")
             }
             out.write(byteArrayOf(1, if (authOk) 0 else 1))
             out.flush()
