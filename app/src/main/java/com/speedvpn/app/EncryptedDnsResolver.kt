@@ -95,7 +95,7 @@ class EncryptedDnsResolver(
                         familyHasAddress = true
                         break
                     }
-                } catch (error: IOException) {
+                } catch (error: Exception) {
                     // Cancellation/policy changes are not resolver outages; propagate them
                     // immediately rather than trying another server after the session ended.
                     ensureRequestAllowed(generation, isStillAllowed)
