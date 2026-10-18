@@ -1551,7 +1551,6 @@ hev_socks5_session_resolve_uid (int protocol,
     for source_path, marker in (
         (session_c, "hev_socks5_session_resolve_uid"),
         (session_tcp_c, "self->data.uid = hev_socks5_session_resolve_uid (6"),
-        (session_udp_c, "self->data.uid = hev_socks5_session_resolve_uid (17"),
         (session_udp_c, "self->data.uid = hev_socks5_session_resolve_uid (17, &pcb->remote_ip"),
         (tunnel_c, "hev_socks5_session_udp_new (pcb, addr, port, &mutex)"),
     ):
