@@ -755,8 +755,8 @@ PY
       echo
       echo "- Result: ENV_INSUFFICIENT"
       echo "- Acceptance: BLOCKED (no 38/38 speed metrics were produced; this is not a pass)."
-      echo "- Download median minimum: 96 Mbps"
-      echo "- Upload median minimum: 90 Mbps"
+      echo "- Download median minimum: 105.6 Mbps"
+      echo "- Upload median minimum: 105.6 Mbps"
       echo "- Primary sample-spread limit: 25% of the median in each direction"
       echo "- Bounded one-outlier recovery: raw spread <=30%, closest pair <=25%, maximum deviation <=30%"
       echo "- ENV_NOTE: $ENV_NOTE"
@@ -1053,7 +1053,7 @@ cat > "$RUN_DIR/speed-limit-sweep-summary.md" <<MD
 - Summary generated at (UTC): $SUMMARY_RECORDED_AT_UTC
 - Presets attempted: $TESTED_PRESET_COUNT/$TOTAL
 - Download/Upload metric results recorded: $METRIC_RESULT_COUNT/$EXPECTED_METRIC_RESULTS
-- Three-sample baseline preflight: $BASELINE_PREFLIGHT_STATUS (Download median=$BASELINE_PREFLIGHT_DOWNLOAD; Upload median=$BASELINE_PREFLIGHT_UPLOAD; minimums=96/90 Mbps; primary spread limit=25%, with bounded single-outlier recovery up to 30%)
+- Three-sample baseline preflight: $BASELINE_PREFLIGHT_STATUS (Download median=$BASELINE_PREFLIGHT_DOWNLOAD; Upload median=$BASELINE_PREFLIGHT_UPLOAD; minimums=105.6/105.6 Mbps; primary spread limit=25%, with bounded single-outlier recovery up to 30%)
 - Preflight detail: $BASELINE_PREFLIGHT_REASON
 - ENV_NOTE: $ENV_NOTE
 - Metric PASS: $PASS_COUNT
