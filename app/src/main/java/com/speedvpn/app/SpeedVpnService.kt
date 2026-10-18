@@ -262,7 +262,8 @@ class SpeedVpnService : VpnService() {
                 protectTcp = { protect(it) },
                 protectUdp = { protect(it) },
                 currentNetwork = { findUnderlyingNetwork() },
-                ipv6Enabled = true,
+                ipv6Enabled = compatibility.ipv6Enabled,
+                dnsIpv4Only = compatibility.dnsIpv4Only,
                 accountQuotaBytes = ::accountQuotaBytesForRelay,
                 // A configured per-app quota requires exact owner attribution. Unknown UIDs
                 // can no longer pass through the relay unaccounted.
@@ -315,9 +316,12 @@ class SpeedVpnService : VpnService() {
                 // No public resolver is hard-coded.
                 .apply { dnsServers.forEach { addDnsServer(it) } }
                 .apply {
-                    // Capture IPv6 in TUN as well; otherwise blocked apps can bypass via IPv6.
-                    addAddress(TUN_V6, 128)
-                    addRoute("::", 0)
+                    // Match the user's compatibility setting. Do not install an IPv6
+                    // TUN address/route when IPv6 is disabled, or the toggle has no effect.
+                    if (compatibility.ipv6Enabled) {
+                        addAddress(TUN_V6, 128)
+                        addRoute("::", 0)
+                    }
                 }
                 .apply {
                     // Exempt only SpeedVPN itself to prevent a local proxy-routing loop.
@@ -613,7 +617,7 @@ class SpeedVpnService : VpnService() {
             appendLine("tunnel:")
             appendLine("  mtu: ${compatibility.mtu}")
             appendLine("  ipv4: $TUN_V4")
-            appendLine("  ipv6: '$TUN_V6'")
+            if (compatibility.ipv6Enabled) appendLine("  ipv6: '$TUN_V6'")
             appendLine("socks5:")
             appendLine("  port: ${relay.port}")
             appendLine("  address: 127.0.0.1")
