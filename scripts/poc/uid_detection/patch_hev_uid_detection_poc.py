@@ -1529,6 +1529,15 @@ hev_socks5_session_resolve_uid (int protocol,
     )
     session_udp_c_text = replace_text_once(
         session_udp_c_text,
+        "    self->data.self = self;\n\n    return 0;",
+        "    self->data.self = self;\n"
+        "    self->data.uid = hev_socks5_session_resolve_uid (17, &pcb->remote_ip,\n"
+        "        pcb->remote_port, src_ip, src_port);\n"
+        "\n    return 0;",
+        "capture UDP flow UID",
+    )
+    session_udp_c_text = replace_text_once(
+        session_udp_c_text,
         "static HevListNode *\nhev_socks5_session_udp_get_node (HevSocks5Session *base)",
         "static int\nhev_socks5_session_udp_get_uid (HevSocks5Session *base)\n"
         "{\n    HevSocks5SessionUDP *self = HEV_SOCKS5_SESSION_UDP (base);\n"
