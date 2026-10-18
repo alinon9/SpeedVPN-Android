@@ -170,7 +170,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
-        handleE2eIntent(intent)
+        handleE2eIntent(getIntent())
     }
 
     override fun onNewIntent(intent: Intent) {
