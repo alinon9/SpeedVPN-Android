@@ -120,6 +120,10 @@ class Socks5Server internal constructor(
             else -> false
         }
 
+        /** Defense-in-depth check for a SOCKS association whose owner became blocked. */
+        internal fun isSessionUidBlocked(sessionUid: Int?, blockedUids: Set<Int>): Boolean =
+            sessionUid != null && sessionUid > 0 && sessionUid in blockedUids
+
         /** A health probe has a distinct authenticated identity, never a UID-less app identity. */
         internal fun healthProbeUsername(baseUsername: String): String = "$baseUsername#health-probe"
 
@@ -1212,9 +1216,15 @@ class Socks5Server internal constructor(
                 pool.execute {
                     val buf = ByteArray(UDP_BUFFER_SIZE)
                     try {
-                        while (running && policyEpoch == expectedPolicyEpoch && SpeedLimiter.isGenerationActive(generation) && !relaySocket.isClosed) {
+                        while (running && policyEpoch == expectedPolicyEpoch &&
+                            SpeedLimiter.isGenerationActive(generation) && !relaySocket.isClosed &&
+                            !Socks5Server.isSessionUidBlocked(sessionUid, blockedUids)
+                        ) {
                             val pkt = DatagramPacket(buf, buf.size)
                             relaySocket.receive(pkt)
+                            // A block may be installed while receive() is waiting. Re-check
+                            // immediately after wake-up before parsing or forwarding the packet.
+                            if (Socks5Server.isSessionUidBlocked(sessionUid, blockedUids)) break
                             val sender = pkt.address
                             val first = clientAddr.compareAndSet(null, sender)
                             // RFC 1928 requires source-IP validation for UDP ASSOCIATE.
@@ -1375,6 +1385,14 @@ class Socks5Server internal constructor(
         }
 
         fun killConnectionsForBlockedUids(blockedUids: Set<Int>) {
+            // Closing only current channels is insufficient for UDP: the SOCKS UDP
+            // association remains alive and could create a fresh channel on its next
+            // datagram. Close the association socket too, forcing its receive loop out.
+            if (Socks5Server.isSessionUidBlocked(sessionUid, blockedUids)) {
+                runCatching { relaySocket.close() }
+                close()
+                return
+            }
             synchronized(lock) {
                 val entries = bindings.entries.toList()
                 entries.forEach { entry ->
@@ -1419,12 +1437,19 @@ class Socks5Server internal constructor(
             offset: Int,
             length: Int,
         ): Boolean {
-            if (!runningMux.get() || !running || policyEpoch != expectedPolicyEpoch || !SpeedLimiter.isGenerationActive(generation)) return false
+            if (!runningMux.get() || !running || policyEpoch != expectedPolicyEpoch ||
+                !SpeedLimiter.isGenerationActive(generation) ||
+                Socks5Server.isSessionUidBlocked(sessionUid, blockedUids)
+            ) return false
             if (isDestinationBlocked(IPPROTO_UDP, address, port)) return false
 
             val remote = InetSocketAddress(address, port)
             var exceededPackages: Set<String> = emptySet()
             val sent = synchronized(lock) {
+                // Re-check inside the same critical section as channel creation/send.
+                if (Socks5Server.isSessionUidBlocked(sessionUid, blockedUids) ||
+                    !runningMux.get() || policyEpoch != expectedPolicyEpoch
+                ) return@synchronized false
                 var binding = bindings[flow.logicalKey]
                     ?.takeUnless { !it.channel.isOpen }
 
@@ -1499,7 +1524,11 @@ class Socks5Server internal constructor(
                 bindings.clear()
             }
             selector.wakeup()
-            runCatching { worker.join(1_000) }
+            // Quota exhaustion may close this mux from its selector worker callback.
+            // Never join the current thread: the loop exits after this callback returns.
+            if (Thread.currentThread() !== worker) {
+                runCatching { worker.join(1_000) }
+            }
             runCatching { selector.close() }
         }
 
@@ -1553,7 +1582,10 @@ class Socks5Server internal constructor(
         private fun runLoop() {
             val buffer = ByteBuffer.allocate(UDP_BUFFER_SIZE)
             try {
-                while (runningMux.get() && running && policyEpoch == expectedPolicyEpoch && SpeedLimiter.isGenerationActive(generation)) {
+                while (runningMux.get() && running && policyEpoch == expectedPolicyEpoch &&
+                    SpeedLimiter.isGenerationActive(generation) &&
+                    !Socks5Server.isSessionUidBlocked(sessionUid, blockedUids)
+                ) {
                     selector.select(500)
                     val selected = selector.selectedKeys()
                     val iterator = selected.iterator()
@@ -1563,6 +1595,7 @@ class Socks5Server internal constructor(
                         if (!key.isValid) continue
 
                         val binding = key.attachment() as? UdpBinding ?: continue
+                        if (Socks5Server.isSessionUidBlocked(sessionUid, blockedUids)) break
                         try {
                             buffer.clear()
                             val count = binding.channel.read(buffer)
