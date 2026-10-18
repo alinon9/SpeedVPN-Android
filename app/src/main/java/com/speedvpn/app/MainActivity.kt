@@ -184,8 +184,8 @@ class MainActivity : ComponentActivity() {
      * These commands are inert in Release builds.
      */
     private fun handleE2eIntent(command: Intent?) {
-        if (!BuildConfig.DEBUG) return
-        val action = command?.getStringExtra("e2e_action")?.trim().orEmpty()
+        if (!BuildConfig.DEBUG || command == null) return
+        val action = command.getStringExtra("e2e_action")?.trim().orEmpty()
         if (action.isBlank()) return
         val eventId = command.getStringExtra("e2e_id").orEmpty().ifBlank { action }
         val pkg = command.getStringExtra("e2e_package").orEmpty()
