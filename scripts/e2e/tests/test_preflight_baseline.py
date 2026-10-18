@@ -28,7 +28,7 @@ class PreflightBaselineTests(unittest.TestCase):
         self.assertTrue(any("below 105.60 Mbps" in error for error in result["errors"]))
 
     def test_attempt_1_catastrophic_spread_remains_rejected(self):
-        # Run #6 Attempt 1: high raw spread plus upload below the 90 Mbps floor.
+        # Run #6 Attempt 1: high raw spread plus upload below the 105.6 Mbps top-preset floor.
         result = summarize_series([70.69, 121.54, 111.26], 105.6, 25.0)
         self.assertFalse(result["passed"])
         self.assertGreater(result["spread_percent_of_median"], 45.0)
