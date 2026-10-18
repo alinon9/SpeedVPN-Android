@@ -97,7 +97,7 @@ class SweepValidationTests(unittest.TestCase):
         self.write_rows(rows)
         self.assertEqual(1, self.validate_without_ci_run())
 
-    def test_documented_environment_limited_row_is_an_accepted_final_state(self) -> None:
+    def test_documented_environment_limited_row_blocks_release_acceptance(self) -> None:
         rows = valid_rows()
         row = next(r for r in rows if r["index"] == "16" and r["direction"] == "Download")
         target = EXPECTED_PRESETS[16][1] * 1_000.0
@@ -109,7 +109,7 @@ class SweepValidationTests(unittest.TestCase):
         row["reason"] = "environment baseline below documented 1.2x headroom floor"
         row["failure_reason"] = row["reason"]
         self.write_rows(rows)
-        self.assertEqual(0, self.validate_without_ci_run())
+        self.assertEqual(1, self.validate_without_ci_run())
 
     def test_measured_out_of_range_result_with_sufficient_headroom_still_fails(self) -> None:
         rows = valid_rows()
@@ -156,7 +156,7 @@ class SweepValidationTests(unittest.TestCase):
         self.write_rows(rows)
         self.assertEqual(1, self.validate_without_ci_run())
 
-    def test_unavailable_accuracy_is_required_for_environment_limited_metric(self) -> None:
+    def test_environment_limited_metric_with_unavailable_accuracy_blocks_release(self) -> None:
         rows = valid_rows()
         row = next(r for r in rows if r["index"] == "16" and r["direction"] == "Download")
         target = EXPECTED_PRESETS[16][1] * 1_000.0
@@ -168,7 +168,7 @@ class SweepValidationTests(unittest.TestCase):
         row["failure_reason"] = "baseline below 1.2x headroom"
         row["reason"] = row["failure_reason"]
         self.write_rows(rows)
-        self.assertEqual(0, self.validate_without_ci_run())
+        self.assertEqual(1, self.validate_without_ci_run())
     
     def test_verify_is_never_a_speed_direction(self) -> None:
         rows = valid_rows()
