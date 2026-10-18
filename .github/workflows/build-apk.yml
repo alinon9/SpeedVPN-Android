@@ -50,6 +50,25 @@ jobs:
         run: |
           test "$(git -C app/src/main/jni/hev-socks5-tunnel rev-parse HEAD)" = "d9dca26c7ad0e494492244f0309e80ee583e739e"
 
+      - name: Package updated project source ZIP
+        run: |
+          set -euo pipefail
+          SOURCE_ZIP="$RUNNER_TEMP/SpeedVPN-Android-quota-fix-source.zip"
+          zip -qr "$SOURCE_ZIP" . \
+            -x ".git/*" "*/.git/*" "*/.git" \
+               ".gradle/*" "*/.gradle/*" "*/build/*" \
+               "*/.idea/*" "*/local.properties" \
+               "*/captures/*" "*/.externalNativeBuild/*"
+          test -s "$SOURCE_ZIP"
+          ls -lh "$SOURCE_ZIP"
+
+      - name: Upload updated project source ZIP
+        uses: actions/upload-artifact@v7
+        with:
+          name: SpeedVPN-Android-quota-fix-source
+          path: ${{ runner.temp }}/SpeedVPN-Android-quota-fix-source.zip
+          if-no-files-found: error
+          retention-days: 30
       - name: Run unit tests
         run: ./gradlew :app:testDebugUnitTest --stacktrace --no-daemon
 
@@ -167,6 +186,23 @@ jobs:
         with:
           name: speedvpn-debug-fixture-apk
           path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      - name: Build separate-UID app-policy E2E fixtures
+        run: ./gradlew :e2e-fixture:assembleBlockedDebug :e2e-fixture:assembleAllowedDebug --stacktrace --no-daemon
+
+      - name: Upload blocked-UID fixture APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: speedvpn-e2e-fixture-blocked
+          path: e2e-fixture/build/outputs/apk/blocked/debug/e2e-fixture-blocked-debug.apk
+          if-no-files-found: error
+
+      - name: Upload allowed-UID fixture APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: speedvpn-e2e-fixture-allowed
+          path: e2e-fixture/build/outputs/apk/allowed/debug/e2e-fixture-allowed-debug.apk
           if-no-files-found: error
 
   emulator-smoke-test:
@@ -288,6 +324,18 @@ jobs:
         with:
           name: speedvpn-debug-fixture-apk
           path: app/build/outputs/apk/fixture
+
+      - name: Download blocked-UID fixture APK
+        uses: actions/download-artifact@v8
+        with:
+          name: speedvpn-e2e-fixture-blocked
+          path: app/build/e2e-fixtures/blocked
+
+      - name: Download allowed-UID fixture APK
+        uses: actions/download-artifact@v8
+        with:
+          name: speedvpn-e2e-fixture-allowed
+          path: app/build/e2e-fixtures/allowed
 
       - name: Fingerprint emulator test APKs
         run: |
@@ -940,7 +988,15 @@ jobs:
 
           echo "Verify Speed end-to-end test passed on emulator."
 
-          echo "Build 197 speed test passed on emulator."
+          echo "Running real-UID app-blocking and data-quota verification before emulator cleanup..."
+          test -s app/build/e2e-fixtures/blocked/e2e-fixture-blocked-debug.apk
+          test -s app/build/e2e-fixtures/allowed/e2e-fixture-allowed-debug.apk
+          bash scripts/e2e/verify_app_blocking_and_quota.sh \
+            app/build/e2e-fixtures/blocked/e2e-fixture-blocked-debug.apk \
+            app/build/e2e-fixtures/allowed/e2e-fixture-allowed-debug.apk
+
+          echo "Build 197 speed test and app-policy E2E passed on emulator."
+
       - name: Upload emulator logs
         if: ${{ always() }}
         uses: actions/upload-artifact@v7
@@ -962,6 +1018,8 @@ jobs:
             verify-speed-live-logcat.txt
             verify-speed-results.txt
             verify-speed-metrics.json
+            app-policy-e2e-logcat.txt
+            app-policy-e2e-results.txt
             verify-speed-result.xml
             verify-speed-result.xml.loading.xml
             speed-test-server.log

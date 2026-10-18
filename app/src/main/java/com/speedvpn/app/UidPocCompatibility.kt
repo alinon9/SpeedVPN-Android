@@ -39,8 +39,8 @@ internal object UidPocCompatibility {
 }
 
 /**
- * Keeps existing service/application/resolver sources source-compatible without
- * editing the protected VPN service, Java bridge, or native tunnel sources.
+ * Keeps legacy diagnostics call sites source-compatible. Packet enforcement is performed
+ * by the native TUN packet hook; this facade only records diagnostic events.
  */
 @Suppress("UNUSED_PARAMETER")
 internal object UidPocDiagnostics {

@@ -18,8 +18,9 @@ STATUS_MISMATCH = "❌ السرعة غير متطابقة"
 STATUS_UNJUDGEABLE = "⚠️ لا يمكن الحكم"
 STATUS_UNLIMITED = "✅ لا يظهر سقف واضح"
 
-# Final CI states: verified passes or explicitly documented infrastructure limits.
+# Diagnostic classifications emitted by per-metric parsing; environment-limited values are not release passes.
 ACCEPTED_FINAL_STATES = {"PASS", "PASS_UNLIMITED", "ENV_LIMITED", "ENV_INSUFFICIENT"}
+RELEASE_PASS_STATES = {"PASS", "PASS_UNLIMITED"}
 
 VALUE_TAGS = {
     f"verify_{direction}_{field}_value"
@@ -641,6 +642,17 @@ def validate_sweep(csv_path: str) -> int:
             errors.append(f"CSV line {line}: failure_reason disagrees with reason")
 
         status = (row.get("status") or "").strip()
+        required_release_status = "PASS_UNLIMITED" if expected_value == 0 else "PASS"
+        # Diagnostic ENV_LIMITED/ENV_INSUFFICIENT states remain available in per-metric
+        # logs, but they cannot satisfy the strict release acceptance gate.
+        classification = (row.get("classification") or "").strip()
+        if status in ACCEPTED_FINAL_STATES and (
+            status != required_release_status or classification != required_release_status
+        ):
+            errors.append(
+                f"{key}: release acceptance requires {required_release_status}; "
+                f"got status={status}, classification={classification}"
+            )
         allowed_statuses = ACCEPTED_FINAL_STATES | {"FAIL", "UNJUDGEABLE", "MEASUREMENT_ERROR", "CONFIGURATION_ERROR"}
         if status not in allowed_statuses:
             errors.append(f"CSV line {line}: invalid/missing status {status!r}")
