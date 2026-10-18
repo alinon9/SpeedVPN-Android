@@ -52,18 +52,19 @@ probe() {
   local id="$2"
   local bytes="$3"
   local expected="$4"
+  local protocol="${5:-tcp}"
   local component="$package/com.speedvpn.e2e.ProbeActivity"
   capture_logs
   # Clearing logcat can fail transiently on emulator logd under network load.
   # Every wait uses a unique E2E id, so stale entries cannot satisfy the assertion.
   "${ADB[@]}" logcat -c >/dev/null 2>&1 || true
-  "${ADB[@]}" shell am start -W -n "$component" --es probe_id "$id" --ei bytes "$bytes" >/dev/null
+  "${ADB[@]}" shell am start -W -n "$component" --es probe_id "$id" --es probe_protocol "$protocol" --ei bytes "$bytes" >/dev/null
   local line
   line="$(wait_for_log "E2E_PROBE id=$id" 75)"
   capture_logs
   log "$line"
   if [[ "$expected" == "PASS" ]]; then
-    grep -Fq "result=PASS" <<< "$line" || { log "FAIL: $id expected a complete HTTP transfer from $package"; return 1; }
+    grep -Fq "result=PASS" <<< "$line" || { log "FAIL: $id expected a complete $protocol transfer from $package"; return 1; }
     grep -Fq "received=$bytes" <<< "$line" || { log "FAIL: $id did not receive the complete expected payload"; return 1; }
   else
     grep -Fq "result=FAIL" <<< "$line" || { log "FAIL: $id expected traffic to be dropped/truncated from $package"; return 1; }
@@ -101,6 +102,9 @@ sleep 2
 log "Live block must drop one UID and preserve another UID's network access."
 probe "$BLOCKED_PACKAGE" manual-block-drops 4096 FAIL
 probe "$ALLOWED_PACKAGE" allowed-during-manual-block 4096 PASS
+log "The same live block policy must also drop UDP while preserving UDP for the allowed UID."
+probe "$BLOCKED_PACKAGE" manual-udp-block-drops 512 FAIL udp
+probe "$ALLOWED_PACKAGE" allowed-udp-during-manual-block 512 PASS udp
 
 log "Removing the manual block."
 line="$(control manual_block manual-block-off --ez e2e_enabled false)"
@@ -108,6 +112,7 @@ grep -Fq "result=PASS" <<< "$line"
 # Wait for the native policy transition to be published by SpeedVpnService.
 sleep 2
 probe "$BLOCKED_PACKAGE" manual-unblock-restores-traffic 4096 PASS
+probe "$BLOCKED_PACKAGE" manual-udp-unblock-restores 512 PASS udp
 
 log "Applying an exact 1,000,000-byte daily quota."
 line="$(control set_quota set-one-mb-quota --el e2e_bytes 1000000)"
@@ -159,6 +164,8 @@ PY
 sleep 2
 log "The unrelated UID must still transfer data after quota policy has settled."
 probe "$ALLOWED_PACKAGE" allowed-after-quota 4096 PASS
+probe "$BLOCKED_PACKAGE" quota-block-drops-udp 512 FAIL udp
+probe "$ALLOWED_PACKAGE" allowed-udp-after-quota 512 PASS udp
 
 log "Restarting SpeedVpnService and verifying durable enforcement."
 line="$(control restart restart-after-quota)"
@@ -171,6 +178,8 @@ grep -Fq "quota=DAILY:1000000:" <<< "$line"
 
 probe "$BLOCKED_PACKAGE" quota-block-survives-service-restart 4096 FAIL
 probe "$ALLOWED_PACKAGE" allowed-after-service-restart 4096 PASS
+probe "$BLOCKED_PACKAGE" quota-block-survives-restart-udp 512 FAIL udp
+probe "$ALLOWED_PACKAGE" allowed-udp-after-service-restart 512 PASS udp
 
 log "APP_BLOCK_AND_QUOTA_E2E=PASS"
 capture_logs
