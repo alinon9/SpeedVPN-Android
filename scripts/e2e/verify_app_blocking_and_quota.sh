@@ -137,6 +137,14 @@ PY
 # service monitor invalidate stale sessions before testing a different UID, so this
 # probe does not race the transition and confuse a stale-session reset with a global block.
 sleep 2
+log "Waiting for the quota-block policy transition to finish before probing the unrelated UID."
+# The service briefly fences and invalidates pre-transition SOCKS sessions to prevent
+# an unattributed session from surviving a policy change. Do not mistake that intentional
+# transition window for a persistent global block: wait for the published native/relay
+# snapshot, then immediately test a fresh connection from the unrelated allowed UID.
+wait_for_log "UID_POLICY_CHANGED blockedPackages=$BLOCKED_PACKAGE" 15 | tee -a "$RESULTS"
+sleep 1
+
 log "The unrelated UID must still transfer data after quota exhaustion."
 probe "$ALLOWED_PACKAGE" allowed-after-quota 4096 PASS
 
