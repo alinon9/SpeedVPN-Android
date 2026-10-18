@@ -288,7 +288,7 @@ jobs:
               exit 1
               ;;
             *)
-              echo "SPEED_SWEEP_ERROR: speed-limit-sweep.sh exited with code ${SWEEP_RC}; only exit 75 (ENV_INSUFFICIENT) is accepted as an environmental limitation." | tee -a "$GITHUB_STEP_SUMMARY"
+              echo "SPEED_SWEEP_ERROR: speed-limit-sweep.sh exited with code ${SWEEP_RC}; only exit 0 plus a passing 38/38 validator is acceptable. Exit 75 means inconclusive network headroom and blocks release acceptance." | tee -a "$GITHUB_STEP_SUMMARY"
               exit "$SWEEP_RC"
               ;;
           esac
