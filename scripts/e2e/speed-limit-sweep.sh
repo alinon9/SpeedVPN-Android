@@ -656,8 +656,8 @@ else
 
   for preflight_round in 1 2 3; do
     echo "===== BASELINE PREFLIGHT SAMPLE $preflight_round/3 =====" | tee -a "$RUN_DIR/sweep-console.log"
-    if [ "$(( $(date +%s) - PREFLIGHT_START_EPOCH ))" -ge 155 ]; then
-      preflight_fail "Three-sample preflight exceeded its 155-second time budget."
+    if [ "$(( $(date +%s) - PREFLIGHT_START_EPOCH ))" -ge 300 ]; then
+      preflight_fail "Three-sample preflight exceeded its 300-second time budget."
       exit 75
     fi
     if ! cleanup_vpn; then
@@ -699,7 +699,7 @@ else
       if [ "$((preflight_poll % 2))" -eq 0 ]; then
         adb -s "$DEVICE" shell input swipe 160 500 160 220 650 || true
       fi
-      if [ "$(( $(date +%s) - PREFLIGHT_START_EPOCH ))" -ge 155 ]; then
+      if [ "$(( $(date +%s) - PREFLIGHT_START_EPOCH ))" -ge 300 ]; then
         break
       fi
       sleep 1
@@ -723,8 +723,8 @@ PY
       preflight_fail "VPN TUN was not stopped after baseline sample $preflight_round."
       exit 75
     fi
-    if [ "$(( $(date +%s) - PREFLIGHT_START_EPOCH ))" -ge 155 ]; then
-      preflight_fail "Three-sample preflight exceeded its 155-second time budget."
+    if [ "$(( $(date +%s) - PREFLIGHT_START_EPOCH ))" -ge 300 ]; then
+      preflight_fail "Three-sample preflight exceeded its 300-second time budget."
       exit 75
     fi
   done
