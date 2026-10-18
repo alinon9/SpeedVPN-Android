@@ -1591,7 +1591,6 @@ hev_socks5_session_resolve_uid (int protocol,
         "        pbuf_free (p);\n"
         "        return -1;\n"
         "    }\n"
-        "    frame->data = p;\n"
         "    memset (&frame->node, 0, sizeof (frame->node));\n"
         "    res = hev_socks5_addr_from_lwip (&frame->addr, &self->pcb->local_ip, self->pcb->local_port);\n"
         "    if (res < 0) {\n"
@@ -1599,6 +1598,14 @@ hev_socks5_session_resolve_uid (int protocol,
         "        hev_free (frame);\n"
         "        return -1;\n"
         "    }\n"
+        "    /* The new task can run before udp_input unwinds. Give it an independent pbuf. */\n"
+        "    frame->data = pbuf_clone (PBUF_RAW, PBUF_RAM, p);\n"
+        "    if (!frame->data) {\n"
+        "        pbuf_free (p);\n"
+        "        hev_free (frame);\n"
+        "        return -1;\n"
+        "    }\n"
+        "    pbuf_free (p);\n"
         "    if (frame->addr.atype == HEV_SOCKS5_ADDR_TYPE_NAME) {\n"
         "        self->addr = ip_2_ip4 (&self->pcb->local_ip)->addr;\n"
         "        self->port = self->pcb->local_port;\n"
@@ -1638,6 +1645,7 @@ hev_socks5_session_resolve_uid (int protocol,
         (session_tcp_c, "self->data.uid = hev_socks5_session_resolve_uid (6"),
         (session_udp_c, "self->data.uid = hev_socks5_session_resolve_uid (17"),
         (session_udp_c, "hev_socks5_session_udp_enqueue_initial (HevSocks5SessionUDP *self, struct pbuf *p)"),
+        (session_udp_c, "frame->data = pbuf_clone (PBUF_RAW, PBUF_RAM, p);"),
         (tunnel_c, "hev_socks5_session_udp_new (pcb, addr, port, &mutex)"),
         (tunnel_c, "hev_socks5_session_udp_enqueue_initial (udp, p)"),
     ):
