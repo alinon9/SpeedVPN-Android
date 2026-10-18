@@ -49,9 +49,9 @@ class EncryptedDnsResolver(
                     listOf(InetAddress.getByName(provider.ipv4))
             })
             .socketFactory(ProtectedNetworkSocketFactory(network, protect))
-            .connectTimeout(TIMEOUT_MS, TimeUnit.MILLISECONDS)
-            .readTimeout(TIMEOUT_MS, TimeUnit.MILLISECONDS)
-            .writeTimeout(TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            .connectTimeout(PROVIDER_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            .readTimeout(PROVIDER_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            .writeTimeout(PROVIDER_TIMEOUT_MS, TimeUnit.MILLISECONDS)
             .retryOnConnectionFailure(false)
             .build()
 
