@@ -94,7 +94,19 @@ probe "$BLOCKED_PACKAGE" manual-unblock-restores-traffic 4096 PASS
 log "Applying an exact 1,000,000-byte daily quota."
 line="$(control set_quota set-one-mb-quota --el e2e_bytes 1000000)"
 grep -Fq "result=PASS" <<< "$line"
-grep -Fq "quota=DAILY:1000000:0" <<< "$line"
+grep -Fq "quota=DAILY:1000000:" <<< "$line"
+python3 - "$line" <<'PY'
+import re
+import sys
+line = sys.argv[1]
+m = re.search(r"quota=DAILY:1000000:(\\d+)", line)
+if not m:
+    raise SystemExit("E2E quota setup did not return its configured daily policy: " + line)
+used = int(m.group(1))
+if used >= 1_000_000:
+    raise SystemExit(f"quota baseline already exhausted before the relay test (used={used})")
+print(f"PASS: quota configured with a valid non-exhausted baseline of {used} bytes")
+PY
 
 log "A 2 MB download must be truncated by the relay quota gate."
 probe "$BLOCKED_PACKAGE" quota-overrun-is-cut 2000000 FAIL
