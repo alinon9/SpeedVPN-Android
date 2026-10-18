@@ -223,14 +223,47 @@ def make_server(host: str, port: int) -> ReusableThreadingHTTPServer:
     return ReusableThreadingHTTPServer((host, port), SpeedTestRequestHandler)
 
 
+def serve_udp_echo(sock: socket.socket, stop_event: threading.Event) -> None:
+    """Echo fixture datagrams so the Android E2E app can verify per-UID UDP policy."""
+    sock.settimeout(0.5)
+    print(f"SpeedVPN UDP echo fixture listening on {sock.getsockname()}", flush=True)
+    while not stop_event.is_set():
+        try:
+            payload, peer = sock.recvfrom(65_507)
+        except socket.timeout:
+            continue
+        except OSError:
+            if stop_event.is_set():
+                break
+            raise
+        try:
+            sock.sendto(payload, peer)
+            print(f"UDP_ECHO peer={peer[0]}:{peer[1]} bytes={len(payload)}", flush=True)
+        except OSError as error:
+            if not stop_event.is_set():
+                print(f"UDP_ECHO_ERROR peer={peer[0]}:{peer[1]} error={error}", flush=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=18765)
+    parser.add_argument("--udp-port", type=int, default=18766)
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
         parser.error("--port must be in 1..65535")
+    if not 1 <= args.udp_port <= 65535 or args.udp_port == args.port:
+        parser.error("--udp-port must be in 1..65535 and differ from --port")
     server = make_server(args.host, args.port)
+    udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    udp_socket.bind((args.host, args.udp_port))
+    udp_stop = threading.Event()
+    udp_thread = threading.Thread(
+        target=serve_udp_echo, args=(udp_socket, udp_stop),
+        name="speedvpn-udp-fixture", daemon=True,
+    )
+    udp_thread.start()
     effective_rcvbuf = server.socket.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
     print(
         f"SpeedVPN local speed-test fixture listening on {args.host}:{args.port}; "
@@ -243,6 +276,9 @@ def main() -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        udp_stop.set()
+        udp_socket.close()
+        udp_thread.join(timeout=1.0)
         server.server_close()
     return 0
 
