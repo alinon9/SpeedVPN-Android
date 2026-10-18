@@ -283,7 +283,9 @@ jobs:
               ;;
             75)
               echo "sweep_status=ENV_INSUFFICIENT" >> "$GITHUB_OUTPUT"
-              echo "ACCEPTANCE_PASS: ENV_INSUFFICIENT — runner preflight could not establish required network headroom. APK build and JVM unit tests completed; the exhaustive speed sweep did not run, so no speed metrics are claimed." | tee -a "$GITHUB_STEP_SUMMARY"
+              echo "ACCEPTANCE_BLOCKED: ENV_INSUFFICIENT — no speed-limiter acceptance result is available because the runner did not establish required network headroom. This is an inconclusive run, not a pass; select a suitable runner/network and rerun the full 38/38 gate." | tee -a "$GITHUB_STEP_SUMMARY"
+              # Do not let a skipped sweep be reported as a successful release check.
+              exit 1
               ;;
             *)
               echo "SPEED_SWEEP_ERROR: speed-limit-sweep.sh exited with code ${SWEEP_RC}; only exit 75 (ENV_INSUFFICIENT) is accepted as an environmental limitation." | tee -a "$GITHUB_STEP_SUMMARY"
