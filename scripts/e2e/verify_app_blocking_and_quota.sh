@@ -133,6 +133,10 @@ if used < 1_000_000:
 print(f"PASS: durable quota counter reached {used} bytes and quotaBlocked=true")
 PY
 
+# The quota-triggered UID-policy transition runs asynchronously. Let its one-second
+# service monitor invalidate stale sessions before testing a different UID, so this
+# probe does not race the transition and confuse a stale-session reset with a global block.
+sleep 2
 log "The unrelated UID must still transfer data after quota exhaustion."
 probe "$ALLOWED_PACKAGE" allowed-after-quota 4096 PASS
 
