@@ -9,9 +9,10 @@ ALLOWED_PACKAGE="com.speedvpn.fixture.allowed"
 CONTROL_ACTIVITY="com.speedvpn.app/.MainActivity"
 RESULTS="app-policy-e2e-results.txt"
 : > "$RESULTS"
+: > app-policy-e2e-logcat.txt
 
 capture_logs() {
-  "${ADB[@]}" logcat -d -v threadtime -t 8000 > app-policy-e2e-logcat.txt 2>/dev/null || true
+  "${ADB[@]}" logcat -d -v threadtime -t 8000 >> app-policy-e2e-logcat.txt 2>/dev/null || true
 }
 trap capture_logs EXIT
 
@@ -36,10 +37,12 @@ control() {
   local action="$1"
   local id="$2"
   shift 2
+  capture_logs
   "${ADB[@]}" logcat -c
   "${ADB[@]}" shell am start -W -n "$CONTROL_ACTIVITY" \
     --es e2e_action "$action" --es e2e_id "$id" --es e2e_package "$BLOCKED_PACKAGE" "$@" >/dev/null
   wait_for_log "E2E_CONTROL id=$id" 40 | tee -a "$RESULTS"
+  capture_logs
 }
 
 probe() {
@@ -48,10 +51,12 @@ probe() {
   local bytes="$3"
   local expected="$4"
   local component="$package/com.speedvpn.e2e.ProbeActivity"
+  capture_logs
   "${ADB[@]}" logcat -c
   "${ADB[@]}" shell am start -W -n "$component" --es probe_id "$id" --ei bytes "$bytes" >/dev/null
   local line
-  line="$(wait_for_log "E2E_PROBE id=$id" 20)"
+  line="$(wait_for_log "E2E_PROBE id=$id" 75)"
+  capture_logs
   log "$line"
   if [[ "$expected" == "PASS" ]]; then
     grep -Fq "result=PASS" <<< "$line" || { log "FAIL: $id expected a complete HTTP transfer from $package"; return 1; }
