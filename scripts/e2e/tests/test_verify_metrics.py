@@ -147,7 +147,7 @@ class VerifyMetricClassificationTests(unittest.TestCase):
                 with redirect_stdout(output), redirect_stderr(error_output):
                     code = validate_sweep(str(path))
             self.assertEqual(1, code)
-            self.assertIn("release acceptance requires PASS; got ENV_LIMITED", error_output.getvalue())
+            self.assertIn("release acceptance requires PASS; got status=ENV_LIMITED, classification=ENV_LIMITED", error_output.getvalue())
             self.assertNotIn("STRICT_GATE_ACCEPTED=38/38", output.getvalue())
 
     def test_parse_json_reports_environment_limit_without_claiming_pass(self):
