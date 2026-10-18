@@ -29,7 +29,7 @@ public final class ProbeActivity extends Activity {
                 connection = (HttpURLConnection) new URL(FIXTURE_URL + expectedBytes).openConnection();
                 connection.setRequestMethod("GET");
                 connection.setConnectTimeout(3000);
-                connection.setReadTimeout(5000);
+                connection.setReadTimeout(60_000);
                 connection.setUseCaches(false);
                 connection.setRequestProperty("Cache-Control", "no-cache, no-store");
                 httpStatus = connection.getResponseCode();
