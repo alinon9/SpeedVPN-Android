@@ -22,14 +22,14 @@ class EncryptedDnsResolver(
     private val ipv6Enabled: Boolean,
     private val dnsIpv4Only: Boolean = false,
 ) {
-    private data class DohProvider(val host: String, val ipv4: String)
+    private data class DohProvider(val host: String, val ipv4: String, val jsonPath: String)
 
     companion object {
         // Keep independent providers. A failure or filtering of one endpoint must not
         // make every hostname lookup fail when another encrypted resolver is reachable.
         private val DOH_PROVIDERS = listOf(
-            DohProvider("cloudflare-dns.com", "1.1.1.1"),
-            DohProvider("dns.google", "8.8.8.8"),
+            DohProvider("cloudflare-dns.com", "1.1.1.1", "/dns-query"),
+            DohProvider("dns.google", "8.8.8.8", "/resolve"),
         )
         // One hostname lookup must stay bounded even when both address families and
         // the fallback resolver are tried. Each provider attempt gets at most 1.2 s.
@@ -155,7 +155,7 @@ class EncryptedDnsResolver(
         val remaining = remainingMillis(deadlineNanos)
         if (remaining <= 0L) throw IOException("Encrypted DNS resolution deadline exceeded")
         val url = ("https://" + provider.host).toHttpUrl().newBuilder()
-            .addPathSegment("dns-query")
+            .encodedPath(provider.jsonPath)
             .addQueryParameter("name", host)
             .addQueryParameter("type", if (family == 4) "A" else "AAAA")
             .build()
