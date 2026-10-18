@@ -30,7 +30,10 @@ class EncryptedDnsResolver(
             DohProvider("cloudflare-dns.com", "1.1.1.1"),
             DohProvider("dns.google", "8.8.8.8"),
         )
-        private const val TIMEOUT_MS = 3_000L
+        // One hostname lookup must stay bounded even when both address families and
+        // the fallback resolver are tried. Each provider attempt gets at most 1.2 s.
+        private const val RESOLUTION_TIMEOUT_MS = 3_000L
+        private const val PROVIDER_TIMEOUT_MS = 1_200L
     }
 
     private val requestGeneration = AtomicLong(0L)
@@ -59,18 +62,21 @@ class EncryptedDnsResolver(
         }
         ensureRequestAllowed(requestGeneration.get(), isStillAllowed)
         val generation = requestGeneration.get()
+        val deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(RESOLUTION_TIMEOUT_MS)
         val addresses = mutableListOf<InetAddress>()
         val errors = mutableListOf<IOException>()
         var successfulResponses = 0
 
         // IPv4 and IPv6 are independent lookups. A failure or empty AAAA response must
         // never discard an already usable A result. Try the secondary resolver for each
-        // family if the primary errors or returns no usable records.
+        // family if the primary errors or returns no usable records, within one shared
+        // deadline so a broken resolver cannot stall page loads for many timeout periods.
         val families = if (ipv6Enabled) listOf(4, 6) else listOf(4)
         for (family in families) {
             var familyHasAddress = false
             for (provider in DOH_PROVIDERS) {
                 ensureRequestAllowed(generation, isStillAllowed)
+                if (remainingMillis(deadlineNanos) <= 0L) break
                 val providerAddresses = mutableListOf<InetAddress>()
                 try {
                     query(
@@ -79,6 +85,7 @@ class EncryptedDnsResolver(
                         out = providerAddresses,
                         family = family,
                         generation = generation,
+                        deadlineNanos = deadlineNanos,
                         isStillAllowed = isStillAllowed,
                     )
                     successfulResponses++
@@ -121,6 +128,9 @@ class EncryptedDnsResolver(
         }
     }
 
+    private fun remainingMillis(deadlineNanos: Long): Long =
+        TimeUnit.NANOSECONDS.toMillis((deadlineNanos - System.nanoTime()).coerceAtLeast(0L))
+
     /** Cancel DNS work after any app-policy change so it cannot outlive its relay session. */
     internal fun cancelPendingRequests() {
         requestGeneration.incrementAndGet()
@@ -137,9 +147,12 @@ class EncryptedDnsResolver(
         out: MutableList<InetAddress>,
         family: Int,
         generation: Long,
+        deadlineNanos: Long,
         isStillAllowed: () -> Boolean,
     ) {
         ensureRequestAllowed(generation, isStillAllowed)
+        val remaining = remainingMillis(deadlineNanos)
+        if (remaining <= 0L) throw IOException("Encrypted DNS resolution deadline exceeded")
         val url = ("https://" + provider.host).toHttpUrl().newBuilder()
             .addPathSegment("dns-query")
             .addQueryParameter("name", host)
@@ -152,6 +165,7 @@ class EncryptedDnsResolver(
             .build()
         val client = clients.getValue(provider)
         val call = client.newCall(request)
+        call.timeout().timeout(minOf(remaining, PROVIDER_TIMEOUT_MS), TimeUnit.MILLISECONDS)
         activeCalls.add(call)
         try {
             ensureRequestAllowed(generation, isStillAllowed)
