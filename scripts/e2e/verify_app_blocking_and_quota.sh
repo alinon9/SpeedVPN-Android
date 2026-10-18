@@ -99,7 +99,7 @@ python3 - "$line" <<'PY'
 import re
 import sys
 line = sys.argv[1]
-m = re.search(r"quota=DAILY:1000000:(\\d+)", line)
+m = re.search(r"quota=DAILY:1000000:(\d+)", line)
 if not m:
     raise SystemExit("E2E quota setup did not return its configured daily policy: " + line)
 used = int(m.group(1))
