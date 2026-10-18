@@ -116,6 +116,13 @@ PY
 log "A 2 MB download must be truncated by the relay quota gate."
 probe "$BLOCKED_PACKAGE" quota-overrun-is-cut 2000000 FAIL
 
+log "Waiting for the native/relay quota policy transition before reading persisted state."
+# The quota callback blocks the target UID immediately; the service monitor then publishes
+# the UID-scoped policy snapshot and invalidates pre-transition SOCKS sessions. Wait for that
+# single transition before clearing logcat for a status command or probing another UID.
+wait_for_log "UID_POLICY_CHANGED blockedPackages=$BLOCKED_PACKAGE" 15 | tee -a "$RESULTS"
+sleep 1
+
 log "Checking persisted usage and quota block before restart."
 line="$(control status quota-state-before-restart)"
 grep -Fq "result=PASS" <<< "$line"
@@ -137,15 +144,7 @@ PY
 # service monitor invalidate stale sessions before testing a different UID, so this
 # probe does not race the transition and confuse a stale-session reset with a global block.
 sleep 2
-log "Waiting for the quota-block policy transition to finish before probing the unrelated UID."
-# The service briefly fences and invalidates pre-transition SOCKS sessions to prevent
-# an unattributed session from surviving a policy change. Do not mistake that intentional
-# transition window for a persistent global block: wait for the published native/relay
-# snapshot, then immediately test a fresh connection from the unrelated allowed UID.
-wait_for_log "UID_POLICY_CHANGED blockedPackages=$BLOCKED_PACKAGE" 15 | tee -a "$RESULTS"
-sleep 1
-
-log "The unrelated UID must still transfer data after quota exhaustion."
+log "The unrelated UID must still transfer data after quota policy has settled."
 probe "$ALLOWED_PACKAGE" allowed-after-quota 4096 PASS
 
 log "Restarting SpeedVpnService and verifying durable enforcement."
