@@ -266,9 +266,12 @@ class SpeedVpnService : VpnService() {
                 accountQuotaBytes = ::accountQuotaBytesForRelay,
                 // A configured per-app quota requires exact owner attribution. Unknown UIDs
                 // can no longer pass through the relay unaccounted.
+                // Active app blocks and per-app quotas both require owner attribution.
+                // Otherwise an unknown-owner SOCKS session could bypass a live policy.
                 requireUidAttribution = {
-                    runCatching { UsageRepository.readQuotaPolicies(this@SpeedVpnService).isNotEmpty() }
-                        .getOrDefault(true)
+                    currentBlockedPackages().isNotEmpty() ||
+                        runCatching { UsageRepository.readQuotaPolicies(this@SpeedVpnService).isNotEmpty() }
+                            .getOrDefault(true)
                 },
                 onQuotaExceeded = {
                     enforceQuotaBlockImmediately(myServiceGeneration)
@@ -943,10 +946,23 @@ class SpeedVpnService : VpnService() {
                     currentNetwork = { findUnderlyingNetwork() },
                     ipv6Enabled = VpnSettings.read(this@SpeedVpnService).ipv6Enabled,
                     accountQuotaBytes = ::accountQuotaBytesForRelay,
+                    // Recovery must preserve startup's owner-attribution policy for blocks
+                    // and quotas, then seed UID blocks before the relay accepts traffic.
+                    requireUidAttribution = {
+                        currentBlockedPackages().isNotEmpty() ||
+                            runCatching {
+                                UsageRepository.readQuotaPolicies(this@SpeedVpnService).isNotEmpty()
+                            }.getOrDefault(true)
+                    },
                     onQuotaExceeded = {
                         enforceQuotaBlockImmediately(relayGeneration)
                     },
-                ).also { it.start() }
+                ).also { recoveredRelay ->
+                    recoveredRelay.updateBlockedUids(
+                        VpnApplicationPolicy.blockedUids(this@SpeedVpnService, currentBlockedPackages())
+                    )
+                    recoveredRelay.start()
+                }
             }.getOrNull() ?: run {
                 failLocked("SOCKS relay recovery failed")
                 return HealthResult.FAILED
