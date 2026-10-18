@@ -1564,6 +1564,13 @@ hev_socks5_session_resolve_uid (int protocol,
     )
     session_udp_c_text = replace_text_once(
         session_udp_c_text,
+        "        siptr->get_node = hev_socks5_session_udp_get_node;\n",
+        "        siptr->get_node = hev_socks5_session_udp_get_node;\n"
+        "        siptr->get_uid = hev_socks5_session_udp_get_uid;\n",
+        "register UDP UID accessor",
+    )
+    session_udp_c_text = replace_text_once(
+        session_udp_c_text,
         "HevSocks5SessionUDP *\nhev_socks5_session_udp_new (struct udp_pcb *pcb, const ip_addr_t *src_ip,\n"
         "                            u16_t src_port, HevTaskMutex *mutex)",
         "int\n"
@@ -1631,6 +1638,7 @@ hev_socks5_session_resolve_uid (int protocol,
         (session_tcp_c, "self->data.uid = hev_socks5_session_resolve_uid (6"),
         (session_udp_c, "self->data.uid = hev_socks5_session_resolve_uid (17, src_ip, src_port,"),
         (session_udp_c, "hev_socks5_session_udp_enqueue_initial (HevSocks5SessionUDP *self, struct pbuf *p)"),
+        (session_udp_c, "siptr->get_uid = hev_socks5_session_udp_get_uid;"),
         (tunnel_c, "hev_socks5_session_udp_new (pcb, addr, port, &mutex)"),
         (tunnel_c, "hev_socks5_session_udp_enqueue_initial (udp, p)"),
     ):
