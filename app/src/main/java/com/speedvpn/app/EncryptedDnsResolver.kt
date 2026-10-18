@@ -20,6 +20,7 @@ class EncryptedDnsResolver(
     private val network: Network,
     private val protect: (Socket) -> Boolean,
     private val ipv6Enabled: Boolean,
+    private val dnsIpv4Only: Boolean = false,
 ) {
     private data class DohProvider(val host: String, val ipv4: String)
 
@@ -71,7 +72,7 @@ class EncryptedDnsResolver(
         // never discard an already usable A result. Try the secondary resolver for each
         // family if the primary errors or returns no usable records, within one shared
         // deadline so a broken resolver cannot stall page loads for many timeout periods.
-        val families = if (ipv6Enabled) listOf(4, 6) else listOf(4)
+        val families = if (ipv6Enabled && !dnsIpv4Only) listOf(4, 6) else listOf(4)
         for (family in families) {
             var familyHasAddress = false
             for (provider in DOH_PROVIDERS) {
