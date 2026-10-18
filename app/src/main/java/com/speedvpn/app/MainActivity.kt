@@ -199,14 +199,9 @@ class MainActivity : ComponentActivity() {
                     "manual_block" -> {
                         require(pkg.isNotBlank())
                         val info = packageManager.getApplicationInfo(pkg, 0)
+                        // Individual package blocks must work even when the optional global
+                        // firewall preference is off. Do not silently force that preference on.
                         VpnAppControl.setBlocked(appContext, pkg, enabled)
-                        VpnAppControl.save(
-                            appContext,
-                            VpnAppControlSettings(
-                                firewallEnabled = true,
-                                blockedPackages = VpnAppControl.read(appContext).blockedPackages,
-                            ),
-                        )
                         UsageRepository.setBlocked(
                             appContext, pkg, info.loadLabel(packageManager).toString(), info.uid, enabled,
                         )
@@ -231,10 +226,12 @@ class MainActivity : ComponentActivity() {
                         UsageRepository.setDailyLimitBytes(
                             appContext, pkg, info.loadLabel(packageManager).toString(), info.uid, null,
                         )
+                        // Start the E2E policy scenario with the optional global preference off.
+                        // The following probe proves that per-app blocking works independently.
                         VpnAppControl.save(
                             appContext,
                             VpnAppControlSettings(
-                                firewallEnabled = true,
+                                firewallEnabled = false,
                                 blockedPackages = VpnAppControl.read(appContext).blockedPackages - pkg,
                             ),
                         )
@@ -1058,7 +1055,6 @@ class MainActivity : ComponentActivity() {
         val usageAccess = usageAccessState.value
         val catalogRefreshVersion = appCatalogRefreshTrigger.value
         var isLoadingAppCatalog by remember { mutableStateOf(true) }
-        var firewallEnabled by remember { mutableStateOf(VpnAppControl.read(this@MainActivity).firewallEnabled) }
         var blockedPackages by remember { mutableStateOf(VpnAppControl.read(this@MainActivity).blockedPackages) }
         var apps by remember { mutableStateOf<List<AppTrafficUsage>>(emptyList()) }
         var policies by remember { mutableStateOf<Map<String, AppPolicy>>(emptyMap()) }
@@ -1156,19 +1152,24 @@ class MainActivity : ComponentActivity() {
             }
 
             GlassCard {
-                SectionLabel("جدار التطبيقات", "الحظر اليدوي وحد استخدام التطبيق يعملان كحالتين مستقلتين")
-                SettingSwitch("تفعيل جدار التطبيقات", "الحظر الفعلي يحتاج Always-on VPN + Lockdown", firewallEnabled) {
-                    firewallEnabled = it
-                    saveAppControlSettings(VpnAppControlSettings(it, blockedPackages))
-                }
-                if (firewallEnabled) {
-                    Text("تُطبّق قائمة الحظر أثناء اتصال VPN. لمنع الاتصال المباشر إذا توقفت خدمة VPN، فعّل Always-on VPN وBlock connections without VPN من إعدادات Android.", color = Amber, fontSize = 10.sp)
-                    OutlinedButton(
-                        onClick = { runCatching { startActivity(AppTrafficManager.vpnSettingsIntent()) } },
-                        shape = RoundedCornerShape(12.dp),
-                        modifier = Modifier.fillMaxWidth(),
-                    ) { Text("فتح إعدادات VPN", fontSize = 11.sp) }
-                }
+                SectionLabel(
+                    "حظر التطبيقات وحماية VPN",
+                    "حظر التطبيق المختار مستقل عن إعداد جدار التطبيقات العام",
+                )
+                Text(
+                    "يعمل الحظر لكل تطبيق أثناء اتصال SpeedVPN، ولا يلزم تفعيل مفتاح عام. " +
+                        "الحماية النظامية الإضافية اختيارية: من إعدادات Android فعّل Always-on VPN وBlock connections without VPN لمنع المرور خارج النفق إذا توقف VPN.",
+                    color = TextSecondary,
+                    fontSize = 10.sp,
+                )
+                OutlinedButton(
+                    onClick = {
+                        runCatching { startActivity(AppTrafficManager.vpnSettingsIntent()) }
+                            .onFailure { log("Unable to open Android VPN settings: ${it.message}") }
+                    },
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("فتح إعدادات VPN (اختياري)", fontSize = 11.sp) }
             }
 
             GlassCard {
@@ -1238,7 +1239,12 @@ class MainActivity : ComponentActivity() {
                                             if (blocked) add(app.packageName) else remove(app.packageName)
                                         }.toSet()
                                         blockedPackages = next
-                                        saveAppControlSettings(VpnAppControlSettings(firewallEnabled, next))
+                                        saveAppControlSettings(
+                                            VpnAppControlSettings(
+                                                firewallEnabled = VpnAppControl.read(this@MainActivity).firewallEnabled,
+                                                blockedPackages = next,
+                                            ),
+                                        )
                                     },
                                 )
                             }

@@ -429,10 +429,9 @@ class SpeedVpnService : VpnService() {
             activeServiceGeneration.get() == serviceGeneration
 
     internal fun currentBlockedPackages(): Set<String> {
-        val state = VpnAppControl.read(this)
+        val settings = VpnAppControl.read(this)
         val quotaBlocked = VpnAppControl.quotaBlockedPackages(this)
-        val manualBlocked = if (state.firewallEnabled) state.blockedPackages else emptySet()
-        return (manualBlocked + quotaBlocked).toSet()
+        return VpnApplicationPolicy.packagesToEnforce(settings, quotaBlocked)
     }
 
     private fun accountQuotaBytesForRelay(

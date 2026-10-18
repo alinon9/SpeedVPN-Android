@@ -74,8 +74,13 @@ log "Installing two separate-UID HTTP probe apps."
 "${ADB[@]}" install -r "$BLOCKED_APK" | tee -a "$RESULTS"
 "${ADB[@]}" install -r "$ALLOWED_APK" | tee -a "$RESULTS"
 
-log "Resetting target policy."
-control reset_policy reset-before-block
+log "Resetting target policy with the optional global firewall preference disabled."
+line="$(control reset_policy reset-before-block)"
+grep -Fq "result=PASS" <<< "$line"
+grep -Fq "firewall=false" <<< "$line" || {
+  log "FAIL: E2E did not start with the optional global firewall preference off"
+  exit 1
+}
 
 log "Starting the actual VPN tunnel before changing the live app policy."
 line="$(control connect connect-before-block-test)"
@@ -86,6 +91,10 @@ log "Enabling manual block for $BLOCKED_PACKAGE while VPN is connected."
 line="$(control manual_block manual-block-on --ez e2e_enabled true)"
 grep -Fq "result=PASS" <<< "$line"
 grep -Fq "effectiveBlocked=true" <<< "$line"
+grep -Fq "firewall=false" <<< "$line" || {
+  log "FAIL: manual block unexpectedly enabled the global firewall preference"
+  exit 1
+}
 # The running service applies package changes from its one-second policy monitor.
 sleep 2
 

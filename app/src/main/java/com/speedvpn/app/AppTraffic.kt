@@ -212,6 +212,7 @@ object AppTrafficManager {
 }
 
 data class VpnAppControlSettings(
+    /** Legacy global preference retained for compatibility; it does not gate per-app blocks. */
     val firewallEnabled: Boolean = false,
     val blockedPackages: Set<String> = emptySet(),
 )

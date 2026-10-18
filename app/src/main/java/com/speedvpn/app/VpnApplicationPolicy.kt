@@ -7,6 +7,17 @@ import android.content.Context
  * Runtime routing must send every app through TUN before UID policy can drop it.
  */
 internal object VpnApplicationPolicy {
+    /**
+     * Return package blocks that the active VPN must enforce.
+     *
+     * Individual package blocks do not depend on the optional global firewall
+     * preference. Quota blocks are always merged into the enforcement set.
+     */
+    fun packagesToEnforce(
+        settings: VpnAppControlSettings,
+        quotaBlockedPackages: Set<String>,
+    ): Set<String> = (settings.blockedPackages + quotaBlockedPackages).toSet()
+
     /** Resolve package names to Android UIDs; absent/uninstalled packages are ignored. */
     fun blockedUids(context: Context, blockedPackages: Set<String>): Set<Int> {
         val packageManager = context.packageManager

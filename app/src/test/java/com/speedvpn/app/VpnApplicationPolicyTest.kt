@@ -7,6 +7,34 @@ import org.junit.Test
 
 class VpnApplicationPolicyTest {
     @Test
+    fun individualPackageBlocksDoNotDependOnTheGlobalFirewallPreference() {
+        val blockedPackage = "com.example.blocked"
+        for (firewallEnabled in listOf(false, true)) {
+            assertEquals(
+                setOf(blockedPackage),
+                VpnApplicationPolicy.packagesToEnforce(
+                    VpnAppControlSettings(
+                        firewallEnabled = firewallEnabled,
+                        blockedPackages = setOf(blockedPackage),
+                    ),
+                    emptySet(),
+                ),
+            )
+        }
+    }
+
+    @Test
+    fun quotaBlocksRemainEnforcedWhenTheGlobalFirewallPreferenceIsOff() {
+        assertEquals(
+            setOf("com.example.quota"),
+            VpnApplicationPolicy.packagesToEnforce(
+                VpnAppControlSettings(firewallEnabled = false, blockedPackages = emptySet()),
+                setOf("com.example.quota"),
+            ),
+        )
+    }
+
+    @Test
     fun onlyTheVpnApplicationIsExemptedFromTunRoutingOutsideVerification() {
         assertEquals(
             setOf("com.speedvpn.app"),
