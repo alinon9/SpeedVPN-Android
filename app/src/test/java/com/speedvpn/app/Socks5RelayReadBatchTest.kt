@@ -9,6 +9,54 @@ import org.junit.Test
 
 class Socks5RelayReadBatchTest {
     @Test
+    fun healthProbeCanAuthenticateWithoutUidWhenQuotaRequiresAttribution() {
+        assertTrue(
+            Socks5Server.usernameShapeAllowed(
+                suppliedUsername = "session-user",
+                baseUsername = "session-user",
+                sessionUid = null,
+                requireUidAttribution = true,
+                isHealthProbe = true,
+            ),
+        )
+    }
+
+    @Test
+    fun ordinaryUidlessSessionIsRejectedWhenQuotaRequiresAttribution() {
+        assertTrue(
+            !Socks5Server.usernameShapeAllowed(
+                suppliedUsername = "session-user",
+                baseUsername = "session-user",
+                sessionUid = null,
+                requireUidAttribution = true,
+                isHealthProbe = false,
+            ),
+        )
+    }
+
+    @Test
+    fun uidTaggedSessionMustMatchTheExactUidSuffix() {
+        assertTrue(
+            Socks5Server.usernameShapeAllowed(
+                suppliedUsername = "session-user#10242",
+                baseUsername = "session-user",
+                sessionUid = 10242,
+                requireUidAttribution = true,
+                isHealthProbe = false,
+            ),
+        )
+        assertTrue(
+            !Socks5Server.usernameShapeAllowed(
+                suppliedUsername = "session-user#10243",
+                baseUsername = "session-user",
+                sessionUid = 10242,
+                requireUidAttribution = true,
+                isHealthProbe = false,
+            ),
+        )
+    }
+
+    @Test
     fun lowRatePlanBoundsTcpRelayReadToOneKiB() {
         val bytesPerSecond = SpeedLimiter.kbpsToBytesPerSec(
             SpeedLimiter.kilobytesPerSecondToKbps(10L),
