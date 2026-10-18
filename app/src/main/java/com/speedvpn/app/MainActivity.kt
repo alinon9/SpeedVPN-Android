@@ -544,12 +544,13 @@ class MainActivity : ComponentActivity() {
                                 // baseline/VPN measurements are still in progress.
                                 lastVerification = null
                                 verifyProgress = "جاري تحضير التحقق…"
+                                val verificationStartedAt = System.currentTimeMillis()
                                 val loadingStartedAt = android.os.SystemClock.elapsedRealtime()
                                 try {
                                     // A fast-fail can otherwise finish before Compose draws the
                                     // loading label. Keep the state observable, then do blocking
                                     // network work away from Main.
-                                    delay(1_200L)
+                                    delay(2_000L)
                                     val result = withContext(Dispatchers.IO) {
                                         SpeedVerificationEngine.verify(
                                             context = this@MainActivity,
@@ -569,7 +570,7 @@ class MainActivity : ComponentActivity() {
                                     throw cancelled
                                 } catch (error: Exception) {
                                     val failed = SpeedVerificationEngine.unavailable(
-                                        started = loadingStartedAt,
+                                        started = verificationStartedAt,
                                         note = "فشل التحقق: ${error.message ?: error.javaClass.simpleName}",
                                         planDownloadKbps = s.downloadLimitKbps,
                                         planUploadKbps = s.uploadLimitKbps,
@@ -581,7 +582,7 @@ class MainActivity : ComponentActivity() {
                                     // The CI hierarchy dumper polls periodically; preserve a minimum
                                     // visible interval even if the engine returns immediately.
                                     val elapsed = android.os.SystemClock.elapsedRealtime() - loadingStartedAt
-                                    val remaining = 1_200L - elapsed
+                                    val remaining = 2_000L - elapsed
                                     if (remaining > 0L) delay(remaining)
                                     verifyBusy = false
                                     verifyProgress = null
