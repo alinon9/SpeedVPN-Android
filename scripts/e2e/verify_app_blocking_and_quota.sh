@@ -72,6 +72,8 @@ log "Enabling manual block for $BLOCKED_PACKAGE."
 line="$(control manual_block manual-block-on --ez e2e_enabled true)"
 grep -Fq "result=PASS" <<< "$line"
 grep -Fq "effectiveBlocked=true" <<< "$line"
+# The running service applies package changes from its one-second policy monitor.
+sleep 2
 
 log "Starting the actual VPN tunnel."
 line="$(control connect connect-before-block-test)"
@@ -85,11 +87,12 @@ probe "$ALLOWED_PACKAGE" allowed-during-manual-block 4096 PASS
 log "Removing the manual block."
 line="$(control manual_block manual-block-off --ez e2e_enabled false)"
 grep -Fq "result=PASS" <<< "$line"
+# Wait for the native policy transition to be published by SpeedVpnService.
 sleep 2
 probe "$BLOCKED_PACKAGE" manual-unblock-restores-traffic 4096 PASS
 
 log "Applying an exact 1,000,000-byte daily quota."
-line="$(control set_quota set-one-mb-quota --ei e2e_bytes 1000000)"
+line="$(control set_quota set-one-mb-quota --el e2e_bytes 1000000)"
 grep -Fq "result=PASS" <<< "$line"
 grep -Fq "quota=DAILY:1000000:0" <<< "$line"
 
