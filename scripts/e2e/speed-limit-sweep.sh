@@ -754,6 +754,7 @@ PY
       echo "# SpeedVPN baseline preflight"
       echo
       echo "- Result: ENV_INSUFFICIENT"
+      echo "- Acceptance: BLOCKED (no 38/38 speed metrics were produced; this is not a pass)."
       echo "- Download median minimum: 96 Mbps"
       echo "- Upload median minimum: 90 Mbps"
       echo "- Primary sample-spread limit: 25% of the median in each direction"
