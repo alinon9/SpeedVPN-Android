@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import csv
 import os
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -12,7 +11,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import verify_metrics  # noqa: E402
 from verify_metrics import CSV_FIELDS, EXPECTED_PRESETS, STATUS_MISMATCH, STATUS_PASS, STATUS_UNLIMITED, validate_sweep  # noqa: E402
+
+# Deterministic test provenance; production still validates the real checked-out SHA.
+TEST_COMMIT_SHA = "a" * 40
 
 
 def rate_label(bps: float) -> str:
@@ -40,9 +43,7 @@ def valid_rows() -> list[dict[str, str]]:
                 )
                 accuracy = "100.0%"
             now = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-            commit_sha = subprocess.run(
-                ["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True, timeout=5,
-            ).stdout.strip()
+            commit_sha = TEST_COMMIT_SHA
             unit = {"bps": 1e-6, "Kbps": 1e-3, "Mbps": 1.0, "Gbps": 1000.0}
             original_mbps = float(baseline.split()[0]) * unit[baseline.split()[1]]
             vpn_mbps = float(vpn.split()[0]) * unit[vpn.split()[1]]
@@ -75,7 +76,9 @@ class SweepValidationTests(unittest.TestCase):
             writer.writerows(rows)
 
     def validate_without_ci_run(self) -> int:
-        with patch.dict(os.environ, {"GITHUB_RUN_ID": ""}):
+        # These tests must also run from source ZIPs that intentionally omit .git.
+        with patch("verify_metrics.current_commit_sha", return_value=TEST_COMMIT_SHA), \
+             patch.dict(os.environ, {"GITHUB_RUN_ID": ""}):
             return validate_sweep(str(self.csv_path))
 
     def test_exact_38_valid_unique_results_pass(self) -> None:
@@ -125,7 +128,8 @@ class SweepValidationTests(unittest.TestCase):
 
     def test_wrong_run_id_fails_when_github_context_is_present(self) -> None:
         self.write_rows(valid_rows())
-        with patch.dict(os.environ, {"GITHUB_RUN_ID": "current-run-456"}):
+        with patch("verify_metrics.current_commit_sha", return_value=TEST_COMMIT_SHA), \
+             patch.dict(os.environ, {"GITHUB_RUN_ID": "current-run-456"}):
             self.assertEqual(1, validate_sweep(str(self.csv_path)))
 
     def test_mixed_run_ids_are_rejected(self) -> None:
@@ -210,10 +214,11 @@ class SweepValidationTests(unittest.TestCase):
             row["completed_at"] = stale
             row["recorded_at_utc"] = stale
         self.write_rows(rows)
-        with patch.dict(os.environ, {
-            "GITHUB_RUN_ID": "",
-            "SPEEDVPN_SWEEP_STARTED_AT": "2026-10-11T10:00:00.000Z",
-        }):
+        with patch("verify_metrics.current_commit_sha", return_value=TEST_COMMIT_SHA), \
+             patch.dict(os.environ, {
+                 "GITHUB_RUN_ID": "",
+                 "SPEEDVPN_SWEEP_STARTED_AT": "2026-10-11T10:00:00.000Z",
+             }):
             self.assertEqual(1, validate_sweep(str(self.csv_path)))
 
 
