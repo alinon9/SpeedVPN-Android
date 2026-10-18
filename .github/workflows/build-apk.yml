@@ -988,16 +988,14 @@ jobs:
 
           echo "Verify Speed end-to-end test passed on emulator."
 
-          echo "Build 197 speed test passed on emulator."
-
-      - name: Verify app blocking and data quota end-to-end
-        run: |
-          set -euo pipefail
+          echo "Running real-UID app-blocking and data-quota verification before emulator cleanup..."
           test -s app/build/e2e-fixtures/blocked/e2e-fixture-blocked-debug.apk
           test -s app/build/e2e-fixtures/allowed/e2e-fixture-allowed-debug.apk
           bash scripts/e2e/verify_app_blocking_and_quota.sh \
             app/build/e2e-fixtures/blocked/e2e-fixture-blocked-debug.apk \
             app/build/e2e-fixtures/allowed/e2e-fixture-allowed-debug.apk
+
+          echo "Build 197 speed test and app-policy E2E passed on emulator."
 
       - name: Upload emulator logs
         if: ${{ always() }}
