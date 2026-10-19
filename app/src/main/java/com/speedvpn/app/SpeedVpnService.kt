@@ -1168,8 +1168,11 @@ class SpeedVpnService : VpnService() {
             SpeedLimiter.beginSession(newGeneration)
         }
         val started = runCatching {
-            val hookDisabled = getSharedPreferences(UidPocSettings.PREFS, MODE_PRIVATE)
-                .getBoolean(UidPocSettings.KEY_DISABLE_JNI_HOOK, false)
+            // Diagnostic branch only: force-disable the Kotlin/JNI UID callback in Debug APKs.
+            // Release behavior is unchanged, and this branch must not be merged as a fix.
+            val hookDisabled = BuildConfig.DEBUG ||
+                getSharedPreferences(UidPocSettings.PREFS, MODE_PRIVATE)
+                    .getBoolean(UidPocSettings.KEY_DISABLE_JNI_HOOK, false)
             // App blocking must also be active in Release. The test preference may disable the hook only in Debug builds.
             if (!BuildConfig.DEBUG || !hookDisabled) {
                 UidPocDiagnostics.log(this, "JNI_HOOK_REGISTER_BEGIN generation=$newGeneration mode=HOOK_ENABLED")
@@ -1189,7 +1192,9 @@ class SpeedVpnService : VpnService() {
                 uidDetectionPoc = null
             }
             val initialBlockedUids = VpnApplicationPolicy.blockedUids(this, currentBlockedPackages())
-            check(TProxyService.TProxySetUidPocPolicyEnabled(initialBlockedUids.isNotEmpty())) {
+            check(TProxyService.TProxySetUidPocPolicyEnabled(
+                initialBlockedUids.isNotEmpty() && !BuildConfig.DEBUG
+            )) {
                 "Unable to initialize native UID policy"
             }
             UidPocDiagnostics.log(this, "JNI_NATIVE_START_BEGIN generation=$newGeneration fd=${expectedTun.fd}")
