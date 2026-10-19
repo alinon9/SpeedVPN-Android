@@ -1345,7 +1345,6 @@ native_is_running (JNIEnv *env, jobject thiz)
         "uid_poc_store_result_locked",
         "hev_jni_uid_poc_resolve_uid",
         "UID_SESSION_RESOLVE protocol=%d tuple=%s:%d",
-        "Normalize IPv4-mapped IPv6 tuples to their four-byte IPv4 form.",
         "native_set_uid_poc_policy_enabled",
         "UID_POC_DECISION_TIMEOUT_MS",
         "pthread_cond_timedwait (&uid_poc_condition",
@@ -1727,6 +1726,7 @@ hev_socks5_session_resolve_uid (int protocol,
     # Refuse a broken generated native patch before Gradle builds an APK.
     for source_path, marker in (
         (session_c, "hev_socks5_session_resolve_uid"),
+        (session_c, "Normalize IPv4-mapped IPv6 tuples to their four-byte IPv4 form."),
         (session_tcp_c, "self->data.uid = hev_socks5_session_resolve_uid (6"),
         (session_udp_c, "self->data.uid = hev_socks5_session_resolve_uid (17, src_ip, src_port,"),
         (session_udp_c, "hev_socks5_session_udp_enqueue_initial (HevSocks5SessionUDP *self, struct pbuf *p)"),
