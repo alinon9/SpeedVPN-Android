@@ -1345,6 +1345,7 @@ native_is_running (JNIEnv *env, jobject thiz)
         "uid_poc_store_result_locked",
         "hev_jni_uid_poc_resolve_uid",
         "UID_SESSION_RESOLVE protocol=%d tuple=%s:%d",
+        "Normalize IPv4-mapped IPv6 tuples to their four-byte IPv4 form.",
         "native_set_uid_poc_policy_enabled",
         "UID_POC_DECISION_TIMEOUT_MS",
         "pthread_cond_timedwait (&uid_poc_condition",
@@ -1461,6 +1462,18 @@ hev_socks5_session_copy_ip (const ip_addr_t *addr, unsigned char *out)
     if (addr->type == IPADDR_TYPE_V6) {
         /* ip6_addr_t stores its four network-order words contiguously. */
         memcpy (out, ip_2_ip6 (addr)->addr, 16);
+        /*
+         * Normalize IPv4-mapped IPv6 tuples to their four-byte IPv4 form.
+         * The original TUN packet parser records IPv4 addresses as four bytes;
+         * retaining ::ffff:a.b.c.d here would create a different native cache
+         * key for the same socket and make SOCKS UID attribution miss.
+         */
+        if (out[0] == 0 && out[1] == 0 && out[2] == 0 && out[3] == 0 &&
+            out[4] == 0 && out[5] == 0 && out[6] == 0 && out[7] == 0 &&
+            out[8] == 0 && out[9] == 0 && out[10] == 0xff && out[11] == 0xff) {
+            memmove (out, out + 12, 4);
+            return 4;
+        }
         return 16;
     }
     return 0;
