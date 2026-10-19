@@ -9,6 +9,90 @@ import org.junit.Test
 
 class Socks5RelayReadBatchTest {
     @Test
+    fun healthProbeIdentityAuthenticatesWithoutQuotaDatabaseLookup() {
+        val probeName = Socks5Server.healthProbeUsername("session-user")
+        assertEquals("session-user#health-probe", probeName)
+        assertTrue(
+            Socks5Server.usernameShapeAllowed(
+                suppliedUsername = probeName,
+                baseUsername = "session-user",
+                sessionUid = null,
+                requireUidAttribution = true,
+            ),
+        )
+    }
+
+    @Test
+    fun ordinaryUidlessSessionIsRejectedWhenQuotaRequiresAttribution() {
+        assertTrue(
+            !Socks5Server.usernameShapeAllowed(
+                suppliedUsername = "session-user",
+                baseUsername = "session-user",
+                sessionUid = null,
+                requireUidAttribution = true,
+            ),
+        )
+    }
+
+    @Test
+    fun uidTaggedSessionMustMatchTheExactUidSuffix() {
+        assertTrue(
+            Socks5Server.usernameShapeAllowed(
+                suppliedUsername = "session-user#10242",
+                baseUsername = "session-user",
+                sessionUid = 10242,
+                requireUidAttribution = true,
+            ),
+        )
+        assertTrue(
+            !Socks5Server.usernameShapeAllowed(
+                suppliedUsername = "session-user#10243",
+                baseUsername = "session-user",
+                sessionUid = 10242,
+                requireUidAttribution = true,
+            ),
+        )
+    }
+
+    @Test
+    fun baseUsernameCannotBypassUidlessQuotaAfterProbeReservationCollision() {
+        // A source-port reservation may choose the probe worker, but the base username
+        // alone must not authorize an ownerless app relay while per-app quotas exist.
+        assertTrue(
+            !Socks5Server.usernameShapeAllowed(
+                suppliedUsername = "session-user",
+                baseUsername = "session-user",
+                sessionUid = null,
+                requireUidAttribution = true,
+            ),
+        )
+    }
+
+    @Test
+    fun probeReservationExpiresInsteadOfMatchingLateSockets() {
+        assertTrue(Socks5Server.healthProbeReservationIsValid(20_000L, 19_999L))
+        assertTrue(!Socks5Server.healthProbeReservationIsValid(20_000L, 20_000L))
+        assertTrue(!Socks5Server.healthProbeReservationIsValid(null, 19_999L))
+    }
+
+    @Test
+    fun lowRatePlanBoundsTcpRelayReadToOneKiB() {
+        val bytesPerSecond = SpeedLimiter.kbpsToBytesPerSec(
+            SpeedLimiter.kilobytesPerSecondToKbps(10L),
+        )
+        val bucket = TokenBucket().apply { setRate(bytesPerSecond) }
+        val payload = ByteArray(8 * 1024) { (it % 251).toByte() }
+        val source = SingleReadInputStream(payload, maxReadBytes = payload.size)
+        val buffer = ByteArray(256 * 1024)
+
+        val batch = readRelayBatch(source, buffer, bucket.recommendedReadBytes())
+
+        assertEquals(10_000L, bytesPerSecond)
+        assertEquals(1024, batch.bytesRead)
+        assertEquals(7 * 1024, source.remainingBytes())
+    }
+
+    @Test
     fun oneRelayIterationUsesOneBlockingReadWithoutPollingAvailable() {
         val payload = ByteArray(48 * 1024) { (it % 251).toByte() }
         val source = SingleReadInputStream(payload, maxReadBytes = 8 * 1024)

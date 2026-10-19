@@ -2,6 +2,7 @@ package com.speedvpn.app
 
 import android.Manifest
 import android.content.Context
+import android.content.Intent
 import android.graphics.Paint
 import android.net.VpnService
 import android.os.Build
@@ -87,8 +88,8 @@ private val TextPrimary = Color(0xFFF3F7FF)
 private val TextSecondary = Color(0xFF95A6C3)
 
 class MainActivity : ComponentActivity() {
-    // UI speeds are expressed as KB/s and converted to the backend's Kbps representation.
-    private fun kbpsFromKBps(value: Long): Long = value.coerceAtLeast(1L) * 8L
+    // UI speeds are expressed as KB/s; share the overflow-safe conversion with unit tests.
+    private fun kbpsFromKBps(value: Long): Long = SpeedLimiter.kilobytesPerSecondToKbps(value)
     private val slowPresets = listOf(
         "10 KB" to kbpsFromKBps(10),
         "25 KB" to kbpsFromKBps(25),
@@ -169,6 +170,126 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+        handleE2eIntent(getIntent())
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleE2eIntent(intent)
+    }
+
+    /**
+     * Debug-only E2E controls. The emulator workflow uses separate-UID fixture APKs.
+     * These commands are inert in Release builds.
+     */
+    private fun handleE2eIntent(command: Intent?) {
+        if (!BuildConfig.DEBUG || command == null) return
+        val action = command.getStringExtra("e2e_action")?.trim().orEmpty()
+        if (action.isBlank()) return
+        val eventId = command.getStringExtra("e2e_id").orEmpty().ifBlank { action }
+        val pkg = command.getStringExtra("e2e_package").orEmpty()
+        val enabled = command.getBooleanExtra("e2e_enabled", false)
+        val bytes = command.getLongExtra("e2e_bytes", 0L)
+        val appContext = applicationContext
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                when (action) {
+                    "manual_block" -> {
+                        require(pkg.isNotBlank())
+                        val info = packageManager.getApplicationInfo(pkg, 0)
+                        // Individual package blocks must work even when the optional global
+                        // firewall preference is off. Do not silently force that preference on.
+                        VpnAppControl.setBlocked(appContext, pkg, enabled)
+                        UsageRepository.setBlocked(
+                            appContext, pkg, info.loadLabel(packageManager).toString(), info.uid, enabled,
+                        )
+                    }
+                    "set_quota" -> {
+                        require(pkg.isNotBlank())
+                        val info = packageManager.getApplicationInfo(pkg, 0)
+                        VpnAppControl.setQuotaBlocked(appContext, pkg, false)
+                        UsageRepository.setDailyLimitBytes(
+                            appContext, pkg, info.loadLabel(packageManager).toString(), info.uid,
+                            bytes.takeIf { it > 0L },
+                        )
+                    }
+                    "reset_policy" -> {
+                        require(pkg.isNotBlank())
+                        val info = packageManager.getApplicationInfo(pkg, 0)
+                        VpnAppControl.setBlocked(appContext, pkg, false)
+                        VpnAppControl.setQuotaBlocked(appContext, pkg, false)
+                        UsageRepository.readQuotaPolicies(appContext, pkg).forEach { policy ->
+                            UsageRepository.deleteQuotaPolicy(appContext, pkg, policy.quotaType)
+                        }
+                        UsageRepository.setDailyLimitBytes(
+                            appContext, pkg, info.loadLabel(packageManager).toString(), info.uid, null,
+                        )
+                        // Start the E2E policy scenario with the optional global preference off.
+                        // The following probe proves that per-app blocking works independently.
+                        VpnAppControl.save(
+                            appContext,
+                            VpnAppControlSettings(
+                                firewallEnabled = false,
+                                blockedPackages = VpnAppControl.read(appContext).blockedPackages - pkg,
+                            ),
+                        )
+                    }
+                    "connect" -> SpeedVpnService.start(appContext)
+                    "restart" -> {
+                        SpeedVpnService.stop(appContext)
+                        if (!waitForE2eTunnel(connected = false)) {
+                            throw IllegalStateException("VPN did not stop before restart")
+                        }
+                        SpeedVpnService.start(appContext)
+                    }
+                    "status" -> Unit
+                    else -> throw IllegalArgumentException("Unknown E2E action: $action")
+                }
+
+                val expectsConnected = action == "connect" || action == "restart"
+                val tunnelReady = if (expectsConnected) waitForE2eTunnel(connected = true) else true
+                val state = VpnRuntime.state.value
+                val settings = VpnAppControl.read(appContext)
+                val effectiveBlocked = pkg.isNotBlank() && pkg in settings.blockedPackages
+                val quotaBlocked = pkg.isNotBlank() && pkg in VpnAppControl.quotaBlockedPackages(appContext)
+                val quotaSummary = if (pkg.isBlank()) "none" else {
+                    UsageRepository.readQuotaPolicies(appContext, pkg).joinToString(",") {
+                        "${it.quotaType}:${it.limitBytes}:${it.usedBytes}"
+                    }.ifBlank { "none" }
+                }
+                val passed = tunnelReady && (!expectsConnected || state.status == VpnStatus.CONNECTED)
+                android.util.Log.i(
+                    "SpeedVPN-E2E",
+                    "E2E_CONTROL id=$eventId action=$action package=$pkg result=${if (passed) "PASS" else "FAIL"} " +
+                        "vpn=${state.status} firewall=${settings.firewallEnabled} " +
+                        "effectiveBlocked=$effectiveBlocked quotaBlocked=$quotaBlocked quota=$quotaSummary",
+                )
+            } catch (error: Exception) {
+                android.util.Log.e(
+                    "SpeedVPN-E2E",
+                    "E2E_CONTROL id=$eventId action=$action package=$pkg result=FAIL error=${error.message}",
+                    error,
+                )
+            }
+        }
+    }
+
+    private suspend fun waitForE2eTunnel(connected: Boolean, timeoutMs: Long = 30_000L): Boolean {
+        val deadline = android.os.SystemClock.elapsedRealtime() + timeoutMs
+        while (android.os.SystemClock.elapsedRealtime() < deadline) {
+            val state = VpnRuntime.state.value.status
+            val matches = if (connected) {
+                state == VpnStatus.CONNECTED
+            } else {
+                state in setOf(VpnStatus.DISCONNECTED, VpnStatus.ERROR) &&
+                    SpeedVpnService.isNativeTunnelStopped()
+            }
+            if (matches) return true
+            delay(250L)
+        }
+        return false
     }
 
     override fun onResume() {
@@ -394,12 +515,36 @@ class MainActivity : ComponentActivity() {
                             testBusy = true
                             lastTest = null
                             testProgress = "جاري بدء الفحص…"
-                            lastTest = SpeedTestEngine.measure(this@MainActivity) { phase ->
-                                val label = if (phase == SpeedTestPhase.DOWNLOAD) "جاري قياس Download…" else "جاري قياس Upload…"
-                                lifecycleScope.launch(Dispatchers.Main.immediate) { testProgress = label }
+                            val measurementStartedAt = android.os.SystemClock.elapsedRealtime()
+                            try {
+                                // Keep the busy label observable even when a local fixture or
+                                // a fast error completes before UIAutomator captures its first
+                                // hierarchy. SpeedTestEngine performs network IO on Dispatchers.IO.
+                                val result = SpeedTestEngine.measure(this@MainActivity) { phase ->
+                                    val label = if (phase == SpeedTestPhase.DOWNLOAD) "جاري قياس Download…" else "جاري قياس Upload…"
+                                    lifecycleScope.launch(Dispatchers.Main.immediate) {
+                                        if (testBusy) testProgress = label
+                                    }
+                                }
+                                lastTest = result
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (error: Exception) {
+                                lastTest = SpeedTestResult(
+                                    downloadBps = null,
+                                    uploadBps = null,
+                                    durationMs = android.os.SystemClock.elapsedRealtime() - measurementStartedAt,
+                                    error = error.message ?: error.javaClass.simpleName,
+                                )
+                            } finally {
+                                // Even a fast-fail retains a stable loading state for at least
+                                // three seconds from click; always update Compose on Main.
+                                val elapsed = android.os.SystemClock.elapsedRealtime() - measurementStartedAt
+                                val remaining = 3_000L - elapsed
+                                if (remaining > 0L) delay(remaining)
+                                testBusy = false
+                                testProgress = null
                             }
-                            testBusy = false
-                            testProgress = null
                         }
                     },
                     modifier = Modifier.fillMaxWidth(),
@@ -420,18 +565,49 @@ class MainActivity : ComponentActivity() {
                                 // baseline/VPN measurements are still in progress.
                                 lastVerification = null
                                 verifyProgress = "جاري تحضير التحقق…"
-                                lastVerification = SpeedVerificationEngine.verify(
-                                    context = this@MainActivity,
-                                    planDownloadKbps = s.downloadLimitKbps,
-                                    planUploadKbps = s.uploadLimitKbps,
-                                    onProgress = { message ->
-                                        lifecycleScope.launch(Dispatchers.Main.immediate) { verifyProgress = message }
-                                    },
-                                )
-                                SpeedVerificationStore.save(this@MainActivity, lastVerification!!)
-                                verificationHistory = SpeedVerificationStore.loadRecent(this@MainActivity, 8)
-                                verifyBusy = false
-                                verifyProgress = null
+                                val verificationStartedAt = System.currentTimeMillis()
+                                val loadingStartedAt = android.os.SystemClock.elapsedRealtime()
+                                try {
+                                    // A fast-fail can otherwise finish before Compose draws the
+                                    // loading label. Keep the state observable, then do blocking
+                                    // network work away from Main.
+                                    delay(2_000L)
+                                    val result = withContext(Dispatchers.IO) {
+                                        SpeedVerificationEngine.verify(
+                                            context = this@MainActivity,
+                                            planDownloadKbps = s.downloadLimitKbps,
+                                            planUploadKbps = s.uploadLimitKbps,
+                                            onProgress = { message ->
+                                                lifecycleScope.launch(Dispatchers.Main.immediate) {
+                                                    if (verifyBusy) verifyProgress = message
+                                                }
+                                            },
+                                        )
+                                    }
+                                    lastVerification = result
+                                    SpeedVerificationStore.save(this@MainActivity, result)
+                                    verificationHistory = SpeedVerificationStore.loadRecent(this@MainActivity, 8)
+                                } catch (cancelled: CancellationException) {
+                                    throw cancelled
+                                } catch (error: Exception) {
+                                    val failed = SpeedVerificationEngine.unavailable(
+                                        started = verificationStartedAt,
+                                        note = "فشل التحقق: ${error.message ?: error.javaClass.simpleName}",
+                                        planDownloadKbps = s.downloadLimitKbps,
+                                        planUploadKbps = s.uploadLimitKbps,
+                                    )
+                                    lastVerification = failed
+                                    SpeedVerificationStore.save(this@MainActivity, failed)
+                                    verificationHistory = SpeedVerificationStore.loadRecent(this@MainActivity, 8)
+                                } finally {
+                                    // The CI hierarchy dumper polls periodically; preserve a minimum
+                                    // visible interval even if the engine returns immediately.
+                                    val elapsed = android.os.SystemClock.elapsedRealtime() - loadingStartedAt
+                                    val remaining = 2_000L - elapsed
+                                    if (remaining > 0L) delay(remaining)
+                                    verifyBusy = false
+                                    verifyProgress = null
+                                }
                             }
                         }
                     },
@@ -879,7 +1055,6 @@ class MainActivity : ComponentActivity() {
         val usageAccess = usageAccessState.value
         val catalogRefreshVersion = appCatalogRefreshTrigger.value
         var isLoadingAppCatalog by remember { mutableStateOf(true) }
-        var firewallEnabled by remember { mutableStateOf(VpnAppControl.read(this@MainActivity).firewallEnabled) }
         var blockedPackages by remember { mutableStateOf(VpnAppControl.read(this@MainActivity).blockedPackages) }
         var apps by remember { mutableStateOf<List<AppTrafficUsage>>(emptyList()) }
         var policies by remember { mutableStateOf<Map<String, AppPolicy>>(emptyMap()) }
@@ -977,19 +1152,24 @@ class MainActivity : ComponentActivity() {
             }
 
             GlassCard {
-                SectionLabel("جدار التطبيقات", "الحظر اليدوي وحد استخدام التطبيق يعملان كحالتين مستقلتين")
-                SettingSwitch("تفعيل جدار التطبيقات", "الحظر الفعلي يحتاج Always-on VPN + Lockdown", firewallEnabled) {
-                    firewallEnabled = it
-                    saveAppControlSettings(VpnAppControlSettings(it, blockedPackages))
-                }
-                if (firewallEnabled) {
-                    Text("فعّل Always-on VPN وBlock connections without VPN من إعدادات Android حتى يصبح الحظر فعليًا.", color = Amber, fontSize = 10.sp)
-                    OutlinedButton(
-                        onClick = { runCatching { startActivity(AppTrafficManager.vpnSettingsIntent()) } },
-                        shape = RoundedCornerShape(12.dp),
-                        modifier = Modifier.fillMaxWidth(),
-                    ) { Text("فتح إعدادات VPN", fontSize = 11.sp) }
-                }
+                SectionLabel(
+                    "حظر التطبيقات وحماية VPN",
+                    "حظر التطبيق المختار مستقل عن إعداد جدار التطبيقات العام",
+                )
+                Text(
+                    "يعمل الحظر لكل تطبيق أثناء اتصال SpeedVPN، ولا يلزم تفعيل مفتاح عام. " +
+                        "الحماية النظامية الإضافية اختيارية: من إعدادات Android فعّل Always-on VPN وBlock connections without VPN لمنع المرور خارج النفق إذا توقف VPN.",
+                    color = TextSecondary,
+                    fontSize = 10.sp,
+                )
+                OutlinedButton(
+                    onClick = {
+                        runCatching { startActivity(AppTrafficManager.vpnSettingsIntent()) }
+                            .onFailure { log("Unable to open Android VPN settings: ${it.message}") }
+                    },
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("فتح إعدادات VPN (اختياري)", fontSize = 11.sp) }
             }
 
             GlassCard {
@@ -1059,7 +1239,12 @@ class MainActivity : ComponentActivity() {
                                             if (blocked) add(app.packageName) else remove(app.packageName)
                                         }.toSet()
                                         blockedPackages = next
-                                        saveAppControlSettings(VpnAppControlSettings(firewallEnabled, next))
+                                        saveAppControlSettings(
+                                            VpnAppControlSettings(
+                                                firewallEnabled = VpnAppControl.read(this@MainActivity).firewallEnabled,
+                                                blockedPackages = next,
+                                            ),
+                                        )
                                     },
                                 )
                             }

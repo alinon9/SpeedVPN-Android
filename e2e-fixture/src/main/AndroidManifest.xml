@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <application
+        android:allowBackup="false"
+        android:label="SpeedVPN E2E Fixture"
+        android:usesCleartextTraffic="true">
+        <activity
+            android:name="com.speedvpn.e2e.ProbeActivity"
+            android:exported="true"
+            android:label="SpeedVPN E2E Fixture">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

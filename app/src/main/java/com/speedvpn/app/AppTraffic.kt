@@ -18,6 +18,15 @@ import java.util.Locale
  * so this screen intentionally labels the values as session usage rather than
  * a packet-perfect live counter.
  */
+internal data class UidTrafficCounters(
+    val downloadBytes: Long,
+    val uploadBytes: Long,
+) {
+    val totalBytes: Long
+        get() = if (Long.MAX_VALUE - downloadBytes < uploadBytes) Long.MAX_VALUE
+        else downloadBytes + uploadBytes
+}
+
 data class AppTrafficUsage(
     val packageName: String,
     val label: String,
@@ -115,10 +124,19 @@ object AppTrafficManager {
         uid: Int,
         startTimeMs: Long,
         endTimeMs: Long = System.currentTimeMillis(),
-    ): Long? {
+    ): Long? = queryUidUsageBreakdown(context, uid, startTimeMs, endTimeMs)?.totalBytes
+
+    /** One-shot historical baseline for a quota period; live accounting stays in Socks5Server. */
+    internal fun queryUidUsageBreakdown(
+        context: Context,
+        uid: Int,
+        startTimeMs: Long,
+        endTimeMs: Long = System.currentTimeMillis(),
+    ): UidTrafficCounters? {
         if (uid < 0 || endTimeMs <= startTimeMs || !hasUsageAccess(context)) return null
         val manager = context.getSystemService(NetworkStatsManager::class.java) ?: return null
-        var total = 0L
+        var download = 0L
+        var upload = 0L
         var queried = false
         for (networkType in NETWORK_TYPES) {
             runCatching {
@@ -133,14 +151,15 @@ object AppTrafficManager {
                     val bucket = NetworkStats.Bucket()
                     while (stream.hasNextBucket()) {
                         stream.getNextBucket(bucket)
-                        total = safeAdd(total, safeAdd(bucket.rxBytes, bucket.txBytes))
+                        download = safeAdd(download, bucket.rxBytes)
+                        upload = safeAdd(upload, bucket.txBytes)
                     }
                 }
             }.onFailure {
                 log("UID quota query failed for uid=" + uid + " type=" + networkType + ": " + it.message)
             }
         }
-        return if (queried) total else null
+        return if (queried) UidTrafficCounters(download, upload) else null
     }
 
     fun querySessionUsage(context: Context, startTimeMs: Long, endTimeMs: Long = System.currentTimeMillis()): List<AppTrafficUsage> {
@@ -193,11 +212,14 @@ object AppTrafficManager {
 }
 
 data class VpnAppControlSettings(
+    /** Legacy global preference retained for compatibility; it does not gate per-app blocks. */
     val firewallEnabled: Boolean = false,
     val blockedPackages: Set<String> = emptySet(),
 )
 
 object VpnAppControl {
+    private val quotaBlockLock = Any()
+
     const val PREFS = "app_control"
     const val FIREWALL_ENABLED = "firewall_enabled"
     const val BLOCKED_PACKAGES = "blocked_packages"
@@ -240,17 +262,34 @@ object VpnAppControl {
             .getStringSet(QUOTA_BLOCKED_PACKAGES, emptySet()).orEmpty().toSet()
 
     fun setQuotaBlocked(context: Context, packageName: String, blocked: Boolean) {
-        val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val set = p.getStringSet(QUOTA_BLOCKED_PACKAGES, emptySet()).orEmpty().toMutableSet()
-        if (blocked) set.add(packageName) else set.remove(packageName)
-        p.edit().putStringSet(QUOTA_BLOCKED_PACKAGES, set).commit()
+        synchronized(quotaBlockLock) {
+            val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            val set = p.getStringSet(QUOTA_BLOCKED_PACKAGES, emptySet()).orEmpty().toMutableSet()
+            if (blocked) set.add(packageName) else set.remove(packageName)
+            p.edit().putStringSet(QUOTA_BLOCKED_PACKAGES, set).commit()
+        }
     }
 
+    /** Atomically merges newly exhausted packages and returns just the newly added blocks. */
+    fun addQuotaBlockedPackages(context: Context, packages: Set<String>): Set<String> =
+        synchronized(quotaBlockLock) {
+            val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            val current = p.getStringSet(QUOTA_BLOCKED_PACKAGES, emptySet()).orEmpty().toSet()
+            val next = current + packages
+            val added = next - current
+            if (added.isNotEmpty()) {
+                p.edit().putStringSet(QUOTA_BLOCKED_PACKAGES, next).commit()
+            }
+            added
+        }
+
     fun replaceQuotaBlockedPackages(context: Context, packages: Set<String>) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .edit()
-            .putStringSet(QUOTA_BLOCKED_PACKAGES, packages.toSet())
-            .commit()
+        synchronized(quotaBlockLock) {
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .putStringSet(QUOTA_BLOCKED_PACKAGES, packages.toSet())
+                .commit()
+        }
     }
 }
 

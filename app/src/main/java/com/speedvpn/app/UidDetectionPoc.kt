@@ -139,7 +139,7 @@ internal class UidDetectionPoc(
     }
 
     internal fun isUidBlocked(uid: Int): Boolean =
-        uid > 0 && blockedUids.contains(uid)
+        VpnApplicationPolicy.shouldDropUid(uid, blockedUids)
 
     init {
         Log.i(TAG, "START Android API=${Build.VERSION.SDK_INT}; package=${service.packageName}")
@@ -186,7 +186,13 @@ internal class UidDetectionPoc(
         } catch (error: Throwable) {
             outcome = "throwable:${error.javaClass.simpleName}"
             reportException(protocol, source, srcPort, destination, dstPort, callId, error)
-            return encodeUidDecision(Process.INVALID_UID, false)
+            return encodeUidDecision(
+                Process.INVALID_UID,
+                VpnApplicationPolicy.shouldDropUnresolvedUid(
+                    blockPolicy.uids,
+                    attributionExhausted = true,
+                ),
+            )
         } finally {
             UidPocDiagnostics.jniEvent(
                 service,
@@ -208,8 +214,17 @@ internal class UidDetectionPoc(
     private fun encodeUidDecision(uid: Int, shouldBlock: Boolean): Long =
         (uid.toLong() shl 32) or (if (shouldBlock) 1L else 0L)
 
-    private fun unresolvedUid(): UidResolution =
-        UidResolution(Process.INVALID_UID, "INVALID_UID", false)
+    private fun unresolvedUid(): UidResolution {
+        val shouldBlock = VpnApplicationPolicy.shouldDropUnresolvedUid(
+            blockPolicy.uids,
+            attributionExhausted = true,
+        )
+        return UidResolution(
+            Process.INVALID_UID,
+            if (shouldBlock) "UID_UNRESOLVED_FAIL_CLOSED" else "INVALID_UID",
+            shouldBlock,
+        )
+    }
 
     /** Runs only on the dedicated native UID worker, never on the TUN coroutine. */
     private fun resolveUid(
@@ -220,10 +235,6 @@ internal class UidDetectionPoc(
         dstPort: Int,
         callId: Long,
     ): UidResolution {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-            UidPocDiagnostics.log(service, "OWNER_UID_QUERY_SKIPPED id=$callId reason=API_BELOW_29")
-            return unresolvedUid()
-        }
         if (protocol != IPPROTO_TCP && protocol != IPPROTO_UDP) {
             UidPocDiagnostics.log(service, "OWNER_UID_QUERY_SKIPPED id=$callId reason=UNSUPPORTED_PROTOCOL protocol=$protocol")
             return unresolvedUid()
@@ -242,19 +253,66 @@ internal class UidDetectionPoc(
         val remote = InetSocketAddress(InetAddress.getByAddress(dstAddress), dstPort)
 
         UidPocDiagnostics.log(service, "OWNER_UID_QUERY_BEGIN id=$callId tuple=$tuple thread=${Thread.currentThread().name}")
-        val uid = connectivity.getConnectionOwnerUid(protocol, local, remote)
+        val androidUid = if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            UidPocDiagnostics.log(service, "OWNER_UID_QUERY_SKIPPED id=$callId reason=API_BELOW_29; trying procfs")
+            Process.INVALID_UID
+        } else {
+            runCatching { connectivity.getConnectionOwnerUid(protocol, local, remote) }
+                .onFailure {
+                    UidPocDiagnostics.error(service, "OWNER_UID_API_FAILED id=$callId; trying procfs", it)
+                }
+                .getOrDefault(Process.INVALID_UID)
+        }
+        val procUid = if (androidUid == Process.INVALID_UID) {
+            runCatching {
+                ProcSocketUidResolver.resolve(
+                    protocol = protocol,
+                    srcAddress = srcAddress,
+                    srcPort = srcPort,
+                    dstAddress = dstAddress,
+                    dstPort = dstPort,
+                )
+            }.onFailure {
+                UidPocDiagnostics.error(service, "PROC_UID_FALLBACK_FAILED id=$callId tuple=$tuple", it)
+            }.getOrNull().also { fallbackUid ->
+                UidPocDiagnostics.log(
+                    service,
+                    "PROC_UID_FALLBACK id=$callId tuple=$tuple uid=${fallbackUid ?: Process.INVALID_UID} " +
+                        "result=${if (fallbackUid == null) "UNRESOLVED" else "MATCH"}",
+                )
+            }
+        } else {
+            null
+        }
+        val uid = androidUid.takeIf { it != Process.INVALID_UID }
+            ?: procUid
+            ?: Process.INVALID_UID
+        val uidSource = when {
+            androidUid != Process.INVALID_UID -> "ANDROID_API"
+            procUid != null -> "PROC_NET"
+            else -> "UNRESOLVED"
+        }
         val packages = if (uid == Process.INVALID_UID) {
             emptyList()
         } else {
-            packageManager.getPackagesForUid(uid)?.sorted().orEmpty()
+            runCatching { packageManager.getPackagesForUid(uid)?.sorted().orEmpty() }
+                .getOrDefault(emptyList())
         }
         val policy = blockPolicy
         val policyPackagesForUid = policy.packagesByUid[uid].orEmpty()
         val knownPackages = (packages + policyPackagesForUid).distinct().sorted()
         val blockedPackageMatches = knownPackages.filter { it in policy.packages }
-        val shouldBlock = uid != Process.INVALID_UID && uid in policy.uids
+        val shouldBlock = if (uid == Process.INVALID_UID) {
+            VpnApplicationPolicy.shouldDropUnresolvedUid(
+                policy.uids,
+                attributionExhausted = true,
+            )
+        } else {
+            VpnApplicationPolicy.shouldDropUid(uid, policy.uids)
+        }
         val targetMatch = blockedPackageMatches.joinToString(",").ifBlank { "-" }
         val verdict = when {
+            uid == Process.INVALID_UID && shouldBlock -> "UID_UNRESOLVED_FAIL_CLOSED"
             uid == Process.INVALID_UID -> "INVALID_UID"
             shouldBlock -> "BLOCKED_UID"
             else -> "UID_FOUND_OTHER_OR_UNLISTED"
@@ -262,8 +320,13 @@ internal class UidDetectionPoc(
         val action = if (shouldBlock) "BLOCK" else "ALLOW"
         UidDetectionPocResultStore.add(
             protocol, src, srcPort, dst, dstPort, uid, knownPackages,
-            if (uid == Process.INVALID_UID) "INVALID" else "MATCH",
-            "resolverCall=$callId; targetMatch=$targetMatch; action=$action; thread=${Thread.currentThread().name}",
+            when {
+                uid == Process.INVALID_UID && shouldBlock -> "BLOCKED_UNRESOLVED"
+                uid == Process.INVALID_UID -> "INVALID"
+                shouldBlock -> "BLOCKED"
+                else -> "MATCH"
+            },
+            "resolverCall=$callId; uidSource=$uidSource; targetMatch=$targetMatch; action=$action; thread=${Thread.currentThread().name}",
         )
         Log.i(
             TAG,

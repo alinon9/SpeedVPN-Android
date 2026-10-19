@@ -601,7 +601,7 @@ preflight_fail() {
     echo
     echo "- GitHub run ID: $CSV_RUN_ID"
     echo "- Result: ENV_INSUFFICIENT"
-    echo "- Required median baseline: Download >= 96 Mbps; Upload >= 90 Mbps"
+    echo "- Required median baseline: Download >= 105.6 Mbps; Upload >= 105.6 Mbps (1.2x the 88 Mbps top preset)"
     echo "- Primary sample-spread limit: 25% of the median in each direction"
     echo "- Bounded outlier rule: raw spread up to 30% only when the closest pair is within 25% and every reading is within 30% of median"
     echo "- ENV_NOTE: $ENV_NOTE"
@@ -656,8 +656,8 @@ else
 
   for preflight_round in 1 2 3; do
     echo "===== BASELINE PREFLIGHT SAMPLE $preflight_round/3 =====" | tee -a "$RUN_DIR/sweep-console.log"
-    if [ "$(( $(date +%s) - PREFLIGHT_START_EPOCH ))" -ge 155 ]; then
-      preflight_fail "Three-sample preflight exceeded its 155-second time budget."
+    if [ "$(( $(date +%s) - PREFLIGHT_START_EPOCH ))" -ge 300 ]; then
+      preflight_fail "Three-sample preflight exceeded its 300-second time budget."
       exit 75
     fi
     if ! cleanup_vpn; then
@@ -699,7 +699,7 @@ else
       if [ "$((preflight_poll % 2))" -eq 0 ]; then
         adb -s "$DEVICE" shell input swipe 160 500 160 220 650 || true
       fi
-      if [ "$(( $(date +%s) - PREFLIGHT_START_EPOCH ))" -ge 155 ]; then
+      if [ "$(( $(date +%s) - PREFLIGHT_START_EPOCH ))" -ge 300 ]; then
         break
       fi
       sleep 1
@@ -723,8 +723,8 @@ PY
       preflight_fail "VPN TUN was not stopped after baseline sample $preflight_round."
       exit 75
     fi
-    if [ "$(( $(date +%s) - PREFLIGHT_START_EPOCH ))" -ge 155 ]; then
-      preflight_fail "Three-sample preflight exceeded its 155-second time budget."
+    if [ "$(( $(date +%s) - PREFLIGHT_START_EPOCH ))" -ge 300 ]; then
+      preflight_fail "Three-sample preflight exceeded its 300-second time budget."
       exit 75
     fi
   done
@@ -734,7 +734,7 @@ PY
       "$PREFLIGHT_SAMPLES_DIR/round-1.json" \
       "$PREFLIGHT_SAMPLES_DIR/round-2.json" \
       "$PREFLIGHT_SAMPLES_DIR/round-3.json" \
-      --download-min 96 --upload-min 90 --max-variability 25 \
+      --download-min 105.6 --upload-min 105.6 --max-variability 25 \
       --output "$preflight_summary" 2>&1 | tee -a "$RUN_DIR/sweep-console.log"; then
     BASELINE_PREFLIGHT_STATUS="PASS"
     BASELINE_PREFLIGHT_REASON="Three samples per direction passed median headroom and the 25% stability gate (with bounded single-outlier recovery up to 30%)."
@@ -742,7 +742,7 @@ PY
     echo "ENV_NOTE=$ENV_NOTE" | tee -a "$RUN_DIR/sweep-console.log"
     BASELINE_PREFLIGHT_DOWNLOAD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["directions"]["download"]["median_mbps"])' "$preflight_summary") Mbps (median)"
     BASELINE_PREFLIGHT_UPLOAD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["directions"]["upload"]["median_mbps"])' "$preflight_summary") Mbps (median)"
-    echo "BASELINE_PREFLIGHT_PASS=3/3 samples per direction; download>=96 Mbps; upload>=90 Mbps; primary spread<=25% with bounded single-outlier recovery up to 30%." | tee -a "$RUN_DIR/sweep-console.log"
+    echo "BASELINE_PREFLIGHT_PASS=3/3 samples per direction; download>=105.6 Mbps; upload>=105.6 Mbps; primary spread<=25% with bounded single-outlier recovery up to 30%." | tee -a "$RUN_DIR/sweep-console.log"
   else
     BASELINE_PREFLIGHT_STATUS="ENV_INSUFFICIENT"
     BASELINE_PREFLIGHT_REASON="Baseline headroom or variability failed. No speed sweep was started."
@@ -754,8 +754,9 @@ PY
       echo "# SpeedVPN baseline preflight"
       echo
       echo "- Result: ENV_INSUFFICIENT"
-      echo "- Download median minimum: 96 Mbps"
-      echo "- Upload median minimum: 90 Mbps"
+      echo "- Acceptance: BLOCKED (no 38/38 speed metrics were produced; this is not a pass)."
+      echo "- Download median minimum: 105.6 Mbps"
+      echo "- Upload median minimum: 105.6 Mbps"
       echo "- Primary sample-spread limit: 25% of the median in each direction"
       echo "- Bounded one-outlier recovery: raw spread <=30%, closest pair <=25%, maximum deviation <=30%"
       echo "- ENV_NOTE: $ENV_NOTE"
@@ -1052,7 +1053,7 @@ cat > "$RUN_DIR/speed-limit-sweep-summary.md" <<MD
 - Summary generated at (UTC): $SUMMARY_RECORDED_AT_UTC
 - Presets attempted: $TESTED_PRESET_COUNT/$TOTAL
 - Download/Upload metric results recorded: $METRIC_RESULT_COUNT/$EXPECTED_METRIC_RESULTS
-- Three-sample baseline preflight: $BASELINE_PREFLIGHT_STATUS (Download median=$BASELINE_PREFLIGHT_DOWNLOAD; Upload median=$BASELINE_PREFLIGHT_UPLOAD; minimums=96/90 Mbps; primary spread limit=25%, with bounded single-outlier recovery up to 30%)
+- Three-sample baseline preflight: $BASELINE_PREFLIGHT_STATUS (Download median=$BASELINE_PREFLIGHT_DOWNLOAD; Upload median=$BASELINE_PREFLIGHT_UPLOAD; minimums=105.6/105.6 Mbps; primary spread limit=25%, with bounded single-outlier recovery up to 30%)
 - Preflight detail: $BASELINE_PREFLIGHT_REASON
 - ENV_NOTE: $ENV_NOTE
 - Metric PASS: $PASS_COUNT

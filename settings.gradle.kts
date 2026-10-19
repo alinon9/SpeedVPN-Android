@@ -13,4 +13,4 @@ dependencyResolutionManagement {
     }
 }
 rootProject.name = "SpeedVPN"
-include(":app")
+include(":app", ":e2e-fixture")
