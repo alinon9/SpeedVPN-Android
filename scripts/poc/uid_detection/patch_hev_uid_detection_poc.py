@@ -1647,13 +1647,13 @@ hev_socks5_session_resolve_uid (int protocol,
         "    self->data.self = self;\n\n    return 0;",
         "    self->data.self = self;\n"
         "        /*\n"
-        "         * On the pinned PRETEND_UDP path, addr/port is the destination tuple, while\n"
-        "         * pcb->local_ip/local_port carries the original TUN source endpoint. Use\n"
-        "         * both endpoints so the session lookup matches the exact packet-hook key;\n"
-        "         * never synthesize a same-endpoint tuple for UDP attribution.\n"
+        "         * On PRETEND_UDP, callback src_ip/src_port are the packet destination.\n"
+        "         * udp_input creates this PCB with remote_ip/remote_port from the original\n"
+        "         * TUN packet source, so use that as source and callback args as destination.\n"
+        "         * This preserves the exact 5-tuple used by the packet-policy cache.\n"
         "         */\n"
-        "    self->data.uid = hev_socks5_session_resolve_uid (17, &pcb->local_ip,\n"
-        "        pcb->local_port, src_ip, src_port);\n"
+        "    self->data.uid = hev_socks5_session_resolve_uid (17, &pcb->remote_ip,\n"
+        "        pcb->remote_port, src_ip, src_port);\n"
         "\n    return 0;",
         "capture UDP flow UID",
     )
@@ -1741,7 +1741,7 @@ hev_socks5_session_resolve_uid (int protocol,
         (session_c, "hev_socks5_session_resolve_uid"),
         (session_c, "Normalize IPv4-mapped IPv6 tuples to their four-byte IPv4 form."),
         (session_tcp_c, "self->data.uid = hev_socks5_session_resolve_uid (6"),
-        (session_udp_c, "self->data.uid = hev_socks5_session_resolve_uid (17, &pcb->local_ip,"),
+        (session_udp_c, "self->data.uid = hev_socks5_session_resolve_uid (17, &pcb->remote_ip,"),
         (session_udp_c, "hev_socks5_session_udp_enqueue_initial (HevSocks5SessionUDP *self, struct pbuf *p)"),
         (session_udp_c, "siptr->get_uid = hev_socks5_session_udp_get_uid;"),
         (tunnel_c, "hev_socks5_session_udp_new (pcb, addr, port, &mutex)"),
