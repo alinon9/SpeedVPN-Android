@@ -1209,6 +1209,8 @@ hev_jni_uid_poc_resolve_uid (int protocol,
     uid_poc_flow_key key;
     struct timespec deadline;
     int found = 0, slot, result_uid = -1;
+    int exact_seen = 0, fallback_used = 0, ambiguous = 0;
+    char src_text[64], dst_text[64];
 
     if (!src || !dst || src_len != dst_len ||
         (src_len != 4 && src_len != 16) ||
@@ -1232,6 +1234,7 @@ hev_jni_uid_poc_resolve_uid (int protocol,
         slot = uid_poc_find_slot_locked (&key, uid_poc_now_ms (), &found);
         if (slot < 0 || !found)
             break;
+        exact_seen = 1;
         entry = &uid_poc_cache[slot];
         if (entry->uid != UID_POC_UID_PENDING) {
             if (entry->uid >= 0 && entry->action != UID_POC_ACTION_BLOCK)
@@ -1243,9 +1246,84 @@ hev_jni_uid_poc_resolve_uid (int protocol,
         if (wait_result != 0)
             break;
     }
+
+    /*
+     * The transparent UDP listener may expose a destination tuple that differs
+     * from the original TUN packet on some lwIP paths. If the exact 5-tuple was
+     * not cached, attribute UDP only when every live cache entry for the same
+     * source IP:port resolves to the same unblocked UID. Ambiguous, blocked,
+     * unresolved, and timed-out entries remain fail-closed.
+     */
+    if (protocol == 17 && !exact_seen) {
+        for (;;) {
+            unsigned int i;
+            unsigned long long now = uid_poc_now_ms ();
+            int candidate_uid = -1, candidate_seen = 0, pending_seen = 0;
+            int wait_result;
+
+            ambiguous = 0;
+            for (i = 0; i < UID_POC_FLOW_TABLE_SLOTS; i++) {
+                uid_poc_cache_entry *entry = &uid_poc_cache[i];
+                int source_matches;
+
+                if (entry->state != UID_POC_CACHE_USED ||
+                    uid_poc_entry_expired (entry, now) ||
+                    entry->key.protocol != protocol ||
+                    entry->key.addr_len != src_len)
+                    continue;
+
+                source_matches =
+                    (entry->key.port_a == (unsigned short) src_port &&
+                     memcmp (entry->key.a, src, (size_t) src_len) == 0) ||
+                    (entry->key.port_b == (unsigned short) src_port &&
+                     memcmp (entry->key.b, src, (size_t) src_len) == 0);
+                if (!source_matches)
+                    continue;
+
+                if (entry->uid == UID_POC_UID_PENDING) {
+                    pending_seen = 1;
+                    continue;
+                }
+                if (entry->uid < 0 || entry->action == UID_POC_ACTION_BLOCK) {
+                    ambiguous = 1;
+                    break;
+                }
+                if (!candidate_seen) {
+                    candidate_uid = entry->uid;
+                    candidate_seen = 1;
+                } else if (candidate_uid != entry->uid) {
+                    ambiguous = 1;
+                    break;
+                }
+            }
+
+            if (ambiguous)
+                break;
+            if (pending_seen) {
+                wait_result = pthread_cond_timedwait (&uid_poc_condition,
+                                                      &uid_poc_mutex, &deadline);
+                if (wait_result == 0)
+                    continue;
+                break;
+            }
+            if (candidate_seen) {
+                result_uid = candidate_uid;
+                fallback_used = 1;
+            }
+            break;
+        }
+    }
+
     pthread_mutex_unlock (&uid_poc_mutex);
+    uid_poc_format_address (src, src_len, src_text, sizeof (src_text));
+    uid_poc_format_address (dst, dst_len, dst_text, sizeof (dst_text));
+    __android_log_print (ANDROID_LOG_INFO, "SpeedVPN-POC-JNI",
+        "UID_SESSION_RESOLVE protocol=%d tuple=%s:%d->%s:%d exact=%d fallback=%d ambiguous=%d uid=%d",
+        protocol, src_text, src_port, dst_text, dst_port,
+        exact_seen, fallback_used, ambiguous, result_uid);
     return result_uid;
 }
+
 /* SPEEDVPN_UID_POC_END */
 
 static jboolean
