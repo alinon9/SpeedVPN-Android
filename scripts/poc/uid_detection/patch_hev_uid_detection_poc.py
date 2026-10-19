@@ -1614,7 +1614,8 @@ hev_socks5_session_resolve_uid (int protocol,
         "HevSocks5SessionUDP *hev_socks5_session_udp_new (struct udp_pcb *pcb,\n"
         "                                                 const ip_addr_t *src_ip,\n"
         "                                                 u16_t src_port, HevTaskMutex *mutex);\n"
-        "int hev_socks5_session_udp_enqueue_initial (HevSocks5SessionUDP *self, struct pbuf *p);\n",
+        "int hev_socks5_session_udp_enqueue_initial (HevSocks5SessionUDP *self, struct pbuf *p,\n"
+        "                                              const ip_addr_t *dst_ip, u16_t dst_port);\n",
         "UDP first packet enqueue declaration",
     )
     session_udp_h.write_text(session_udp_h_text)
@@ -1678,7 +1679,8 @@ hev_socks5_session_resolve_uid (int protocol,
         "HevSocks5SessionUDP *\nhev_socks5_session_udp_new (struct udp_pcb *pcb, const ip_addr_t *src_ip,\n"
         "                            u16_t src_port, HevTaskMutex *mutex)",
         "int\n"
-        "hev_socks5_session_udp_enqueue_initial (HevSocks5SessionUDP *self, struct pbuf *p)\n"
+        "hev_socks5_session_udp_enqueue_initial (HevSocks5SessionUDP *self, struct pbuf *p,\n"
+        "                                           const ip_addr_t *dst_ip, u16_t dst_port)\n"
         "{\n"
         "    HevSocks5UDPFrame *frame;\n"
         "    int res;\n\n"
@@ -1698,7 +1700,12 @@ hev_socks5_session_resolve_uid (int protocol,
         "        return -1;\n"
         "    }\n"
         "    memset (&frame->node, 0, sizeof (frame->node));\n"
-        "    res = hev_socks5_addr_from_lwip (&frame->addr, &self->pcb->local_ip, self->pcb->local_port);\n"
+        "    if (!dst_ip) {\n"
+        "        pbuf_free (p);\n"
+        "        hev_free (frame);\n"
+        "        return -1;\n"
+        "    }\n"
+        "    res = hev_socks5_addr_from_lwip (&frame->addr, dst_ip, dst_port);\n"
         "    if (res < 0) {\n"
         "        pbuf_free (p);\n"
         "        hev_free (frame);\n"
@@ -1731,7 +1738,7 @@ hev_socks5_session_resolve_uid (int protocol,
         "    hev_socks5_session_set_task (HEV_SOCKS5_SESSION (udp), task);\n"
         "    node = hev_socks5_session_get_node (HEV_SOCKS5_SESSION (udp));",
         "    hev_socks5_session_set_task (HEV_SOCKS5_SESSION (udp), task);\n"
-        "    if (hev_socks5_session_udp_enqueue_initial (udp, p) < 0)\n"
+        "    if (hev_socks5_session_udp_enqueue_initial (udp, p, addr, port) < 0)\n"
         "        LOG_W (\"socks5 tunnel udp initial packet enqueue failed\");\n"
         "    node = hev_socks5_session_get_node (HEV_SOCKS5_SESSION (udp));",
         "enqueue first UDP packet before starting session task",
@@ -1744,11 +1751,11 @@ hev_socks5_session_resolve_uid (int protocol,
         (session_c, "Normalize IPv4-mapped IPv6 tuples to their four-byte IPv4 form."),
         (session_tcp_c, "self->data.uid = hev_socks5_session_resolve_uid (6"),
         (session_udp_c, "self->data.uid = hev_socks5_session_resolve_uid (17, &pcb->remote_ip,"),
-        (session_udp_c, "hev_socks5_session_udp_enqueue_initial (HevSocks5SessionUDP *self, struct pbuf *p)"),
+        (session_udp_c, "hev_socks5_session_udp_enqueue_initial (HevSocks5SessionUDP *self, struct pbuf *p,"),
         (session_udp_c, "pbuf_ref (p);"),
         (session_udp_c, "siptr->get_uid = hev_socks5_session_udp_get_uid;"),
         (tunnel_c, "hev_socks5_session_udp_new (pcb, addr, port, &mutex)"),
-        (tunnel_c, "hev_socks5_session_udp_enqueue_initial (udp, p)"),
+        (tunnel_c, "hev_socks5_session_udp_enqueue_initial (udp, p, addr, port)"),
     ):
         if marker not in source_path.read_text():
             raise SystemExit(f"Refusing incomplete per-session UID bridge: missing {marker}")
