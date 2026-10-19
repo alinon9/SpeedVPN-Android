@@ -1646,8 +1646,14 @@ hev_socks5_session_resolve_uid (int protocol,
         session_udp_c_text,
         "    self->data.self = self;\n\n    return 0;",
         "    self->data.self = self;\n"
+        /*
+         * The UDP PCB's local_ip/local_port identify the tunnel's relay socket,
+         * not the original app flow's destination. Pass a deliberately non-matching
+         * destination tuple so the resolver uses its strict source-endpoint fallback:
+         * it accepts only one unambiguous, live, unblocked UID for this source IP:port.
+         */
         "    self->data.uid = hev_socks5_session_resolve_uid (17, src_ip, src_port,\n"
-        "        &pcb->local_ip, pcb->local_port);\n"
+        "        src_ip, 0);\n"
         "\n    return 0;",
         "capture UDP flow UID",
     )
