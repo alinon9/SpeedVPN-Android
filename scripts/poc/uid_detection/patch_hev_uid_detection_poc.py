@@ -1344,6 +1344,7 @@ native_is_running (JNIEnv *env, jobject thiz)
         "UID_WORKER_READY stack=1048576",
         "uid_poc_store_result_locked",
         "hev_jni_uid_poc_resolve_uid",
+        "UID_SESSION_RESOLVE protocol=%d tuple=%s:%d",
         "native_set_uid_poc_policy_enabled",
         "UID_POC_DECISION_TIMEOUT_MS",
         "pthread_cond_timedwait (&uid_poc_condition",
