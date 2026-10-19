@@ -1352,7 +1352,14 @@ native_is_running (JNIEnv *env, jobject thiz)
         "if (uid_poc_report_packet (buf))",
     )
     for marker in required_native_markers:
-        source = Path(__file__).read_text() if marker == "if (uid_poc_report_packet (buf))" else jni_text
+        if marker == "if (uid_poc_report_packet (buf))":
+            source = Path(__file__).read_text()
+        elif marker == "Normalize IPv4-mapped IPv6 tuples to their four-byte IPv4 form.":
+            # Address normalization lives in the generated SOCKS session UID bridge,
+            # not in the JNI translation unit.
+            source = session_c_text
+        else:
+            source = jni_text
         if marker not in source:
             raise SystemExit(f"Refusing incomplete UID firewall patch: missing native marker: {marker}")
 
