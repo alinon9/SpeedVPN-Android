@@ -1647,13 +1647,13 @@ hev_socks5_session_resolve_uid (int protocol,
         "    self->data.self = self;\n\n    return 0;",
         "    self->data.self = self;\n"
         "        /*\n"
-        "         * The UDP PCB's local_ip/local_port identify the tunnel's relay socket,\n"
-        "         * not the original app flow's destination. Pass a deliberately non-matching\n"
-        "         * destination tuple so the resolver uses its strict source-endpoint fallback:\n"
-        "         * it accepts only one unambiguous, live, unblocked UID for this source IP:port.\n"
+        "         * On the pinned PRETEND_UDP path, addr/port is the destination tuple, while\n"
+        "         * pcb->local_ip/local_port carries the original TUN source endpoint. Use\n"
+        "         * both endpoints so the session lookup matches the exact packet-hook key;\n"
+        "         * never synthesize a same-endpoint tuple for UDP attribution.\n"
         "         */\n"
-        "    self->data.uid = hev_socks5_session_resolve_uid (17, src_ip, src_port,\n"
-        "        src_ip, 0);\n"
+        "    self->data.uid = hev_socks5_session_resolve_uid (17, &pcb->local_ip,\n"
+        "        pcb->local_port, src_ip, src_port);\n"
         "\n    return 0;",
         "capture UDP flow UID",
     )
@@ -1741,7 +1741,7 @@ hev_socks5_session_resolve_uid (int protocol,
         (session_c, "hev_socks5_session_resolve_uid"),
         (session_c, "Normalize IPv4-mapped IPv6 tuples to their four-byte IPv4 form."),
         (session_tcp_c, "self->data.uid = hev_socks5_session_resolve_uid (6"),
-        (session_udp_c, "self->data.uid = hev_socks5_session_resolve_uid (17, src_ip, src_port,"),
+        (session_udp_c, "self->data.uid = hev_socks5_session_resolve_uid (17, &pcb->local_ip,"),
         (session_udp_c, "hev_socks5_session_udp_enqueue_initial (HevSocks5SessionUDP *self, struct pbuf *p)"),
         (session_udp_c, "siptr->get_uid = hev_socks5_session_udp_get_uid;"),
         (tunnel_c, "hev_socks5_session_udp_new (pcb, addr, port, &mutex)"),
