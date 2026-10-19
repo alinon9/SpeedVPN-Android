@@ -1589,10 +1589,11 @@ class Socks5Server internal constructor(
                     packages = emptySet(),
                     tuple = sessionUid?.let { "SOCKS5_UID_AUTH:$it" } ?: "UID_UNRESOLVED",
                 )
-                synchronized(selector) {
-                    selector.wakeup()
-                    channel.register(selector, SelectionKey.OP_READ, binding)
-                }
+                // Selector registration is thread-safe. Do not synchronize on the
+                // Selector object: select() may hold that monitor while blocking, which
+                // prevents this thread from calling wakeup() and delays UDP setup.
+                selector.wakeup()
+                channel.register(selector, SelectionKey.OP_READ, binding)
                 trackUpstream(socket)
                 bindings[flow.logicalKey] = binding
                 return binding
