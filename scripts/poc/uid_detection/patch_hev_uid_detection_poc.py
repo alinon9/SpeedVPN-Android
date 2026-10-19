@@ -124,7 +124,16 @@ def main() -> None:
     root = Path(sys.argv[1]).resolve()
     tunnel_c = root / "src/hev-socks5-tunnel.c"
     jni_c = root / "src/hev-jni.c"
-    for required in (tunnel_c, jni_c):
+    session_c = root / "src/hev-socks5-session.c"
+    session_h = root / "src/hev-socks5-session.h"
+    session_tcp_c = root / "src/hev-socks5-session-tcp.c"
+    session_tcp_h = root / "src/hev-socks5-session-tcp.h"
+    session_udp_c = root / "src/hev-socks5-session-udp.c"
+    session_udp_h = root / "src/hev-socks5-session-udp.h"
+    for required in (
+        tunnel_c, jni_c, session_c, session_h,
+        session_tcp_c, session_tcp_h, session_udp_c, session_udp_h,
+    ):
         if not required.is_file():
             raise SystemExit(f"Missing pinned hev source file: {required}")
 
@@ -173,18 +182,22 @@ uid_poc_report_packet (const struct pbuf *buf)
             return 0;
         ip_header_len = (ip[0] & 0x0f) * 4;
         if (ip_header_len < 20 || ip_header_len > sizeof (ip) ||
-            total < ip_header_len + 8 ||
+            total < ip_header_len ||
             pbuf_copy_partial (buf, ip, ip_header_len, 0) != ip_header_len)
             return 0;
         fragment_field = ((unsigned int) ip[6] << 8) | ip[7];
-        /* Non-initial IPv4 fragments do not contain the TCP/UDP ports. */
-        if (fragment_field & 0x1fff)
-            return 0;
         protocol = ip[9];
         src_len = 4;
         offset = ip_header_len;
         memcpy (src, ip + 12, 4);
         memcpy (dst, ip + 16, 4);
+        /* Portless fragments fail closed while the app UID policy is active. */
+        if (fragment_field & 0x1fff) {
+            if (protocol == 6 || protocol == 17)
+                return hev_jni_uid_poc_packet (protocol, src, src_len, -1,
+                                               dst, src_len, -1);
+            return 0;
+        }
     } else if (version == 6) {
         unsigned int extensions;
         if (total < 40 || pbuf_copy_partial (buf, ip, 40, 0) != 40)
@@ -212,9 +225,12 @@ uid_poc_report_packet (const struct pbuf *buf)
                     return 0;
                 next_header = ip[0];
                 fragment_offset = (((unsigned int) ip[2] << 8) | ip[3]) & 0xfff8u;
-                /* Non-initial IPv6 fragments do not contain the TCP/UDP ports. */
-                if (fragment_offset != 0)
-                    return 0;
+                /* Portless IPv6 fragments fail closed while UID enforcement is active. */
+                if (fragment_offset != 0) {
+                    int fragment_protocol = (next_header == 6 || next_header == 17) ? (int) next_header : 17;
+                    return hev_jni_uid_poc_packet (fragment_protocol, src, src_len, -1,
+                                                   dst, src_len, -1);
+                }
                 extension_length = 8;
             } else if (protocol == 51) {
                 if (total < offset + 2 ||
@@ -249,7 +265,7 @@ uid_poc_report_packet (const struct pbuf *buf)
     return hev_jni_uid_poc_packet (protocol, src, src_len, src_port,
                                    dst, src_len, dst_port);
 }
- /* SPEEDVPN_UID_POC_END */
+/* SPEEDVPN_UID_POC_END */
 #else
 #define uid_poc_report_packet(buf) 0
 #endif
@@ -454,6 +470,7 @@ __attribute__((constructor)) static void native_poc_crash_init (void)
             + "#define UID_POC_FLOW_IDLE_MS 30000ULL\n"
             + "#define UID_POC_NEGATIVE_CACHE_MS 750ULL\n"
             + "#define UID_POC_PENDING_TIMEOUT_MS 10000ULL\n"
+            + "#define UID_POC_DECISION_TIMEOUT_MS 50ULL\n"
             + "typedef struct { int protocol; int addr_len; unsigned char a[16]; unsigned char b[16]; unsigned short port_a; unsigned short port_b; } uid_poc_flow_key;\n"
             + "typedef struct { int state; uid_poc_flow_key key; int uid; int action; int drop_logged; unsigned long long updated_ms; unsigned long long request_id; } uid_poc_cache_entry;\n"
             + "typedef struct { uid_poc_flow_key key; int protocol; int src_len; unsigned char src[16]; int src_port; int dst_len; unsigned char dst[16]; int dst_port; unsigned long long request_id; } uid_poc_request;\n"
@@ -467,6 +484,7 @@ __attribute__((constructor)) static void native_poc_crash_init (void)
             + "static unsigned int uid_poc_active_flows = 0;\n"
             + "static pthread_t uid_poc_worker_thread;\n"
             + "static int uid_poc_worker_started = 0, uid_poc_worker_ready = 0, uid_poc_worker_stop_requested = 0;\n"
+            + "static int uid_poc_policy_active = 0;\n"
             + "static volatile unsigned long long uid_poc_next_request_id = 0;\n"
             + "static volatile unsigned long long uid_poc_packets = 0, uid_poc_cache_hits = 0, uid_poc_cache_misses = 0;\n"
             + "static volatile unsigned long long uid_poc_pending_hits = 0, uid_poc_unique_requests = 0, uid_poc_jni_lookups = 0;\n"
@@ -477,7 +495,8 @@ __attribute__((constructor)) static void native_poc_crash_init (void)
         jni_text = jni_text.replace(
             "static jlongArray native_get_stats (JNIEnv *env, jobject thiz);\n",
             "static jlongArray native_get_stats (JNIEnv *env, jobject thiz);\n"
-            "static jboolean native_set_uid_poc_callback (JNIEnv *env, jobject thiz, jobject callback);\n",
+            "static jboolean native_set_uid_poc_callback (JNIEnv *env, jobject thiz, jobject callback);\n"
+            "static jboolean native_set_uid_poc_policy_enabled (JNIEnv *env, jobject thiz, jboolean enabled);\n",
             1,
         )
         anchor = '    { "TProxyGetStats", "()[J", (void *)native_get_stats },\n'
@@ -485,7 +504,9 @@ __attribute__((constructor)) static void native_poc_crash_init (void)
             raise SystemExit("Refusing unsafe patch: JNI method table anchor is not unique")
         jni_text = jni_text.replace(
             anchor,
-            anchor + '    { "TProxySetUidPocCallback", "(Ljava/lang/Object;)Z", (void *)native_set_uid_poc_callback },\n',
+            anchor +
+                '    { "TProxySetUidPocCallback", "(Ljava/lang/Object;)Z", (void *)native_set_uid_poc_callback },\n' +
+                '    { "TProxySetUidPocPolicyEnabled", "(Z)Z", (void *)native_set_uid_poc_policy_enabled },\n',
             1,
         )
         fn_anchor = "static jboolean\nnative_is_running (JNIEnv *env, jobject thiz)\n"
@@ -611,11 +632,11 @@ uid_poc_entry_expired (const uid_poc_cache_entry *entry, unsigned long long now)
     unsigned long long age = now >= entry->updated_ms ? now - entry->updated_ms : 0;
     if (entry->uid == UID_POC_UID_PENDING)
         return age > UID_POC_PENDING_TIMEOUT_MS;
+    /* DROP entries, including unresolved owners, remain cached while the flow is active. */
+    if (entry->action == UID_POC_ACTION_BLOCK)
+        return age > UID_POC_FLOW_IDLE_MS;
     if (entry->uid < 0)
         return age > UID_POC_NEGATIVE_CACHE_MS;
-    /* A confirmed DROP flow is pinned until the callback/session is reset. */
-    if (entry->action == UID_POC_ACTION_BLOCK)
-        return 0;
     return age > UID_POC_FLOW_IDLE_MS;
 }
 
@@ -695,10 +716,12 @@ uid_poc_store_result_locked (const uid_poc_flow_key *key, int uid, int action,
     if (entry->uid != UID_POC_UID_PENDING || entry->request_id != request_id)
         return;
     entry->uid = uid;
-    entry->action = (uid >= 0 && action == UID_POC_ACTION_BLOCK)
+    /* A BLOCK decision may intentionally have UID=-1 when attribution fails. */
+    entry->action = action == UID_POC_ACTION_BLOCK
         ? UID_POC_ACTION_BLOCK : UID_POC_ACTION_ALLOW;
     entry->drop_logged = 0;
     entry->updated_ms = now;
+    pthread_cond_broadcast (&uid_poc_condition);
     if (entry->action == UID_POC_ACTION_BLOCK) {
         __android_log_print (ANDROID_LOG_WARN, "SpeedVPN-POC-JNI",
             "UID_POLICY_RESULT uid=%d action=BLOCK packetBlocking=IMPLEMENTED",
@@ -707,6 +730,48 @@ uid_poc_store_result_locked (const uid_poc_flow_key *key, int uid, int action,
         __android_log_print (ANDROID_LOG_INFO, "SpeedVPN-POC-JNI",
             "UID_POLICY_RESULT uid=%d action=ALLOW hookMode=HOOK_BLOCKING packetBlocking=IMPLEMENTED",
             uid);
+    }
+}
+
+/* Caller holds uid_poc_mutex. Wait only for a bounded first-packet UID decision. */
+static int
+uid_poc_wait_for_decision_locked (const uid_poc_flow_key *key,
+                                  unsigned long long request_id,
+                                  int *should_drop)
+{
+    struct timespec deadline;
+    if (!should_drop || clock_gettime (CLOCK_REALTIME, &deadline) != 0)
+        return 0;
+
+    deadline.tv_nsec += (long) UID_POC_DECISION_TIMEOUT_MS * 1000000L;
+    deadline.tv_sec += deadline.tv_nsec / 1000000000L;
+    deadline.tv_nsec %= 1000000000L;
+
+    for (;;) {
+        int found = 0;
+        int slot = uid_poc_find_slot_locked (key, uid_poc_now_ms (), &found);
+        uid_poc_cache_entry *entry;
+        int wait_result;
+        if (slot < 0 || !found)
+            return 0;
+        entry = &uid_poc_cache[slot];
+        if (entry->request_id != request_id)
+            return 0;
+        if (entry->uid != UID_POC_UID_PENDING) {
+            *should_drop = entry->action == UID_POC_ACTION_BLOCK;
+            entry->updated_ms = uid_poc_now_ms ();
+            return 1;
+        }
+
+        wait_result = pthread_cond_timedwait (&uid_poc_condition, &uid_poc_mutex, &deadline);
+        if (wait_result != 0) {
+            /* Drop this packet but keep the pending lookup alive. A late result may safely
+             * allow an unblocked app; future packets remain fail-closed until that result. */
+            __android_log_print (ANDROID_LOG_WARN, "SpeedVPN-POC-JNI",
+                "UID_DECISION_TIMEOUT protocol=%d action=DROP pending_lookup_retained=1",
+                key->protocol);
+            return 0;
+        }
     }
 }
 
@@ -805,8 +870,6 @@ uid_poc_worker_main (void *unused)
                     uid = (jint) (packed_bits >> 32);
                     action = (packed_bits & 1ULL)
                         ? UID_POC_ACTION_BLOCK : UID_POC_ACTION_ALLOW;
-                    if (uid < 0)
-                        action = UID_POC_ACTION_ALLOW;
                     call_ok = 1;
                 }
             } else {
@@ -823,8 +886,10 @@ uid_poc_worker_main (void *unused)
 
         pthread_mutex_lock (&uid_poc_mutex);
         uid_poc_store_result_locked (&request.key, call_ok ? (int) uid : -1,
-                                     call_ok ? action : UID_POC_ACTION_ALLOW,
+                                     call_ok ? action :
+                                         (uid_poc_policy_active ? UID_POC_ACTION_BLOCK : UID_POC_ACTION_ALLOW),
                                      uid_poc_now_ms (), request.request_id);
+        pthread_cond_broadcast (&uid_poc_condition);
         pthread_mutex_unlock (&uid_poc_mutex);
     }
 
@@ -962,9 +1027,25 @@ native_set_uid_poc_callback (JNIEnv *env, jobject thiz, jobject callback)
     return JNI_TRUE;
 }
 
+static jboolean
+native_set_uid_poc_policy_enabled (JNIEnv *env, jobject thiz, jboolean enabled)
+{
+    (void) env;
+    (void) thiz;
+    pthread_mutex_lock (&uid_poc_mutex);
+    uid_poc_policy_active = enabled == JNI_TRUE;
+    /* Publish policy and flush cached ALLOW decisions in one critical section. */
+    uid_poc_reset_locked ();
+    pthread_cond_broadcast (&uid_poc_condition);
+    pthread_mutex_unlock (&uid_poc_mutex);
+    __android_log_print (ANDROID_LOG_INFO, "SpeedVPN-POC-JNI",
+        "UID_POLICY_ENFORCEMENT enabled=%d cache=FLUSHED", enabled == JNI_TRUE ? 1 : 0);
+    return JNI_TRUE;
+}
+
 /* Called for each candidate TCP/UDP packet by the HEV coroutine.
- * It does only a native cache lookup and bounded queue operation; JNI is worker-only.
- * Return 1 only when the known UID policy says to drop this packet. */
+ * With enforcement active, wait briefly for first-packet UID attribution; timeout drops.
+ * Return 1 when the decision denies the packet or cannot be resolved safely. */
 int
 hev_jni_uid_poc_packet (int protocol,
                         const unsigned char *src, int src_len, int src_port,
@@ -974,12 +1055,23 @@ hev_jni_uid_poc_packet (int protocol,
     uid_poc_request request;
     unsigned long long now, packet_count;
     int found = 0, slot, should_drop = 0;
+    unsigned long long request_id = 0;
     char src_text[64], dst_text[64], tuple_text[200];
 
     if (!src || !dst || src_len != dst_len ||
         (src_len != 4 && src_len != 16) ||
-        (protocol != 6 && protocol != 17) ||
-        src_port < 0 || src_port > 65535 || dst_port < 0 || dst_port > 65535)
+        (protocol != 6 && protocol != 17))
+        return 0;
+
+    /* Non-initial IP fragments have no socket ports. Deny them while UID policy is active. */
+    if (src_port < 0 || dst_port < 0) {
+        int deny_fragment;
+        pthread_mutex_lock (&uid_poc_mutex);
+        deny_fragment = uid_poc_policy_active;
+        pthread_mutex_unlock (&uid_poc_mutex);
+        return deny_fragment;
+    }
+    if (src_port > 65535 || dst_port > 65535)
         return 0;
 
     uid_poc_make_key (&key, protocol, src, src_len, src_port, dst, dst_len, dst_port);
@@ -996,8 +1088,11 @@ hev_jni_uid_poc_packet (int protocol,
     pthread_mutex_lock (&uid_poc_mutex);
     if (!uid_poc_worker_started || !uid_poc_worker_ready ||
         uid_poc_worker_stop_requested || !uid_poc_callback || !uid_poc_method) {
+        should_drop = uid_poc_policy_active;
+        if (should_drop)
+            __sync_add_and_fetch (&uid_poc_dropped_packets, 1ULL);
         pthread_mutex_unlock (&uid_poc_mutex);
-        return 0;
+        return should_drop;
     }
     packet_count = __sync_add_and_fetch (&uid_poc_packets, 1ULL);
     now = uid_poc_now_ms ();
@@ -1006,9 +1101,17 @@ hev_jni_uid_poc_packet (int protocol,
         uid_poc_cache_entry *entry = &uid_poc_cache[slot];
         if (entry->uid == UID_POC_UID_PENDING) {
             __sync_add_and_fetch (&uid_poc_pending_hits, 1ULL);
+            if (uid_poc_policy_active) {
+                request_id = entry->request_id;
+                if (!uid_poc_wait_for_decision_locked (&key, request_id, &should_drop)) {
+                    should_drop = 1;
+                    __sync_add_and_fetch (&uid_poc_dropped_packets, 1ULL);
+                }
+            }
         } else {
             __sync_add_and_fetch (&uid_poc_cache_hits, 1ULL);
-            if (entry->uid >= 0 && entry->action == UID_POC_ACTION_BLOCK) {
+            if (entry->action == UID_POC_ACTION_BLOCK) {
+                entry->updated_ms = now;
                 should_drop = 1;
                 __sync_add_and_fetch (&uid_poc_dropped_packets, 1ULL);
                 if (!entry->drop_logged) {
@@ -1038,27 +1141,31 @@ hev_jni_uid_poc_packet (int protocol,
         slot = uid_poc_find_slot_locked (&key, now, &found);
     }
     if (uid_poc_queue_count >= UID_POC_QUEUE_CAPACITY) {
-        /* Briefly negative-cache overload so every packet does not retry the full queue. */
+        /* Overloaded attribution fails closed while block enforcement is active. */
         __sync_add_and_fetch (&uid_poc_queue_full, 1ULL);
+        should_drop = uid_poc_policy_active;
         if (slot >= 0) {
             if (!found)
                 uid_poc_active_flows++;
             uid_poc_cache[slot].state = UID_POC_CACHE_USED;
             uid_poc_cache[slot].key = key;
             uid_poc_cache[slot].uid = -1;
-            uid_poc_cache[slot].action = UID_POC_ACTION_ALLOW;
+            uid_poc_cache[slot].action = should_drop ? UID_POC_ACTION_BLOCK : UID_POC_ACTION_ALLOW;
             uid_poc_cache[slot].drop_logged = 0;
             uid_poc_cache[slot].updated_ms = now;
             uid_poc_cache[slot].request_id = 0;
         }
+        if (should_drop)
+            __sync_add_and_fetch (&uid_poc_dropped_packets, 1ULL);
         pthread_mutex_unlock (&uid_poc_mutex);
         uid_poc_log_metrics (packet_count);
-        return 0;
+        return should_drop;
     }
     if (slot >= 0) {
         if (!found)
             uid_poc_active_flows++;
         request.request_id = __sync_add_and_fetch (&uid_poc_next_request_id, 1ULL);
+        request_id = request.request_id;
         uid_poc_cache[slot].state = UID_POC_CACHE_USED;
         uid_poc_cache[slot].key = key;
         uid_poc_cache[slot].uid = UID_POC_UID_PENDING;
@@ -1073,10 +1180,71 @@ hev_jni_uid_poc_packet (int protocol,
         pthread_cond_signal (&uid_poc_condition);
     } else {
         __sync_add_and_fetch (&uid_poc_queue_full, 1ULL);
+        should_drop = uid_poc_policy_active;
+    }
+    if (uid_poc_policy_active && request_id != 0) {
+        if (!uid_poc_wait_for_decision_locked (&key, request_id, &should_drop)) {
+            /* A timed-out or invalidated first lookup must not leak a packet. */
+            should_drop = 1;
+            __sync_add_and_fetch (&uid_poc_dropped_packets, 1ULL);
+        } else if (should_drop) {
+            __sync_add_and_fetch (&uid_poc_dropped_packets, 1ULL);
+        }
+    } else if (should_drop) {
+        __sync_add_and_fetch (&uid_poc_dropped_packets, 1ULL);
     }
     pthread_mutex_unlock (&uid_poc_mutex);
     uid_poc_log_metrics (packet_count);
-    return 0;
+    return should_drop;
+}
+
+/* Resolve the cached UID for one exact original app tuple. HEV calls this when it
+ * creates a TCP session or a per-flow UDP association, then passes the UID to SOCKS5
+ * as username#UID. A bounded wait lets the first-packet Android callback finish. */
+int
+hev_jni_uid_poc_resolve_uid (int protocol,
+                             const unsigned char *src, int src_len, int src_port,
+                             const unsigned char *dst, int dst_len, int dst_port)
+{
+    uid_poc_flow_key key;
+    struct timespec deadline;
+    int found = 0, slot, result_uid = -1;
+
+    if (!src || !dst || src_len != dst_len ||
+        (src_len != 4 && src_len != 16) ||
+        (protocol != 6 && protocol != 17) ||
+        src_port < 0 || src_port > 65535 ||
+        dst_port < 0 || dst_port > 65535)
+        return -1;
+
+    uid_poc_make_key (&key, protocol, src, src_len, src_port, dst, dst_len, dst_port);
+    if (clock_gettime (CLOCK_REALTIME, &deadline) != 0)
+        return -1;
+    deadline.tv_nsec += 1000L * 1000000L;
+    deadline.tv_sec += deadline.tv_nsec / 1000000000L;
+    deadline.tv_nsec %= 1000000000L;
+
+    pthread_mutex_lock (&uid_poc_mutex);
+    for (;;) {
+        uid_poc_cache_entry *entry;
+        int wait_result;
+
+        slot = uid_poc_find_slot_locked (&key, uid_poc_now_ms (), &found);
+        if (slot < 0 || !found)
+            break;
+        entry = &uid_poc_cache[slot];
+        if (entry->uid != UID_POC_UID_PENDING) {
+            if (entry->uid >= 0 && entry->action != UID_POC_ACTION_BLOCK)
+                result_uid = entry->uid;
+            break;
+        }
+
+        wait_result = pthread_cond_timedwait (&uid_poc_condition, &uid_poc_mutex, &deadline);
+        if (wait_result != 0)
+            break;
+    }
+    pthread_mutex_unlock (&uid_poc_mutex);
+    return result_uid;
 }
 /* SPEEDVPN_UID_POC_END */
 
@@ -1097,6 +1265,10 @@ native_is_running (JNIEnv *env, jobject thiz)
         "DetachCurrentThread (java_vm)",
         "UID_WORKER_READY stack=1048576",
         "uid_poc_store_result_locked",
+        "hev_jni_uid_poc_resolve_uid",
+        "native_set_uid_poc_policy_enabled",
+        "UID_POC_DECISION_TIMEOUT_MS",
+        "pthread_cond_timedwait (&uid_poc_condition",
         "PACKET_DROPPED uid=%d tuple=%s",
         "if (uid_poc_report_packet (buf))",
     )
@@ -1156,7 +1328,324 @@ native_is_running (JNIEnv *env, jobject thiz)
     jni_text = inject_native_start_step_logs(jni_text)
     jni_c.write_text(jni_text)
 
-    print("OK - temporary UID detection POC hook and native STEP 1-6 logging applied")
+
+    # Carry native-resolved ownership through the HEV SOCKS5 session authentication. The UID
+    # cache is keyed by the original 5-tuple; destination-only association is not authoritative.
+    session_h_text = session_h.read_text()
+    session_h_text = replace_text_once(
+        session_h_text,
+        "#define HEV_SOCKS5_SESSION(p)",
+        "#include <lwip/ip_addr.h>\n\n#define HEV_SOCKS5_SESSION(p)",
+        "session IP address type include",
+    )
+    session_h_text = replace_text_once(
+        session_h_text,
+        "    HevSocks5Session *self;\n};",
+        "    HevSocks5Session *self;\n    int uid; /* Exact UID captured from the native 5-tuple cache, or -1. */\n};",
+        "session UID storage",
+    )
+    session_h_text = replace_text_once(
+        session_h_text,
+        "    HevListNode *(*get_node) (HevSocks5Session *self);\n};",
+        "    HevListNode *(*get_node) (HevSocks5Session *self);\n    int (*get_uid) (HevSocks5Session *self);\n};",
+        "session UID interface",
+    )
+    session_h_text = replace_text_once(
+        session_h_text,
+        "void hev_socks5_session_terminate (HevSocks5Session *self);\n",
+        "void hev_socks5_session_terminate (HevSocks5Session *self);\n"
+        "int hev_socks5_session_resolve_uid (int protocol, const ip_addr_t *src_ip, u16_t src_port,\n"
+        "                                    const ip_addr_t *dst_ip, u16_t dst_port);\n",
+        "session UID resolver declaration",
+    )
+    session_h.write_text(session_h_text)
+
+    session_c_text = session_c.read_text()
+    session_uid_helper = r'''#include <stdio.h>
+#ifdef __ANDROID__
+extern int hev_jni_uid_poc_resolve_uid (int protocol,
+                                        const unsigned char *src, int src_len, int src_port,
+                                        const unsigned char *dst, int dst_len, int dst_port);
+#endif
+
+static int
+hev_socks5_session_copy_ip (const ip_addr_t *addr, unsigned char *out)
+{
+    int i;
+    if (!addr || !out)
+        return 0;
+    if (addr->type == IPADDR_TYPE_V4) {
+        for (i = 0; i < 4; i++)
+            out[i] = ip4_addr_get_byte (ip_2_ip4 (addr), i);
+        return 4;
+    }
+    if (addr->type == IPADDR_TYPE_V6) {
+        /* ip6_addr_t stores its four network-order words contiguously. */
+        memcpy (out, ip_2_ip6 (addr)->addr, 16);
+        return 16;
+    }
+    return 0;
+}
+
+int
+hev_socks5_session_resolve_uid (int protocol,
+                                const ip_addr_t *src_ip, u16_t src_port,
+                                const ip_addr_t *dst_ip, u16_t dst_port)
+{
+#ifdef __ANDROID__
+    unsigned char src[16], dst[16];
+    int src_len, dst_len;
+    src_len = hev_socks5_session_copy_ip (src_ip, src);
+    dst_len = hev_socks5_session_copy_ip (dst_ip, dst);
+    if (src_len == 0 || src_len != dst_len)
+        return -1;
+    return hev_jni_uid_poc_resolve_uid (protocol, src, src_len, (int) src_port,
+                                        dst, dst_len, (int) dst_port);
+#else
+    (void) protocol;
+    (void) src_ip;
+    (void) src_port;
+    (void) dst_ip;
+    (void) dst_port;
+    return -1;
+#endif
+}
+
+'''
+    session_c_text = replace_text_once(
+        session_c_text,
+        '#include "hev-socks5-session.h"\n',
+        '#include "hev-socks5-session.h"\n\n' + session_uid_helper,
+        "session UID resolver implementation",
+    )
+    session_c_text = replace_text_once(
+        session_c_text,
+        "    HevConfigServer *srv;\n    int res;\n",
+        "    HevConfigServer *srv;\n    char flow_username[256];\n"
+        "    const char *auth_username;\n    int flow_uid;\n    int res;\n",
+        "per-session SOCKS auth locals",
+    )
+    session_c_text = replace_text_once(
+        session_c_text,
+        "    srv = hev_config_get_socks5_server ();\n\n    res = hev_socks5_client_connect",
+        "    srv = hev_config_get_socks5_server ();\n"
+        "    iface = HEV_OBJECT_GET_IFACE (self, HEV_SOCKS5_SESSION_TYPE);\n"
+        "    flow_uid = iface && iface->get_uid ? iface->get_uid (self) : -1;\n"
+        "    auth_username = srv->user;\n\n"
+        "    res = hev_socks5_client_connect",
+        "resolve session UID before SOCKS auth",
+    )
+    session_c_text = replace_text_once(
+        session_c_text,
+        "    if (srv->user && srv->pass) {\n"
+        "        hev_socks5_client_set_auth (HEV_SOCKS5_CLIENT (self), srv->user,\n"
+        "                                    srv->pass);\n"
+        "        LOG_D (\"%p socks5 client auth %s:%s\", self, srv->user, srv->pass);\n"
+        "    }",
+        "    if (srv->user && srv->pass) {\n"
+        "        if (flow_uid >= 0) {\n"
+        "            (void) snprintf (flow_username, sizeof (flow_username), \"%s#%d\",\n"
+        "                             srv->user, flow_uid);\n"
+        "            auth_username = flow_username;\n"
+        "        }\n"
+        "        hev_socks5_client_set_auth (HEV_SOCKS5_CLIENT (self), auth_username,\n"
+        "                                    srv->pass);\n"
+        "        LOG_D (\"%p socks5 client auth uid=%d\", self, flow_uid);\n"
+        "    }",
+        "per-session UID in SOCKS username",
+    )
+    session_c.write_text(session_c_text)
+
+    session_tcp_c_text = session_tcp_c.read_text()
+    session_tcp_c_text = replace_text_once(
+        session_tcp_c_text,
+        "int\nhev_socks5_session_tcp_construct (HevSocks5SessionTCP *self,",
+        "static int\nhev_socks5_session_tcp_get_uid (HevSocks5Session *base)\n"
+        "{\n    HevSocks5SessionTCP *self = HEV_SOCKS5_SESSION_TCP (base);\n"
+        "    return self->data.uid;\n}\n\n"
+        "int\nhev_socks5_session_tcp_construct (HevSocks5SessionTCP *self,",
+        "TCP UID accessor",
+    )
+    session_tcp_c_text = replace_text_once(
+        session_tcp_c_text,
+        "    self->data.self = self;\n\n    return 0;",
+        "    self->data.self = self;\n"
+        "    self->data.uid = hev_socks5_session_resolve_uid (6, &pcb->remote_ip,\n"
+        "        pcb->remote_port, &pcb->local_ip, pcb->local_port);\n\n    return 0;",
+        "capture TCP flow UID",
+    )
+    session_tcp_c_text = replace_text_once(
+        session_tcp_c_text,
+        "        siptr->get_node = hev_socks5_session_tcp_get_node;\n",
+        "        siptr->get_node = hev_socks5_session_tcp_get_node;\n"
+        "        siptr->get_uid = hev_socks5_session_tcp_get_uid;\n",
+        "register TCP UID accessor",
+    )
+    session_tcp_c.write_text(session_tcp_c_text)
+
+    session_udp_h_text = session_udp_h.read_text()
+    session_udp_h_text = replace_text_once(
+        session_udp_h_text,
+        "#include <hev-socks5-client-udp.h>",
+        "#include <lwip/pbuf.h>\n#include <hev-socks5-client-udp.h>",
+        "UDP initial datagram pbuf type",
+    )
+    session_udp_h_text = replace_text_once(
+        session_udp_h_text,
+        "int hev_socks5_session_udp_construct (HevSocks5SessionUDP *self,\n"
+        "                                      struct udp_pcb *pcb, HevTaskMutex *mutex);",
+        "int hev_socks5_session_udp_construct (HevSocks5SessionUDP *self,\n"
+        "                                      struct udp_pcb *pcb, const ip_addr_t *src_ip,\n"
+        "                                      u16_t src_port, HevTaskMutex *mutex);",
+        "UDP constructor UID parameters",
+    )
+    session_udp_h_text = replace_text_once(
+        session_udp_h_text,
+        "HevSocks5SessionUDP *hev_socks5_session_udp_new (struct udp_pcb *pcb,\n"
+        "                                                 HevTaskMutex *mutex);",
+        "HevSocks5SessionUDP *hev_socks5_session_udp_new (struct udp_pcb *pcb,\n"
+        "                                                 const ip_addr_t *src_ip,\n"
+        "                                                 u16_t src_port, HevTaskMutex *mutex);",
+        "UDP factory UID parameters",
+    )
+    session_udp_h_text = replace_text_once(
+        session_udp_h_text,
+        "HevSocks5SessionUDP *hev_socks5_session_udp_new (struct udp_pcb *pcb,\n"
+        "                                                 const ip_addr_t *src_ip,\n"
+        "                                                 u16_t src_port, HevTaskMutex *mutex);",
+        "HevSocks5SessionUDP *hev_socks5_session_udp_new (struct udp_pcb *pcb,\n"
+        "                                                 const ip_addr_t *src_ip,\n"
+        "                                                 u16_t src_port, HevTaskMutex *mutex);\n"
+        "int hev_socks5_session_udp_enqueue_initial (HevSocks5SessionUDP *self, struct pbuf *p);\n",
+        "UDP first packet enqueue declaration",
+    )
+    session_udp_h.write_text(session_udp_h_text)
+
+    session_udp_c_text = session_udp_c.read_text()
+    session_udp_c_text = replace_text_once(
+        session_udp_c_text,
+        "hev_socks5_session_udp_construct (HevSocks5SessionUDP *self,\n"
+        "                                  struct udp_pcb *pcb, HevTaskMutex *mutex)",
+        "hev_socks5_session_udp_construct (HevSocks5SessionUDP *self,\n"
+        "                                  struct udp_pcb *pcb, const ip_addr_t *src_ip,\n"
+        "                                  u16_t src_port, HevTaskMutex *mutex)",
+        "UDP constructor UID parameters",
+    )
+    session_udp_c_text = replace_text_once(
+        session_udp_c_text,
+        "hev_socks5_session_udp_construct (self, pcb, mutex)",
+        "hev_socks5_session_udp_construct (self, pcb, src_ip, src_port, mutex)",
+        "pass UDP source tuple",
+    )
+    session_udp_c_text = replace_text_once(
+        session_udp_c_text,
+        "hev_socks5_session_udp_new (struct udp_pcb *pcb, HevTaskMutex *mutex)",
+        "hev_socks5_session_udp_new (struct udp_pcb *pcb, const ip_addr_t *src_ip,\n"
+        "                            u16_t src_port, HevTaskMutex *mutex)",
+        "UDP factory UID parameters",
+    )
+    session_udp_c_text = replace_text_once(
+        session_udp_c_text,
+        "    self->data.self = self;\n\n    return 0;",
+        "    self->data.self = self;\n"
+        "    self->data.uid = hev_socks5_session_resolve_uid (17, src_ip, src_port,\n"
+        "        &pcb->local_ip, pcb->local_port);\n"
+        "\n    return 0;",
+        "capture UDP flow UID",
+    )
+    session_udp_c_text = replace_text_once(
+        session_udp_c_text,
+        "static HevListNode *\nhev_socks5_session_udp_get_node (HevSocks5Session *base)",
+        "static int\nhev_socks5_session_udp_get_uid (HevSocks5Session *base)\n"
+        "{\n    HevSocks5SessionUDP *self = HEV_SOCKS5_SESSION_UDP (base);\n"
+        "    return self->data.uid;\n}\n\n"
+        "static HevListNode *\nhev_socks5_session_udp_get_node (HevSocks5Session *base)",
+        "UDP UID accessor",
+    )
+    session_udp_c_text = replace_text_once(
+        session_udp_c_text,
+        "        siptr->get_node = hev_socks5_session_udp_get_node;\n",
+        "        siptr->get_node = hev_socks5_session_udp_get_node;\n"
+        "        siptr->get_uid = hev_socks5_session_udp_get_uid;\n",
+        "register UDP UID accessor",
+    )
+    session_udp_c_text = replace_text_once(
+        session_udp_c_text,
+        "HevSocks5SessionUDP *\nhev_socks5_session_udp_new (struct udp_pcb *pcb, const ip_addr_t *src_ip,\n"
+        "                            u16_t src_port, HevTaskMutex *mutex)",
+        "int\n"
+        "hev_socks5_session_udp_enqueue_initial (HevSocks5SessionUDP *self, struct pbuf *p)\n"
+        "{\n"
+        "    HevSocks5UDPFrame *frame;\n"
+        "    int res;\n\n"
+        "    if (!self || !p) {\n"
+        "        if (p) pbuf_free (p);\n"
+        "        return -1;\n"
+        "    }\n"
+        "    if (self->frames > UDP_POOL_SIZE) {\n"
+        "        pbuf_free (p);\n"
+        "        return -1;\n"
+        "    }\n"
+        "    frame = hev_malloc (sizeof (HevSocks5UDPFrame));\n"
+        "    if (!frame) {\n"
+        "        pbuf_free (p);\n"
+        "        return -1;\n"
+        "    }\n"
+        "    memset (&frame->node, 0, sizeof (frame->node));\n"
+        "    res = hev_socks5_addr_from_lwip (&frame->addr, &self->pcb->local_ip, self->pcb->local_port);\n"
+        "    if (res < 0) {\n"
+        "        pbuf_free (p);\n"
+        "        hev_free (frame);\n"
+        "        return -1;\n"
+        "    }\n"
+        "    frame->data = p;\n"
+        "    if (frame->addr.atype == HEV_SOCKS5_ADDR_TYPE_NAME) {\n"
+        "        self->addr = ip_2_ip4 (&self->pcb->local_ip)->addr;\n"
+        "        self->port = self->pcb->local_port;\n"
+        "    }\n"
+        "    self->frames++;\n"
+        "    hev_list_add_tail (&self->frame_list, &frame->node);\n"
+        "    return 0;\n"
+        "}\n\n"
+        "HevSocks5SessionUDP *\nhev_socks5_session_udp_new (struct udp_pcb *pcb, const ip_addr_t *src_ip,\n"
+        "                            u16_t src_port, HevTaskMutex *mutex)",
+        "preserve first UDP datagram",
+    )
+    session_udp_c.write_text(session_udp_c_text)
+
+    tunnel_text = tunnel_c.read_text()
+    tunnel_text = replace_text_once(
+        tunnel_text,
+        "udp = hev_socks5_session_udp_new (pcb, &mutex);",
+        "udp = hev_socks5_session_udp_new (pcb, addr, port, &mutex);",
+        "pass original UDP tuple into session",
+    )
+    tunnel_text = replace_text_once(
+        tunnel_text,
+        "    hev_socks5_session_set_task (HEV_SOCKS5_SESSION (udp), task);\n"
+        "    node = hev_socks5_session_get_node (HEV_SOCKS5_SESSION (udp));",
+        "    hev_socks5_session_set_task (HEV_SOCKS5_SESSION (udp), task);\n"
+        "    if (hev_socks5_session_udp_enqueue_initial (udp, p) < 0)\n"
+        "        LOG_W (\"socks5 tunnel udp initial packet enqueue failed\");\n"
+        "    node = hev_socks5_session_get_node (HEV_SOCKS5_SESSION (udp));",
+        "enqueue first UDP packet before starting session task",
+    )
+    tunnel_c.write_text(tunnel_text)
+
+    # Refuse a broken generated native patch before Gradle builds an APK.
+    for source_path, marker in (
+        (session_c, "hev_socks5_session_resolve_uid"),
+        (session_tcp_c, "self->data.uid = hev_socks5_session_resolve_uid (6"),
+        (session_udp_c, "self->data.uid = hev_socks5_session_resolve_uid (17, src_ip, src_port,"),
+        (session_udp_c, "hev_socks5_session_udp_enqueue_initial (HevSocks5SessionUDP *self, struct pbuf *p)"),
+        (session_udp_c, "siptr->get_uid = hev_socks5_session_udp_get_uid;"),
+        (tunnel_c, "hev_socks5_session_udp_new (pcb, addr, port, &mutex)"),
+        (tunnel_c, "hev_socks5_session_udp_enqueue_initial (udp, p)"),
+    ):
+        if marker not in source_path.read_text():
+            raise SystemExit(f"Refusing incomplete per-session UID bridge: missing {marker}")
+
+    print("OK - per-session UID propagation, UID detection hook, and native diagnostics applied")
 
 
 if __name__ == "__main__":

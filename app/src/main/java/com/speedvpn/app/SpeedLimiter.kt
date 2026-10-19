@@ -27,9 +27,9 @@ class TokenBucket {
     companion object {
         private const val NANOS_PER_SECOND = 1_000_000_000.0
         private const val BURST_WINDOW_NS = 10_000_000L
-        // Preserve the relay's normal 16 KiB TCP read size as the minimum burst.
+        // Keep low-rate plans responsive; a 16 KiB minimum creates long bursts at 10 KB/s.
         // At higher rates, permit at most 256 KiB of accumulated credit.
-        private const val MIN_BURST_BYTES = 16 * 1024
+        private const val MIN_BURST_BYTES = 1024
         private const val MAX_BURST_BYTES = 256 * 1024
     }
 
@@ -113,8 +113,8 @@ class TokenBucket {
     /**
      * Chooses a relay read size close to the token bucket's bounded burst window.
      *
-     * Small plans retain the 16 KiB minimum so a single read cannot create a
-     * large burst. Faster plans use larger reads to reduce per-chunk scheduler
+     * Small plans use a 1 KiB minimum to avoid large low-rate bursts. Faster
+     * plans use larger reads to reduce per-chunk scheduler
      * and lock overhead, up to the same 256 KiB maximum used by the bucket.
      */
     internal fun recommendedReadBytes(): Int = lock.withLock {
@@ -206,6 +206,8 @@ object SpeedLimiter {
     val verificationInProgress = MutableStateFlow(false)
 
     private val verificationLock = Any()
+    // Tracks whether this process has loaded or accepted the user's normal speed plan.
+    private var normalLimitsInitialized = false
     private var verificationLimits: Pair<Long?, Long?>? = null
     private var externalVpnCommandsInProgress = 0
     @Volatile
@@ -283,11 +285,34 @@ object SpeedLimiter {
         return normalized.toLong().coerceAtMost(Long.MAX_VALUE / 125L).takeIf { it > 0L }
     }
 
-    private fun kbpsToBytesPerSec(kbps: Long?): Long =
+    /** Convert the decimal KB/s UI unit to the Kbps representation stored by the app. */
+    internal fun kilobytesPerSecondToKbps(kilobytesPerSecond: Long): Long =
+        kilobytesPerSecond.coerceAtLeast(1L)
+            .coerceAtMost(Long.MAX_VALUE / 8L)
+            .times(8L)
+
+    /** Convert stored decimal Kbps to the bytes/second unit consumed by TokenBucket. */
+    internal fun kbpsToBytesPerSec(kbps: Long?): Long =
         kbps?.takeIf { it > 0L }
             ?.coerceAtMost(Long.MAX_VALUE / 125L)
             ?.times(125L)
             ?: 0L
+
+    /**
+     * Restores persisted limits once per process without overwriting a live UI selection
+     * or a temporary verification plan. The paired update is atomic with normal setters.
+     */
+    fun initializeLimitsIfUnset(downloadKbps: Long?, uploadKbps: Long?): Boolean =
+        synchronized(verificationLock) {
+            if (normalLimitsInitialized || verificationLimits != null || externalVpnCommandsInProgress > 0) {
+                false
+            } else {
+                applyDownloadKbps(downloadKbps)
+                applyUploadKbps(uploadKbps)
+                normalLimitsInitialized = true
+                true
+            }
+        }
 
     /** Begins a verification and freezes the limiter at the requested rates. */
     fun beginVerification(downloadKbps: Long?, uploadKbps: Long?): Boolean =
@@ -331,6 +356,7 @@ object SpeedLimiter {
         synchronized(verificationLock) {
             applyDownloadKbps(downloadKbps)
             applyUploadKbps(uploadKbps)
+            normalLimitsInitialized = true
             verificationOwnPackageRoutingEnabled = false
             verificationLimits = null
             verificationInProgress.value = false
@@ -355,6 +381,7 @@ object SpeedLimiter {
         synchronized(verificationLock) {
             if (verificationLimits != null) return false
             applyDownloadKbps(kbps)
+            normalLimitsInitialized = true
             onApplied?.invoke()
             return true
         }
@@ -364,6 +391,7 @@ object SpeedLimiter {
         synchronized(verificationLock) {
             if (verificationLimits != null) return false
             applyUploadKbps(kbps)
+            normalLimitsInitialized = true
             onApplied?.invoke()
             return true
         }
@@ -379,6 +407,7 @@ object SpeedLimiter {
             if (verificationLimits != null) return false
             applyDownloadKbps(downloadKbps)
             applyUploadKbps(uploadKbps)
+            normalLimitsInitialized = true
             onApplied?.invoke()
             return true
         }

@@ -14,7 +14,11 @@ else
 fi
 
 git -C "$DIR" checkout --detach "$COMMIT"
+# The native patchers edit tracked files in this pinned checkout. Reset it and its
+# submodules before applying patches so repeated setup runs always start pristine.
+git -C "$DIR" reset --hard "$COMMIT"
 git -C "$DIR" submodule update --init --recursive
+git -C "$DIR" submodule foreach --recursive 'git reset --hard'
 HEAD="$(git -C "$DIR" rev-parse HEAD)"
 case "$HEAD" in
   "$COMMIT"*) ;;

@@ -44,7 +44,12 @@ object SpeedLimitStore {
 
     fun applyToLimiter(context: Context) {
         val (download, upload) = load(context)
-        SpeedLimiter.setDownloadKbps(download)
-        SpeedLimiter.setUploadKbps(upload)
+        SpeedLimiter.setLimitsKbps(download, upload)
+    }
+
+    /** Restore saved rates only if this process has not accepted a newer live plan. */
+    fun restoreToLimiterIfUninitialized(context: Context) {
+        val (download, upload) = load(context)
+        SpeedLimiter.initializeLimitsIfUnset(download, upload)
     }
 }
