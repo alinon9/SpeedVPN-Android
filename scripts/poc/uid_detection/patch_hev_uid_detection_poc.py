@@ -1682,10 +1682,12 @@ hev_socks5_session_resolve_uid (int protocol,
         "{\n"
         "    HevSocks5UDPFrame *frame;\n"
         "    int res;\n\n"
-        "    if (!self || !p) {\n"
-        "        if (p) pbuf_free (p);\n"
+        "    if (!self || !p)\n"
         "        return -1;\n"
-        "    }\n"
+        "    /* udp_input retains its original reference and frees it after this\n"
+        "     * receive callback returns. Give the queued frame its own reference.\n"
+        "     * Every failure path below releases only this additional reference. */\n"
+        "    pbuf_ref (p);\n"
         "    if (self->frames > UDP_POOL_SIZE) {\n"
         "        pbuf_free (p);\n"
         "        return -1;\n"
@@ -1743,6 +1745,7 @@ hev_socks5_session_resolve_uid (int protocol,
         (session_tcp_c, "self->data.uid = hev_socks5_session_resolve_uid (6"),
         (session_udp_c, "self->data.uid = hev_socks5_session_resolve_uid (17, &pcb->remote_ip,"),
         (session_udp_c, "hev_socks5_session_udp_enqueue_initial (HevSocks5SessionUDP *self, struct pbuf *p)"),
+        (session_udp_c, "pbuf_ref (p);"),
         (session_udp_c, "siptr->get_uid = hev_socks5_session_udp_get_uid;"),
         (tunnel_c, "hev_socks5_session_udp_new (pcb, addr, port, &mutex)"),
         (tunnel_c, "hev_socks5_session_udp_enqueue_initial (udp, p)"),
