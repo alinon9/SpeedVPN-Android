@@ -555,6 +555,14 @@ uid_poc_format_address (const unsigned char *address, int addr_len,
     }
 }
 
+static int
+uid_poc_is_internal_mapdns (int protocol, const unsigned char *dst,
+                            int dst_len, int dst_port)
+{
+    return protocol == 17 && dst != NULL && dst_len == 4 && dst_port == 53 &&
+           dst[0] == 198 && dst[1] == 18 && dst[2] == 0 && dst[3] == 2;
+}
+
 static unsigned long long
 uid_poc_now_ms (void)
 {
@@ -884,10 +892,17 @@ uid_poc_worker_main (void *unused)
         if (!call_ok || uid < 0)
             __sync_add_and_fetch (&uid_poc_lookup_failures, 1ULL);
 
+        if ((!call_ok || uid < 0) &&
+            uid_poc_is_internal_mapdns (request.protocol, request.dst,
+                                        request.dst_len, request.dst_port)) {
+            action = UID_POC_ACTION_ALLOW;
+        } else if (!call_ok) {
+            action = uid_poc_policy_active ? UID_POC_ACTION_BLOCK : UID_POC_ACTION_ALLOW;
+        }
+
         pthread_mutex_lock (&uid_poc_mutex);
         uid_poc_store_result_locked (&request.key, call_ok ? (int) uid : -1,
-                                     call_ok ? action :
-                                         (uid_poc_policy_active ? UID_POC_ACTION_BLOCK : UID_POC_ACTION_ALLOW),
+                                     action,
                                      uid_poc_now_ms (), request.request_id);
         pthread_cond_broadcast (&uid_poc_condition);
         pthread_mutex_unlock (&uid_poc_mutex);
@@ -1055,6 +1070,7 @@ hev_jni_uid_poc_packet (int protocol,
     uid_poc_request request;
     unsigned long long now, packet_count;
     int found = 0, slot, should_drop = 0;
+    int is_internal_mapdns = 0;
     unsigned long long request_id = 0;
     char src_text[64], dst_text[64], tuple_text[200];
 
@@ -1074,6 +1090,7 @@ hev_jni_uid_poc_packet (int protocol,
     if (src_port > 65535 || dst_port > 65535)
         return 0;
 
+    is_internal_mapdns = uid_poc_is_internal_mapdns (protocol, dst, dst_len, dst_port);
     uid_poc_make_key (&key, protocol, src, src_len, src_port, dst, dst_len, dst_port);
     memset (&request, 0, sizeof (request));
     request.key = key;
@@ -1088,7 +1105,7 @@ hev_jni_uid_poc_packet (int protocol,
     pthread_mutex_lock (&uid_poc_mutex);
     if (!uid_poc_worker_started || !uid_poc_worker_ready ||
         uid_poc_worker_stop_requested || !uid_poc_callback || !uid_poc_method) {
-        should_drop = uid_poc_policy_active;
+        should_drop = uid_poc_policy_active && !is_internal_mapdns;
         if (should_drop)
             __sync_add_and_fetch (&uid_poc_dropped_packets, 1ULL);
         pthread_mutex_unlock (&uid_poc_mutex);
@@ -1104,13 +1121,15 @@ hev_jni_uid_poc_packet (int protocol,
             if (uid_poc_policy_active) {
                 request_id = entry->request_id;
                 if (!uid_poc_wait_for_decision_locked (&key, request_id, &should_drop)) {
-                    should_drop = 1;
-                    __sync_add_and_fetch (&uid_poc_dropped_packets, 1ULL);
+                    should_drop = !is_internal_mapdns;
+                    if (should_drop)
+                        __sync_add_and_fetch (&uid_poc_dropped_packets, 1ULL);
                 }
             }
         } else {
             __sync_add_and_fetch (&uid_poc_cache_hits, 1ULL);
-            if (entry->action == UID_POC_ACTION_BLOCK) {
+            if (entry->action == UID_POC_ACTION_BLOCK &&
+                !(is_internal_mapdns && entry->uid < 0)) {
                 entry->updated_ms = now;
                 should_drop = 1;
                 __sync_add_and_fetch (&uid_poc_dropped_packets, 1ULL);
@@ -1143,7 +1162,7 @@ hev_jni_uid_poc_packet (int protocol,
     if (uid_poc_queue_count >= UID_POC_QUEUE_CAPACITY) {
         /* Overloaded attribution fails closed while block enforcement is active. */
         __sync_add_and_fetch (&uid_poc_queue_full, 1ULL);
-        should_drop = uid_poc_policy_active;
+        should_drop = uid_poc_policy_active && !is_internal_mapdns;
         if (slot >= 0) {
             if (!found)
                 uid_poc_active_flows++;
@@ -1180,13 +1199,14 @@ hev_jni_uid_poc_packet (int protocol,
         pthread_cond_signal (&uid_poc_condition);
     } else {
         __sync_add_and_fetch (&uid_poc_queue_full, 1ULL);
-        should_drop = uid_poc_policy_active;
+        should_drop = uid_poc_policy_active && !is_internal_mapdns;
     }
     if (uid_poc_policy_active && request_id != 0) {
         if (!uid_poc_wait_for_decision_locked (&key, request_id, &should_drop)) {
             /* A timed-out or invalidated first lookup must not leak a packet. */
-            should_drop = 1;
-            __sync_add_and_fetch (&uid_poc_dropped_packets, 1ULL);
+            should_drop = !is_internal_mapdns;
+            if (should_drop)
+                __sync_add_and_fetch (&uid_poc_dropped_packets, 1ULL);
         } else if (should_drop) {
             __sync_add_and_fetch (&uid_poc_dropped_packets, 1ULL);
         }
@@ -1388,18 +1408,19 @@ native_is_running (JNIEnv *env, jobject thiz)
         "    if (!tdata->path) {\n        close (tdata->fd);\n        free (tdata);\n        goto exit;\n    }",
         "path allocation cleanup",
     )
-    jni_text = replace_text_once(
-        jni_text,
-        "    hev_socks5_tunnel_main (tdata->path, tdata->fd);\n\n"
-        "    atomic_store_explicit (&is_running, 0, memory_order_release);",
-        "    /* Install SA_ONSTACK storage on the worker OS thread before HEV switches stacks. */\n"
-        "    native_install_alt_stack_for_thread ();\n"
-        "    hev_socks5_tunnel_main (tdata->path, tdata->fd);\n\n"
-        "    /* TUN FD is a native-owned dup; close only after the engine exits. */\n"
-        "    close (tdata->fd);\n\n"
-        "    atomic_store_explicit (&is_running, 0, memory_order_release);",
-        "native worker stack/FD lifetime",
-    )
+    if "/* TUN FD is a native-owned dup; close only after the engine exits. */" not in jni_text:
+        jni_text = replace_text_once(
+            jni_text,
+            "    hev_socks5_tunnel_main (tdata->path, tdata->fd);\n\n"
+            "    atomic_store_explicit (&is_running, 0, memory_order_release);",
+            "    /* Install SA_ONSTACK storage on the worker OS thread before HEV switches stacks. */\n"
+            "    native_install_alt_stack_for_thread ();\n"
+            "    hev_socks5_tunnel_main (tdata->path, tdata->fd);\n\n"
+            "    /* TUN FD is a native-owned dup; close only after the engine exits. */\n"
+            "    close (tdata->fd);\n\n"
+            "    atomic_store_explicit (&is_running, 0, memory_order_release);",
+            "native worker stack/FD lifetime",
+        )
     jni_text = replace_text_once(
         jni_text,
         "    if (res != 0) {\n"
@@ -1676,6 +1697,51 @@ hev_socks5_session_resolve_uid (int protocol,
     )
     session_udp_c_text = replace_text_once(
         session_udp_c_text,
+        "static void\n"
+        "udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,\n"
+        "                  const ip_addr_t *addr, u16_t port)\n"
+        "{\n"
+        "    HevSocks5SessionUDP *self = arg;\n"
+        "    HevSocks5UDPFrame *frame;\n\n"
+        "    if (!p) {\n"
+        "        hev_socks5_session_terminate (HEV_SOCKS5_SESSION (self));\n"
+        "        return;\n"
+        "    }\n\n"
+        "    if (self->frames > UDP_POOL_SIZE) {",
+        "static int\n"
+        "hev_socks5_session_udp_has_pbuf (HevSocks5SessionUDP *self, const struct pbuf *p)\n"
+        "{\n"
+        "    HevListNode *node;\n\n"
+        "    if (!self || !p)\n"
+        "        return 0;\n"
+        "    for (node = hev_list_first (&self->frame_list); node;\n"
+        "         node = hev_list_node_next (node)) {\n"
+        "        HevSocks5UDPFrame *frame = container_of (node, HevSocks5UDPFrame, node);\n"
+        "        if (frame->data == p)\n"
+        "            return 1;\n"
+        "    }\n"
+        "    return 0;\n"
+        "}\n\n"
+        "static void\n"
+        "udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,\n"
+        "                  const ip_addr_t *addr, u16_t port)\n"
+        "{\n"
+        "    HevSocks5SessionUDP *self = arg;\n"
+        "    HevSocks5UDPFrame *frame;\n\n"
+        "    if (!p) {\n"
+        "        hev_socks5_session_terminate (HEV_SOCKS5_SESSION (self));\n"
+        "        return;\n"
+        "    }\n\n"
+        "    if (hev_socks5_session_udp_has_pbuf (self, p)) {\n"
+        "        pbuf_free (p);\n"
+        "        hev_task_wakeup (self->data.task);\n"
+        "        return;\n"
+        "    }\n\n"
+        "    if (self->frames > UDP_POOL_SIZE) {",
+        "deduplicate UDP session pbuf enqueue",
+    )
+    session_udp_c_text = replace_text_once(
+        session_udp_c_text,
         "HevSocks5SessionUDP *\nhev_socks5_session_udp_new (struct udp_pcb *pcb, const ip_addr_t *src_ip,\n"
         "                            u16_t src_port, HevTaskMutex *mutex)",
         "int\n"
@@ -1686,6 +1752,8 @@ hev_socks5_session_resolve_uid (int protocol,
         "    int res;\n\n"
         "    if (!self || !p)\n"
         "        return -1;\n"
+        "    if (hev_socks5_session_udp_has_pbuf (self, p))\n"
+        "        return 0;\n"
         "    /* udp_input retains its original reference and frees it after this\n"
         "     * receive callback returns. Give the queued frame its own reference.\n"
         "     * Every failure path below releases only this additional reference. */\n"
@@ -1733,29 +1801,42 @@ hev_socks5_session_resolve_uid (int protocol,
         "udp = hev_socks5_session_udp_new (pcb, addr, port, &mutex);",
         "pass original UDP tuple into session",
     )
-    tunnel_text = replace_text_once(
-        tunnel_text,
-        "    hev_socks5_session_set_task (HEV_SOCKS5_SESSION (udp), task);\n"
-        "    node = hev_socks5_session_get_node (HEV_SOCKS5_SESSION (udp));",
+    # Remove legacy duplicate initial UDP packet enqueue if present on an already-patched tree.
+    legacy_dup_enqueue = (
         "    hev_socks5_session_set_task (HEV_SOCKS5_SESSION (udp), task);\n"
         "    if (hev_socks5_session_udp_enqueue_initial (udp, p, addr, port) < 0)\n"
         "        LOG_W (\"socks5 tunnel udp initial packet enqueue failed\");\n"
-        "    node = hev_socks5_session_get_node (HEV_SOCKS5_SESSION (udp));",
-        "enqueue first UDP packet before starting session task",
+        "    node = hev_socks5_session_get_node (HEV_SOCKS5_SESSION (udp));"
     )
+    single_dispatch_comment = (
+        "    hev_socks5_session_set_task (HEV_SOCKS5_SESSION (udp), task);\n"
+        "    /* lwIP's PRETEND_UDP path (udp.c:goto again) strips UDP_HLEN and dispatches\n"
+        "     * this initial pbuf to the session's udp_recv_handler immediately after\n"
+        "     * this callback returns; do not enqueue it a second time here. */\n"
+        "    node = hev_socks5_session_get_node (HEV_SOCKS5_SESSION (udp));"
+    )
+    if legacy_dup_enqueue in tunnel_text:
+        tunnel_text = tunnel_text.replace(legacy_dup_enqueue, single_dispatch_comment, 1)
+    else:
+        tunnel_text = replace_text_once(
+            tunnel_text,
+            "    hev_socks5_session_set_task (HEV_SOCKS5_SESSION (udp), task);\n"
+            "    node = hev_socks5_session_get_node (HEV_SOCKS5_SESSION (udp));",
+            single_dispatch_comment,
+            "single UDP initial packet dispatch via lwIP pretend retry",
+        )
     tunnel_c.write_text(tunnel_text)
 
     # Refuse a broken generated native patch before Gradle builds an APK.
     for source_path, marker in (
+        (jni_c, "uid_poc_is_internal_mapdns"),
         (session_c, "hev_socks5_session_resolve_uid"),
         (session_c, "Normalize IPv4-mapped IPv6 tuples to their four-byte IPv4 form."),
         (session_tcp_c, "self->data.uid = hev_socks5_session_resolve_uid (6"),
         (session_udp_c, "self->data.uid = hev_socks5_session_resolve_uid (17, &pcb->remote_ip,"),
-        (session_udp_c, "hev_socks5_session_udp_enqueue_initial (HevSocks5SessionUDP *self, struct pbuf *p,"),
-        (session_udp_c, "pbuf_ref (p);"),
+        (session_udp_c, "hev_socks5_session_udp_has_pbuf (self, p)"),
         (session_udp_c, "siptr->get_uid = hev_socks5_session_udp_get_uid;"),
         (tunnel_c, "hev_socks5_session_udp_new (pcb, addr, port, &mutex)"),
-        (tunnel_c, "hev_socks5_session_udp_enqueue_initial (udp, p, addr, port)"),
     ):
         if marker not in source_path.read_text():
             raise SystemExit(f"Refusing incomplete per-session UID bridge: missing {marker}")

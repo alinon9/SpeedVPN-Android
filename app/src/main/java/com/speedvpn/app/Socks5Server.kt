@@ -1386,6 +1386,9 @@ class Socks5Server internal constructor(
         private val lock = Any()
         private val bindings = HashMap<String, UdpBinding>()
         private val runningMux = AtomicBoolean(true)
+        private val selectorRegistrationGate = Any()
+        private val pendingSelectorRegistrations = AtomicInteger(0)
+
         private val worker = thread(name = "socks-udp-mux", isDaemon = true) {
             runLoop()
         }
@@ -1562,6 +1565,30 @@ class Socks5Server internal constructor(
             runCatching { selector.close() }
         }
 
+        internal fun registerChannelWithSelector(
+            channel: DatagramChannel,
+            attachment: Any,
+        ) {
+            pendingSelectorRegistrations.incrementAndGet()
+            try {
+                selector.wakeup()
+                synchronized(selectorRegistrationGate) {
+                    selector.wakeup()
+                    channel.register(selector, SelectionKey.OP_READ, attachment)
+                }
+            } finally {
+                pendingSelectorRegistrations.decrementAndGet()
+                selector.wakeup()
+            }
+        }
+
+        internal fun yieldToPendingSelectorRegistrations() {
+            if (pendingSelectorRegistrations.get() <= 0) return
+            synchronized(selectorRegistrationGate) {
+                // Wait for channel registration to finish before selecting again.
+            }
+        }
+
         private fun createBindingLocked(flow: UdpFlow, remote: InetSocketAddress): UdpBinding {
             if (policyEpoch != expectedPolicyEpoch) throw SocketException("Socket closed by app policy change")
             val network = currentNetwork()
@@ -1592,8 +1619,7 @@ class Socks5Server internal constructor(
                 // Selector registration is thread-safe. Do not synchronize on the
                 // Selector object: select() may hold that monitor while blocking, which
                 // prevents this thread from calling wakeup() and delays UDP setup.
-                selector.wakeup()
-                channel.register(selector, SelectionKey.OP_READ, binding)
+                registerChannelWithSelector(channel, binding)
                 trackUpstream(socket)
                 bindings[flow.logicalKey] = binding
                 return binding
@@ -1618,6 +1644,7 @@ class Socks5Server internal constructor(
                     SpeedLimiter.isGenerationActive(generation) &&
                     !Socks5Server.isSessionUidBlocked(sessionUid, blockedUids)
                 ) {
+                    yieldToPendingSelectorRegistrations()
                     selector.select(500)
                     val selected = selector.selectedKeys()
                     val iterator = selected.iterator()

@@ -7,6 +7,10 @@ import android.content.Context
  * Runtime routing must send every app through TUN before UID policy can drop it.
  */
 internal object VpnApplicationPolicy {
+    private const val IPPROTO_UDP = 17
+    private const val MAP_DNS_IPV4 = "198.18.0.2"
+    private const val MAP_DNS_PORT = 53
+
     /**
      * Return package blocks that the active VPN must enforce.
      *
@@ -45,14 +49,31 @@ internal object VpnApplicationPolicy {
         uid > 0 && uid in blockedUids
 
     /**
+     * True only for UDP queries addressed to the internal TUN MapDNS endpoint (198.18.0.2:53).
+     * Android's netd sends system DNS queries without an app UID (uid=-1), and MapDNS terminates
+     * them in-memory inside hev-socks5-tunnel without forwarding any packet off-device.
+     */
+    fun isInternalMapDnsQuery(
+        protocol: Int,
+        dstIp: String,
+        dstPort: Int,
+    ): Boolean = protocol == IPPROTO_UDP && dstPort == MAP_DNS_PORT && dstIp == MAP_DNS_IPV4
+
+    /**
      * With a blacklist active, an unresolved flow is denied only after both the Android owner
-     * API and the procfs socket-table fallback have been attempted. Callers must not make this
-     * decision before fallback attribution has completed.
+     * API and the procfs socket-table fallback have been attempted, except for internal MapDNS
+     * queries (UDP 198.18.0.2:53) which are terminated locally inside TUN.
      */
     fun shouldDropUnresolvedUid(
         blockedUids: Set<Int>,
         attributionExhausted: Boolean = true,
-    ): Boolean = attributionExhausted && blockedUids.isNotEmpty()
+        protocol: Int = -1,
+        dstIp: String = "",
+        dstPort: Int = -1,
+    ): Boolean =
+        attributionExhausted &&
+            blockedUids.isNotEmpty() &&
+            !isInternalMapDnsQuery(protocol, dstIp, dstPort)
 
     // Legacy helper retained for source compatibility; never use it to configure Builder.
     fun allowedPackages(
