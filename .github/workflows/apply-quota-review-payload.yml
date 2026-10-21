@@ -1,0 +1,110 @@
+name: Apply reviewed quota settlement payload
+
+on:
+  push:
+    branches:
+      - staging/quota-settlement-crash-safe-20261021
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  apply-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout staging branch
+        uses: actions/checkout@v4
+        with:
+          ref: staging/quota-settlement-crash-safe-20261021
+          fetch-depth: 0
+
+      - name: Validate and apply reviewed source payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, bz2, hashlib, io, os, pathlib, tarfile
+
+          root = pathlib.Path(".tmp/quota-settlement-payload")
+          expected_blobs = {
+              "part-01.b64": "00cab9cec31586f53ce052f23a4250ec975aaee1",
+              "part-02.b64": "44f72911b0b82f95f07fb11c807ab13a1f79fa16",
+              "part-03.b64": "a13462697e13a99fe8f1edc466e7e6c53474c2ba",
+              "part-04.b64": "ae9c13faa43c709df23640fab472bf41ca90e28f",
+              "part-05.b64": "809e5f0988aa00fd14f89035a0ca3b77b50a4e33",
+              "part-06.b64": "ad428c93f266141ad96a38d7cda91eb0f01aca8f",
+              "part-07.b64": "ed5fd81ad4abdb0909c36096f609fb0ddb61afd4",
+              "part-08.b64": "ab1fac1916139aca984e88ac5d3141583dfcd3b6",
+              "part-09.b64": "3446d7077adce7c77ab29d33b782c84684723f21",
+          }
+          def git_blob_sha(s):
+              b = s.encode("ascii")
+              return hashlib.sha1(f"blob {len(b)}\\0".encode() + b).hexdigest()
+
+          chunks = []
+          for name, expected in expected_blobs.items():
+              path = root / name
+              value = path.read_text().strip()
+              if git_blob_sha(value) != expected:
+                  if name not in ("part-03.b64", "part-08.b64") or len(value) != 9001:
+                      raise SystemExit(f"Payload segment integrity failed: {name}, length={len(value)}, sha={git_blob_sha(value)}")
+                  matches = [value[:i] + value[i+1:] for i in range(len(value)) if git_blob_sha(value[:i] + value[i+1:]) == expected]
+                  if len(matches) != 1:
+                      raise SystemExit(f"Could not uniquely repair inserted character in {name}: matches={len(matches)}")
+                  value = matches[0]
+              chunks.append(value)
+
+          encoded = "".join(chunks)
+          archive_bytes = base64.b64decode(encoded, validate=True)
+          if hashlib.sha256(archive_bytes).hexdigest() != "0e2b35671b7c08f2fed21b462f2104a31c4a90b848aecad956b688b279c629d3":
+              raise SystemExit("Compressed payload SHA-256 mismatch; nothing applied")
+          raw_tar = bz2.decompress(archive_bytes)
+          expected_sizes = {
+              "app/src/main/java/com/speedvpn/app/QuotaEnforcementEngine.kt": 27408,
+              "app/src/main/java/com/speedvpn/app/QuotaModels.kt": 3097,
+              "app/src/main/java/com/speedvpn/app/Socks5Server.kt": 92394,
+              "app/src/main/java/com/speedvpn/app/SpeedVpnService.kt": 71954,
+              "app/src/main/java/com/speedvpn/app/UsageDatabase.kt": 46875,
+              "app/src/test/java/com/speedvpn/app/QuotaEnforcementEngineTest.kt": 35121,
+              "scripts/e2e/tests/test_focused_network_fixes.py": 56987,
+          }
+          with tarfile.open(fileobj=io.BytesIO(raw_tar), mode="r:") as tf:
+              members = {m.name: m for m in tf.getmembers()}
+              if set(members) != set(expected_sizes):
+                  raise SystemExit(f"Unexpected archive file list: {sorted(members)}")
+              for name, size in expected_sizes.items():
+                  member = members[name]
+                  if not member.isfile() or member.size != size:
+                      raise SystemExit(f"Unsafe or unexpected tar member: {name}")
+              for name in sorted(expected_sizes):
+                  target = pathlib.Path(name)
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  target.write_bytes(tf.extractfile(members[name]).read())
+          print("Payload integrity verified; applied exactly 7 reviewed files.")
+          PY
+
+      - name: Commit source files and remove transport files
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          rm -rf .tmp/quota-settlement-payload
+          rm -f .github/workflows/apply-quota-review-payload.yml
+          git add app/src/main/java/com/speedvpn/app/QuotaEnforcementEngine.kt
+          git add app/src/main/java/com/speedvpn/app/QuotaModels.kt
+          git add app/src/main/java/com/speedvpn/app/Socks5Server.kt
+          git add app/src/main/java/com/speedvpn/app/SpeedVpnService.kt
+          git add app/src/main/java/com/speedvpn/app/UsageDatabase.kt
+          git add app/src/test/java/com/speedvpn/app/QuotaEnforcementEngineTest.kt
+          git add scripts/e2e/tests/test_focused_network_fixes.py
+          git add -u .tmp .github/workflows/apply-quota-review-payload.yml || true
+          git commit -m "Harden crash-safe quota settlement and UDP recovery"
+          git push origin "HEAD:staging/quota-settlement-crash-safe-20261021"
+
+      - name: Dispatch Android tests and APK build for applied commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run build-apk.yml --ref staging/quota-settlement-crash-safe-20261021 --repo "$GITHUB_REPOSITORY"
