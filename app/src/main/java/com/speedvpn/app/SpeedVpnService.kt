@@ -265,13 +265,15 @@ class SpeedVpnService : VpnService() {
                 ipv6Enabled = compatibility.ipv6Enabled,
                 dnsIpv4Only = compatibility.dnsIpv4Only,
                 accountQuotaBytes = ::accountQuotaBytesForRelay,
+                recordForwardedBytes = ::recordForwardedBytesForRelay,
+                settleQuotaBytes = ::settleQuotaBytesForRelay,
                 // A configured per-app quota requires exact owner attribution. Unknown UIDs
                 // can no longer pass through the relay unaccounted.
                 // Active app blocks and per-app quotas both require owner attribution.
                 // Otherwise an unknown-owner SOCKS session could bypass a live policy.
                 requireUidAttribution = {
                     currentBlockedPackages().isNotEmpty() ||
-                        runCatching { UsageRepository.readQuotaPolicies(this@SpeedVpnService).isNotEmpty() }
+                        runCatching { QuotaEnforcementEngine.hasAnyConfiguredQuotaPolicies(this@SpeedVpnService) }
                             .getOrDefault(true)
                 },
                 onQuotaExceeded = {
@@ -372,10 +374,11 @@ class SpeedVpnService : VpnService() {
             return@withLock
         }
 
-        // Restore persistent local limits inside the Service so background/Always-on
-        // starts do not depend on MainActivity having been recreated first.
-        SpeedLimitStore.applyToLimiter(this)
-        log("Restored local speed limits before native data plane start")
+        // Restore persistent local limits inside the Service only when uninitialized so
+        // background/Always-on starts do not depend on MainActivity, without overwriting
+        // a newer live selection whose async disk commit is still in flight.
+        SpeedLimitStore.restoreToLimiterIfUninitialized(this)
+        log("Ensured local speed limits initialized before native data plane start")
 
         log("Starting hev tunnel")
         val started = startNativeIfCurrent(mySession, pfd, conf.absolutePath)
@@ -446,14 +449,12 @@ class SpeedVpnService : VpnService() {
         uid: Int?,
         direction: QuotaTrafficDirection,
         bytes: Int,
+        transport: QuotaTransport,
     ): QuotaTrafficDecision {
         val resolvedPackages = if (packages.isNotEmpty()) {
             packages
         } else {
-            uid?.takeIf { it > 0 }?.let { ownerUid ->
-                runCatching { packageManager.getPackagesForUid(ownerUid)?.toSet().orEmpty() }
-                    .getOrDefault(emptySet())
-            }.orEmpty()
+            QuotaEnforcementEngine.resolvePackagesForUidCached(this, uid)
         }
         return QuotaEnforcementEngine.accountRelayBytes(
             context = this,
@@ -461,6 +462,51 @@ class SpeedVpnService : VpnService() {
             uid = uid,
             direction = direction,
             requestedBytes = bytes,
+            transport = transport,
+        )
+    }
+
+    private fun recordForwardedBytesForRelay(
+        packages: Set<String>,
+        uid: Int?,
+        direction: QuotaTrafficDirection,
+        bytes: Int,
+    ) {
+        val resolvedPackages = if (packages.isNotEmpty()) {
+            packages
+        } else {
+            QuotaEnforcementEngine.resolvePackagesForUidCached(this, uid)
+        }
+        QuotaEnforcementEngine.recordForwardedRelayBytes(
+            context = this,
+            packageNames = resolvedPackages,
+            uid = uid,
+            direction = direction,
+            forwardedBytes = bytes,
+        )
+    }
+
+    private fun settleQuotaBytesForRelay(
+        packages: Set<String>,
+        uid: Int?,
+        direction: QuotaTrafficDirection,
+        decision: QuotaTrafficDecision,
+        outcome: QuotaSettlementOutcome,
+        forwardedBytes: Int,
+    ): QuotaTrafficDecision {
+        val resolvedPackages = if (packages.isNotEmpty()) {
+            packages
+        } else {
+            QuotaEnforcementEngine.resolvePackagesForUidCached(this, uid)
+        }
+        return QuotaEnforcementEngine.settleRelayBytes(
+            context = this,
+            packageNames = resolvedPackages,
+            uid = uid,
+            direction = direction,
+            decision = decision,
+            outcome = outcome,
+            forwardedBytes = forwardedBytes,
         )
     }
 
@@ -622,6 +668,7 @@ class SpeedVpnService : VpnService() {
             appendLine("  port: ${relay.port}")
             appendLine("  address: 127.0.0.1")
             appendLine("  udp: 'udp'")
+            appendLine("  pipeline: true")
             appendLine("  username: '${relay.username}'")
             appendLine("  password: '${relay.password}'")
             appendLine("mapdns:")
@@ -950,12 +997,14 @@ class SpeedVpnService : VpnService() {
                     currentNetwork = { findUnderlyingNetwork() },
                     ipv6Enabled = VpnSettings.read(this@SpeedVpnService).ipv6Enabled,
                     accountQuotaBytes = ::accountQuotaBytesForRelay,
+                    recordForwardedBytes = ::recordForwardedBytesForRelay,
+                    settleQuotaBytes = ::settleQuotaBytesForRelay,
                     // Recovery must preserve startup's owner-attribution policy for blocks
                     // and quotas, then seed UID blocks before the relay accepts traffic.
                     requireUidAttribution = {
                         currentBlockedPackages().isNotEmpty() ||
                             runCatching {
-                                UsageRepository.readQuotaPolicies(this@SpeedVpnService).isNotEmpty()
+                                QuotaEnforcementEngine.hasAnyConfiguredQuotaPolicies(this@SpeedVpnService)
                             }.getOrDefault(true)
                     },
                     onQuotaExceeded = {
@@ -1022,7 +1071,7 @@ class SpeedVpnService : VpnService() {
             while (isActive && sessionId.get() == mySession) {
                 delay(5_000)
                 if (!sessionIsCurrent(mySession)) break
-                if (UsageRepository.readQuotaPolicies(this@SpeedVpnService).isEmpty()) continue
+                if (!QuotaEnforcementEngine.hasAnyConfiguredQuotaPolicies(this@SpeedVpnService)) continue
                 runCatching {
                     // Recovery and period rollover only. The data plane enforces every admitted
                     // TCP/UDP payload chunk synchronously before forwarding it.
@@ -1044,6 +1093,7 @@ class SpeedVpnService : VpnService() {
         meter?.cancel()
         quotaMonitor?.cancel()
         meter = scope.launch {
+            val smartSampler = SmartSampler(this@SpeedVpnService)
             var lastDown = SpeedLimiter.download.total.get()
             var lastUp = SpeedLimiter.upload.total.get()
             var lastSampleNs = System.nanoTime()
@@ -1051,40 +1101,41 @@ class SpeedVpnService : VpnService() {
             var previousUpBps = 0L
             var firstSample = true
             while (isActive && sessionId.get() == mySession) {
-                delay(1_000)
+                delay(500)
                 if (!sessionIsCurrent(mySession)) break
                 val nowNs = System.nanoTime()
                 val elapsedNs = (nowNs - lastSampleNs).coerceAtLeast(1L)
                 val d = SpeedLimiter.download.total.get()
                 val u = SpeedLimiter.upload.total.get()
-                // Use monotonic elapsed time instead of assuming delay(1000) woke up
-                // exactly one second later. This removes scheduler-jitter error from
+                // Use monotonic elapsed time instead of assuming delay(500) woke up
+                // at an exact interval. This removes scheduler-jitter error from
                 // the displayed bps value.
                 val rawDownBps = (((d - lastDown).coerceAtLeast(0L).toDouble() * 8.0 * 1_000_000_000.0) /
                     elapsedNs.toDouble()).toLong().coerceAtLeast(0L)
                 val rawUpBps = (((u - lastUp).coerceAtLeast(0L).toDouble() * 8.0 * 1_000_000_000.0) /
                     elapsedNs.toDouble()).toLong().coerceAtLeast(0L)
-                // Two-sample moving average: enough to suppress one-second packet
-                // bursts without hiding real speed changes for long periods.
+                // Two-sample moving average at 500ms cadence: responsive to real speed
+                // changes within 0.5-1.0s while smoothing sub-second packet bursts.
                 val smoothDownBps = if (firstSample) rawDownBps else
                     ((previousDownBps + rawDownBps) / 2L).coerceAtLeast(0L)
                 val smoothUpBps = if (firstSample) rawUpBps else
                     ((previousUpBps + rawUpBps) / 2L).coerceAtLeast(0L)
                 val sessionDown = SpeedLimiter.download.sessionBytes(myServiceGeneration)
                 val sessionUp = SpeedLimiter.upload.sessionBytes(myServiceGeneration)
-                synchronized(processNativeLifecycleLock) {
-                    if (activeServiceGeneration.get() == myServiceGeneration) {
-                        VpnRuntime.update {
-                            it.copy(
-                                downloadBps = smoothDownBps,
-                                uploadBps = smoothUpBps,
-                                sessionDownloadBytes = sessionDown,
-                                sessionUploadBytes = sessionUp,
-                            )
-                        }
-                    } else {
-                        return@launch
+                // Do not block UI telemetry updates on processNativeLifecycleLock.
+                // activeServiceGeneration is an AtomicLong and safe to read lock-free.
+                if (activeServiceGeneration.get() == myServiceGeneration) {
+                    VpnRuntime.update {
+                        it.copy(
+                            downloadBps = smoothDownBps,
+                            uploadBps = smoothUpBps,
+                            sessionDownloadBytes = sessionDown,
+                            sessionUploadBytes = sessionUp,
+                        )
                     }
+                    runCatching { smartSampler.sample() }
+                } else {
+                    return@launch
                 }
                 lastDown = d
                 lastUp = u
