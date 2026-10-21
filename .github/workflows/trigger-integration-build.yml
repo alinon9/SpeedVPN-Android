@@ -1,0 +1,30 @@
+name: Trigger APK build for integration branch
+
+on:
+  push:
+    branches:
+      - integration/uid-attribution-e2e-20261019
+    paths:
+      - .github/workflows/trigger-integration-build.yml
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  trigger-and-clean:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch APK build for current integration commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh workflow run build-apk.yml --ref integration/uid-attribution-e2e-20261019 --repo "$GITHUB_REPOSITORY"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          rm .github/workflows/trigger-integration-build.yml
+          git add -u .github/workflows/trigger-integration-build.yml
+          git commit -m "Remove temporary integration build dispatcher"
+          git push origin "HEAD:integration/uid-attribution-e2e-20261019"
