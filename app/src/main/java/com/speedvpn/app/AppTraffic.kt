@@ -9,14 +9,16 @@ import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.provider.Settings
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 
 /**
- * Per-app traffic view for the current VPN session.
+ * Per-app traffic view for the current VPN session and daily statistics.
  *
- * Android's NetworkStatsManager is a historical accounting API. It is useful for
- * session consumption totals, but the platform can update its buckets with delay,
- * so this screen intentionally labels the values as session usage rather than
- * a packet-perfect live counter.
+ * Android's NetworkStatsManager is a historical accounting API whose buckets
+ * can lag behind live traffic by several minutes. AppTrafficManager therefore
+ * combines NetworkStatsManager snapshots with real-time per-UID/per-package
+ * bytes observed directly by Socks5Server during the current calendar day.
  */
 internal data class UidTrafficCounters(
     val downloadBytes: Long,
@@ -49,6 +51,83 @@ object AppTrafficManager {
         android.net.ConnectivityManager.TYPE_WIFI,
         android.net.ConnectivityManager.TYPE_ETHERNET,
     )
+
+    private class LiveDirectionalAccumulator {
+        val download = AtomicLong(0L)
+        val upload = AtomicLong(0L)
+
+        fun add(direction: QuotaTrafficDirection, bytes: Int) {
+            if (bytes <= 0) return
+            val delta = bytes.toLong()
+            val target = if (direction == QuotaTrafficDirection.DOWNLOAD) download else upload
+            target.updateAndGet { current ->
+                if (Long.MAX_VALUE - current < delta) Long.MAX_VALUE else current + delta
+            }
+        }
+
+        fun snapshot(): UidTrafficCounters = UidTrafficCounters(download.get(), upload.get())
+    }
+
+    @Volatile
+    private var liveDayKey: String = ""
+    private val liveByUid = ConcurrentHashMap<Int, LiveDirectionalAccumulator>()
+    private val liveByPackage = ConcurrentHashMap<String, LiveDirectionalAccumulator>()
+
+    private fun ensureCurrentDay(today: String = UsageDate.today()) {
+        if (liveDayKey == today) return
+        synchronized(this) {
+            if (liveDayKey != today) {
+                liveByUid.clear()
+                liveByPackage.clear()
+                liveDayKey = today
+            }
+        }
+    }
+
+    /**
+     * Records bytes forwarded by the local SOCKS5 relay for immediate UI visibility
+     * before Android's NetworkStatsManager flushes its periodic accounting buckets.
+     */
+    internal fun recordLiveRelayTraffic(
+        uid: Int?,
+        packages: Set<String>,
+        direction: QuotaTrafficDirection,
+        bytes: Int,
+        today: String = UsageDate.today(),
+    ) {
+        if (bytes <= 0) return
+        ensureCurrentDay(today)
+        if (uid != null && uid > 0) {
+            liveByUid.computeIfAbsent(uid) { LiveDirectionalAccumulator() }.add(direction, bytes)
+        }
+        packages.forEach { pkg ->
+            if (pkg.isNotBlank()) {
+                liveByPackage.computeIfAbsent(pkg) { LiveDirectionalAccumulator() }.add(direction, bytes)
+            }
+        }
+    }
+
+    internal fun liveRelayUsage(
+        uid: Int,
+        packageName: String? = null,
+        today: String = UsageDate.today(),
+    ): UidTrafficCounters {
+        ensureCurrentDay(today)
+        val pkgSnapshot = packageName?.let { liveByPackage[it]?.snapshot() }
+        val uidSnapshot = if (uid > 0) liveByUid[uid]?.snapshot() else null
+        return UidTrafficCounters(
+            downloadBytes = maxOf(pkgSnapshot?.downloadBytes ?: 0L, uidSnapshot?.downloadBytes ?: 0L),
+            uploadBytes = maxOf(pkgSnapshot?.uploadBytes ?: 0L, uidSnapshot?.uploadBytes ?: 0L),
+        )
+    }
+
+    internal fun clearLiveRelayTrafficForTests() {
+        synchronized(this) {
+            liveByUid.clear()
+            liveByPackage.clear()
+            liveDayKey = ""
+        }
+    }
 
     fun hasUsageAccess(context: Context): Boolean {
         val appOps = context.getSystemService(AppOpsManager::class.java) ?: return false
@@ -195,14 +274,16 @@ object AppTrafficManager {
             }
         }
 
+        val today = UsageDate.today()
         return apps.map { app ->
             val counter = bytesByUid[app.uid]
+            val live = liveRelayUsage(app.uid, app.packageName, today)
             AppTrafficUsage(
                 packageName = app.packageName,
                 label = app.loadLabel(pm).toString(),
                 uid = app.uid,
-                downloadBytes = counter?.getOrNull(0) ?: 0L,
-                uploadBytes = counter?.getOrNull(1) ?: 0L,
+                downloadBytes = maxOf(counter?.getOrNull(0) ?: 0L, live.downloadBytes),
+                uploadBytes = maxOf(counter?.getOrNull(1) ?: 0L, live.uploadBytes),
             )
         }.sortedByDescending { it.totalBytes }
     }

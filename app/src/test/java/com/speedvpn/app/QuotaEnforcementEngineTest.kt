@@ -6,6 +6,7 @@ import androidx.work.ListenableWorker
 import androidx.work.testing.TestListenableWorkerBuilder
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -29,6 +30,8 @@ class QuotaEnforcementEngineTest {
             .edit().clear().commit()
         context.getSharedPreferences("smart_settings", Context.MODE_PRIVATE)
             .edit().clear().commit()
+        AppTrafficManager.clearLiveRelayTrafficForTests()
+        QuotaEnforcementEngine.invalidateQuotaBaselineCache()
     }
 
     @After
@@ -36,6 +39,8 @@ class QuotaEnforcementEngineTest {
         context.deleteDatabase("speedvpn_usage.db")
         context.getSharedPreferences(VpnAppControl.PREFS, Context.MODE_PRIVATE)
             .edit().clear().commit()
+        AppTrafficManager.clearLiveRelayTrafficForTests()
+        QuotaEnforcementEngine.invalidateQuotaBaselineCache()
     }
 
     @Test
@@ -401,6 +406,372 @@ class QuotaEnforcementEngineTest {
         val worker = TestListenableWorkerBuilder<QuotaEnforcementWorker>(context).build()
         assertEquals(ListenableWorker.Result.success().toString(), worker.doWork().toString())
         assertEquals(setOf(packageName), VpnAppControl.quotaBlockedPackages(context))
+    }
+
+    @Test
+    fun partialTcpWriteRecordsOnlyWrittenPrefixAndDroppedUdpRecordsZeroLiveStats() {
+        val tcpPackage = "com.example.partialtcp"
+        val tcpUid = 2030
+        val now = System.currentTimeMillis()
+        val today = date(now)
+        UsageRepository.setQuotaPolicy(
+            context, tcpPackage, "Partial TCP", tcpUid, QuotaType.DAILY, 1_000L,
+        )
+
+        // 1. Admission alone increments inFlightReservedBytes, NOT live-forwarded counters.
+        val upDecision = QuotaEnforcementEngine.accountRelayBytes(
+            context, setOf(tcpPackage), tcpUid, QuotaTrafficDirection.UPLOAD, 700, now,
+        )
+        assertEquals(700, upDecision.allowedBytes)
+        assertEquals(700L, QuotaEnforcementEngine.inFlightReservedBytes(tcpPackage))
+        assertEquals(0L, QuotaEnforcementEngine.committedForwardedBytes(tcpPackage))
+        assertEquals(0L, AppTrafficManager.liveRelayUsage(tcpUid, tcpPackage, today).uploadBytes)
+
+        val upBuffer = ByteArray(700) { 1 }
+        val upStream = java.io.ByteArrayOutputStream()
+        val upWritten = writeAdmittedTcpRelayChunk(
+            destination = upStream,
+            buffer = upBuffer,
+            requestedBytes = 700,
+            decision = upDecision,
+            bucket = TokenBucket(),
+            generation = 1L,
+            packages = setOf(tcpPackage),
+            uid = tcpUid,
+            direction = QuotaTrafficDirection.UPLOAD,
+            hasOwner = true,
+            settleQuotaBytes = { pkgs, uid, dir, dec, outcome, bytes ->
+                QuotaEnforcementEngine.settleRelayBytes(context, pkgs, uid, dir, dec, outcome, bytes, now)
+            },
+        )
+        assertEquals(700, upWritten)
+        assertEquals(700, upStream.size())
+        assertEquals(0L, QuotaEnforcementEngine.inFlightReservedBytes(tcpPackage))
+        assertEquals(700L, QuotaEnforcementEngine.committedForwardedBytes(tcpPackage))
+        assertEquals(700L, AppTrafficManager.liveRelayUsage(tcpUid, tcpPackage, today).uploadBytes)
+
+        // 2. Request 500 download bytes when only 300 remain in quota:
+        // TCP writes only the admitted 300-byte prefix, and live stats must record 300 (never 500).
+        val downDecision = QuotaEnforcementEngine.accountRelayBytes(
+            context, setOf(tcpPackage), tcpUid, QuotaTrafficDirection.DOWNLOAD, 500, now,
+        )
+        assertEquals(300, downDecision.allowedBytes)
+        assertEquals(setOf(tcpPackage), downDecision.exhaustedPackages)
+        assertEquals(300L, QuotaEnforcementEngine.inFlightReservedBytes(tcpPackage))
+        assertEquals(0L, AppTrafficManager.liveRelayUsage(tcpUid, tcpPackage, today).downloadBytes)
+
+        val downBuffer = ByteArray(500) { 2 }
+        val downStream = java.io.ByteArrayOutputStream()
+        val downWritten = writeAdmittedTcpRelayChunk(
+            destination = downStream,
+            buffer = downBuffer,
+            requestedBytes = 500,
+            decision = downDecision,
+            bucket = TokenBucket(),
+            generation = 1L,
+            packages = setOf(tcpPackage),
+            uid = tcpUid,
+            direction = QuotaTrafficDirection.DOWNLOAD,
+            hasOwner = true,
+            settleQuotaBytes = { pkgs, uid, dir, dec, outcome, bytes ->
+                QuotaEnforcementEngine.settleRelayBytes(context, pkgs, uid, dir, dec, outcome, bytes, now)
+            },
+        )
+        assertEquals(300, downWritten)
+        assertEquals(300, downStream.size())
+        assertEquals(0L, QuotaEnforcementEngine.inFlightReservedBytes(tcpPackage))
+        assertEquals(1_000L, QuotaEnforcementEngine.committedForwardedBytes(tcpPackage))
+        val tcpLive = AppTrafficManager.liveRelayUsage(tcpUid, tcpPackage, today)
+        assertEquals(300L, tcpLive.downloadBytes)
+        assertEquals(700L, tcpLive.uploadBytes)
+        assertEquals(setOf(tcpPackage), VpnAppControl.quotaBlockedPackages(context))
+
+        // 3. Confirmed UDP drop (allowedBytes < payloadBytes) or send failure releases durable
+        // reservation and records 0 live bytes so the remaining 300 bytes stay usable.
+        val udpPackage = "com.example.droppedudp"
+        val udpUid = 2031
+        UsageRepository.setQuotaPolicy(
+            context, udpPackage, "Dropped UDP", udpUid, QuotaType.DAILY, 1_000L,
+        )
+        val firstUdpDecision = QuotaEnforcementEngine.accountRelayBytes(
+            context, setOf(udpPackage), udpUid, QuotaTrafficDirection.UPLOAD, 700, now,
+        )
+        val firstDelivered = deliverAdmittedUdpDatagram(
+            payloadBytes = 700,
+            decision = firstUdpDecision,
+            packages = setOf(udpPackage),
+            uid = udpUid,
+            direction = QuotaTrafficDirection.UPLOAD,
+            hasOwner = true,
+            sendDatagram = { true },
+            settleQuotaBytes = { pkgs, uid, dir, dec, outcome, bytes ->
+                QuotaEnforcementEngine.settleRelayBytes(context, pkgs, uid, dir, dec, outcome, bytes, now)
+            },
+        )
+        assertEquals(true, firstDelivered)
+        assertEquals(700L, AppTrafficManager.liveRelayUsage(udpUid, udpPackage, today).uploadBytes)
+
+        // Second UDP datagram requests 500 bytes when only 300 remain -> dropped in full,
+        // reservation of 300 bytes is released back to durable SQLite quota (usedBytes == 700).
+        val secondUdpDecision = QuotaEnforcementEngine.accountRelayBytes(
+            context, setOf(udpPackage), udpUid, QuotaTrafficDirection.DOWNLOAD, 500, now,
+        )
+        assertEquals(300, secondUdpDecision.allowedBytes)
+        var datagramSent = false
+        val secondDelivery = deliverAdmittedUdpDatagramDetailed(
+            payloadBytes = 500,
+            decision = secondUdpDecision,
+            packages = setOf(udpPackage),
+            uid = udpUid,
+            direction = QuotaTrafficDirection.DOWNLOAD,
+            hasOwner = true,
+            sendDatagram = {
+                datagramSent = true
+                true
+            },
+            settleQuotaBytes = { pkgs, uid, dir, dec, outcome, bytes ->
+                QuotaEnforcementEngine.settleRelayBytes(context, pkgs, uid, dir, dec, outcome, bytes, now)
+            },
+        )
+        assertEquals(false, secondDelivery.delivered)
+        assertEquals(false, datagramSent)
+        assertEquals(emptySet<String>(), secondDelivery.settledDecision.exhaustedPackages)
+        val policyAfterDrop = UsageRepository.readQuotaPolicies(context, udpPackage).single()
+        assertEquals("Dropped UDP datagram must release its 300-byte reservation", 700L, policyAfterDrop.usedBytes)
+        assertEquals(0L, policyAfterDrop.downloadBytes)
+        assertEquals(700L, policyAfterDrop.uploadBytes)
+        assertEquals(false, udpPackage in VpnAppControl.quotaBlockedPackages(context))
+        val udpLive = AppTrafficManager.liveRelayUsage(udpUid, udpPackage, today)
+        assertEquals("Dropped UDP datagram must not increase live download stats", 0L, udpLive.downloadBytes)
+        assertEquals(700L, udpLive.uploadBytes)
+
+        // Subsequent 300-byte UDP datagram that fits within the remaining 300-byte budget succeeds and exhausts quota.
+        val thirdUdpDecision = QuotaEnforcementEngine.accountRelayBytes(
+            context, setOf(udpPackage), udpUid, QuotaTrafficDirection.DOWNLOAD, 300, now,
+        )
+        assertEquals(300, thirdUdpDecision.allowedBytes)
+        val thirdDelivery = deliverAdmittedUdpDatagramDetailed(
+            payloadBytes = 300,
+            decision = thirdUdpDecision,
+            packages = setOf(udpPackage),
+            uid = udpUid,
+            direction = QuotaTrafficDirection.DOWNLOAD,
+            hasOwner = true,
+            sendDatagram = { true },
+            settleQuotaBytes = { pkgs, uid, dir, dec, outcome, bytes ->
+                QuotaEnforcementEngine.settleRelayBytes(context, pkgs, uid, dir, dec, outcome, bytes, now)
+            },
+        )
+        assertEquals(true, thirdDelivery.delivered)
+        assertEquals(setOf(udpPackage), thirdDelivery.settledDecision.exhaustedPackages)
+        val policyAfterThird = UsageRepository.readQuotaPolicies(context, udpPackage).single()
+        assertEquals(1_000L, policyAfterThird.usedBytes)
+        assertEquals(300L, policyAfterThird.downloadBytes)
+        assertEquals(700L, policyAfterThird.uploadBytes)
+        assertTrue(udpPackage in VpnAppControl.quotaBlockedPackages(context))
+    }
+
+    @Test
+    fun tcpWriteExceptionFollowsConservativeDurableQuotaRetentionWithoutIncrementingLiveStats() {
+        val pkg = "com.example.tcpfail"
+        val uid = 2032
+        val now = System.currentTimeMillis()
+        val today = date(now)
+        UsageRepository.setQuotaPolicy(context, pkg, "TCP Fail", uid, QuotaType.DAILY, 1_000L)
+
+        val decision = QuotaEnforcementEngine.accountRelayBytes(
+            context, setOf(pkg), uid, QuotaTrafficDirection.UPLOAD, 1_000, now,
+        )
+        assertEquals(1_000, decision.allowedBytes)
+        assertEquals(setOf(pkg), decision.exhaustedPackages)
+        assertEquals(1_000L, QuotaEnforcementEngine.inFlightReservedBytes(pkg))
+
+        val failingOutput = object : java.io.OutputStream() {
+            override fun write(b: Int) {
+                throw java.net.SocketException("Broken pipe")
+            }
+
+            override fun write(b: ByteArray, off: Int, len: Int) {
+                throw java.net.SocketException("Broken pipe")
+            }
+        }
+        val bucket = TokenBucket().apply { beginSession(11L) }
+
+        var threw = false
+        try {
+            writeAdmittedTcpRelayChunk(
+                destination = failingOutput,
+                buffer = ByteArray(1_000) { 1 },
+                requestedBytes = 1_000,
+                decision = decision,
+                bucket = bucket,
+                generation = 11L,
+                packages = setOf(pkg),
+                uid = uid,
+                direction = QuotaTrafficDirection.UPLOAD,
+                hasOwner = true,
+                settleQuotaBytes = { pkgs, ownerUid, dir, dec, outcome, bytes ->
+                    QuotaEnforcementEngine.settleRelayBytes(context, pkgs, ownerUid, dir, dec, outcome, bytes, now)
+                },
+            )
+        } catch (_: java.net.SocketException) {
+            threw = true
+        }
+        assertTrue(threw)
+        assertEquals(0L, QuotaEnforcementEngine.inFlightReservedBytes(pkg))
+        assertEquals(0L, QuotaEnforcementEngine.committedForwardedBytes(pkg))
+        assertEquals(0L, bucket.sessionBytes(11L))
+        assertEquals(0L, AppTrafficManager.liveRelayUsage(uid, pkg, today).uploadBytes)
+
+        // Durable quota conservatively retains the 1,000-byte reservation so an app cannot
+        // exploit socket write exceptions to undercount partially flushed kernel buffers.
+        val policy = UsageRepository.readQuotaPolicies(context, pkg).single()
+        assertEquals(1_000L, policy.usedBytes)
+        assertEquals(1_000L, policy.uploadBytes)
+        assertTrue(pkg in VpnAppControl.quotaBlockedPackages(context))
+    }
+
+    @Test
+    fun concurrentFlowsCannotExceedConfiguredQuotaAndMaintainMultiPolicyConsistency() {
+        val pkgA = "com.example.concurrent.a"
+        val pkgB = "com.example.concurrent.b"
+        val sharedUid = 2033
+        val now = System.currentTimeMillis()
+        val today = date(now)
+
+        UsageRepository.setQuotaPolicy(context, pkgA, "Concurrent A", sharedUid, QuotaType.DAILY, 1_000L)
+        UsageRepository.setQuotaPolicy(context, pkgA, "Concurrent A", sharedUid, QuotaType.WEEKLY, 2_000L)
+        UsageRepository.setQuotaPolicy(context, pkgA, "Concurrent A", sharedUid, QuotaType.MONTHLY, 5_000L)
+        UsageRepository.setQuotaPolicy(context, pkgB, "Concurrent B", sharedUid, QuotaType.DAILY, 1_000L)
+
+        val packages = setOf(pkgA, pkgB)
+        val startLatch = java.util.concurrent.CountDownLatch(1)
+        val doneLatch = java.util.concurrent.CountDownLatch(8)
+        val totalCommitted = java.util.concurrent.atomic.AtomicInteger(0)
+
+        repeat(8) {
+            Thread {
+                try {
+                    startLatch.await()
+                    val decision = QuotaEnforcementEngine.accountRelayBytes(
+                        context, packages, sharedUid, QuotaTrafficDirection.DOWNLOAD, 250, now,
+                    )
+                    if (decision.allowedBytes > 0) {
+                        val out = java.io.ByteArrayOutputStream()
+                        val written = writeAdmittedTcpRelayChunk(
+                            destination = out,
+                            buffer = ByteArray(250) { 7 },
+                            requestedBytes = 250,
+                            decision = decision,
+                            bucket = TokenBucket(),
+                            generation = 12L,
+                            packages = packages,
+                            uid = sharedUid,
+                            direction = QuotaTrafficDirection.DOWNLOAD,
+                            hasOwner = true,
+                            settleQuotaBytes = { pkgs, ownerUid, dir, dec, outcome, bytes ->
+                                QuotaEnforcementEngine.settleRelayBytes(context, pkgs, ownerUid, dir, dec, outcome, bytes, now)
+                            },
+                        )
+                        totalCommitted.addAndGet(written)
+                    }
+                } finally {
+                    doneLatch.countDown()
+                }
+            }.start()
+        }
+
+        startLatch.countDown()
+        assertTrue(doneLatch.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        assertEquals(1_000, totalCommitted.get())
+        assertEquals(0L, QuotaEnforcementEngine.inFlightReservedBytes(pkgA))
+        assertEquals(0L, QuotaEnforcementEngine.inFlightReservedBytes(pkgB))
+        assertEquals(1_000L, QuotaEnforcementEngine.committedForwardedBytes(pkgA))
+        assertEquals(1_000L, QuotaEnforcementEngine.committedForwardedBytes(pkgB))
+        assertEquals(1_000L, AppTrafficManager.liveRelayUsage(sharedUid, pkgA, today).downloadBytes)
+
+        val policiesA = UsageRepository.readQuotaPolicies(context, pkgA).associateBy { it.quotaType }
+        assertEquals(1_000L, policiesA.getValue(QuotaType.DAILY).usedBytes)
+        assertEquals(1_000L, policiesA.getValue(QuotaType.WEEKLY).usedBytes)
+        assertEquals(1_000L, policiesA.getValue(QuotaType.MONTHLY).usedBytes)
+        val policyB = UsageRepository.readQuotaPolicies(context, pkgB).single()
+        assertEquals(1_000L, policyB.usedBytes)
+    }
+
+    @Test
+    fun udpSendSucceedsBeforeProcessDeathAndBeforeSettlementRetainsQuotaAndPreventsBypass() {
+        val udpPkg = "com.example.crash.udp"
+        val tcpPkg = "com.example.crash.tcp"
+        val udpUid = 2040
+        val tcpUid = 2041
+        val now = System.currentTimeMillis()
+
+        UsageRepository.setQuotaPolicy(context, udpPkg, "Crash UDP", udpUid, QuotaType.DAILY, 1_000L)
+        UsageRepository.setQuotaPolicy(context, udpPkg, "Crash UDP", udpUid, QuotaType.WEEKLY, 2_000L)
+        UsageRepository.setQuotaPolicy(context, tcpPkg, "Crash TCP", tcpUid, QuotaType.DAILY, 1_000L)
+
+        // 1. Commit 700 bytes of UDP traffic normally.
+        val committedUdp = QuotaEnforcementEngine.accountRelayBytes(
+            context, setOf(udpPkg), udpUid, QuotaTrafficDirection.UPLOAD, 700, now, QuotaTransport.UDP,
+        )
+        assertEquals(700, committedUdp.allowedBytes)
+        QuotaEnforcementEngine.settleRelayBytes(
+            context, setOf(udpPkg), udpUid, QuotaTrafficDirection.UPLOAD,
+            committedUdp, QuotaSettlementOutcome.UDP_DELIVERED, 700, now,
+        )
+
+        // 2. Oversized UDP datagram (500 > 300 remaining) is rejected at admission without charging used_bytes.
+        val oversizedUdp = QuotaEnforcementEngine.accountRelayBytes(
+            context, setOf(udpPkg), udpUid, QuotaTrafficDirection.DOWNLOAD, 500, now, QuotaTransport.UDP,
+        )
+        assertEquals(0, oversizedUdp.allowedBytes)
+        assertEquals(700L, UsageRepository.readQuotaPolicies(context, udpPkg).first { it.quotaType == QuotaType.DAILY }.usedBytes)
+
+        // 3. Reserve the remaining 300 bytes for a fitting UDP datagram, simulate the UDP send
+        // succeeding on the wire, and then simulate process death BEFORE settleRelayBytes() runs.
+        val inFlightUdp = QuotaEnforcementEngine.accountRelayBytes(
+            context, setOf(udpPkg), udpUid, QuotaTrafficDirection.DOWNLOAD, 300, now, QuotaTransport.UDP,
+        )
+        assertEquals(300, inFlightUdp.allowedBytes)
+        var wireDatagramSent = false
+        run {
+            // The kernel UDP send completes, then the process is killed before settleRelayBytes().
+            wireDatagramSent = true
+        }
+        assertTrue(wireDatagramSent)
+        assertEquals(setOf(udpPkg), inFlightUdp.exhaustedPackages)
+        assertTrue(udpPkg in VpnAppControl.quotaBlockedPackages(context))
+
+        val inFlightTcp = QuotaEnforcementEngine.accountRelayBytes(
+            context, setOf(tcpPkg), tcpUid, QuotaTrafficDirection.UPLOAD, 1_000, now, QuotaTransport.TCP,
+        )
+        assertEquals(1_000, inFlightTcp.allowedBytes)
+        assertTrue(tcpPkg in VpnAppControl.quotaBlockedPackages(context))
+
+        // Simulate abrupt process termination and restart before settleRelayBytes() executes.
+        QuotaEnforcementEngine.simulateProcessRestartForTests(context, now + 100L)
+
+        // 4. Because the process died after UDP send and before settlement, the outcome is uncertain
+        // to the restarted process: it MUST conservatively retain the 300-byte reservation (total 1,000)
+        // and keep udpPkg blocked so post-send crashes cannot undercount traffic or bypass quota.
+        val udpPolicies = UsageRepository.readQuotaPolicies(context, udpPkg).associateBy { it.quotaType }
+        assertEquals(1_000L, udpPolicies.getValue(QuotaType.DAILY).usedBytes)
+        assertEquals(300L, udpPolicies.getValue(QuotaType.DAILY).downloadBytes)
+        assertEquals(700L, udpPolicies.getValue(QuotaType.DAILY).uploadBytes)
+        assertEquals(1_000L, udpPolicies.getValue(QuotaType.WEEKLY).usedBytes)
+        assertTrue(udpPkg in VpnAppControl.quotaBlockedPackages(context))
+
+        // A subsequent UDP datagram after restart must be rejected (0 allowedBytes).
+        val afterRestartAttempt = QuotaEnforcementEngine.accountRelayBytes(
+            context, setOf(udpPkg), udpUid, QuotaTrafficDirection.DOWNLOAD, 100, now + 200L, QuotaTransport.UDP,
+        )
+        assertEquals(0, afterRestartAttempt.allowedBytes)
+        assertEquals(setOf(udpPkg), afterRestartAttempt.exhaustedPackages)
+
+        val tcpPolicy = UsageRepository.readQuotaPolicies(context, tcpPkg).single()
+        assertEquals(1_000L, tcpPolicy.usedBytes)
+        assertEquals(1_000L, tcpPolicy.uploadBytes)
+        assertTrue(tcpPkg in VpnAppControl.quotaBlockedPackages(context))
     }
 
     private object UsageDatabaseTestSupport {
