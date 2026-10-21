@@ -24,8 +24,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import base64, bz2, hashlib, io, os, pathlib, tarfile
-
+          import base64, bz2, hashlib, io, pathlib, tarfile
           root = pathlib.Path(".tmp/quota-settlement-payload")
           expected_blobs = {
               "part-01.b64": "00cab9cec31586f53ce052f23a4250ec975aaee1",
@@ -40,12 +39,10 @@ jobs:
           }
           def git_blob_sha(s):
               b = s.encode("ascii")
-              return hashlib.sha1(f"blob {len(b)}\\0".encode() + b).hexdigest()
-
+              return hashlib.sha1(b"blob " + str(len(b)).encode() + bytes([0]) + b).hexdigest()
           chunks = []
           for name, expected in expected_blobs.items():
-              path = root / name
-              value = path.read_text().strip()
+              value = (root / name).read_text().strip()
               if git_blob_sha(value) != expected:
                   if name not in ("part-03.b64", "part-08.b64") or len(value) != 9001:
                       raise SystemExit(f"Payload segment integrity failed: {name}, length={len(value)}, sha={git_blob_sha(value)}")
@@ -54,9 +51,7 @@ jobs:
                       raise SystemExit(f"Could not uniquely repair inserted character in {name}: matches={len(matches)}")
                   value = matches[0]
               chunks.append(value)
-
-          encoded = "".join(chunks)
-          archive_bytes = base64.b64decode(encoded, validate=True)
+          archive_bytes = base64.b64decode("".join(chunks), validate=True)
           if hashlib.sha256(archive_bytes).hexdigest() != "0e2b35671b7c08f2fed21b462f2104a31c4a90b848aecad956b688b279c629d3":
               raise SystemExit("Compressed payload SHA-256 mismatch; nothing applied")
           raw_tar = bz2.decompress(archive_bytes)
@@ -92,6 +87,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           rm -rf .tmp/quota-settlement-payload
           rm -f .github/workflows/apply-quota-review-payload.yml
+          git add -u
           git add app/src/main/java/com/speedvpn/app/QuotaEnforcementEngine.kt
           git add app/src/main/java/com/speedvpn/app/QuotaModels.kt
           git add app/src/main/java/com/speedvpn/app/Socks5Server.kt
@@ -99,7 +95,6 @@ jobs:
           git add app/src/main/java/com/speedvpn/app/UsageDatabase.kt
           git add app/src/test/java/com/speedvpn/app/QuotaEnforcementEngineTest.kt
           git add scripts/e2e/tests/test_focused_network_fixes.py
-          git add -u .tmp .github/workflows/apply-quota-review-payload.yml || true
           git commit -m "Harden crash-safe quota settlement and UDP recovery"
           git push origin "HEAD:staging/quota-settlement-crash-safe-20261021"
 
