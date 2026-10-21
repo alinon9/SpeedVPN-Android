@@ -72,6 +72,225 @@ internal fun readRelayBatch(
     return RelayReadBatch(bytesRead, if (bytesRead < 0) 0 else 1)
 }
 
+internal data class UdpDatagramDeliveryResult(
+    val delivered: Boolean,
+    val settledDecision: QuotaTrafficDecision,
+)
+
+/**
+ * Writes the quota-admitted prefix of a TCP chunk and settles the reservation according to
+ * the explicit TCP settlement policy:
+ * - On normal return of [OutputStream.write], commits [allowedBytes] and records [allowedBytes]
+ *   in [bucket] and live traffic counters.
+ * - On an [OutputStream.write] exception, settles with [QuotaSettlementOutcome.TCP_WRITE_FAILED_CONSERVATIVE]
+ *   (retaining the durable quota reservation because Java sockets do not report partial bytes
+ *   flushed to the kernel before throwing, while recording 0 bytes in [bucket] and live stats).
+ */
+internal fun writeAdmittedTcpRelayChunk(
+    destination: OutputStream,
+    buffer: ByteArray,
+    requestedBytes: Int,
+    decision: QuotaTrafficDecision,
+    bucket: TokenBucket,
+    generation: Long,
+    packages: Set<String>,
+    uid: Int?,
+    direction: QuotaTrafficDirection,
+    hasOwner: Boolean,
+    recordForwardedBytes: (Set<String>, Int?, QuotaTrafficDirection, Int) -> Unit = { _, _, _, _ -> },
+    settleQuotaBytes: (
+        Set<String>,
+        Int?,
+        QuotaTrafficDirection,
+        QuotaTrafficDecision,
+        QuotaSettlementOutcome,
+        Int,
+    ) -> QuotaTrafficDecision = { pkgs, ownerUid, dir, dec, outcome, bytes ->
+        if (outcome == QuotaSettlementOutcome.TCP_WRITE_SUCCEEDED && bytes > 0) {
+            recordForwardedBytes(pkgs, ownerUid, dir, bytes)
+        }
+        dec
+    },
+    onWriteStarted: (Long) -> Unit = {},
+    onWriteCompleted: (Long) -> Unit = {},
+): Int {
+    val allowedBytes = decision.allowedBytes.coerceIn(0, requestedBytes)
+    if (allowedBytes <= 0) return 0
+    val startedNs = System.nanoTime()
+    onWriteStarted(startedNs)
+    try {
+        destination.write(buffer, 0, allowedBytes)
+    } catch (error: Throwable) {
+        if (hasOwner) {
+            runCatching {
+                settleQuotaBytes(
+                    packages,
+                    uid,
+                    direction,
+                    decision,
+                    QuotaSettlementOutcome.TCP_WRITE_FAILED_CONSERVATIVE,
+                    0,
+                )
+            }
+        }
+        throw error
+    }
+    val finishedNs = System.nanoTime()
+    onWriteCompleted(finishedNs)
+    bucket.recordForwarded(allowedBytes, generation)
+    if (hasOwner) {
+        runCatching {
+            settleQuotaBytes(
+                packages,
+                uid,
+                direction,
+                decision,
+                QuotaSettlementOutcome.TCP_WRITE_SUCCEEDED,
+                allowedBytes,
+            )
+        }
+    }
+    return allowedBytes
+}
+
+/**
+ * Atomic UDP datagram admission and post-delivery settlement. A UDP datagram whose size
+ * exceeds [decision].allowedBytes or whose channel/socket send returns false is not
+ * transmitted on the wire; its uncommitted durable quota reservation is released via
+ * [QuotaSettlementOutcome.UDP_DROPPED_OR_SEND_FAILED] and zero live bytes are recorded.
+ */
+internal fun deliverAdmittedUdpDatagramDetailed(
+    payloadBytes: Int,
+    decision: QuotaTrafficDecision,
+    packages: Set<String>,
+    uid: Int?,
+    direction: QuotaTrafficDirection,
+    hasOwner: Boolean,
+    sendDatagram: () -> Boolean,
+    recordForwardedBytes: (Set<String>, Int?, QuotaTrafficDirection, Int) -> Unit = { _, _, _, _ -> },
+    settleQuotaBytes: (
+        Set<String>,
+        Int?,
+        QuotaTrafficDirection,
+        QuotaTrafficDecision,
+        QuotaSettlementOutcome,
+        Int,
+    ) -> QuotaTrafficDecision = { pkgs, ownerUid, dir, dec, outcome, bytes ->
+        if (outcome == QuotaSettlementOutcome.UDP_DELIVERED && bytes > 0) {
+            recordForwardedBytes(pkgs, ownerUid, dir, bytes)
+            dec
+        } else {
+            dec.copy(allowedBytes = 0)
+        }
+    },
+): UdpDatagramDeliveryResult {
+    if (payloadBytes <= 0 || decision.allowedBytes < payloadBytes) {
+        val settled = if (hasOwner) {
+            runCatching {
+                settleQuotaBytes(
+                    packages,
+                    uid,
+                    direction,
+                    decision,
+                    QuotaSettlementOutcome.UDP_DROPPED_OR_SEND_FAILED,
+                    0,
+                )
+            }.getOrElse { decision.copy(allowedBytes = 0) }
+        } else {
+            decision.copy(allowedBytes = 0)
+        }
+        return UdpDatagramDeliveryResult(delivered = false, settledDecision = settled)
+    }
+
+    val delivered = try {
+        sendDatagram()
+    } catch (error: Throwable) {
+        if (hasOwner) {
+            runCatching {
+                settleQuotaBytes(
+                    packages,
+                    uid,
+                    direction,
+                    decision,
+                    QuotaSettlementOutcome.UDP_DROPPED_OR_SEND_FAILED,
+                    0,
+                )
+            }
+        }
+        throw error
+    }
+
+    if (!delivered) {
+        val settled = if (hasOwner) {
+            runCatching {
+                settleQuotaBytes(
+                    packages,
+                    uid,
+                    direction,
+                    decision,
+                    QuotaSettlementOutcome.UDP_DROPPED_OR_SEND_FAILED,
+                    0,
+                )
+            }.getOrElse { decision.copy(allowedBytes = 0) }
+        } else {
+            decision.copy(allowedBytes = 0)
+        }
+        return UdpDatagramDeliveryResult(delivered = false, settledDecision = settled)
+    }
+
+    val settled = if (hasOwner) {
+        runCatching {
+            settleQuotaBytes(
+                packages,
+                uid,
+                direction,
+                decision,
+                QuotaSettlementOutcome.UDP_DELIVERED,
+                payloadBytes,
+            )
+        }.getOrElse { decision }
+    } else {
+        decision
+    }
+    return UdpDatagramDeliveryResult(delivered = true, settledDecision = settled)
+}
+
+internal fun deliverAdmittedUdpDatagram(
+    payloadBytes: Int,
+    decision: QuotaTrafficDecision,
+    packages: Set<String>,
+    uid: Int?,
+    direction: QuotaTrafficDirection,
+    hasOwner: Boolean,
+    sendDatagram: () -> Boolean,
+    recordForwardedBytes: (Set<String>, Int?, QuotaTrafficDirection, Int) -> Unit = { _, _, _, _ -> },
+    settleQuotaBytes: (
+        Set<String>,
+        Int?,
+        QuotaTrafficDirection,
+        QuotaTrafficDecision,
+        QuotaSettlementOutcome,
+        Int,
+    ) -> QuotaTrafficDecision = { pkgs, ownerUid, dir, dec, outcome, bytes ->
+        if (outcome == QuotaSettlementOutcome.UDP_DELIVERED && bytes > 0) {
+            recordForwardedBytes(pkgs, ownerUid, dir, bytes)
+            dec
+        } else {
+            dec.copy(allowedBytes = 0)
+        }
+    },
+): Boolean = deliverAdmittedUdpDatagramDetailed(
+    payloadBytes = payloadBytes,
+    decision = decision,
+    packages = packages,
+    uid = uid,
+    direction = direction,
+    hasOwner = hasOwner,
+    sendDatagram = sendDatagram,
+    recordForwardedBytes = recordForwardedBytes,
+    settleQuotaBytes = settleQuotaBytes,
+).delivered
+
 /**
  * Local SOCKS5 relay used by the native tun2socks engine.
  *
@@ -91,7 +310,33 @@ class Socks5Server internal constructor(
         uid: Int?,
         direction: QuotaTrafficDirection,
         requestedBytes: Int,
-    ) -> QuotaTrafficDecision = { _, _, _, requestedBytes -> QuotaTrafficDecision(requestedBytes) },
+        transport: QuotaTransport,
+    ) -> QuotaTrafficDecision = { _, _, _, requestedBytes, _ -> QuotaTrafficDecision(requestedBytes) },
+    private val recordForwardedBytes: (
+        packages: Set<String>,
+        uid: Int?,
+        direction: QuotaTrafficDirection,
+        forwardedBytes: Int,
+    ) -> Unit = { _, _, _, _ -> },
+    private val settleQuotaBytes: (
+        packages: Set<String>,
+        uid: Int?,
+        direction: QuotaTrafficDirection,
+        decision: QuotaTrafficDecision,
+        outcome: QuotaSettlementOutcome,
+        forwardedBytes: Int,
+    ) -> QuotaTrafficDecision = { pkgs, uid, dir, decision, outcome, forwardedBytes ->
+        if ((outcome == QuotaSettlementOutcome.TCP_WRITE_SUCCEEDED ||
+                outcome == QuotaSettlementOutcome.UDP_DELIVERED) && forwardedBytes > 0
+        ) {
+            recordForwardedBytes(pkgs, uid, dir, forwardedBytes)
+        }
+        if (outcome == QuotaSettlementOutcome.UDP_DROPPED_OR_SEND_FAILED) {
+            decision.copy(allowedBytes = 0)
+        } else {
+            decision
+        }
+    },
     private val onQuotaExceeded: (Set<String>) -> Unit = {},
     /** Refuse ownerless data sessions while at least one per-app quota is configured. */
     private val requireUidAttribution: () -> Boolean = { false },
@@ -104,6 +349,7 @@ class Socks5Server internal constructor(
         private const val MAX_WORKERS = 192
         private const val HANDSHAKE_TIMEOUT_MS = 10_000
         private const val UDP_BUFFER_SIZE = 65_535
+        private const val UDP_SOCKET_BUFFER_SIZE = 256 * 1024
         private const val MAX_UDP_ASSOCIATIONS = 24
         private const val UDP_DNS_WORKERS = 4
         private const val UDP_FLOW_TTL_MS = 30_000L
@@ -967,6 +1213,7 @@ class Socks5Server internal constructor(
         var limiterCallNs = 0L
         var destinationWriteNs = 0L
         var destinationWriteInProgress = false
+        var exhaustedOnFailedWrite: Set<String> = emptySet()
         try {
             // Match relay read granularity to the current pacing bucket. A 16 KiB
             // read requires hundreds of scheduler wakeups per second at high rates;
@@ -1014,25 +1261,42 @@ class Socks5Server internal constructor(
                     QuotaTrafficDecision(n)
                 } else {
                     try {
-                        accountQuotaBytes(owner.packages, owner.uid, direction, n)
+                        accountQuotaBytes(owner.packages, owner.uid, direction, n, QuotaTransport.TCP)
                     } catch (error: Exception) {
                         logE("Quota accounting failed; dropping this relay chunk flowId=$flowId", error)
                         exitReason = "quota_accounting_failed"
                         QuotaTrafficDecision(0)
                     }
                 }
-                val allowedBytes = quotaDecision.allowedBytes.coerceIn(0, n)
+                var writeStartedNs = 0L
+                exhaustedOnFailedWrite = quotaDecision.exhaustedPackages
+                val allowedBytes = writeAdmittedTcpRelayChunk(
+                    destination = dst,
+                    buffer = buf,
+                    requestedBytes = n,
+                    decision = quotaDecision,
+                    bucket = bucket,
+                    generation = generation,
+                    packages = owner?.packages.orEmpty(),
+                    uid = owner?.uid,
+                    direction = direction,
+                    hasOwner = owner != null,
+                    recordForwardedBytes = recordForwardedBytes,
+                    settleQuotaBytes = settleQuotaBytes,
+                    onWriteStarted = { startedNs ->
+                        writeStartedNs = startedNs
+                        destinationWriteInProgress = true
+                    },
+                    onWriteCompleted = { finishedNs ->
+                        destinationWriteInProgress = false
+                        exhaustedOnFailedWrite = emptySet()
+                        writeCalls++
+                        destinationWriteNs += finishedNs - writeStartedNs
+                        if (firstForwardedNs == 0L) firstForwardedNs = writeStartedNs
+                        lastForwardedNs = finishedNs
+                    },
+                )
                 if (allowedBytes > 0) {
-                    val writeStartedNs = System.nanoTime()
-                    destinationWriteInProgress = true
-                    dst.write(buf, 0, allowedBytes)
-                    destinationWriteInProgress = false
-                    writeCalls++
-                    val writeFinishedNs = System.nanoTime()
-                    destinationWriteNs += writeFinishedNs - writeStartedNs
-                    if (firstForwardedNs == 0L) firstForwardedNs = writeStartedNs
-                    lastForwardedNs = writeFinishedNs
-                    bucket.recordForwarded(allowedBytes, generation)
                     forwardedBytes += allowedBytes.toLong()
                 }
 
@@ -1059,6 +1323,10 @@ class Socks5Server internal constructor(
             exitReason = "relay_error"
             logPipeException(error, bucket, generation, flowId)
         } finally {
+            if (exhaustedOnFailedWrite.isNotEmpty()) {
+                runCatching { onQuotaExceeded(exhaustedOnFailedWrite) }
+                    .onFailure { logE("Immediate quota block callback failed after TCP write error", it) }
+            }
             val wallDurationNs = (System.nanoTime() - pipeStartedNs).coerceAtLeast(1L)
             val transferDurationNs = if (firstForwardedNs > 0L) {
                 (lastForwardedNs - firstForwardedNs).coerceAtLeast(1L)
@@ -1182,6 +1450,10 @@ class Socks5Server internal constructor(
         try {
             relay = track(DatagramSocket(0, InetAddress.getByName("127.0.0.1")))
             val relaySocket = requireNotNull(relay)
+            runCatching {
+                relaySocket.receiveBufferSize = UDP_SOCKET_BUFFER_SIZE
+                relaySocket.sendBufferSize = UDP_SOCKET_BUFFER_SIZE
+            }
 
             // Fail closed at association creation time when there is no physical
             // network. Individual flow sockets also re-check the network before
@@ -1386,6 +1658,9 @@ class Socks5Server internal constructor(
         private val lock = Any()
         private val bindings = HashMap<String, UdpBinding>()
         private val runningMux = AtomicBoolean(true)
+        private val selectorRegistrationGate = Any()
+        private val pendingSelectorRegistrations = AtomicInteger(0)
+
         private val worker = thread(name = "socks-udp-mux", isDaemon = true) {
             runLoop()
         }
@@ -1501,6 +1776,7 @@ class Socks5Server internal constructor(
                             activeBinding.uid,
                             QuotaTrafficDirection.UPLOAD,
                             length,
+                            QuotaTransport.UDP,
                         )
                     } else {
                         QuotaTrafficDecision(length)
@@ -1509,21 +1785,32 @@ class Socks5Server internal constructor(
                     logE("Quota accounting failed; dropping UDP upload datagram", error)
                     return@synchronized false
                 }
-                exceededPackages = decision.exhaustedPackages
                 if (decision.allowedBytes < length) {
                     // UDP payloads are atomic: do not emit a malformed partial datagram.
                     log("SOCKS_UDP_QUOTA_DROP uid=${sessionUid ?: "UNRESOLVED"} requested=$length allowed=${decision.allowedBytes}")
-                    return@synchronized false
                 }
-
-                runCatching {
-                    val written = activeBinding.channel.write(ByteBuffer.wrap(data, offset, length))
-                    written == length
-                }.getOrElse {
-                    if (bindings[flow.logicalKey] === activeBinding) bindings.remove(flow.logicalKey)
-                    closeBindingLocked(activeBinding)
-                    false
-                }
+                val delivery = deliverAdmittedUdpDatagramDetailed(
+                    payloadBytes = length,
+                    decision = decision,
+                    packages = activeBinding.packages,
+                    uid = activeBinding.uid,
+                    direction = QuotaTrafficDirection.UPLOAD,
+                    hasOwner = activeBinding.uid != null || activeBinding.packages.isNotEmpty(),
+                    sendDatagram = {
+                        runCatching {
+                            val written = activeBinding.channel.write(ByteBuffer.wrap(data, offset, length))
+                            written == length
+                        }.getOrElse {
+                            if (bindings[flow.logicalKey] === activeBinding) bindings.remove(flow.logicalKey)
+                            closeBindingLocked(activeBinding)
+                            false
+                        }
+                    },
+                    recordForwardedBytes = recordForwardedBytes,
+                    settleQuotaBytes = settleQuotaBytes,
+                )
+                exceededPackages = delivery.settledDecision.exhaustedPackages
+                delivery.delivered
             }
             if (exceededPackages.isNotEmpty()) {
                 runCatching { onQuotaExceeded(exceededPackages) }
@@ -1562,6 +1849,30 @@ class Socks5Server internal constructor(
             runCatching { selector.close() }
         }
 
+        internal fun registerChannelWithSelector(
+            channel: DatagramChannel,
+            attachment: Any,
+        ) {
+            pendingSelectorRegistrations.incrementAndGet()
+            try {
+                selector.wakeup()
+                synchronized(selectorRegistrationGate) {
+                    selector.wakeup()
+                    channel.register(selector, SelectionKey.OP_READ, attachment)
+                }
+            } finally {
+                pendingSelectorRegistrations.decrementAndGet()
+                selector.wakeup()
+            }
+        }
+
+        internal fun yieldToPendingSelectorRegistrations() {
+            if (pendingSelectorRegistrations.get() <= 0) return
+            synchronized(selectorRegistrationGate) {
+                // Wait for channel registration to finish before selecting again.
+            }
+        }
+
         private fun createBindingLocked(flow: UdpFlow, remote: InetSocketAddress): UdpBinding {
             if (policyEpoch != expectedPolicyEpoch) throw SocketException("Socket closed by app policy change")
             val network = currentNetwork()
@@ -1569,8 +1880,8 @@ class Socks5Server internal constructor(
             val channel = DatagramChannel.open()
             val socket = channel.socket()
             try {
-                socket.receiveBufferSize = 64 * 1024
-                socket.sendBufferSize = 64 * 1024
+                socket.receiveBufferSize = UDP_SOCKET_BUFFER_SIZE
+                socket.sendBufferSize = UDP_SOCKET_BUFFER_SIZE
                 network.bindSocket(socket)
                 socket.bind(InetSocketAddress(0))
                 if (!protectUdp(socket)) {
@@ -1592,8 +1903,7 @@ class Socks5Server internal constructor(
                 // Selector registration is thread-safe. Do not synchronize on the
                 // Selector object: select() may hold that monitor while blocking, which
                 // prevents this thread from calling wakeup() and delays UDP setup.
-                selector.wakeup()
-                channel.register(selector, SelectionKey.OP_READ, binding)
+                registerChannelWithSelector(channel, binding)
                 trackUpstream(socket)
                 bindings[flow.logicalKey] = binding
                 return binding
@@ -1618,6 +1928,7 @@ class Socks5Server internal constructor(
                     SpeedLimiter.isGenerationActive(generation) &&
                     !Socks5Server.isSessionUidBlocked(sessionUid, blockedUids)
                 ) {
+                    yieldToPendingSelectorRegistrations()
                     selector.select(500)
                     val selected = selector.selectedKeys()
                     val iterator = selected.iterator()
@@ -1652,6 +1963,7 @@ class Socks5Server internal constructor(
                                         binding.uid,
                                         QuotaTrafficDirection.DOWNLOAD,
                                         count,
+                                        QuotaTransport.UDP,
                                     )
                                 } else {
                                     QuotaTrafficDecision(count)
@@ -1660,49 +1972,53 @@ class Socks5Server internal constructor(
                                 logE("Quota accounting failed; dropping UDP download datagram", error)
                                 continue
                             }
-                            if (quotaDecision.allowedBytes < count) {
-                                if (quotaDecision.exhaustedPackages.isNotEmpty()) {
-                                    runCatching { onQuotaExceeded(quotaDecision.exhaustedPackages) }
-                                        .onFailure { logE("Immediate quota block callback failed for UDP download", it) }
-                                }
-                                // Drop the full datagram when only a prefix remains in quota.
-                                continue
-                            }
-
                             // Candidate fallback may replace this binding while the
                             // selector still has a queued event. Serialize the final
                             // ownership check with candidate replacement and relay send.
-                            var delivered = false
-                            synchronized(lock) {
-                                if (bindings[binding.flow.logicalKey] === binding && binding.channel.isOpen) {
-                                    val destination = binding.flow.clientEndpoint
-                                    val address = binding.remote.address.address
-                                    val type = if (address.size == 4) 1 else 4
-                                    val header = ByteBuffer.allocate(4 + address.size + 2 + count)
-                                        .put(byteArrayOf(0, 0, 0, type.toByte()))
-                                        .put(address)
-                                        .putShort(binding.remote.port.toShort())
-                                        .put(payload)
+                            val delivery = deliverAdmittedUdpDatagramDetailed(
+                                payloadBytes = count,
+                                decision = quotaDecision,
+                                packages = binding.packages,
+                                uid = binding.uid,
+                                direction = QuotaTrafficDirection.DOWNLOAD,
+                                hasOwner = binding.uid != null || binding.packages.isNotEmpty(),
+                                sendDatagram = {
+                                    var sent = false
+                                    synchronized(lock) {
+                                        if (bindings[binding.flow.logicalKey] === binding && binding.channel.isOpen) {
+                                            val destination = binding.flow.clientEndpoint
+                                            val address = binding.remote.address.address
+                                            val type = if (address.size == 4) 1 else 4
+                                            val header = ByteBuffer.allocate(4 + address.size + 2 + count)
+                                                .put(byteArrayOf(0, 0, 0, type.toByte()))
+                                                .put(address)
+                                                .putShort(binding.remote.port.toShort())
+                                                .put(payload)
 
-                                    relaySocket.send(
-                                        DatagramPacket(
-                                            header.array(),
-                                            0,
-                                            header.position(),
-                                            destination.address,
-                                            destination.port,
-                                        )
-                                    )
-                                    udpFlows.markReply(binding.flow, System.currentTimeMillis())
-                                    delivered = true
-                                }
+                                            relaySocket.send(
+                                                DatagramPacket(
+                                                    header.array(),
+                                                    0,
+                                                    header.position(),
+                                                    destination.address,
+                                                    destination.port,
+                                                )
+                                            )
+                                            udpFlows.markReply(binding.flow, System.currentTimeMillis())
+                                            sent = true
+                                        }
+                                    }
+                                    sent
+                                },
+                                recordForwardedBytes = recordForwardedBytes,
+                                settleQuotaBytes = settleQuotaBytes,
+                            )
+                            if (delivery.settledDecision.exhaustedPackages.isNotEmpty()) {
+                                runCatching { onQuotaExceeded(delivery.settledDecision.exhaustedPackages) }
+                                    .onFailure { logE("Immediate quota block callback failed for UDP download", it) }
                             }
-                            if (delivered) {
+                            if (delivery.delivered) {
                                 SpeedLimiter.download.recordForwarded(count, generation)
-                                if (quotaDecision.exhaustedPackages.isNotEmpty()) {
-                                    runCatching { onQuotaExceeded(quotaDecision.exhaustedPackages) }
-                                        .onFailure { logE("Immediate quota block callback failed for UDP download", it) }
-                                }
                             }
                         } catch (error: Exception) {
                             if (runningMux.get() && running && policyEpoch == expectedPolicyEpoch) {

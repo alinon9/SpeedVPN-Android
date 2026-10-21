@@ -189,8 +189,11 @@ internal class UidDetectionPoc(
             return encodeUidDecision(
                 Process.INVALID_UID,
                 VpnApplicationPolicy.shouldDropUnresolvedUid(
-                    blockPolicy.uids,
+                    blockedUids = blockPolicy.uids,
                     attributionExhausted = true,
+                    protocol = protocol,
+                    dstIp = destination,
+                    dstPort = dstPort,
                 ),
             )
         } finally {
@@ -214,10 +217,17 @@ internal class UidDetectionPoc(
     private fun encodeUidDecision(uid: Int, shouldBlock: Boolean): Long =
         (uid.toLong() shl 32) or (if (shouldBlock) 1L else 0L)
 
-    private fun unresolvedUid(): UidResolution {
+    private fun unresolvedUid(
+        protocol: Int = -1,
+        dstIp: String = "",
+        dstPort: Int = -1,
+    ): UidResolution {
         val shouldBlock = VpnApplicationPolicy.shouldDropUnresolvedUid(
-            blockPolicy.uids,
+            blockedUids = blockPolicy.uids,
             attributionExhausted = true,
+            protocol = protocol,
+            dstIp = dstIp,
+            dstPort = dstPort,
         )
         return UidResolution(
             Process.INVALID_UID,
@@ -304,8 +314,11 @@ internal class UidDetectionPoc(
         val blockedPackageMatches = knownPackages.filter { it in policy.packages }
         val shouldBlock = if (uid == Process.INVALID_UID) {
             VpnApplicationPolicy.shouldDropUnresolvedUid(
-                policy.uids,
+                blockedUids = policy.uids,
                 attributionExhausted = true,
+                protocol = protocol,
+                dstIp = dst,
+                dstPort = dstPort,
             )
         } else {
             VpnApplicationPolicy.shouldDropUid(uid, policy.uids)
@@ -405,4 +418,3 @@ internal class UidDetectionPoc(
         const val IPPROTO_UDP = 17
     }
 }
-

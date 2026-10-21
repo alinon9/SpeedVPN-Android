@@ -14,12 +14,156 @@ internal object QuotaEnforcementEngine {
     // stale periodic evaluation cannot clear a block reached concurrently by a live relay.
     private val quotaStateLock = Any()
     private val quotaBaselineDayByPackage = ConcurrentHashMap<String, Long>()
+    // Cached set of packages that actually have configured quota policies. Null means
+    // unknown/needs refresh. Allows unquoted relay flows (e.g. YouTube/browser with no
+    // quota set) to avoid per-chunk SQLite transactions and lock contention.
+    @Volatile
+    private var configuredQuotaPackages: Set<String>? = null
+    private val uidPackagesCache = ConcurrentHashMap<Int, Set<String>>()
+    private val inFlightReservedByPackage = ConcurrentHashMap<String, AtomicLong>()
+    private val committedForwardedByPackage = ConcurrentHashMap<String, AtomicLong>()
+    @Volatile
+    private var currentProcessToken: String = "proc-" + System.nanoTime() + "-" + java.util.UUID.randomUUID()
+    @Volatile
+    private var recoveredForProcessToken: String = ""
     private const val RESTART_THROTTLE_MS = 5_000L
 
     /** Invalidated when a quota policy is created, removed, or reconfigured. */
-    internal fun invalidateQuotaBaselineCache(packageName: String) {
-        quotaBaselineDayByPackage.remove(packageName)
+    internal fun invalidateQuotaBaselineCache(packageName: String? = null) {
+        if (packageName == null) {
+            quotaBaselineDayByPackage.clear()
+            inFlightReservedByPackage.clear()
+            committedForwardedByPackage.clear()
+        } else {
+            quotaBaselineDayByPackage.remove(packageName)
+            inFlightReservedByPackage.remove(packageName)
+            committedForwardedByPackage.remove(packageName)
+        }
+        configuredQuotaPackages = null
     }
+
+    /**
+     * Simulates an abrupt process termination and restart in tests by rotating the
+     * active process token and clearing in-memory volatile state without running
+     * normal [settleRelayBytes] callbacks for in-flight reservations.
+     */
+    internal fun simulateProcessRestartForTests(
+        context: Context,
+        nowMillis: Long = System.currentTimeMillis(),
+    ) {
+        synchronized(quotaStateLock) {
+            inFlightReservedByPackage.clear()
+            committedForwardedByPackage.clear()
+            quotaBaselineDayByPackage.clear()
+            configuredQuotaPackages = null
+            currentProcessToken = "proc-" + System.nanoTime() + "-" + java.util.UUID.randomUUID()
+            recoveredForProcessToken = ""
+            ensureOrphanedUdpReservationsRecoveredLocked(context, nowMillis)
+        }
+    }
+
+    private fun ensureOrphanedUdpReservationsRecoveredLocked(
+        context: Context,
+        nowMillis: Long,
+    ) {
+        val token = currentProcessToken
+        if (recoveredForProcessToken == token) return
+        val dbFile = runCatching { context.getDatabasePath("speedvpn_usage.db") }.getOrNull()
+        if (dbFile != null && !dbFile.exists()) {
+            recoveredForProcessToken = token
+            return
+        }
+        val (affectedPackages, stillExhausted) = runCatching {
+            UsageRepository.recoverOrphanedUdpReservations(context, token, nowMillis)
+        }.getOrDefault(emptySet<String>() to emptySet())
+        if (stillExhausted.isNotEmpty()) {
+            VpnAppControl.addQuotaBlockedPackages(context, stillExhausted)
+        }
+        if (affectedPackages.isNotEmpty()) {
+            (affectedPackages - stillExhausted).forEach { packageName ->
+                VpnAppControl.setQuotaBlocked(context, packageName, false)
+            }
+        }
+        recoveredForProcessToken = token
+    }
+
+    internal fun inFlightReservedBytes(packageName: String): Long =
+        inFlightReservedByPackage[packageName]?.get()?.coerceAtLeast(0L) ?: 0L
+
+    internal fun committedForwardedBytes(packageName: String): Long =
+        committedForwardedByPackage[packageName]?.get()?.coerceAtLeast(0L) ?: 0L
+
+    private fun addInFlightReservation(packages: Set<String>, bytes: Int) {
+        if (bytes <= 0) return
+        val delta = bytes.toLong()
+        packages.forEach { pkg ->
+            if (pkg.isNotBlank()) {
+                inFlightReservedByPackage.computeIfAbsent(pkg) { AtomicLong(0L) }
+                    .updateAndGet { current ->
+                        if (Long.MAX_VALUE - current < delta) Long.MAX_VALUE else current + delta
+                    }
+            }
+        }
+    }
+
+    private fun releaseInFlightReservation(packages: Set<String>, bytes: Int) {
+        if (bytes <= 0) return
+        val delta = bytes.toLong()
+        packages.forEach { pkg ->
+            if (pkg.isNotBlank()) {
+                inFlightReservedByPackage[pkg]?.updateAndGet { current ->
+                    (current - delta).coerceAtLeast(0L)
+                }
+            }
+        }
+    }
+
+    private fun addCommittedForwarded(packages: Set<String>, bytes: Int) {
+        if (bytes <= 0) return
+        val delta = bytes.toLong()
+        packages.forEach { pkg ->
+            if (pkg.isNotBlank()) {
+                committedForwardedByPackage.computeIfAbsent(pkg) { AtomicLong(0L) }
+                    .updateAndGet { current ->
+                        if (Long.MAX_VALUE - current < delta) Long.MAX_VALUE else current + delta
+                    }
+            }
+        }
+    }
+
+    internal fun resolvePackagesForUidCached(context: Context, uid: Int?): Set<String> {
+        val validUid = uid?.takeIf { it > 0 } ?: return emptySet()
+        uidPackagesCache[validUid]?.let { return it }
+        val resolved = runCatching {
+            context.packageManager.getPackagesForUid(validUid)?.filter { it.isNotBlank() }?.toSet().orEmpty()
+        }.getOrDefault(emptySet())
+        if (resolved.isNotEmpty()) {
+            uidPackagesCache[validUid] = resolved
+        }
+        return resolved
+    }
+
+    private fun currentQuotaPackages(context: Context): Set<String> {
+        val dbFile = runCatching { context.getDatabasePath("speedvpn_usage.db") }.getOrNull()
+        if (dbFile != null && !dbFile.exists()) {
+            quotaBaselineDayByPackage.clear()
+            configuredQuotaPackages = emptySet()
+            return emptySet()
+        }
+        configuredQuotaPackages?.let { return it }
+        return synchronized(quotaStateLock) {
+            configuredQuotaPackages?.let { return@synchronized it }
+            val loaded = runCatching {
+                UsageRepository.readQuotaPolicies(context).map { it.packageName }.toSet()
+            }.getOrDefault(emptySet())
+            configuredQuotaPackages = loaded
+            loaded
+        }
+    }
+
+    internal fun hasAnyConfiguredQuotaPolicies(context: Context): Boolean =
+        currentQuotaPackages(context).isNotEmpty()
+
     private val lastRestartAtMillis = AtomicLong(Long.MIN_VALUE)
     private val restartPending = AtomicLong(0L)
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -28,6 +172,7 @@ internal object QuotaEnforcementEngine {
         mainHandler.removeCallbacksAndMessages(null)
         restartPending.set(0L)
         lastRestartAtMillis.set(Long.MIN_VALUE)
+        invalidateQuotaBaselineCache()
     }
 
     internal fun tryAcquireRestart(nowMillis: Long): Boolean {
@@ -44,7 +189,12 @@ internal object QuotaEnforcementEngine {
 
     /**
      * Reserves bytes at the actual SOCKS relay boundary. The database serializes concurrent
-     * flows, and a caller may forward only the admitted prefix returned by this method.
+     * flows when a quota is configured for the package, while flows belonging to apps with
+     * no quota policy return immediately in O(1) memory.
+     *
+     * Live UI traffic counters are intentionally NOT updated here: the relay records only
+     * the bytes that are actually written/delivered via [recordForwardedRelayBytes] so a
+     * partial TCP write or a dropped UDP datagram never inflates per-app usage statistics.
      */
     fun accountRelayBytes(
         context: Context,
@@ -53,36 +203,178 @@ internal object QuotaEnforcementEngine {
         direction: QuotaTrafficDirection,
         requestedBytes: Int,
         nowMillis: Long = System.currentTimeMillis(),
-    ): QuotaTrafficDecision = synchronized(quotaStateLock) {
+        transport: QuotaTransport = QuotaTransport.TCP,
+    ): QuotaTrafficDecision {
+        val requested = requestedBytes.coerceAtLeast(0)
+        if (requested == 0) return QuotaTrafficDecision(0)
         val resolvedPackages = packageNames.filter { it.isNotBlank() }.toSet().ifEmpty {
-            uid?.takeIf { it > 0 }?.let { appUid ->
-                runCatching { context.packageManager.getPackagesForUid(appUid)?.toSet().orEmpty() }
-                    .getOrDefault(emptySet())
-            }.orEmpty()
+            resolvePackagesForUidCached(context, uid)
         }
-        val dayStart = QuotaPeriod.current(QuotaType.DAILY, nowMillis).startMillis
-        if (resolvedPackages.any { quotaBaselineDayByPackage[it] != dayStart }) {
-            initializeMissingQuotaBaselines(context, nowMillis, resolvedPackages)
+        if (resolvedPackages.isEmpty()) return QuotaTrafficDecision(requested)
+
+        // Fast-path: skip quotaStateLock and SQLite transactions when none of the
+        // resolved packages have an active quota policy.
+        val quotaPackages = currentQuotaPackages(context)
+        if (quotaPackages.isEmpty() || resolvedPackages.none { it in quotaPackages }) {
+            addInFlightReservation(resolvedPackages, requested)
+            return QuotaTrafficDecision(requested)
         }
-        val decision = UsageRepository.reserveQuotaBytes(
-            context = context,
-            packageNames = resolvedPackages,
-            direction = direction,
-            requestedBytes = requestedBytes,
-            nowMillis = nowMillis,
-        )
-        if (decision.exhaustedPackages.isNotEmpty()) {
-            VpnAppControl.addQuotaBlockedPackages(context, decision.exhaustedPackages).forEach { packageName ->
-                DiagnosticsRepository.record(
-                    context,
-                    "WARN",
-                    "DataLimit",
-                    "APP_QUOTA_REACHED",
-                    "$packageName reached its configured relay-byte quota; uid=" + (uid ?: -1),
-                )
+
+        return synchronized(quotaStateLock) {
+            ensureOrphanedUdpReservationsRecoveredLocked(context, nowMillis)
+            val dayStart = QuotaPeriod.current(QuotaType.DAILY, nowMillis).startMillis
+            if (resolvedPackages.any { quotaBaselineDayByPackage[it] != dayStart }) {
+                initializeMissingQuotaBaselines(context, nowMillis, resolvedPackages)
+            }
+            val decision = UsageRepository.reserveQuotaBytes(
+                context = context,
+                packageNames = resolvedPackages,
+                direction = direction,
+                requestedBytes = requested,
+                nowMillis = nowMillis,
+                transport = transport,
+                processToken = currentProcessToken,
+            )
+            addInFlightReservation(resolvedPackages, decision.allowedBytes)
+            if (decision.exhaustedPackages.isNotEmpty()) {
+                VpnAppControl.addQuotaBlockedPackages(context, decision.exhaustedPackages).forEach { packageName ->
+                    DiagnosticsRepository.record(
+                        context,
+                        "WARN",
+                        "DataLimit",
+                        "APP_QUOTA_REACHED",
+                        "$packageName reached its configured relay-byte quota; uid=" + (uid ?: -1),
+                    )
+                }
+            }
+            decision
+        }
+    }
+
+    /**
+     * Settles an admitted relay reservation after socket/channel I/O completes or fails:
+     * - [QuotaSettlementOutcome.TCP_WRITE_SUCCEEDED] and [QuotaSettlementOutcome.UDP_DELIVERED]
+     *   commit the forwarded byte count and update live per-app traffic counters.
+     * - [QuotaSettlementOutcome.TCP_WRITE_FAILED_CONSERVATIVE] retains the durable SQLite
+     *   reservation conservatively (because OutputStream.write() does not report partial bytes
+     *   copied to the kernel before throwing) while recording 0 live-forwarded bytes.
+     * - [QuotaSettlementOutcome.UDP_DROPPED_OR_SEND_FAILED] releases the uncommitted durable
+     *   reservation in SQLite and reconciles [VpnAppControl.quotaBlockedPackages] so an atomic
+     *   UDP datagram that was never transmitted does not consume quota or prematurely block the app.
+     */
+    internal fun settleRelayBytes(
+        context: Context,
+        packageNames: Set<String>,
+        uid: Int?,
+        direction: QuotaTrafficDirection,
+        decision: QuotaTrafficDecision,
+        outcome: QuotaSettlementOutcome,
+        forwardedBytes: Int,
+        nowMillis: Long = System.currentTimeMillis(),
+    ): QuotaTrafficDecision {
+        val resolvedPackages = packageNames.filter { it.isNotBlank() }.toSet().ifEmpty {
+            resolvePackagesForUidCached(context, uid)
+        }
+        releaseInFlightReservation(resolvedPackages, decision.allowedBytes)
+
+        return when (outcome) {
+            QuotaSettlementOutcome.TCP_WRITE_SUCCEEDED,
+            QuotaSettlementOutcome.UDP_DELIVERED -> {
+                val maxCommit = if (decision.allowedBytes > 0) decision.allowedBytes else forwardedBytes.coerceAtLeast(0)
+                val committed = forwardedBytes.coerceIn(0, maxCommit)
+                val unusedReserved = (decision.allowedBytes - committed).coerceAtLeast(0)
+                val settled = if (unusedReserved > 0 && decision.reservations.isNotEmpty()) {
+                    releaseReservationAndReconcileBlocks(context, decision, unusedReserved, nowMillis)
+                        .copy(allowedBytes = committed)
+                } else {
+                    if (decision.reservations.any { it.reservationId > 0L }) {
+                        synchronized(quotaStateLock) {
+                            runCatching { UsageRepository.commitQuotaReservation(context, decision) }
+                        }
+                    }
+                    decision.copy(allowedBytes = committed)
+                }
+                if (committed > 0) {
+                    addCommittedForwarded(resolvedPackages, committed)
+                    AppTrafficManager.recordLiveRelayTraffic(
+                        uid = uid,
+                        packages = resolvedPackages,
+                        direction = direction,
+                        bytes = committed,
+                        today = formatDate(nowMillis),
+                    )
+                }
+                settled
+            }
+            QuotaSettlementOutcome.TCP_WRITE_FAILED_CONSERVATIVE -> {
+                // Conservative TCP settlement: keep the durable reservation in SQLite
+                // because OutputStream.write() may have flushed part or all of the slice
+                // before throwing, but do not count unconfirmed bytes in live UI traffic.
+                decision
+            }
+            QuotaSettlementOutcome.UDP_DROPPED_OR_SEND_FAILED -> {
+                if (decision.reservations.isNotEmpty()) {
+                    releaseReservationAndReconcileBlocks(
+                        context = context,
+                        decision = decision,
+                        bytesToRelease = decision.allowedBytes,
+                        nowMillis = nowMillis,
+                    )
+                } else {
+                    decision.copy(allowedBytes = 0)
+                }
             }
         }
-        decision
+    }
+
+    private fun releaseReservationAndReconcileBlocks(
+        context: Context,
+        decision: QuotaTrafficDecision,
+        bytesToRelease: Int,
+        nowMillis: Long,
+    ): QuotaTrafficDecision = synchronized(quotaStateLock) {
+        val stillExhausted = UsageRepository.releaseQuotaReservation(
+            context = context,
+            decision = decision,
+            bytesToRelease = bytesToRelease,
+            nowMillis = nowMillis,
+        )
+        val noLongerExhausted = decision.exhaustedPackages - stillExhausted
+        noLongerExhausted.forEach { packageName ->
+            VpnAppControl.setQuotaBlocked(context, packageName, false)
+        }
+        QuotaTrafficDecision(
+            allowedBytes = (decision.allowedBytes - bytesToRelease).coerceAtLeast(0),
+            exhaustedPackages = stillExhausted,
+            reservations = emptyList(),
+        )
+    }
+
+    /**
+     * Records only bytes that were actually written/forwarded to the destination socket or
+     * datagram channel after quota admission and I/O completion. Partial TCP writes record
+     * only the written prefix (allowedBytes), and dropped UDP datagrams record zero bytes.
+     */
+    internal fun recordForwardedRelayBytes(
+        context: Context,
+        packageNames: Set<String>,
+        uid: Int?,
+        direction: QuotaTrafficDirection,
+        forwardedBytes: Int,
+        nowMillis: Long = System.currentTimeMillis(),
+    ) {
+        val actual = forwardedBytes.coerceAtLeast(0)
+        if (actual == 0) return
+        settleRelayBytes(
+            context = context,
+            packageNames = packageNames,
+            uid = uid,
+            direction = direction,
+            decision = QuotaTrafficDecision(actual),
+            outcome = QuotaSettlementOutcome.TCP_WRITE_SUCCEEDED,
+            forwardedBytes = actual,
+            nowMillis = nowMillis,
+        )
     }
 
     /**
@@ -92,9 +384,12 @@ internal object QuotaEnforcementEngine {
     fun evaluateBlockedPackages(
         context: Context,
         nowMillis: Long = System.currentTimeMillis(),
-    ): Set<String> {
+    ): Set<String> = synchronized(quotaStateLock) {
+        ensureOrphanedUdpReservationsRecoveredLocked(context, nowMillis)
         initializeMissingQuotaBaselines(context, nowMillis, packageNames = null)
-        return UsageRepository.readQuotaPolicies(context)
+        val policies = UsageRepository.readQuotaPolicies(context)
+        configuredQuotaPackages = policies.map { it.packageName }.toSet()
+        return policies
             .filter { policy -> policy.usedBytes >= policy.limitBytes }
             .map { it.packageName }
             .toSet()

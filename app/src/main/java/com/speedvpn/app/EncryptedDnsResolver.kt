@@ -25,6 +25,9 @@ class EncryptedDnsResolver(
     private data class DohProvider(val host: String, val ipv4: String, val jsonPath: String)
 
     companion object {
+        internal const val DNS_TYPE_A = 1
+        internal const val DNS_TYPE_AAAA = 28
+
         // Keep independent providers. A failure or filtering of one endpoint must not
         // make every hostname lookup fail when another encrypted resolver is reachable.
         private val DOH_PROVIDERS = listOf(
@@ -35,6 +38,32 @@ class EncryptedDnsResolver(
         // the fallback resolver are tried. Each provider attempt gets at most 1.2 s.
         private const val RESOLUTION_TIMEOUT_MS = 3_000L
         private const val PROVIDER_TIMEOUT_MS = 1_200L
+
+        internal fun expectedDnsRecordType(family: Int): Int = when (family) {
+            4 -> DNS_TYPE_A
+            6 -> DNS_TYPE_AAAA
+            else -> -1
+        }
+
+        internal fun parseDnsAnswerAddress(
+            answerType: Int,
+            family: Int,
+            data: String,
+            ipv6Enabled: Boolean,
+        ): InetAddress? {
+            val expectedType = expectedDnsRecordType(family)
+            if (expectedType < 0 || answerType != expectedType) return null
+            val trimmed = data.trim()
+            if (trimmed.isEmpty() || !isNumericAddress(trimmed)) return null
+            val expectedBytes = if (family == 4) 4 else 16
+            return runCatching { InetAddress.getByName(trimmed) }
+                .getOrNull()
+                ?.takeIf { it.address.size == expectedBytes && (ipv6Enabled || it.address.size == 4) }
+        }
+
+        internal fun isNumericAddress(host: String): Boolean =
+            host.isNotEmpty() &&
+                host.all { it.isDigit() || it == '.' || it == ':' || it in 'a'..'f' || it in 'A'..'F' }
     }
 
     private val requestGeneration = AtomicLong(0L)
@@ -180,22 +209,18 @@ class EncryptedDnsResolver(
                 val answers = json.optJSONArray("Answer") ?: return
                 for (i in 0 until answers.length()) {
                     val answer = answers.optJSONObject(i) ?: continue
-                    if (answer.optInt("type", -1) != family) continue
-                    val value = answer.optString("data", "")
-                    if (value.isBlank()) continue
-                    runCatching { InetAddress.getByName(value) }
-                        .getOrNull()
-                        ?.takeIf { ipv6Enabled || it.address.size == 4 }
-                        ?.let(out::add)
+                    parseDnsAnswerAddress(
+                        answerType = answer.optInt("type", -1),
+                        family = family,
+                        data = answer.optString("data", ""),
+                        ipv6Enabled = ipv6Enabled,
+                    )?.let(out::add)
                 }
             }
         } finally {
             activeCalls.remove(call)
         }
     }
-
-    private fun isNumericAddress(host: String): Boolean =
-        host.all { it.isDigit() || it == '.' || it == ':' || it in 'a'..'f' || it in 'A'..'F' }
 
     private class ProtectedNetworkSocketFactory(
         private val network: Network,
