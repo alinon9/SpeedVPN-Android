@@ -373,3 +373,10 @@ object VpnAppControl {
         }
     }
 }
+
+fun formatDataBytes(bytes: Long): String = when {
+    bytes < 1_000L -> "$bytes B"
+    bytes < 1_000_000L -> String.format(Locale.US, "%.1f KB", bytes / 1_000.0)
+    bytes < 1_000_000_000L -> String.format(Locale.US, "%.2f MB", bytes / 1_000_000.0)
+    else -> String.format(Locale.US, "%.2f GB", bytes / 1_000_000_000.0)
+}
