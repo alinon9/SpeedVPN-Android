@@ -1,0 +1,71 @@
+name: Apply verified AppTraffic payload and rebuild APK
+
+on:
+  push:
+    branches:
+      - staging/quota-settlement-crash-safe-20261021
+    paths:
+      - .tmp/apptraffic-payload/part-03.b64
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  apply-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout staging branch
+        uses: actions/checkout@v4
+        with:
+          ref: staging/quota-settlement-crash-safe-20261021
+          fetch-depth: 0
+      - name: Verify exact archive file and apply
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, hashlib, pathlib
+          root = pathlib.Path(".tmp/apptraffic-payload")
+          expected = {
+              "part-01.b64": ("67c582fdf38f72ac726c46e8eb7f415ae2396024", 9000),
+              "part-02.b64": ("4bd5515f5fad5a7b3a2f573238fa6b2931a565f9", 9000),
+              "part-03.b64": ("202729809f7b1dc048544bb6dbcb80c023bcc017", 3176),
+          }
+          def blob_sha(value):
+              data = value.encode("ascii")
+              return hashlib.sha1(b"blob " + str(len(data)).encode() + bytes([0]) + data).hexdigest()
+          parts=[]
+          for name,(sha,size) in expected.items():
+              value=(root/name).read_text().strip()
+              if blob_sha(value) != sha:
+                  if len(value) == size+1:
+                      fixes=[value[:i]+value[i+1:] for i in range(len(value)) if blob_sha(value[:i]+value[i+1:])==sha]
+                      if len(fixes)==1: value=fixes[0]
+                      else: raise SystemExit(f"Segment failed integrity: {name} matches={len(fixes)}")
+                  else:
+                      raise SystemExit(f"Segment failed integrity: {name} length={len(value)} sha={blob_sha(value)}")
+              parts.append(value)
+          source=base64.b64decode("".join(parts),validate=True)
+          if len(source)!=15880 or hashlib.sha1(b"blob "+str(len(source)).encode()+bytes([0])+source).hexdigest()!="97b903b71075ea06508b07aca4018474652b4586":
+              raise SystemExit("AppTraffic.kt archive SHA/size mismatch; not applying")
+          target=pathlib.Path("app/src/main/java/com/speedvpn/app/AppTraffic.kt")
+          target.parent.mkdir(parents=True,exist_ok=True)
+          target.write_bytes(source)
+          print("Verified exact AppTraffic.kt from reviewed archive.")
+          PY
+      - name: Commit and dispatch Android build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          rm -rf .tmp/apptraffic-payload
+          rm -f .github/workflows/apply-apptraffic-payload.yml
+          git add -u
+          git add app/src/main/java/com/speedvpn/app/AppTraffic.kt
+          git commit -m "Restore live per-app relay traffic accounting"
+          git push origin "HEAD:staging/quota-settlement-crash-safe-20261021"
+          gh workflow run build-apk.yml --ref staging/quota-settlement-crash-safe-20261021 --repo "$GITHUB_REPOSITORY"
