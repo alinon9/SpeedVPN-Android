@@ -27,7 +27,7 @@ object SpeedVerificationPolicy {
     // reaches the plan itself. All other presets retain the stricter 1.2x floor.
     private val LOW_RATE_HEADROOM_TARGETS_KBPS = setOf(600L, 800L)
 
-    private fun headroomMultiplierFor(planKbps: Long): Double =
+    internal fun headroomMultiplierFor(planKbps: Long): Double =
         if (planKbps in LOW_RATE_HEADROOM_TARGETS_KBPS) 1.0 else BASELINE_HEADROOM_MULTIPLIER
 
     fun evaluate(planKbps: Long?, baselineBps: Long?, vpnBps: Long?): SpeedMetricVerification {
@@ -64,9 +64,10 @@ object SpeedVerificationPolicy {
 
         val headroomMultiplier = headroomMultiplierFor(planKbps)
         if (baselineBps.toDouble() < targetBps.toDouble() * headroomMultiplier) {
+            val requiredLabel = if (headroomMultiplier <= 1.0) "1.0" else "1.2"
             return SpeedMetricVerification(
                 planKbps, baselineBps, vpnBps, SpeedVerificationStatus.NOT_VERIFIABLE, null,
-                "سرعة الشبكة الأصلية يجب أن تبلغ 1.2 مرة من الخطة على الأقل.",
+                "سرعة الشبكة الأصلية يجب أن تبلغ $requiredLabel مرة من الخطة على الأقل.",
             )
         }
 

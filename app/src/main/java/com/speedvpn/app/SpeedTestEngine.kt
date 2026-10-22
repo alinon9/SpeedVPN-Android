@@ -165,7 +165,8 @@ object SpeedTestEngine {
                     "downloadTargetKbps=${expectedDownloadKbps ?: "unlimited"} " +
                     "uploadTargetKbps=${expectedUploadKbps ?: "unlimited"}",
             )
-            var firstError: String? = null
+            var downloadError: String? = null
+            var uploadError: String? = null
             val testClient = buildTestClient(context)
 
             val download = try {
@@ -179,8 +180,8 @@ object SpeedTestEngine {
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Throwable) {
-                firstError = errorMessage(error)
-                Log.w(TAG, "Download failed: ${errorMessage(error)}", error)
+                downloadError = errorMessage(error)
+                Log.w(TAG, "Download failed: $downloadError", error)
                 null
             }
 
@@ -195,8 +196,8 @@ object SpeedTestEngine {
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Throwable) {
-                firstError = firstError ?: errorMessage(error)
-                Log.w(TAG, "Upload failed: ${errorMessage(error)}", error)
+                uploadError = errorMessage(error)
+                Log.w(TAG, "Upload failed: $uploadError", error)
                 null
             }
 
@@ -204,13 +205,19 @@ object SpeedTestEngine {
                 downloadBps = download?.throughputBps,
                 uploadBps = upload?.throughputBps,
                 durationMs = System.currentTimeMillis() - startedAt,
-                error = firstError,
+                error = combinePhaseErrors(downloadError, uploadError),
                 uploadPayloadBytesWritten = upload?.completedPayloadBytes ?: 0L,
             )
         }
 
     private fun errorMessage(error: Throwable): String =
         error.message?.takeIf { it.isNotBlank() } ?: error.javaClass.simpleName
+
+    internal fun combinePhaseErrors(downloadError: String?, uploadError: String?): String? =
+        listOfNotNull(
+            downloadError?.trim()?.takeIf { it.isNotEmpty() },
+            uploadError?.trim()?.takeIf { it.isNotEmpty() },
+        ).distinct().joinToString(" • ").takeIf { it.isNotEmpty() }
 
     private fun executeMeasuredRequest(
         client: OkHttpClient,
@@ -494,7 +501,7 @@ object SpeedTestEngine {
             }
         }
 
-    private fun warmupBytesFor(expectedKbps: Long?, verificationProfile: Boolean = false): Long =
+    internal fun warmupBytesFor(expectedKbps: Long?, verificationProfile: Boolean = false): Long =
         when {
             verificationProfile && (expectedKbps == null || expectedKbps <= 0L) -> min(
                 1_000_000L,
@@ -505,7 +512,7 @@ object SpeedTestEngine {
             expectedKbps <= 1_000L -> 16_000L
             else -> min(
                 1_000_000L,
-                requestSizesFor(expectedKbps).firstOrNull()?.div(4L) ?: WARMUP_BYTES,
+                requestSizesFor(expectedKbps, verificationProfile).firstOrNull()?.div(4L) ?: WARMUP_BYTES,
             ).coerceAtLeast(WARMUP_BYTES)
         }
 

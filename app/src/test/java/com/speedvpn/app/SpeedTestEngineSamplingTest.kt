@@ -323,4 +323,34 @@ class SpeedTestEngineSamplingTest {
         assertEquals("close", upload.header("Connection"))
     }
 
+    @Test
+    fun warmupBytesForHonorsVerificationProfileAndCapsAtOneMegabyte() {
+        // At 2,000 Kbps (250 KB/s): public request size is 375,000 B (warmup 100,000 B floor),
+        // while verification request size is 750,000 B (warmup 750,000 / 4 = 187,500 B).
+        assertEquals(100_000L, SpeedTestEngine.warmupBytesFor(2_000L, verificationProfile = false))
+        assertEquals(187_500L, SpeedTestEngine.warmupBytesFor(2_000L, verificationProfile = true))
+        // High-rate plans remain capped at 1,000,000 B warm-up.
+        assertEquals(1_000_000L, SpeedTestEngine.warmupBytesFor(88_000L, verificationProfile = true))
+        assertEquals(1_000_000L, SpeedTestEngine.warmupBytesFor(null, verificationProfile = true))
+    }
+
+    @Test
+    fun combinePhaseErrorsPreservesBothDownloadAndUploadFailuresWithoutDuplicatingIdenticalMessages() {
+        assertEquals(
+            "Download HTTP 403 • Upload HTTP 403",
+            SpeedTestEngine.combinePhaseErrors("Download HTTP 403", "Upload HTTP 403"),
+        )
+        assertEquals(
+            "Network unreachable",
+            SpeedTestEngine.combinePhaseErrors("Network unreachable", "Network unreachable"),
+        )
+        assertEquals(
+            "Upload HTTP 403",
+            SpeedTestEngine.combinePhaseErrors(null, "Upload HTTP 403"),
+        )
+        assertEquals(
+            null,
+            SpeedTestEngine.combinePhaseErrors(null, "   "),
+        )
+    }
 }

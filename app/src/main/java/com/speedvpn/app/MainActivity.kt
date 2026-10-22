@@ -299,10 +299,23 @@ class MainActivity : ComponentActivity() {
         VpnRuntime.update { it.copy(permissionGranted = VpnService.prepare(this) == null) }
     }
 
-    private fun loadLocalLimits() = SpeedLimitStore.applyToLimiter(this)
+    private fun loadLocalLimits() = SpeedLimitStore.restoreToLimiterIfUninitialized(this)
 
     private val settingsWriteMutex = Mutex()
     private val appControlWriteGeneration = AtomicLong(0L)
+    private val limitWriteGeneration = AtomicLong(0L)
+
+    // Keep speed-test and verification UI state across tab navigation and recomposition
+    // so switching tabs cannot reset busy flags or launch overlapping runs.
+    private val speedTestBusyState = mutableStateOf(false)
+    private val speedTestProgressState = mutableStateOf<String?>(null)
+    private val lastSpeedTestState = mutableStateOf<SpeedTestResult?>(null)
+    private val preflightBusyState = mutableStateOf(false)
+    private val preflightProgressState = mutableStateOf<String?>(null)
+    private val lastPreflightState = mutableStateOf<SpeedTestResult?>(null)
+    private val verifyBusyState = mutableStateOf(false)
+    private val verifyProgressState = mutableStateOf<String?>(null)
+    private val lastVerificationState = mutableStateOf<SpeedVerificationResult?>(null)
 
     private fun saveAppControlSettings(settings: VpnAppControlSettings) {
         val generation = appControlWriteGeneration.incrementAndGet()
@@ -326,23 +339,39 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun saveLocalLimit(download: Boolean, kbps: Long?) {
-        if (SpeedLimiter.verificationInProgress.value) return
-        // SharedPreferences.commit() is synchronous. Keep disk I/O off the main
-        // thread while serializing writes so rapid slider changes cannot reorder
-        // the persisted value.
-        lifecycleScope.launch(Dispatchers.IO) {
-            settingsWriteMutex.withLock {
-                if (download) {
-                    SpeedLimitStore.saveDownload(this@MainActivity, kbps)
-                } else {
-                    SpeedLimitStore.saveUpload(this@MainActivity, kbps)
-                }
+        if (SpeedLimiter.verificationInProgress.value ||
+            verifyBusyState.value ||
+            speedTestBusyState.value ||
+            preflightBusyState.value
+        ) {
+            return
+        }
+        val applied = if (download) {
+            SpeedLimiter.setDownloadKbps(kbps) {
+                SpeedLimitStore.stageDownload(this, kbps)
+            }
+        } else {
+            SpeedLimiter.setUploadKbps(kbps) {
+                SpeedLimitStore.stageUpload(this, kbps)
             }
         }
-        if (download) {
-            SpeedLimiter.setDownloadKbps(kbps)
-        } else {
-            SpeedLimiter.setUploadKbps(kbps)
+        if (!applied) return
+        val generation = limitWriteGeneration.incrementAndGet()
+        // SharedPreferences.commit() is synchronous. Keep disk I/O off the main
+        // thread while serializing writes so rapid slider changes cannot reorder
+        // the persisted value or overwrite a newer verification/remote state.
+        lifecycleScope.launch(Dispatchers.IO) {
+            settingsWriteMutex.withLock {
+                if (SpeedLimiter.verificationInProgress.value) return@withLock
+                val (stagedDownload, stagedUpload) = SpeedLimitStore.load(this@MainActivity)
+                if (generation == limitWriteGeneration.get()) {
+                    if (download) {
+                        SpeedLimitStore.saveDownload(this@MainActivity, stagedDownload)
+                    } else {
+                        SpeedLimitStore.saveUpload(this@MainActivity, stagedUpload)
+                    }
+                }
+            }
         }
     }
 
@@ -371,10 +400,14 @@ class MainActivity : ComponentActivity() {
     private fun SpeedVpnApp(signedIn: Boolean, onLink: () -> Unit, onSignOut: () -> Unit) {
         val s by VpnRuntime.state.collectAsStateWithLifecycle()
         val verificationInProgress by SpeedLimiter.verificationInProgress.collectAsStateWithLifecycle()
+        val speedActionBusy = verificationInProgress ||
+            verifyBusyState.value ||
+            speedTestBusyState.value ||
+            preflightBusyState.value
         var tab by remember { mutableStateOf(0) }
         Scaffold(
             containerColor = Bg,
-            bottomBar = { BottomBar(tab, enabled = !verificationInProgress, onTab = { tab = it }) },
+            bottomBar = { BottomBar(tab, enabled = !speedActionBusy, onTab = { tab = it }) },
         ) { padding ->
             if (showVpnDisclosure.value) {
                 AlertDialog(
@@ -439,15 +472,15 @@ class MainActivity : ComponentActivity() {
     @OptIn(ExperimentalComposeUiApi::class)
     @Composable
     private fun SpeedScreen(s: Snapshot, verificationInProgress: Boolean) {
-        var testBusy by remember { mutableStateOf(false) }
-        var testProgress by remember { mutableStateOf<String?>(null) }
-        var lastTest by remember { mutableStateOf<SpeedTestResult?>(null) }
-        var preflightBusy by remember { mutableStateOf(false) }
-        var preflightProgress by remember { mutableStateOf<String?>(null) }
-        var lastPreflight by remember { mutableStateOf<SpeedTestResult?>(null) }
-        var verifyBusy by remember { mutableStateOf(false) }
-        var verifyProgress by remember { mutableStateOf<String?>(null) }
-        var lastVerification by remember { mutableStateOf<SpeedVerificationResult?>(null) }
+        var testBusy by speedTestBusyState
+        var testProgress by speedTestProgressState
+        var lastTest by lastSpeedTestState
+        var preflightBusy by preflightBusyState
+        var preflightProgress by preflightProgressState
+        var lastPreflight by lastPreflightState
+        var verifyBusy by verifyBusyState
+        var verifyProgress by verifyProgressState
+        var lastVerification by lastVerificationState
         var verificationHistory by remember { mutableStateOf(SpeedVerificationStore.loadRecent(this@MainActivity, 8)) }
 
         Column(
@@ -558,7 +591,9 @@ class MainActivity : ComponentActivity() {
                     onClick = {
                         if (!s.permissionGranted) {
                             requestVpnPermission()
-                        } else {
+                        } else if (!testBusy && !preflightBusy && !verifyBusy && !verificationInProgress) {
+                            val selectedDownloadKbps = s.downloadLimitKbps
+                            val selectedUploadKbps = s.uploadLimitKbps
                             lifecycleScope.launch {
                                 verifyBusy = true
                                 // Do not expose a previous run's tagged metrics while the new
@@ -575,8 +610,8 @@ class MainActivity : ComponentActivity() {
                                     val result = withContext(Dispatchers.IO) {
                                         SpeedVerificationEngine.verify(
                                             context = this@MainActivity,
-                                            planDownloadKbps = s.downloadLimitKbps,
-                                            planUploadKbps = s.uploadLimitKbps,
+                                            planDownloadKbps = selectedDownloadKbps,
+                                            planUploadKbps = selectedUploadKbps,
                                             onProgress = { message ->
                                                 lifecycleScope.launch(Dispatchers.Main.immediate) {
                                                     if (verifyBusy) verifyProgress = message
@@ -593,8 +628,8 @@ class MainActivity : ComponentActivity() {
                                     val failed = SpeedVerificationEngine.unavailable(
                                         started = verificationStartedAt,
                                         note = "فشل التحقق: ${error.message ?: error.javaClass.simpleName}",
-                                        planDownloadKbps = s.downloadLimitKbps,
-                                        planUploadKbps = s.uploadLimitKbps,
+                                        planDownloadKbps = selectedDownloadKbps,
+                                        planUploadKbps = selectedUploadKbps,
                                     )
                                     lastVerification = failed
                                     SpeedVerificationStore.save(this@MainActivity, failed)
@@ -642,7 +677,7 @@ class MainActivity : ComponentActivity() {
 
             lastTest?.let { result ->
                 GlassCard {
-                    SectionLabel("نتيجة فحص السرعة", "القياس على المسار الحالي بدون تغيير حالة VPN")
+                    SectionLabel("نتيجة فحص السرعة", "قياس سرعة الشبكة الفعلية خارج خنق VPN (لاختبار الخطة عبر النفق استخدم تحقق من السرعة)")
                     InfoRow("Download", result.downloadBps?.let(::formatBitRate) ?: "فشل القياس")
                     InfoRow("Upload", result.uploadBps?.let(::formatBitRate) ?: "فشل القياس")
                     InfoRow("المدة", "${result.durationMs / 1000.0} ثانية")
@@ -1094,19 +1129,25 @@ class MainActivity : ComponentActivity() {
 
             while (isActive) {
                 apps = withContext(Dispatchers.IO) {
-                    if (statsEnabled && usageAccess) UsageCollector.collectToday(this@MainActivity)
+                    if (statsEnabled) UsageCollector.collectToday(this@MainActivity)
+                    val todayKey = UsageDate.today()
                     val usageByPackage = if (statsEnabled) {
-                        UsageRepository.topUsage(this@MainActivity, UsageDate.today(), 100)
+                        UsageRepository.topUsage(this@MainActivity, todayKey, 500)
                             .associateBy { it.packageName }
                     } else emptyMap()
                     installedApps.map { app ->
                         val row = usageByPackage[app.packageName]
+                        val live = if (statsEnabled) {
+                            AppTrafficManager.liveRelayUsage(app.uid, app.packageName, todayKey)
+                        } else {
+                            UidTrafficCounters(0L, 0L)
+                        }
                         AppTrafficUsage(
                             packageName = app.packageName,
                             label = app.loadLabel(packageManager).toString(),
                             uid = app.uid,
-                            downloadBytes = row?.downloadBytes ?: 0L,
-                            uploadBytes = row?.uploadBytes ?: 0L,
+                            downloadBytes = maxOf(row?.downloadBytes ?: 0L, live.downloadBytes),
+                            uploadBytes = maxOf(row?.uploadBytes ?: 0L, live.uploadBytes),
                         )
                     }.sortedWith(
                         compareByDescending<AppTrafficUsage> { it.totalBytes }
@@ -1202,7 +1243,7 @@ class MainActivity : ComponentActivity() {
                         val weeklyQuota = appQuotas.firstOrNull { it.quotaType == QuotaType.WEEKLY }
                         val monthlyQuota = appQuotas.firstOrNull { it.quotaType == QuotaType.MONTHLY }
                         val limit = dailyQuota?.limitBytes ?: policy?.dailyLimitBytes
-                        val used = app.totalBytes
+                        val used = maxOf(app.totalBytes, dailyQuota?.usedBytes ?: 0L)
                         val remaining = limit?.let { (it - used).coerceAtLeast(0L) }
                         Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
                             Column(Modifier.weight(1f)) {
@@ -1365,7 +1406,8 @@ class MainActivity : ComponentActivity() {
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                         label = { Text("MB") },
                     )
-                    Text("الاستهلاك الحالي اليوم: ${formatDataBytes(app.totalBytes)}", color = TextSecondary, fontSize = 10.sp)
+                    val dialogUsedBytes = maxOf(app.totalBytes, selectedPolicy?.usedBytes ?: 0L)
+                    Text("الاستهلاك الحالي اليوم: ${formatDataBytes(dialogUsedBytes)}", color = TextSecondary, fontSize = 10.sp)
                     Text("اتركه فارغًا لإلغاء هذا النوع من الحد.", color = TextSecondary, fontSize = 10.sp)
                 }
             },

@@ -66,33 +66,49 @@ internal object UsageCollector {
     private fun collectDay(context: Context, date: String, start: Long, end: Long) {
         if (end <= start) return
         val apps = AppTrafficManager.installedLaunchableApps(context)
-        if (apps.isEmpty() || !AppTrafficManager.hasUsageAccess(context)) return
+        if (apps.isEmpty()) return
+        val isToday = date == UsageDate.today()
+        val hasAccess = AppTrafficManager.hasUsageAccess(context)
+        if (!hasAccess && !isToday) return
         val byUid = HashMap<Int, LongArray>()
-        val manager = context.getSystemService(NetworkStatsManager::class.java) ?: return
-        for (networkType in networkTypes) {
-            runCatching {
-                val stats = manager.queryDetails(networkType, null, start, end)
-                stats.use { stream ->
-                    val bucket = NetworkStats.Bucket()
-                    while (stream.hasNextBucket()) {
-                        stream.getNextBucket(bucket)
-                        if (bucket.uid < 0) continue
-                        val totals = byUid.getOrPut(bucket.uid) { LongArray(2) }
-                        totals[0] = safeAdd(totals[0], bucket.rxBytes)
-                        totals[1] = safeAdd(totals[1], bucket.txBytes)
-                    }
+        if (hasAccess) {
+            val manager = context.getSystemService(NetworkStatsManager::class.java)
+            if (manager != null) {
+                for (networkType in networkTypes) {
+                    runCatching {
+                        val stats = manager.queryDetails(networkType, null, start, end)
+                        stats.use { stream ->
+                            val bucket = NetworkStats.Bucket()
+                            while (stream.hasNextBucket()) {
+                                stream.getNextBucket(bucket)
+                                if (bucket.uid < 0) continue
+                                val totals = byUid.getOrPut(bucket.uid) { LongArray(2) }
+                                totals[0] = safeAdd(totals[0], bucket.rxBytes)
+                                totals[1] = safeAdd(totals[1], bucket.txBytes)
+                            }
+                        }
+                    }.onFailure { log("Daily usage query failed: ${it.message}") }
                 }
-            }.onFailure { log("Daily usage query failed: ${it.message}") }
+            }
         }
-        apps.forEach { app ->
+        val rows = apps.map { app ->
             val values = byUid[app.uid] ?: LongArray(2)
+            val live = if (isToday) {
+                AppTrafficManager.liveRelayUsage(app.uid, app.packageName, date)
+            } else {
+                UidTrafficCounters(0L, 0L)
+            }
             val label = app.loadLabel(context.packageManager).toString()
-            UsageRepository.upsertDailyUsage(
-                context,
-                DailyUsageRow(date, app.packageName, label, app.uid, values[0], values[1]),
+            DailyUsageRow(
+                date = date,
+                packageName = app.packageName,
+                label = label,
+                uid = app.uid,
+                downloadBytes = max(values[0], live.downloadBytes),
+                uploadBytes = max(values[1], live.uploadBytes),
             )
-            UsageRepository.ensureApp(context, app.packageName, label, app.uid)
         }
+        UsageRepository.upsertDailyUsageBatch(context, rows)
     }
 
     private fun maybeAnalyze(context: Context) {
@@ -137,17 +153,11 @@ internal object UsageCollectionScheduler {
             android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE,
         )
         alarmManager.cancel(pending)
-        val calendar = Calendar.getInstance().apply {
-            add(Calendar.DAY_OF_YEAR, 1)
-            set(Calendar.HOUR_OF_DAY, 0)
-            set(Calendar.MINUTE, 5)
-            set(Calendar.SECOND, 0)
-            set(Calendar.MILLISECOND, 0)
-        }
+        val firstTriggerAtMillis = System.currentTimeMillis() + android.app.AlarmManager.INTERVAL_FIFTEEN_MINUTES
         alarmManager.setInexactRepeating(
             android.app.AlarmManager.RTC_WAKEUP,
-            calendar.timeInMillis,
-            android.app.AlarmManager.INTERVAL_DAY,
+            firstTriggerAtMillis,
+            android.app.AlarmManager.INTERVAL_FIFTEEN_MINUTES,
             pending,
         )
     }
@@ -228,8 +238,8 @@ internal class SmartSampler(private val context: Context) {
         if (lastAt > 0L && now - lastAt < 60_000L) return
         val s = VpnRuntime.state.value
         val dt = now - lastAt
-        val downBps = if (dt > 0 && lastAt > 0) ((s.sessionDownloadBytes - lastDown).coerceAtLeast(0L) * 1000L / dt) else s.downloadBps
-        val upBps = if (dt > 0 && lastAt > 0) ((s.sessionUploadBytes - lastUp).coerceAtLeast(0L) * 1000L / dt) else s.uploadBps
+        val downBps = if (dt > 0 && lastAt > 0) ((s.sessionDownloadBytes - lastDown).coerceAtLeast(0L) * 8_000L / dt) else s.downloadBps
+        val upBps = if (dt > 0 && lastAt > 0) ((s.sessionUploadBytes - lastUp).coerceAtLeast(0L) * 8_000L / dt) else s.uploadBps
         lastDown = s.sessionDownloadBytes
         lastUp = s.sessionUploadBytes
         lastAt = now

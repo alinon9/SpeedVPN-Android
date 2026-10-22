@@ -288,8 +288,12 @@ internal class SpeedOverlayService : Service() {
     private fun set(download: Boolean, kbps: Long?) {
         if (SpeedLimiter.verificationInProgress.value) return
         if (targetPackage == null) {
-            if (download) SpeedLimitStore.saveDownload(this, kbps) else SpeedLimitStore.saveUpload(this, kbps)
-            if (download) SpeedLimiter.setDownloadKbps(kbps) else SpeedLimiter.setUploadKbps(kbps)
+            val applied = if (download) {
+                SpeedLimiter.setDownloadKbps(kbps) { SpeedLimitStore.saveDownload(this, kbps) }
+            } else {
+                SpeedLimiter.setUploadKbps(kbps) { SpeedLimitStore.saveUpload(this, kbps) }
+            }
+            if (!applied) return
             DiagnosticsRepository.record(this, "INFO", "SpeedOverlay", "GLOBAL_SPEED_CHANGED", "Global ${if (download) "download" else "upload"} changed by overlay")
         } else {
             val existing = AiRepository.getSpeedProfile(this, targetPackage)

@@ -118,10 +118,44 @@ def inject_native_start_step_logs(jni_text: str) -> str:
     jni_text = jni_text[:line_start] + logline + jni_text[line_start:]
     return jni_text
 
+def verify_patched_markers(
+    jni_c: Path,
+    session_c: Path,
+    session_tcp_c: Path,
+    session_udp_c: Path,
+    tunnel_c: Path,
+    client_c: Path,
+) -> None:
+    for source_path, marker in (
+        (jni_c, "uid_poc_is_internal_mapdns"),
+        (session_c, "hev_socks5_session_resolve_uid"),
+        (session_c, "Normalize IPv4-mapped IPv6 tuples to their four-byte IPv4 form."),
+        (session_tcp_c, "self->data.uid = hev_socks5_session_resolve_uid (6"),
+        (session_udp_c, "self->data.uid = hev_socks5_session_resolve_uid (17, &pcb->remote_ip,"),
+        (session_udp_c, "hev_socks5_session_udp_has_pbuf (self, p)"),
+        (session_udp_c, "siptr->get_uid = hev_socks5_session_udp_get_uid;"),
+        (tunnel_c, "hev_socks5_session_udp_new (pcb, addr, port, &mutex)"),
+        (client_c, "hev_socks5_client_write_auth_methods (HevSocks5Client *self, int pipeline)"),
+        (client_c, "hev_socks5_client_write_auth_creds (HevSocks5Client *self, int pipeline)"),
+        (client_c, "int flags = MSG_WAITALL | (pipeline ? MSG_MORE : 0);"),
+        (client_c, "hev_socks5_client_write_auth_methods (self, 0);"),
+        (client_c, "hev_socks5_client_write_auth_creds (self, 0);"),
+        (client_c, "hev_socks5_client_write_auth_methods (self, 1);"),
+        (client_c, "hev_socks5_client_write_auth_creds (self, 1);"),
+    ):
+        if marker not in source_path.read_text():
+            raise SystemExit(f"Refusing incomplete per-session UID bridge: missing {marker}")
+
+
 def main() -> None:
-    if len(sys.argv) != 2:
-        raise SystemExit("usage: patch_hev_uid_detection_poc.py <hev-socks5-tunnel-dir>")
-    root = Path(sys.argv[1]).resolve()
+    check_only = False
+    args = sys.argv[1:]
+    if args and args[0] == "--check":
+        check_only = True
+        args = args[1:]
+    if len(args) != 1:
+        raise SystemExit("usage: patch_hev_uid_detection_poc.py [--check] <hev-socks5-tunnel-dir>")
+    root = Path(args[0]).resolve()
     tunnel_c = root / "src/hev-socks5-tunnel.c"
     jni_c = root / "src/hev-jni.c"
     session_c = root / "src/hev-socks5-session.c"
@@ -130,9 +164,10 @@ def main() -> None:
     session_tcp_h = root / "src/hev-socks5-session-tcp.h"
     session_udp_c = root / "src/hev-socks5-session-udp.c"
     session_udp_h = root / "src/hev-socks5-session-udp.h"
+    client_c = root / "src/core/src/hev-socks5-client.c"
     for required in (
         tunnel_c, jni_c, session_c, session_h,
-        session_tcp_c, session_tcp_h, session_udp_c, session_udp_h,
+        session_tcp_c, session_tcp_h, session_udp_c, session_udp_h, client_c,
     ):
         if not required.is_file():
             raise SystemExit(f"Missing pinned hev source file: {required}")
@@ -141,6 +176,10 @@ def main() -> None:
     android_mk = root / "Android.mk"
     if not android_mk.is_file():
         raise SystemExit(f"Missing native Android.mk: {android_mk}")
+    if check_only:
+        verify_patched_markers(jni_c, session_c, session_tcp_c, session_udp_c, tunnel_c, client_c)
+        print("OK - per-session UID propagation, UID detection hook, and SOCKS5 client MSG_MORE patch verified")
+        return
     android_text = android_mk.read_text()
     link_flags = "LOCAL_LDLIBS += -llog -ldl"
     if link_flags not in android_text:
@@ -1827,19 +1866,101 @@ hev_socks5_session_resolve_uid (int protocol,
         )
     tunnel_c.write_text(tunnel_text)
 
+    client_c_text = client_c.read_text()
+    client_c_text = replace_text_once(
+        client_c_text,
+        "static int\n"
+        "hev_socks5_client_write_auth_methods (HevSocks5Client *self)\n"
+        "{\n"
+        "    HevSocks5Auth auth;\n"
+        "    int res;",
+        "static int\n"
+        "hev_socks5_client_write_auth_methods (HevSocks5Client *self, int pipeline)\n"
+        "{\n"
+        "    HevSocks5Auth auth;\n"
+        "    int flags = MSG_WAITALL | (pipeline ? MSG_MORE : 0);\n"
+        "    int res;",
+        "SOCKS5 client write_auth_methods pipeline signature",
+    )
+    client_c_text = replace_text_once(
+        client_c_text,
+        "    res = hev_task_io_socket_send (HEV_SOCKS5 (self)->fd, &auth, 3,\n"
+        "                                   MSG_WAITALL | MSG_MORE, task_io_yielder,\n"
+        "                                   self);",
+        "    res = hev_task_io_socket_send (HEV_SOCKS5 (self)->fd, &auth, 3,\n"
+        "                                   flags, task_io_yielder,\n"
+        "                                   self);",
+        "SOCKS5 client write_auth_methods conditional MSG_MORE flags",
+    )
+    client_c_text = replace_text_once(
+        client_c_text,
+        "static int\n"
+        "hev_socks5_client_write_auth_creds (HevSocks5Client *self)\n"
+        "{\n"
+        "    struct msghdr mh = { 0 };\n"
+        "    struct iovec iov[4];\n"
+        "    unsigned char ub[3];\n"
+        "    int res;",
+        "static int\n"
+        "hev_socks5_client_write_auth_creds (HevSocks5Client *self, int pipeline)\n"
+        "{\n"
+        "    struct msghdr mh = { 0 };\n"
+        "    struct iovec iov[4];\n"
+        "    unsigned char ub[3];\n"
+        "    int flags = MSG_WAITALL | (pipeline ? MSG_MORE : 0);\n"
+        "    int res;",
+        "SOCKS5 client write_auth_creds pipeline signature",
+    )
+    client_c_text = replace_text_once(
+        client_c_text,
+        "    res = hev_task_io_socket_sendmsg (HEV_SOCKS5 (self)->fd, &mh,\n"
+        "                                      MSG_WAITALL | MSG_MORE, task_io_yielder,\n"
+        "                                      self);",
+        "    res = hev_task_io_socket_sendmsg (HEV_SOCKS5 (self)->fd, &mh,\n"
+        "                                      flags, task_io_yielder,\n"
+        "                                      self);",
+        "SOCKS5 client write_auth_creds conditional MSG_MORE flags",
+    )
+    client_c_text = replace_text_once(
+        client_c_text,
+        "    LOG_D (\"%p socks5 client handshake standard\", self);\n\n"
+        "    res = hev_socks5_client_write_auth_methods (self);\n"
+        "    if (res < 0)\n"
+        "        return -1;\n\n"
+        "    res = hev_socks5_client_read_auth_method (self);\n"
+        "    if (res < 0)\n"
+        "        return -1;\n\n"
+        "    if (res == HEV_SOCKS5_AUTH_METHOD_USER) {\n"
+        "        res = hev_socks5_client_write_auth_creds (self);",
+        "    LOG_D (\"%p socks5 client handshake standard\", self);\n\n"
+        "    res = hev_socks5_client_write_auth_methods (self, 0);\n"
+        "    if (res < 0)\n"
+        "        return -1;\n\n"
+        "    res = hev_socks5_client_read_auth_method (self);\n"
+        "    if (res < 0)\n"
+        "        return -1;\n\n"
+        "    if (res == HEV_SOCKS5_AUTH_METHOD_USER) {\n"
+        "        res = hev_socks5_client_write_auth_creds (self, 0);",
+        "SOCKS5 client standard handshake non-pipeline auth calls",
+    )
+    client_c_text = replace_text_once(
+        client_c_text,
+        "    LOG_D (\"%p socks5 client handshake pipeline\", self);\n\n"
+        "    res = hev_socks5_client_write_auth_methods (self);\n"
+        "    if (res < 0)\n"
+        "        return -1;\n\n"
+        "    res = hev_socks5_client_write_auth_creds (self);",
+        "    LOG_D (\"%p socks5 client handshake pipeline\", self);\n\n"
+        "    res = hev_socks5_client_write_auth_methods (self, 1);\n"
+        "    if (res < 0)\n"
+        "        return -1;\n\n"
+        "    res = hev_socks5_client_write_auth_creds (self, 1);",
+        "SOCKS5 client pipeline handshake auth calls",
+    )
+    client_c.write_text(client_c_text)
+
     # Refuse a broken generated native patch before Gradle builds an APK.
-    for source_path, marker in (
-        (jni_c, "uid_poc_is_internal_mapdns"),
-        (session_c, "hev_socks5_session_resolve_uid"),
-        (session_c, "Normalize IPv4-mapped IPv6 tuples to their four-byte IPv4 form."),
-        (session_tcp_c, "self->data.uid = hev_socks5_session_resolve_uid (6"),
-        (session_udp_c, "self->data.uid = hev_socks5_session_resolve_uid (17, &pcb->remote_ip,"),
-        (session_udp_c, "hev_socks5_session_udp_has_pbuf (self, p)"),
-        (session_udp_c, "siptr->get_uid = hev_socks5_session_udp_get_uid;"),
-        (tunnel_c, "hev_socks5_session_udp_new (pcb, addr, port, &mutex)"),
-    ):
-        if marker not in source_path.read_text():
-            raise SystemExit(f"Refusing incomplete per-session UID bridge: missing {marker}")
+    verify_patched_markers(jni_c, session_c, session_tcp_c, session_udp_c, tunnel_c, client_c)
 
     print("OK - per-session UID propagation, UID detection hook, and native diagnostics applied")
 

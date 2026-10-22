@@ -147,4 +147,31 @@ class SpeedLimiterConversionTest {
         // A refillable bucket has accumulated enough credit to grant this chunk now.
         assertTrue("Credit was not accrued during outside I/O: ${elapsedMs}ms", elapsedMs < 150L)
     }
+
+    @Test
+    fun unlimitedFastPathHonorsCanProceedAndJitterHeadroomCapsBurstDebt() {
+        val bucket = TokenBucket()
+        bucket.setRate(0L)
+        assertTrue(bucket.acquire(64 * 1024) { true })
+        assertTrue(!bucket.acquire(64 * 1024) { false })
+        assertEquals(256 * 1024, bucket.recommendedReadBytes())
+
+        // At 10,000 B/s, capacityBytes is 1,024 and maxCreditBytes is 2,048.
+        // Draining the initial 1,024-byte burst and sleeping 300ms refills at most
+        // 2,048 bytes (not 3,000), so two 1,024-byte chunks pass immediately while
+        // a third 500-byte chunk still paces at 10,000 B/s (~50ms).
+        bucket.setRate(10_000L)
+        assertTrue(bucket.acquire(1024))
+        Thread.sleep(300L)
+        val burstStart = System.nanoTime()
+        assertTrue(bucket.acquire(1024))
+        assertTrue(bucket.acquire(1024))
+        val burstElapsedMs = (System.nanoTime() - burstStart) / 1_000_000L
+        assertTrue("Expected 2x jitter headroom to grant two chunks without sleep, got ${burstElapsedMs}ms", burstElapsedMs < 30L)
+
+        val pacedStart = System.nanoTime()
+        assertTrue(bucket.acquire(500))
+        val pacedElapsedMs = (System.nanoTime() - pacedStart) / 1_000_000L
+        assertTrue("Expected third chunk beyond maxCreditBytes to pace, got ${pacedElapsedMs}ms", pacedElapsedMs >= 35L)
+    }
 }

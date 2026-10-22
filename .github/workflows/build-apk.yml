@@ -69,6 +69,9 @@ jobs:
           path: ${{ runner.temp }}/SpeedVPN-Android-quota-fix-source.zip
           if-no-files-found: error
           retention-days: 30
+      - name: Run Python and native C regression tests
+        run: python3 -m unittest discover -s scripts/e2e/tests -v
+
       - name: Run unit tests
         run: ./gradlew :app:testDebugUnitTest --stacktrace --no-daemon
 

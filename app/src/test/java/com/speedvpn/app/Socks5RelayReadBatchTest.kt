@@ -195,6 +195,183 @@ class Socks5RelayReadBatchTest {
         }
     }
 
+    @Test
+    fun tcpRelayChunkRecordsOnlyAdmittedBytesAfterSuccessfulWrite() {
+        val payload = ByteArray(1024) { ((it * 17 + 3) and 0xff).toByte() }
+        val decision = QuotaTrafficDecision(
+            allowedBytes = 350,
+            exhaustedPackages = setOf("com.example.app"),
+        )
+        val bucket = TokenBucket().apply { beginSession(7L) }
+        var settledOutcome: QuotaSettlementOutcome? = null
+        var settledBytes = -1
+        var bytesRecordedDuringWrite = -1L
+
+        val destination = object : java.io.ByteArrayOutputStream() {
+            override fun write(b: ByteArray, off: Int, len: Int) {
+                // Settlement and bucket accounting must happen only AFTER write completes.
+                bytesRecordedDuringWrite = bucket.sessionBytes(7L)
+                super.write(b, off, len)
+            }
+        }
+
+        val written = writeAdmittedTcpRelayChunk(
+            destination = destination,
+            buffer = payload,
+            requestedBytes = payload.size,
+            decision = decision,
+            bucket = bucket,
+            generation = 7L,
+            packages = setOf("com.example.app"),
+            uid = 10201,
+            direction = QuotaTrafficDirection.DOWNLOAD,
+            hasOwner = true,
+            settleQuotaBytes = { _, _, _, dec, outcome, bytes ->
+                settledOutcome = outcome
+                settledBytes = bytes
+                dec.copy(allowedBytes = bytes)
+            },
+        )
+
+        assertEquals(0L, bytesRecordedDuringWrite)
+        assertEquals(350, written)
+        assertArrayEquals(payload.copyOf(350), destination.toByteArray())
+        assertEquals(350L, bucket.sessionBytes(7L))
+        assertEquals(350L, bucket.total.get())
+        assertEquals(QuotaSettlementOutcome.TCP_WRITE_SUCCEEDED, settledOutcome)
+        assertEquals(350, settledBytes)
+    }
+
+    @Test
+    fun tcpRelayChunkWriteFailureDoesNotRecordLiveTrafficOrBucketBytes() {
+        val payload = ByteArray(512) { 0x42 }
+        val decision = QuotaTrafficDecision(allowedBytes = 512)
+        val bucket = TokenBucket().apply { beginSession(9L) }
+        var liveForwardedCalls = 0
+        var settledOutcome: QuotaSettlementOutcome? = null
+        var settledBytes = -1
+
+        val failingDestination = object : java.io.OutputStream() {
+            override fun write(b: Int) {
+                throw java.net.SocketException("Broken pipe")
+            }
+
+            override fun write(b: ByteArray, off: Int, len: Int) {
+                throw java.net.SocketException("Broken pipe")
+            }
+        }
+
+        assertThrows(java.net.SocketException::class.java) {
+            writeAdmittedTcpRelayChunk(
+                destination = failingDestination,
+                buffer = payload,
+                requestedBytes = payload.size,
+                decision = decision,
+                bucket = bucket,
+                generation = 9L,
+                packages = setOf("com.example.fail"),
+                uid = 10202,
+                direction = QuotaTrafficDirection.UPLOAD,
+                hasOwner = true,
+                recordForwardedBytes = { _, _, _, _ -> liveForwardedCalls++ },
+                settleQuotaBytes = { _, _, _, dec, outcome, bytes ->
+                    settledOutcome = outcome
+                    settledBytes = bytes
+                    dec
+                },
+            )
+        }
+
+        assertEquals(0, liveForwardedCalls)
+        assertEquals(0L, bucket.sessionBytes(9L))
+        assertEquals(0L, bucket.total.get())
+        assertEquals(QuotaSettlementOutcome.TCP_WRITE_FAILED_CONSERVATIVE, settledOutcome)
+        assertEquals(0, settledBytes)
+    }
+
+    @Test
+    fun udpRelayDatagramBelowRemainingQuotaOrFailedSendRecordsZeroLiveTraffic() {
+        var sendAttempts = 0
+        var liveRecordedBytes = 0
+        val outcomes = mutableListOf< Pair<QuotaSettlementOutcome, Int> >()
+
+        // 1. Admitted bytes (300) < UDP payload (500): dropped before send, 0 live bytes.
+        val overQuotaResult = deliverAdmittedUdpDatagramDetailed(
+            payloadBytes = 500,
+            decision = QuotaTrafficDecision(allowedBytes = 300, exhaustedPackages = setOf("com.example.udp")),
+            packages = setOf("com.example.udp"),
+            uid = 10203,
+            direction = QuotaTrafficDirection.UPLOAD,
+            hasOwner = true,
+            sendDatagram = {
+                sendAttempts++
+                true
+            },
+            recordForwardedBytes = { _, _, _, bytes -> liveRecordedBytes += bytes },
+            settleQuotaBytes = { _, _, _, dec, outcome, bytes ->
+                outcomes += outcome to bytes
+                dec.copy(allowedBytes = 0, exhaustedPackages = emptySet())
+            },
+        )
+        assertTrue(!overQuotaResult.delivered)
+        assertEquals(0, sendAttempts)
+        assertEquals(0, liveRecordedBytes)
+        assertEquals(0, overQuotaResult.settledDecision.allowedBytes)
+
+        // 2. Admitted bytes match payload (300), but channel send returns false: 0 live bytes.
+        val failedSendResult = deliverAdmittedUdpDatagramDetailed(
+            payloadBytes = 300,
+            decision = QuotaTrafficDecision(allowedBytes = 300),
+            packages = setOf("com.example.udp"),
+            uid = 10203,
+            direction = QuotaTrafficDirection.UPLOAD,
+            hasOwner = true,
+            sendDatagram = {
+                sendAttempts++
+                false
+            },
+            recordForwardedBytes = { _, _, _, bytes -> liveRecordedBytes += bytes },
+            settleQuotaBytes = { _, _, _, dec, outcome, bytes ->
+                outcomes += outcome to bytes
+                dec.copy(allowedBytes = 0)
+            },
+        )
+        assertTrue(!failedSendResult.delivered)
+        assertEquals(1, sendAttempts)
+        assertEquals(0, liveRecordedBytes)
+
+        // 3. Admitted bytes match payload (300) and channel send succeeds: 300 bytes settled.
+        val deliveredResult = deliverAdmittedUdpDatagramDetailed(
+            payloadBytes = 300,
+            decision = QuotaTrafficDecision(allowedBytes = 300),
+            packages = setOf("com.example.udp"),
+            uid = 10203,
+            direction = QuotaTrafficDirection.UPLOAD,
+            hasOwner = true,
+            sendDatagram = {
+                sendAttempts++
+                true
+            },
+            recordForwardedBytes = { _, _, _, bytes -> liveRecordedBytes += bytes },
+            settleQuotaBytes = { _, _, _, dec, outcome, bytes ->
+                outcomes += outcome to bytes
+                liveRecordedBytes += bytes
+                dec
+            },
+        )
+        assertTrue(deliveredResult.delivered)
+        assertEquals(2, sendAttempts)
+        assertEquals(300, liveRecordedBytes)
+        assertEquals(
+            listOf(
+                QuotaSettlementOutcome.UDP_DROPPED_OR_SEND_FAILED to 0,
+                QuotaSettlementOutcome.UDP_DROPPED_OR_SEND_FAILED to 0,
+                QuotaSettlementOutcome.UDP_DELIVERED to 300,
+            ),
+            outcomes,
+        )
+    }
+
     private class SingleReadInputStream(
         private val payload: ByteArray,
         private val maxReadBytes: Int,

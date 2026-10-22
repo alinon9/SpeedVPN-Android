@@ -27,6 +27,7 @@ class TokenBucket {
     companion object {
         private const val NANOS_PER_SECOND = 1_000_000_000.0
         private const val BURST_WINDOW_NS = 10_000_000L
+        private const val JITTER_HEADROOM_MULTIPLIER = 2.0
         // Keep low-rate plans responsive; a 16 KiB minimum creates long bursts at 10 KB/s.
         // At higher rates, permit at most 256 KiB of accumulated credit.
         private const val MIN_BURST_BYTES = 1024
@@ -40,6 +41,7 @@ class TokenBucket {
     private val lock = ReentrantLock(true)
     private val changed = lock.newCondition()
     private var capacityBytes = 0.0
+    private var maxCreditBytes = 0.0
     private var availableBytes = 0.0
     private var lastRefillNs = System.nanoTime()
 
@@ -54,6 +56,7 @@ class TokenBucket {
             val newRate = max(0L, bytesPerSec)
             this.bytesPerSec = newRate
             capacityBytes = burstCapacity(newRate)
+            maxCreditBytes = capacityBytes * JITTER_HEADROOM_MULTIPLIER
             // Apply a changed rate immediately. One in-flight chunk can complete
             // under the old schedule; subsequent acquires use the new token budget.
             availableBytes = capacityBytes
@@ -70,6 +73,7 @@ class TokenBucket {
      */
     fun acquire(n: Int, canProceed: () -> Boolean = { true }): Boolean {
         if (n <= 0) return canProceed()
+        if (bytesPerSec <= 0L) return canProceed()
 
         lock.lock()
         try {
@@ -117,11 +121,15 @@ class TokenBucket {
      * plans use larger reads to reduce per-chunk scheduler
      * and lock overhead, up to the same 256 KiB maximum used by the bucket.
      */
-    internal fun recommendedReadBytes(): Int = lock.withLock {
-        if (bytesPerSec <= 0L) {
-            MAX_BURST_BYTES
-        } else {
-            ceil(capacityBytes).toInt().coerceIn(MIN_BURST_BYTES, MAX_BURST_BYTES)
+    internal fun recommendedReadBytes(): Int {
+        val currentRate = bytesPerSec
+        if (currentRate <= 0L) return MAX_BURST_BYTES
+        return lock.withLock {
+            if (bytesPerSec <= 0L) {
+                MAX_BURST_BYTES
+            } else {
+                ceil(capacityBytes).toInt().coerceIn(MIN_BURST_BYTES, MAX_BURST_BYTES)
+            }
         }
     }
 
@@ -136,8 +144,9 @@ class TokenBucket {
         val elapsedNs = (nowNs - lastRefillNs).coerceAtLeast(0L)
         lastRefillNs = nowNs
         if (elapsedNs == 0L) return
+        val creditCeiling = if (maxCreditBytes > 0.0) maxCreditBytes else capacityBytes
         availableBytes = min(
-            capacityBytes,
+            creditCeiling,
             availableBytes + elapsedNs.toDouble() * rate.toDouble() / NANOS_PER_SECOND,
         )
     }
@@ -191,6 +200,7 @@ class TokenBucket {
     fun resetScheduler() {
         lock.withLock {
             capacityBytes = burstCapacity(bytesPerSec)
+            maxCreditBytes = capacityBytes * JITTER_HEADROOM_MULTIPLIER
             availableBytes = capacityBytes
             lastRefillNs = System.nanoTime()
             changed.signalAll()
