@@ -56,6 +56,9 @@ class SpeedPlanUsageHistoryTest {
         SpeedLimiter.endSession(1L)
         SpeedLimiter.endSession(2L)
         SpeedPlanUsageTracker.resetForTests("proc-test-cleanup")
+        // Restore Robolectric's real package/UID so the synthetic identity cannot leak
+        // into other test classes that share the SpeedLimiter singleton.
+        SpeedLimiter.clearOwnAppIdentityForTests(context)
         context.deleteDatabase("speedvpn_usage.db")
         context.deleteDatabase(migrationDbName)
     }
@@ -639,7 +642,10 @@ class SpeedPlanUsageHistoryTest {
     @Test
     fun switchingPlansAndClosingSegment_maintainsStrictlyIncreasingSegmentIndexAndByteConservation() {
         val gen = 1L
-        val t0 = 1_729_600_300_000L
+        // setLimitsKbps() notifies the tracker using the real wall clock. Anchor this
+        // lifecycle test to the same clock so its explicit transition timestamps never
+        // precede the automatically opened plan segment.
+        val t0 = System.currentTimeMillis()
         SpeedLimiter.beginSession(gen)
         SpeedLimiter.setLimitsKbps(2_000L, 2_000L) // Low: 250 KB/s
         SpeedPlanUsageTracker.onVpnConnected(context, gen, nowMillis = t0)
