@@ -323,6 +323,12 @@ object SpeedLimiter {
     @Volatile
     private var ownPackageName: String = DEFAULT_OWN_PACKAGE
 
+    // Tests may use a synthetic UID to exercise probe classification. Keep that identity
+    // stable when onVpnConnected()/onMeterSample() re-register the real application UID.
+    // Production never sets this override.
+    @Volatile
+    private var testOwnAppIdentityOverride: Pair<Int, String>? = null
+
     /** True only while the verification tunnel should include SpeedVPN's own UID. */
     val routeVerificationTrafficThroughVpn: Boolean
         get() = verificationOwnPackageRoutingEnabled
@@ -334,6 +340,13 @@ object SpeedLimiter {
     fun currentUploadLimitKbps(): Long? = appliedUploadKbps
 
     fun registerOwnAppIdentity(context: Context) {
+        val testOverride = testOwnAppIdentityOverride
+        if (testOverride != null) {
+            ownAppUid = testOverride.first
+            ownPackageName = testOverride.second
+            return
+        }
+
         val pkg = context.packageName
         if (pkg.isNotBlank()) {
             ownPackageName = pkg
@@ -345,8 +358,16 @@ object SpeedLimiter {
     }
 
     internal fun setOwnAppIdentityForTests(uid: Int, packageName: String = DEFAULT_OWN_PACKAGE) {
+        require(uid > 0) { "Test app UID must be positive" }
+        require(packageName.isNotBlank()) { "Test package name must not be blank" }
+        testOwnAppIdentityOverride = uid to packageName
         ownAppUid = uid
         ownPackageName = packageName
+    }
+
+    internal fun clearOwnAppIdentityForTests(context: Context) {
+        testOwnAppIdentityOverride = null
+        registerOwnAppIdentity(context)
     }
 
     private class ProbeSessionBucket {
