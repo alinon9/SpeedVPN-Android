@@ -60,9 +60,8 @@ object SpeedVerificationEngine {
         try {
             Log.i(TAG, "Stage=disconnect-vpn-for-baseline")
             onProgress("فصل VPN لقياس سرعة الشبكة الأصلية…")
-            val disconnectedForBaseline = if (VpnRuntime.state.value.status != VpnStatus.DISCONNECTED) {
-                SpeedVpnService.stop(context)
-                waitForStatus(VpnStatus.DISCONNECTED)
+            val disconnectedForBaseline = if (!isTunnelStoppedForRestore()) {
+                stopForVerificationRestore(context)
             } else {
                 true
             }

@@ -108,20 +108,16 @@ def build_environment_note(result: dict[str, Any]) -> str:
     upload = directions.get("upload", {})
     median_upload = upload.get("median_mbps")
     if isinstance(median_upload, (int, float)):
-        if median_upload < 90.0:
+        if median_upload < 96.0:
             notes.append(
-                f"upload ceiling ~{median_upload:.0f} Mbps is below the 90 Mbps preflight "
-                "floor; 9/10/11 MB/s upload checks may be ENV_LIMITED."
-            )
-        elif median_upload < 96.0:
-            notes.append(
-                f"upload ceiling ~{median_upload:.0f} Mbps limits 10/11 MB/s upload "
-                "verification (10 MB/s needs >=96 Mbps baseline; 11 MB/s needs >=105.6 Mbps)."
+                f"upload ceiling ~{median_upload:.0f} Mbps is below the 96 Mbps baseline "
+                "needed for 10 MB/s and the 105.6 Mbps baseline needed for 11 MB/s upload verification."
             )
         elif median_upload < 105.6:
             notes.append(
-                f"upload baseline ~{median_upload:.0f} Mbps leaves 11 MB/s upload "
-                "verification ENV_LIMITED (requires >=105.6 Mbps baseline)."
+                f"upload baseline ~{median_upload:.0f} Mbps is below the 105.6 Mbps "
+                "headroom requirement for the 11 MB/s top preset; the full 38-metric sweep "
+                "must remain blocked."
             )
 
     if result.get("status") != "PASS":
@@ -137,8 +133,8 @@ def build_environment_note(result: dict[str, Any]) -> str:
 
 def validate_files(
     json_paths: list[Path],
-    download_min_mbps: float = 96.0,
-    upload_min_mbps: float = 90.0,
+    download_min_mbps: float = 105.6,
+    upload_min_mbps: float = 105.6,
     max_variability_pct: float = 25.0,
 ) -> dict[str, Any]:
     if len(json_paths) != 3:
@@ -196,8 +192,8 @@ def validate_files(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("samples", nargs=3, type=Path, help="three per-run JSON measurements")
-    parser.add_argument("--download-min", type=float, default=96.0)
-    parser.add_argument("--upload-min", type=float, default=90.0)
+    parser.add_argument("--download-min", type=float, default=105.6)
+    parser.add_argument("--upload-min", type=float, default=105.6)
     parser.add_argument("--max-variability", type=float, default=25.0)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()

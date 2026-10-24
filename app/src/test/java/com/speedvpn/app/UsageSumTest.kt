@@ -94,6 +94,33 @@ class UsageSumTest {
         )
     }
 
+    @Test
+    fun batchUpsertPreservesHigherPreviouslyRecordedBytesAndCreatesAppPolicy() {
+        val date = "2026-01-09"
+        UsageRepository.upsertDailyUsageBatch(
+            context,
+            listOf(
+                DailyUsageRow(date, "com.example.a", "App A", 10101, 5_000L, 2_000L),
+                DailyUsageRow(date, "com.example.b", "App B", 10102, 1_000L, 500L),
+            ),
+        )
+        // A lagging NetworkStats snapshot with lower values must not shrink existing daily totals.
+        UsageRepository.upsertDailyUsageBatch(
+            context,
+            listOf(
+                DailyUsageRow(date, "com.example.a", "App A", 10101, 3_000L, 4_000L),
+                DailyUsageRow(date, "com.example.b", "App B", 10102, 2_500L, 200L),
+            ),
+        )
+
+        val rows = UsageRepository.topUsage(context, date, 10).associateBy { it.packageName }
+        assertEquals(5_000L, rows.getValue("com.example.a").downloadBytes)
+        assertEquals(4_000L, rows.getValue("com.example.a").uploadBytes)
+        assertEquals(2_500L, rows.getValue("com.example.b").downloadBytes)
+        assertEquals(500L, rows.getValue("com.example.b").uploadBytes)
+        assertEquals(setOf("com.example.a", "com.example.b"), UsageRepository.readPolicies(context).map { it.packageName }.toSet())
+    }
+
     private fun insert(
         packageName: String,
         date: String,

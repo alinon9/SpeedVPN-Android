@@ -154,6 +154,8 @@ class SpeedVpnService : VpnService() {
 
     override fun onCreate() {
         super.onCreate()
+        SpeedPlanUsageTracker.registerContext(this)
+        runCatching { SpeedPlanUsageTracker.ensureRecovered(this) }
         UidPocDiagnostics.log(this, "SpeedVpnService.onCreate")
         registerPhysicalNetworkCallback()
     }
@@ -227,6 +229,10 @@ class SpeedVpnService : VpnService() {
         }
         if (tun != null || engineRunning) return@withLock
 
+        // A service/agent start can create the process before MainActivity loads preferences.
+        // Restore only once and atomically, so stale disk values cannot overwrite a live slider change.
+        SpeedLimitStore.restoreToLimiterIfUninitialized(this)
+
         val mySession = sessionId.incrementAndGet()
         val myServiceGeneration = synchronized(processNativeLifecycleLock) {
             if (destroying.get()) return@withLock
@@ -248,13 +254,33 @@ class SpeedVpnService : VpnService() {
         }
 
         val compatibility = VpnSettings.read(this)
+        // Restore quota blocks before any application traffic enters the tunnel.
+        runCatching { QuotaEnforcementEngine.enforce(this@SpeedVpnService) }
+            .onFailure { logE("Startup quota recovery failed; retaining persisted block state", it) }
+
         val relay = try {
             Socks5Server(
                 generation = myServiceGeneration,
                 protectTcp = { protect(it) },
                 protectUdp = { protect(it) },
                 currentNetwork = { findUnderlyingNetwork() },
-                ipv6Enabled = true,
+                ipv6Enabled = compatibility.ipv6Enabled,
+                dnsIpv4Only = compatibility.dnsIpv4Only,
+                accountQuotaBytes = ::accountQuotaBytesForRelay,
+                recordForwardedBytes = ::recordForwardedBytesForRelay,
+                settleQuotaBytes = ::settleQuotaBytesForRelay,
+                // A configured per-app quota requires exact owner attribution. Unknown UIDs
+                // can no longer pass through the relay unaccounted.
+                // Active app blocks and per-app quotas both require owner attribution.
+                // Otherwise an unknown-owner SOCKS session could bypass a live policy.
+                requireUidAttribution = {
+                    currentBlockedPackages().isNotEmpty() ||
+                        runCatching { QuotaEnforcementEngine.hasAnyConfiguredQuotaPolicies(this@SpeedVpnService) }
+                            .getOrDefault(true)
+                },
+                onQuotaExceeded = {
+                    enforceQuotaBlockImmediately(myServiceGeneration)
+                },
             ).also {
                 it.updateBlockedUids(
                     VpnApplicationPolicy.blockedUids(this@SpeedVpnService, currentBlockedPackages())
@@ -294,16 +320,28 @@ class SpeedVpnService : VpnService() {
                 // No public resolver is hard-coded.
                 .apply { dnsServers.forEach { addDnsServer(it) } }
                 .apply {
-                    // Capture IPv6 in TUN as well; otherwise blocked apps can bypass via IPv6.
-                    addAddress(TUN_V6, 128)
-                    addRoute("::", 0)
+                    // Match the user's compatibility setting. Do not install an IPv6
+                    // TUN address/route when IPv6 is disabled, or the toggle has no effect.
+                    if (compatibility.ipv6Enabled) {
+                        addAddress(TUN_V6, 128)
+                        addRoute("::", 0)
+                    }
                 }
                 .apply {
-                    // Do not install the VpnService application allow-list: omitted apps route outside TUN.
-                    // All apps except SpeedVPN itself use TUN for UID-based firewalling.
-                    addDisallowedApplication(packageName)
-                    log("VPN_TUN_POLICY mode=all-apps-except-self ipv4=0.0.0.0/0 ipv6=::/0 blockedPackages=" +
-                        currentBlockedPackages().sorted().joinToString(","))
+                    // Exempt only SpeedVPN itself to prevent a local proxy-routing loop.
+                    // Never add blocked target apps here: disallowed apps bypass the VPN.
+                    val routingExemptPackages = VpnApplicationPolicy.routingExemptPackages(
+                        vpnPackageName = packageName,
+                        includeOwnPackageForVerification = SpeedLimiter.routeVerificationTrafficThroughVpn,
+                    )
+                    routingExemptPackages.forEach { addDisallowedApplication(it) }
+                    log(
+                        "VPN_TUN_POLICY mode=all-apps-except-self " +
+                            "verificationOwnUidRouted=${SpeedLimiter.routeVerificationTrafficThroughVpn} " +
+                            "routingExemptPackages=${routingExemptPackages.sorted().joinToString(",")} " +
+                            "ipv4=0.0.0.0/0 ipv6=::/0 blockedPackages=" +
+                            currentBlockedPackages().sorted().joinToString(","),
+                    )
                 }
             builder.establish()
         } catch (e: IllegalStateException) {
@@ -338,10 +376,11 @@ class SpeedVpnService : VpnService() {
             return@withLock
         }
 
-        // Restore persistent local limits inside the Service so background/Always-on
-        // starts do not depend on MainActivity having been recreated first.
-        SpeedLimitStore.applyToLimiter(this)
-        log("Restored local speed limits before native data plane start")
+        // Restore persistent local limits inside the Service only when uninitialized so
+        // background/Always-on starts do not depend on MainActivity, without overwriting
+        // a newer live selection whose async disk commit is still in flight.
+        SpeedLimitStore.restoreToLimiterIfUninitialized(this)
+        log("Ensured local speed limits initialized before native data plane start")
 
         log("Starting hev tunnel")
         val started = startNativeIfCurrent(mySession, pfd, conf.absolutePath)
@@ -389,6 +428,7 @@ class SpeedVpnService : VpnService() {
             return@withLock
         }
         log("VPN session $mySession connected")
+        runCatching { SpeedPlanUsageTracker.onVpnConnected(this@SpeedVpnService, myServiceGeneration) }
         startMeter(mySession, myServiceGeneration)
         startQuotaMonitor(mySession)
         startUidPolicyMonitor(mySession)
@@ -402,10 +442,115 @@ class SpeedVpnService : VpnService() {
             activeServiceGeneration.get() == serviceGeneration
 
     internal fun currentBlockedPackages(): Set<String> {
-        val state = VpnAppControl.read(this)
+        val settings = VpnAppControl.read(this)
         val quotaBlocked = VpnAppControl.quotaBlockedPackages(this)
-        val manualBlocked = if (state.firewallEnabled) state.blockedPackages else emptySet()
-        return (manualBlocked + quotaBlocked).toSet()
+        return VpnApplicationPolicy.packagesToEnforce(settings, quotaBlocked)
+    }
+
+    private fun accountQuotaBytesForRelay(
+        packages: Set<String>,
+        uid: Int?,
+        direction: QuotaTrafficDirection,
+        bytes: Int,
+        transport: QuotaTransport,
+    ): QuotaTrafficDecision {
+        val resolvedPackages = if (packages.isNotEmpty()) {
+            packages
+        } else {
+            QuotaEnforcementEngine.resolvePackagesForUidCached(this, uid)
+        }
+        return QuotaEnforcementEngine.accountRelayBytes(
+            context = this,
+            packageNames = resolvedPackages,
+            uid = uid,
+            direction = direction,
+            requestedBytes = bytes,
+            transport = transport,
+        )
+    }
+
+    private fun recordForwardedBytesForRelay(
+        packages: Set<String>,
+        uid: Int?,
+        direction: QuotaTrafficDirection,
+        bytes: Int,
+    ) {
+        val resolvedPackages = if (packages.isNotEmpty()) {
+            packages
+        } else {
+            QuotaEnforcementEngine.resolvePackagesForUidCached(this, uid)
+        }
+        QuotaEnforcementEngine.recordForwardedRelayBytes(
+            context = this,
+            packageNames = resolvedPackages,
+            uid = uid,
+            direction = direction,
+            forwardedBytes = bytes,
+        )
+    }
+
+    private fun settleQuotaBytesForRelay(
+        packages: Set<String>,
+        uid: Int?,
+        direction: QuotaTrafficDirection,
+        decision: QuotaTrafficDecision,
+        outcome: QuotaSettlementOutcome,
+        forwardedBytes: Int,
+    ): QuotaTrafficDecision {
+        val resolvedPackages = if (packages.isNotEmpty()) {
+            packages
+        } else {
+            QuotaEnforcementEngine.resolvePackagesForUidCached(this, uid)
+        }
+        return QuotaEnforcementEngine.settleRelayBytes(
+            context = this,
+            packageNames = resolvedPackages,
+            uid = uid,
+            direction = direction,
+            decision = decision,
+            outcome = outcome,
+            forwardedBytes = forwardedBytes,
+        )
+    }
+
+    /**
+     * Applies a newly exhausted quota to the UID resolver and all live SOCKS sockets. This
+     * is invoked after the boundary-sized payload has been written, not by the periodic worker.
+     */
+    private fun enforceQuotaBlockImmediately(expectedGeneration: Long) {
+        val blocked = currentBlockedPackages()
+        val callback = uidDetectionPoc
+        runCatching { callback?.updateBlockedPackages(blocked) }
+            .onFailure { logE("Unable to update native quota block policy", it) }
+
+        val blockedUids = runCatching { VpnApplicationPolicy.blockedUids(this, blocked) }
+            .getOrDefault(emptySet())
+        runCatching { socks?.updateBlockedUids(blockedUids) }
+            .onFailure { logE("Unable to close quota-blocked UID sockets", it) }
+        runCatching { socks?.enforceBlockedPackages(blocked) }
+            .onFailure { logE("Unable to close quota-blocked package flows", it) }
+
+        if (callback != null) {
+            synchronized(processNativeLifecycleLock) {
+                if (serviceGeneration == expectedGeneration &&
+                    activeServiceGeneration.get() == expectedGeneration &&
+                    nativeGeneration == expectedGeneration &&
+                    nativeOwnerGeneration.get() == expectedGeneration
+                ) {
+                    runCatching {
+                        check(TProxyService.TProxySetUidPocCallback(null)) {
+                            "Unable to clear UID cache after quota exhaustion"
+                        }
+                        check(TProxyService.TProxySetUidPocCallback(callback)) {
+                            "Unable to refresh UID cache after quota exhaustion"
+                        }
+                    }.onFailure {
+                        UidPocDiagnostics.error(this, "Native UID policy refresh failed after quota exhaustion", it)
+                    }
+                }
+            }
+        }
+        log("QUOTA_EXHAUSTED_BLOCK_APPLIED packages=" + blocked.sorted().joinToString(","))
     }
 
     internal fun recordDetectedFlow(
@@ -416,8 +561,9 @@ class SpeedVpnService : VpnService() {
         dstPort: Int,
         uid: Int,
         packages: Collection<String>,
+        isVerificationProbe: Boolean = false,
     ) {
-        socks?.recordDetectedFlow(protocol, srcIp, srcPort, dstIp, dstPort, uid, packages)
+        socks?.recordDetectedFlow(protocol, srcIp, srcPort, dstIp, dstPort, uid, packages, isVerificationProbe)
     }
 
     internal fun enforceBlockedDetectedFlow(
@@ -453,38 +599,62 @@ class SpeedVpnService : VpnService() {
                 if (!sessionIsCurrent(mySession)) break
                 val current = runCatching { currentBlockedPackages() }.getOrElse { previous }
                 if (current == previous) continue
+                val previousPackages = previous
                 previous = current
 
-                // Close relay sessions whose resolved owner is now blocked. Clear/re-register
-                // the native callback to invalidate cached non-blocked UID results; lookups
-                // still execute on the dedicated native worker, never on the TUN coroutine.
                 val callback = uidDetectionPoc
+                val currentBlockedUids = VpnApplicationPolicy.blockedUids(this@SpeedVpnService, current)
+                val previousBlockedUids = VpnApplicationPolicy.blockedUids(this@SpeedVpnService, previousPackages)
+                val fenceTransition = currentBlockedUids.isNotEmpty() || previousBlockedUids.isNotEmpty()
+
+                // Fence the transition before publishing the new package snapshot. This clears
+                // old ALLOW decisions and causes all new flows to be dropped while no resolver
+                // callback is registered, avoiding a cache/callback gap during policy changes.
+                if (fenceTransition) {
+                    runCatching {
+                        check(TProxyService.TProxySetUidPocPolicyEnabled(true)) {
+                            "Unable to enable native policy transition fence"
+                        }
+                        check(TProxyService.TProxySetUidPocCallback(null)) {
+                            "Unable to pause UID resolver during policy transition"
+                        }
+                    }.onFailure {
+                        UidPocDiagnostics.error(this@SpeedVpnService, "Unable to fence UID policy transition", it)
+                        logE("Unable to fence UID policy transition", it)
+                    }
+                }
+
                 runCatching { callback?.updateBlockedPackages(current) }
                     .onFailure { logE("Unable to refresh blocked UID policy", it) }
+
+                if (fenceTransition && callback != null) {
+                    runCatching {
+                        check(TProxyService.TProxySetUidPocCallback(callback)) {
+                            "Unable to restore UID resolver after policy transition"
+                        }
+                    }.onFailure {
+                        UidPocDiagnostics.error(this@SpeedVpnService, "Unable to restore UID resolver", it)
+                        logE("Unable to restore UID resolver", it)
+                    }
+                }
+
                 runCatching {
-                    socks?.updateBlockedUids(VpnApplicationPolicy.blockedUids(this@SpeedVpnService, current))
+                    check(TProxyService.TProxySetUidPocPolicyEnabled(currentBlockedUids.isNotEmpty())) {
+                        "Unable to apply native UID policy"
+                    }
+                }.onFailure {
+                    UidPocDiagnostics.error(this@SpeedVpnService, "Native UID policy update failed", it)
+                    logE("Unable to apply native UID policy", it)
+                }
+                runCatching {
+                    socks?.updateBlockedUids(currentBlockedUids)
                 }.onFailure { logE("Unable to refresh SOCKS blocked UIDs", it) }
                 runCatching { socks?.enforceBlockedPackages(current) }
                     .onFailure { logE("Unable to enforce changed app block-list", it) }
-                if (callback != null) {
-                    synchronized(processNativeLifecycleLock) {
-                        if (sessionIsCurrent(mySession) &&
-                            nativeOwnerGeneration.get() == nativeGeneration &&
-                            nativeGeneration > 0L
-                        ) {
-                            runCatching {
-                                check(TProxyService.TProxySetUidPocCallback(null)) {
-                                    "Unable to clear UID cache after app policy change"
-                                }
-                                check(TProxyService.TProxySetUidPocCallback(callback)) {
-                                    "Unable to re-register UID callback after app policy change"
-                                }
-                            }.onFailure {
-                                UidPocDiagnostics.error(this@SpeedVpnService, "UID policy cache refresh failed", it)
-                            }
-                        }
-                    }
-                }
+                // SOCKS endpoint ownership can be ambiguous across apps; invalidate old
+                // relays and pending DNS lookups so no unattributed session survives this change.
+                runCatching { socks?.closeActiveSessionsForPolicyChange() }
+                    .onFailure { logE("Unable to close stale SOCKS/DNS sessions", it) }
                 log("UID_POLICY_CHANGED blockedPackages=" + current.sorted().joinToString(","))
             }
         }
@@ -497,11 +667,12 @@ class SpeedVpnService : VpnService() {
             appendLine("tunnel:")
             appendLine("  mtu: ${compatibility.mtu}")
             appendLine("  ipv4: $TUN_V4")
-            appendLine("  ipv6: '$TUN_V6'")
+            if (compatibility.ipv6Enabled) appendLine("  ipv6: '$TUN_V6'")
             appendLine("socks5:")
             appendLine("  port: ${relay.port}")
             appendLine("  address: 127.0.0.1")
             appendLine("  udp: 'udp'")
+            appendLine("  pipeline: true")
             appendLine("  username: '${relay.username}'")
             appendLine("  password: '${relay.password}'")
             appendLine("mapdns:")
@@ -821,14 +992,36 @@ class SpeedVpnService : VpnService() {
             oldRelay
         } else {
             runCatching { oldRelay?.stop() }
+            val relayGeneration = serviceGeneration
+            val recoveryCompatibility = VpnSettings.read(this@SpeedVpnService)
             val fresh = runCatching {
                 Socks5Server(
-                    generation = serviceGeneration,
+                    generation = relayGeneration,
                     protectTcp = { protect(it) },
                     protectUdp = { protect(it) },
                     currentNetwork = { findUnderlyingNetwork() },
-                    ipv6Enabled = VpnSettings.read(this@SpeedVpnService).ipv6Enabled,
-                ).also { it.start() }
+                    ipv6Enabled = recoveryCompatibility.ipv6Enabled,
+                    dnsIpv4Only = recoveryCompatibility.dnsIpv4Only,
+                    accountQuotaBytes = ::accountQuotaBytesForRelay,
+                    recordForwardedBytes = ::recordForwardedBytesForRelay,
+                    settleQuotaBytes = ::settleQuotaBytesForRelay,
+                    // Recovery must preserve startup's owner-attribution policy for blocks
+                    // and quotas, then seed UID blocks before the relay accepts traffic.
+                    requireUidAttribution = {
+                        currentBlockedPackages().isNotEmpty() ||
+                            runCatching {
+                                QuotaEnforcementEngine.hasAnyConfiguredQuotaPolicies(this@SpeedVpnService)
+                            }.getOrDefault(true)
+                    },
+                    onQuotaExceeded = {
+                        enforceQuotaBlockImmediately(relayGeneration)
+                    },
+                ).also { recoveredRelay ->
+                    recoveredRelay.updateBlockedUids(
+                        VpnApplicationPolicy.blockedUids(this@SpeedVpnService, currentBlockedPackages())
+                    )
+                    recoveredRelay.start()
+                }
             }.getOrNull() ?: run {
                 failLocked("SOCKS relay recovery failed")
                 return HealthResult.FAILED
@@ -884,27 +1077,19 @@ class SpeedVpnService : VpnService() {
             while (isActive && sessionId.get() == mySession) {
                 delay(5_000)
                 if (!sessionIsCurrent(mySession)) break
-                if (SmartSettings.isStatsEnabled(this@SpeedVpnService) &&
-                    AppTrafficManager.hasUsageAccess(this@SpeedVpnService)
-                ) {
-                    if (UsageRepository.readQuotaPolicies(this@SpeedVpnService).isEmpty()) {
-                        continue
-                    }
-                    runCatching {
-                        // Enforcement reads NetworkStatsManager directly for each
-                        // configured UID. Do not run the heavier daily snapshot collector
-                        // here: that collector is for UI/reporting and can delay the
-                        // actual quota decision.
-                        QuotaEnforcementEngine.enforce(this@SpeedVpnService)
-                    }.onFailure {
-                        DiagnosticsRepository.record(
-                            this@SpeedVpnService,
-                            "WARN",
-                            "Quota",
-                            "FOREGROUND_QUOTA_CHECK_FAILED",
-                            it.message ?: "quota check failed",
-                        )
-                    }
+                if (!QuotaEnforcementEngine.hasAnyConfiguredQuotaPolicies(this@SpeedVpnService)) continue
+                runCatching {
+                    // Recovery and period rollover only. The data plane enforces every admitted
+                    // TCP/UDP payload chunk synchronously before forwarding it.
+                    QuotaEnforcementEngine.enforce(this@SpeedVpnService)
+                }.onFailure {
+                    DiagnosticsRepository.record(
+                        this@SpeedVpnService,
+                        "WARN",
+                        "Quota",
+                        "FOREGROUND_QUOTA_CHECK_FAILED",
+                        it.message ?: "quota check failed",
+                    )
                 }
             }
         }
@@ -914,6 +1099,7 @@ class SpeedVpnService : VpnService() {
         meter?.cancel()
         quotaMonitor?.cancel()
         meter = scope.launch {
+            val smartSampler = SmartSampler(this@SpeedVpnService)
             var lastDown = SpeedLimiter.download.total.get()
             var lastUp = SpeedLimiter.upload.total.get()
             var lastSampleNs = System.nanoTime()
@@ -921,40 +1107,51 @@ class SpeedVpnService : VpnService() {
             var previousUpBps = 0L
             var firstSample = true
             while (isActive && sessionId.get() == mySession) {
-                delay(1_000)
+                delay(500)
                 if (!sessionIsCurrent(mySession)) break
                 val nowNs = System.nanoTime()
                 val elapsedNs = (nowNs - lastSampleNs).coerceAtLeast(1L)
                 val d = SpeedLimiter.download.total.get()
                 val u = SpeedLimiter.upload.total.get()
-                // Use monotonic elapsed time instead of assuming delay(1000) woke up
-                // exactly one second later. This removes scheduler-jitter error from
+                // Use monotonic elapsed time instead of assuming delay(500) woke up
+                // at an exact interval. This removes scheduler-jitter error from
                 // the displayed bps value.
                 val rawDownBps = (((d - lastDown).coerceAtLeast(0L).toDouble() * 8.0 * 1_000_000_000.0) /
                     elapsedNs.toDouble()).toLong().coerceAtLeast(0L)
                 val rawUpBps = (((u - lastUp).coerceAtLeast(0L).toDouble() * 8.0 * 1_000_000_000.0) /
                     elapsedNs.toDouble()).toLong().coerceAtLeast(0L)
-                // Two-sample moving average: enough to suppress one-second packet
-                // bursts without hiding real speed changes for long periods.
+                // Two-sample moving average at 500ms cadence: responsive to real speed
+                // changes within 0.5-1.0s while smoothing sub-second packet bursts.
                 val smoothDownBps = if (firstSample) rawDownBps else
                     ((previousDownBps + rawDownBps) / 2L).coerceAtLeast(0L)
                 val smoothUpBps = if (firstSample) rawUpBps else
                     ((previousUpBps + rawUpBps) / 2L).coerceAtLeast(0L)
                 val sessionDown = SpeedLimiter.download.sessionBytes(myServiceGeneration)
                 val sessionUp = SpeedLimiter.upload.sessionBytes(myServiceGeneration)
-                synchronized(processNativeLifecycleLock) {
-                    if (activeServiceGeneration.get() == myServiceGeneration) {
-                        VpnRuntime.update {
-                            it.copy(
-                                downloadBps = smoothDownBps,
-                                uploadBps = smoothUpBps,
-                                sessionDownloadBytes = sessionDown,
-                                sessionUploadBytes = sessionUp,
-                            )
-                        }
-                    } else {
-                        return@launch
+                // Do not block UI telemetry updates on processNativeLifecycleLock.
+                // activeServiceGeneration is an AtomicLong and safe to read lock-free.
+                if (activeServiceGeneration.get() == myServiceGeneration) {
+                    VpnRuntime.update {
+                        it.copy(
+                            downloadBps = smoothDownBps,
+                            uploadBps = smoothUpBps,
+                            sessionDownloadBytes = sessionDown,
+                            sessionUploadBytes = sessionUp,
+                        )
                     }
+                    val sampleElapsedMs = (elapsedNs / 1_000_000L).coerceAtLeast(1L)
+                    runCatching {
+                        SpeedPlanUsageTracker.onMeterSample(
+                            context = this@SpeedVpnService,
+                            generation = myServiceGeneration,
+                            rawDownloadBps = rawDownBps,
+                            rawUploadBps = rawUpBps,
+                            sampleElapsedMillis = sampleElapsedMs,
+                        )
+                    }
+                    runCatching { smartSampler.sample() }
+                } else {
+                    return@launch
                 }
                 lastDown = d
                 lastUp = u
@@ -1038,6 +1235,8 @@ class SpeedVpnService : VpnService() {
             SpeedLimiter.beginSession(newGeneration)
         }
         val started = runCatching {
+            // UID attribution is required for per-app blocking and quotas in Debug as well as Release.
+            // The explicit diagnostic preference may disable the callback only for controlled testing.
             val hookDisabled = getSharedPreferences(UidPocSettings.PREFS, MODE_PRIVATE)
                 .getBoolean(UidPocSettings.KEY_DISABLE_JNI_HOOK, false)
             // App blocking must also be active in Release. The test preference may disable the hook only in Debug builds.
@@ -1057,6 +1256,12 @@ class SpeedVpnService : VpnService() {
                     .onFailure { UidPocDiagnostics.error(this, "Unable to clear UID POC callback in disabled mode", it) }
                 uidDetectionPoc?.close()
                 uidDetectionPoc = null
+            }
+            val initialBlockedUids = VpnApplicationPolicy.blockedUids(this, currentBlockedPackages())
+            check(TProxyService.TProxySetUidPocPolicyEnabled(
+                initialBlockedUids.isNotEmpty() && !BuildConfig.DEBUG
+            )) {
+                "Unable to initialize native UID policy"
             }
             UidPocDiagnostics.log(this, "JNI_NATIVE_START_BEGIN generation=$newGeneration fd=${expectedTun.fd}")
             val nativeStarted = TProxyService.TProxyStartService(configPath, expectedTun.fd)
@@ -1139,6 +1344,7 @@ class SpeedVpnService : VpnService() {
 
     private fun cleanupLocked() {
         meter?.cancel(); meter = null
+        quotaMonitor?.cancel(); quotaMonitor = null
         healthMonitor?.cancel(); healthMonitor = null
         uidPolicyMonitor?.cancel(); uidPolicyMonitor = null
         val configFile = tunnelConfigFile
@@ -1205,6 +1411,16 @@ class SpeedVpnService : VpnService() {
         val generation = serviceGeneration
         sessionId.incrementAndGet()
         logE("Connection error: $reason", t)
+        if (generation > 0L) {
+            runCatching {
+                SpeedPlanUsageTracker.onVpnDisconnected(
+                    context = this,
+                    generation = generation,
+                    closeReason = "CONNECT_FAILED",
+                    abnormal = true,
+                )
+            }
+        }
         cleanupLocked()
         val ownsRuntime = synchronized(processNativeLifecycleLock) {
             if (generation <= 0L || !activeServiceGeneration.compareAndSet(generation, 0L)) {
@@ -1280,6 +1496,16 @@ class SpeedVpnService : VpnService() {
             return@withLock
         }
 
+        if (generation > 0L) {
+            runCatching {
+                SpeedPlanUsageTracker.onVpnDisconnected(
+                    context = this@SpeedVpnService,
+                    generation = generation,
+                    closeReason = "VPN_DISCONNECTED",
+                    abnormal = false,
+                )
+            }
+        }
         cleanupLocked()
         val shouldReconnect = reconnectAfterDisconnect
         reconnectAfterDisconnect = false
@@ -1321,8 +1547,19 @@ class SpeedVpnService : VpnService() {
         sessionId.incrementAndGet()
         reconnectAfterDisconnect = false
         meter?.cancel(); meter = null
+        quotaMonitor?.cancel(); quotaMonitor = null
         healthMonitor?.cancel(); healthMonitor = null
         uidPolicyMonitor?.cancel(); uidPolicyMonitor = null
+        if (serviceGeneration > 0L) {
+            runCatching {
+                SpeedPlanUsageTracker.onVpnDisconnected(
+                    context = this,
+                    generation = serviceGeneration,
+                    closeReason = "SERVICE_DESTROYED",
+                    abnormal = true,
+                )
+            }
+        }
 
         // Snapshot and detach this instance's resources on the main thread, then do
         // blocking teardown off-main. Process-wide ownership prevents stale cleanup

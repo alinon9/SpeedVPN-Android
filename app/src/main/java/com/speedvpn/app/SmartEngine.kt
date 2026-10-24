@@ -7,32 +7,62 @@ import android.net.ConnectivityManager
 import java.util.Calendar
 import kotlin.math.max
 import kotlin.math.min
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 internal object SmartSettings {
     private const val PREFS = "smart_settings"
     private const val STATS_ENABLED = "stats_enabled"
     private const val OVERLAY_ENABLED = "overlay_enabled"
 
+    private val statsState = MutableStateFlow(false)
+    private val overlayState = MutableStateFlow(false)
+
+    fun observeStatsEnabled(context: Context): StateFlow<Boolean> {
+        statsState.value = isStatsEnabled(context)
+        return statsState.asStateFlow()
+    }
+
+    fun observeOverlayEnabled(context: Context): StateFlow<Boolean> {
+        overlayState.value = isOverlayEnabled(context)
+        return overlayState.asStateFlow()
+    }
+
     fun isStatsEnabled(context: Context): Boolean =
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(STATS_ENABLED, false)
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getBoolean(STATS_ENABLED, false)
+            .also { statsState.value = it }
 
     fun setStatsEnabled(context: Context, enabled: Boolean) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .edit().putBoolean(STATS_ENABLED, enabled).apply()
+            .edit()
+            .putBoolean(STATS_ENABLED, enabled)
+            .commit()
+        statsState.value = enabled
         if (enabled) {
             UsageCollectionScheduler.schedule(context)
             QuotaWorkScheduler.schedule(context)
         } else {
             UsageCollectionScheduler.cancel(context)
-            QuotaWorkScheduler.cancel(context)
+            AppTrafficManager.clearLiveRelayTrafficForTests()
+            // Never cancel QuotaWorkScheduler if per-app quota policies are configured:
+            // disabling optional statistics must never allow quota bypass.
+            QuotaWorkScheduler.syncWithConfiguredPolicies(context)
         }
     }
 
     fun isOverlayEnabled(context: Context): Boolean =
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(OVERLAY_ENABLED, false)
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getBoolean(OVERLAY_ENABLED, false)
+            .also { overlayState.value = it }
 
     fun setOverlayEnabled(context: Context, enabled: Boolean) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(OVERLAY_ENABLED, enabled).apply()
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(OVERLAY_ENABLED, enabled)
+            .commit()
+        overlayState.value = enabled
     }
 }
 
@@ -66,36 +96,53 @@ internal object UsageCollector {
     private fun collectDay(context: Context, date: String, start: Long, end: Long) {
         if (end <= start) return
         val apps = AppTrafficManager.installedLaunchableApps(context)
-        if (apps.isEmpty() || !AppTrafficManager.hasUsageAccess(context)) return
+        if (apps.isEmpty()) return
+        val isToday = date == UsageDate.today()
+        val hasAccess = AppTrafficManager.hasUsageAccess(context)
+        if (!hasAccess && !isToday) return
         val byUid = HashMap<Int, LongArray>()
-        val manager = context.getSystemService(NetworkStatsManager::class.java) ?: return
-        for (networkType in networkTypes) {
-            runCatching {
-                val stats = manager.queryDetails(networkType, null, start, end)
-                stats.use { stream ->
-                    val bucket = NetworkStats.Bucket()
-                    while (stream.hasNextBucket()) {
-                        stream.getNextBucket(bucket)
-                        if (bucket.uid < 0) continue
-                        val totals = byUid.getOrPut(bucket.uid) { LongArray(2) }
-                        totals[0] = safeAdd(totals[0], bucket.rxBytes)
-                        totals[1] = safeAdd(totals[1], bucket.txBytes)
-                    }
+        if (hasAccess) {
+            val manager = context.getSystemService(NetworkStatsManager::class.java)
+            if (manager != null) {
+                for (networkType in networkTypes) {
+                    runCatching {
+                        val stats = manager.queryDetails(networkType, null, start, end)
+                        stats.use { stream ->
+                            val bucket = NetworkStats.Bucket()
+                            while (stream.hasNextBucket()) {
+                                stream.getNextBucket(bucket)
+                                if (bucket.uid < 0) continue
+                                val totals = byUid.getOrPut(bucket.uid) { LongArray(2) }
+                                totals[0] = safeAdd(totals[0], bucket.rxBytes)
+                                totals[1] = safeAdd(totals[1], bucket.txBytes)
+                            }
+                        }
+                    }.onFailure { log("Daily usage query failed: ${it.message}") }
                 }
-            }.onFailure { log("Daily usage query failed: ${it.message}") }
+            }
         }
-        apps.forEach { app ->
+        val rows = apps.map { app ->
             val values = byUid[app.uid] ?: LongArray(2)
+            val live = if (isToday) {
+                AppTrafficManager.liveRelayUsage(app.uid, app.packageName, date)
+            } else {
+                UidTrafficCounters(0L, 0L)
+            }
             val label = app.loadLabel(context.packageManager).toString()
-            UsageRepository.upsertDailyUsage(
-                context,
-                DailyUsageRow(date, app.packageName, label, app.uid, values[0], values[1]),
+            DailyUsageRow(
+                date = date,
+                packageName = app.packageName,
+                label = label,
+                uid = app.uid,
+                downloadBytes = max(values[0], live.downloadBytes),
+                uploadBytes = max(values[1], live.uploadBytes),
             )
-            UsageRepository.ensureApp(context, app.packageName, label, app.uid)
         }
+        UsageRepository.upsertDailyUsageBatch(context, rows)
     }
 
     private fun maybeAnalyze(context: Context) {
+        if (!SmartSettings.isStatsEnabled(context)) return
         val prefs = context.getSharedPreferences("smart_settings", Context.MODE_PRIVATE)
         val now = System.currentTimeMillis()
         val last = prefs.getLong("last_ai_analysis", 0L)
@@ -127,7 +174,12 @@ internal object UsageCollector {
 internal object UsageCollectionScheduler {
     private const val REQUEST_CODE = 7302
 
+    @Volatile
+    internal var scheduledForTests: Boolean = false
+        private set
+
     fun schedule(context: Context) {
+        scheduledForTests = true
         val alarmManager = context.getSystemService(android.app.AlarmManager::class.java) ?: return
         val intent = android.content.Intent(context, UsageCollectionReceiver::class.java)
         val pending = android.app.PendingIntent.getBroadcast(
@@ -137,22 +189,17 @@ internal object UsageCollectionScheduler {
             android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE,
         )
         alarmManager.cancel(pending)
-        val calendar = Calendar.getInstance().apply {
-            add(Calendar.DAY_OF_YEAR, 1)
-            set(Calendar.HOUR_OF_DAY, 0)
-            set(Calendar.MINUTE, 5)
-            set(Calendar.SECOND, 0)
-            set(Calendar.MILLISECOND, 0)
-        }
+        val firstTriggerAtMillis = System.currentTimeMillis() + android.app.AlarmManager.INTERVAL_FIFTEEN_MINUTES
         alarmManager.setInexactRepeating(
             android.app.AlarmManager.RTC_WAKEUP,
-            calendar.timeInMillis,
-            android.app.AlarmManager.INTERVAL_DAY,
+            firstTriggerAtMillis,
+            android.app.AlarmManager.INTERVAL_FIFTEEN_MINUTES,
             pending,
         )
     }
 
     fun cancel(context: Context) {
+        scheduledForTests = false
         val alarmManager = context.getSystemService(android.app.AlarmManager::class.java) ?: return
         val pending = android.app.PendingIntent.getBroadcast(
             context,
@@ -228,8 +275,8 @@ internal class SmartSampler(private val context: Context) {
         if (lastAt > 0L && now - lastAt < 60_000L) return
         val s = VpnRuntime.state.value
         val dt = now - lastAt
-        val downBps = if (dt > 0 && lastAt > 0) ((s.sessionDownloadBytes - lastDown).coerceAtLeast(0L) * 1000L / dt) else s.downloadBps
-        val upBps = if (dt > 0 && lastAt > 0) ((s.sessionUploadBytes - lastUp).coerceAtLeast(0L) * 1000L / dt) else s.uploadBps
+        val downBps = if (dt > 0 && lastAt > 0) ((s.sessionDownloadBytes - lastDown).coerceAtLeast(0L) * 8_000L / dt) else s.downloadBps
+        val upBps = if (dt > 0 && lastAt > 0) ((s.sessionUploadBytes - lastUp).coerceAtLeast(0L) * 8_000L / dt) else s.uploadBps
         lastDown = s.sessionDownloadBytes
         lastUp = s.sessionUploadBytes
         lastAt = now

@@ -9,10 +9,9 @@ class SpeedLimiterConversionTest {
     fun relayReadSizeFollowsBoundedPacingWindow() {
         val bucket = TokenBucket()
 
-        // Low rates keep the established minimum chunk and must not send 64 KiB
-        // every time the bucket refills.
+        // A 10 KB/s plan should use a small 1 KiB chunk, not burst 16 KiB at once.
         bucket.setRate(10_000L)
-        assertEquals(16 * 1024, bucket.recommendedReadBytes())
+        assertEquals(1024, bucket.recommendedReadBytes())
 
         // Larger finite plans use proportionally larger chunks to reduce wakeups.
         bucket.setRate(2_000_000L)
@@ -32,23 +31,26 @@ class SpeedLimiterConversionTest {
     }
 
     @Test
-    fun convertsKilobitsToBytesPerSecond() {
-        val bucket = TokenBucket()
+    fun convertsUiPresetsAndCustomMegabitsToBytesPerSecond() {
+        // UI presets are expressed in decimal KB/s, stored as Kbps, then paced as B/s.
+        val tenKbPerSec = SpeedLimiter.kilobytesPerSecondToKbps(10L)
+        assertEquals(80L, tenKbPerSec)
+        assertEquals(10_000L, SpeedLimiter.kbpsToBytesPerSec(tenKbPerSec))
 
-        bucket.setRate(10L * 125L)
-        assertEquals(10L * 125L, bucket.bytesPerSec)
+        // 1 MB/s and the high presets must not lose a factor of 8 or 1,000.
+        assertEquals(8_000L, SpeedLimiter.kilobytesPerSecondToKbps(1_000L))
+        assertEquals(1_000_000L, SpeedLimiter.kbpsToBytesPerSec(8_000L))
+        assertEquals(5_000_000L, SpeedLimiter.kbpsToBytesPerSec(40_000L))
 
-        bucket.setRate(800L * 125L)
-        assertEquals(100_000L, bucket.bytesPerSec)
+        // Custom input in Mbps is converted to decimal Kbps before byte pacing.
+        assertEquals(72_000L, SpeedLimiter.toKbps(72.0, "Mbps"))
+        assertEquals(9_000_000L, SpeedLimiter.kbpsToBytesPerSec(SpeedLimiter.toKbps(72.0, "Mbps")))
+        assertEquals(88_000L, SpeedLimiter.toKbps(88.0, "Mbps"))
+        assertEquals(11_000_000L, SpeedLimiter.kbpsToBytesPerSec(SpeedLimiter.toKbps(88.0, "Mbps")))
 
-        bucket.setRate(8_000L * 125L)
-        assertEquals(1_000_000L, bucket.bytesPerSec)
-
-        bucket.setRate(40_000L * 125L)
-        assertEquals(5_000_000L, bucket.bytesPerSec)
-
-        bucket.setRate(800_000L * 125L)
-        assertEquals(100_000_000L, bucket.bytesPerSec)
+        // Zero/null is the documented Unlimited representation.
+        assertEquals(0L, SpeedLimiter.kbpsToBytesPerSec(null))
+        assertEquals(0L, SpeedLimiter.kbpsToBytesPerSec(0L))
     }
 
     @Test
@@ -66,8 +68,8 @@ class SpeedLimiterConversionTest {
         val generation = 1L
         bucket.beginSession(generation)
 
-        // Drain the initial bounded burst, then request 100 bytes at 2,000 B/s.
-        assertTrue(bucket.acquire(16 * 1024, { true }))
+        // Drain the bucket's current bounded burst, then request 100 bytes at 2,000 B/s.
+        assertTrue(bucket.acquire(bucket.recommendedReadBytes(), { true }))
         val start = System.nanoTime()
         assertTrue(bucket.acquire(100, { true }))
         val elapsedMs = (System.nanoTime() - start) / 1_000_000L
@@ -84,7 +86,7 @@ class SpeedLimiterConversionTest {
         bucket.setRate(2_000L)
 
         // Empty the initial burst and prove the finite rate really waits.
-        assertTrue(bucket.acquire(16 * 1024))
+        assertTrue(bucket.acquire(bucket.recommendedReadBytes()))
         var started = System.nanoTime()
         assertTrue(bucket.acquire(100))
         var finiteWaitMs = (System.nanoTime() - started) / 1_000_000L
@@ -99,7 +101,7 @@ class SpeedLimiterConversionTest {
 
         // Returning to a finite plan must restore the configured cap.
         bucket.setRate(2_000L)
-        assertTrue(bucket.acquire(16 * 1024))
+        assertTrue(bucket.acquire(bucket.recommendedReadBytes()))
         started = System.nanoTime()
         assertTrue(bucket.acquire(100))
         finiteWaitMs = (System.nanoTime() - started) / 1_000_000L
@@ -107,21 +109,69 @@ class SpeedLimiterConversionTest {
     }
 
     @Test
+    fun changingToUnlimitedWakesAnExistingWaiterImmediately() {
+        val bucket = TokenBucket()
+        bucket.setRate(1L)
+        assertTrue(bucket.acquire(bucket.recommendedReadBytes()))
+
+        val entered = java.util.concurrent.CountDownLatch(1)
+        val finished = java.util.concurrent.CountDownLatch(1)
+        val acquired = java.util.concurrent.atomic.AtomicBoolean(false)
+        Thread {
+            entered.countDown()
+            acquired.set(bucket.acquire(1))
+            finished.countDown()
+        }.apply { isDaemon = true; start() }
+
+        assertTrue("Waiter did not start", entered.await(1, java.util.concurrent.TimeUnit.SECONDS))
+        Thread.sleep(50L)
+        bucket.setRate(0L)
+        assertTrue("Rate change did not wake the blocked waiter", finished.await(500, java.util.concurrent.TimeUnit.MILLISECONDS))
+        assertTrue(acquired.get())
+    }
+
+    @Test
     fun limiterAccruesCreditDuringOutsideIoWork() {
         val bucket = TokenBucket()
         bucket.setRate(20_000L)
 
-        // Consume half the initial burst. While the caller performs socket I/O,
+        // Consume half the minimum bucket. While the caller performs socket I/O,
         // a true token bucket should earn credit during the 120 ms outside the lock.
-        assertTrue(bucket.acquire(8 * 1024, { true }))
+        assertTrue(bucket.acquire(512, { true }))
         Thread.sleep(120L)
 
         val start = System.nanoTime()
-        assertTrue(bucket.acquire(8 * 1024, { true }))
+        assertTrue(bucket.acquire(512, { true }))
         val elapsedMs = (System.nanoTime() - start) / 1_000_000L
 
-        // The current deadline-per-chunk scheduler waits about another 280 ms here.
         // A refillable bucket has accumulated enough credit to grant this chunk now.
         assertTrue("Credit was not accrued during outside I/O: ${elapsedMs}ms", elapsedMs < 150L)
+    }
+
+    @Test
+    fun unlimitedFastPathHonorsCanProceedAndJitterHeadroomCapsBurstDebt() {
+        val bucket = TokenBucket()
+        bucket.setRate(0L)
+        assertTrue(bucket.acquire(64 * 1024) { true })
+        assertTrue(!bucket.acquire(64 * 1024) { false })
+        assertEquals(256 * 1024, bucket.recommendedReadBytes())
+
+        // At 10,000 B/s, capacityBytes is 1,024 and maxCreditBytes is 2,048.
+        // Draining the initial 1,024-byte burst and sleeping 300ms refills at most
+        // 2,048 bytes (not 3,000), so two 1,024-byte chunks pass immediately while
+        // a third 500-byte chunk still paces at 10,000 B/s (~50ms).
+        bucket.setRate(10_000L)
+        assertTrue(bucket.acquire(1024))
+        Thread.sleep(300L)
+        val burstStart = System.nanoTime()
+        assertTrue(bucket.acquire(1024))
+        assertTrue(bucket.acquire(1024))
+        val burstElapsedMs = (System.nanoTime() - burstStart) / 1_000_000L
+        assertTrue("Expected 2x jitter headroom to grant two chunks without sleep, got ${burstElapsedMs}ms", burstElapsedMs < 30L)
+
+        val pacedStart = System.nanoTime()
+        assertTrue(bucket.acquire(500))
+        val pacedElapsedMs = (System.nanoTime() - pacedStart) / 1_000_000L
+        assertTrue("Expected third chunk beyond maxCreditBytes to pace, got ${pacedElapsedMs}ms", pacedElapsedMs >= 35L)
     }
 }
