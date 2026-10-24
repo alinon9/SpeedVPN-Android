@@ -115,6 +115,33 @@ jobs:
       - name: Run Android JVM unit tests
         run: ./gradlew :app:testDebugUnitTest -PspeedTestBaseUrl=http://10.0.2.2:18765 --stacktrace --no-daemon
 
+      - name: Print JVM unit-test failure details
+        if: failure()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          root = Path('app/build/test-results/testDebugUnitTest')
+          reports = sorted(root.glob('TEST-*.xml')) if root.exists() else []
+          if not reports:
+              print(f'No JUnit XML reports found under {root}')
+          for report in reports:
+              try:
+                  suite = ET.parse(report).getroot()
+              except Exception as exc:
+                  print(f'Could not parse {report}: {exc}')
+                  continue
+              for case in suite.iter('testcase'):
+                  failures = list(case.findall('failure')) + list(case.findall('error'))
+                  if not failures:
+                      continue
+                  print(f'FAILED TEST: {case.get("classname")}.{case.get("name")}')
+                  for failure in failures:
+                      print('MESSAGE:', failure.get('message', ''))
+                      print(failure.text or '')
+          PY
+
       - name: Install Android Emulator
         run: |
           set -euo pipefail
