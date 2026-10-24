@@ -674,6 +674,7 @@ class SpeedPlanUsageHistoryTest {
         SpeedPlanUsageTracker.flushPendingWritesForTests()
 
         val records = UsageRepository.readAllSpeedPlanUsageSessions(context)
+        println("DIAG segments: count=${records.size}; rows=" + records.joinToString { "index=${it.segmentIndex},status=${it.status},bytes=${it.totalBytes},reason=${it.closeReason}" })
         assertEquals(3, records.size)
         assertEquals(listOf(1, 2, 3), records.map { it.segmentIndex })
         assertEquals(3, records.map { it.sessionId }.distinct().size)
@@ -1275,6 +1276,7 @@ class SpeedPlanUsageHistoryTest {
         // DL = (7,000 + 1,800) + (10,000 + 3,000) = 21,800
         // UL = (3,500 + 900) + (5,000 + 1,500) = 10,900
         assertEquals(25_000L, SpeedLimiter.download.planSessionBytes(gen))
+        println("DIAG upload-plan=${SpeedLimiter.upload.planSessionBytes(gen)} upload-probe=${SpeedLimiter.upload.verificationProbeBytes(gen)} download-plan=${SpeedLimiter.download.planSessionBytes(gen)} download-probe=${SpeedLimiter.download.verificationProbeBytes(gen)}")
         assertEquals(12_500L, SpeedLimiter.upload.planSessionBytes(gen))
         assertEquals(21_800L, SpeedLimiter.download.verificationProbeBytes(gen))
         assertEquals(10_900L, SpeedLimiter.upload.verificationProbeBytes(gen))
