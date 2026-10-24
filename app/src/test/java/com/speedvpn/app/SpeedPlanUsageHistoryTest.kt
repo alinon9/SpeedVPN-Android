@@ -642,33 +642,35 @@ class SpeedPlanUsageHistoryTest {
     @Test
     fun switchingPlansAndClosingSegment_maintainsStrictlyIncreasingSegmentIndexAndByteConservation() {
         val gen = 1L
-        // setLimitsKbps() notifies the tracker using the real wall clock. Anchor this
-        // lifecycle test to the same clock so its explicit transition timestamps never
-        // precede the automatically opened plan segment.
+        // Configure the initial plan before the VPN generation starts, so the production
+        // limits-change callback cannot open a segment ahead of onVpnConnected().
+        SpeedLimiter.setLimitsKbps(2_000L, 2_000L) // Low: 250 KB/s
         val t0 = System.currentTimeMillis()
         SpeedLimiter.beginSession(gen)
-        SpeedLimiter.setLimitsKbps(2_000L, 2_000L) // Low: 250 KB/s
         SpeedPlanUsageTracker.onVpnConnected(context, gen, nowMillis = t0)
 
         SpeedLimiter.download.recordForwardedForApp(100_000, gen, uid = 10150, packages = setOf("app.one"))
         SpeedLimiter.upload.recordForwardedForApp(40_000, gen, uid = 10150, packages = setOf("app.one"))
 
-        // Switch to Unlimited at t0 + 4s
-        val t1 = t0 + 4_000L
+        // Switching limits notifies the tracker synchronously through the production callback.
         SpeedLimiter.setLimitsKbps(null, null)
-        SpeedPlanUsageTracker.onAppliedLimitsChanged(null, null, nowMillis = t1, contextOverride = context)
 
         SpeedLimiter.download.recordForwardedForApp(500_000, gen, uid = 10150, packages = setOf("app.one"))
         SpeedLimiter.upload.recordForwardedForApp(200_000, gen, uid = 10150, packages = setOf("app.one"))
 
-        // Pause/close active segment at t0 + 7s and resume via onMeterSample at t0 + 8s within same generation
-        SpeedPlanUsageTracker.closeActiveSegmentForTransition("SEGMENT_PAUSED", nowMillis = t0 + 7_000L)
+        // Close and resume the same VPN generation; use monotonic wall-clock timestamps
+        // because setLimitsKbps() records its transition using the actual current time.
+        SpeedPlanUsageTracker.closeActiveSegmentForTransition(
+            "SEGMENT_PAUSED",
+            nowMillis = System.currentTimeMillis(),
+        )
         SpeedLimiter.download.recordForwardedForApp(300_000, gen, uid = 10150, packages = setOf("app.one"))
         SpeedLimiter.upload.recordForwardedForApp(60_000, gen, uid = 10150, packages = setOf("app.one"))
-        SpeedPlanUsageTracker.onMeterSample(context, gen, 200_000L, 50_000L, 500L, nowMillis = t0 + 8_000L)
+        SpeedPlanUsageTracker.onMeterSample(
+            context, gen, 200_000L, 50_000L, 500L, nowMillis = System.currentTimeMillis(),
+        )
 
-        // Disconnect at t0 + 12s
-        SpeedPlanUsageTracker.onVpnDisconnected(context, gen, nowMillis = t0 + 12_000L)
+        SpeedPlanUsageTracker.onVpnDisconnected(context, gen, nowMillis = System.currentTimeMillis())
         SpeedPlanUsageTracker.flushPendingWritesForTests()
 
         val records = UsageRepository.readAllSpeedPlanUsageSessions(context)
