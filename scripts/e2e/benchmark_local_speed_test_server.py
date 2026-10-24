@@ -109,12 +109,29 @@ def main() -> int:
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--streams", type=int, default=6)
     parser.add_argument("--bytes-per-stream", type=int, default=8_000_000)
-    parser.add_argument("--min-mbps", type=float, default=211.2)
+    parser.add_argument(
+        "--min-mbps",
+        type=float,
+        default=211.2,
+        help="Minimum throughput required in each round (Mbps).",
+    )
+    parser.add_argument(
+        "--max-mbps",
+        type=float,
+        default=None,
+        help=(
+            "Optional sanity ceiling for loopback fixture measurements. Values above this "
+            "ceiling are marked UNREALISTIC and fail the diagnostic instead of being "
+            "interpreted as network headroom."
+        ),
+    )
     parser.add_argument("--timeout-seconds", type=float, default=60.0)
     parser.add_argument("--output", type=Path, default=Path("fixture-throughput-benchmark.json"))
     args = parser.parse_args()
     if args.rounds < 1 or args.streams < 1 or args.bytes_per_stream < 1 or args.min_mbps <= 0:
         parser.error("rounds, streams, bytes-per-stream and min-mbps must be positive")
+    if args.max_mbps is not None and args.max_mbps <= args.min_mbps:
+        parser.error("--max-mbps must be greater than --min-mbps")
 
     results: list[dict[str, object]] = []
     failures: list[str] = []
@@ -126,7 +143,16 @@ def main() -> int:
                 )
                 result["round"] = round_number
                 result["minimum_required_mbps"] = args.min_mbps
-                result["verdict"] = "PASS" if float(result["mbps"]) >= args.min_mbps else "FAIL"
+                measured_mbps = float(result["mbps"])
+                if args.max_mbps is not None and measured_mbps > args.max_mbps:
+                    result["verdict"] = "UNREALISTIC"
+                    result["diagnostic"] = (
+                        f"Loopback throughput {measured_mbps:.3f} Mbps exceeded the "
+                        f"{args.max_mbps:.3f} Mbps sanity ceiling; this is not evidence "
+                        "of end-to-end emulator/VPN network capacity."
+                    )
+                else:
+                    result["verdict"] = "PASS" if measured_mbps >= args.min_mbps else "FAIL"
                 print(
                     f"FIXTURE_BENCHMARK direction={direction} round={round_number}/{args.rounds} "
                     f"streams={args.streams} bytes={result['total_bytes']} "
@@ -134,9 +160,13 @@ def main() -> int:
                     f"minimum_mbps={args.min_mbps} verdict={result['verdict']}",
                     flush=True,
                 )
-                if result["verdict"] != "PASS":
+                if result["verdict"] == "FAIL":
                     failures.append(
                         f"{direction} round {round_number}: {result['mbps']} Mbps below {args.min_mbps} Mbps"
+                    )
+                elif result["verdict"] == "UNREALISTIC":
+                    failures.append(
+                        f"{direction} round {round_number}: " + str(result["diagnostic"])
                     )
                 results.append(result)
             except Exception as error:
@@ -158,6 +188,7 @@ def main() -> int:
         "streams": args.streams,
         "bytes_per_stream": args.bytes_per_stream,
         "minimum_required_mbps": args.min_mbps,
+        "maximum_sanity_mbps": args.max_mbps,
         "results": results,
         "failures": failures,
     }
