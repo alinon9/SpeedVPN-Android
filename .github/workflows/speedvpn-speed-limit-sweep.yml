@@ -59,10 +59,23 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+
+      - name: Run exhaustive speed-limit sweep
+        id: sweep
+        run: |
+          set -euo pipefail
+          export ANDROID_AVD_HOME="${RUNNER_TEMP}/android-avd"
+          mkdir -p "$ANDROID_AVD_HOME"
+          echo no | avdmanager create avd -n speedvpn-sweep -k 'system-images;android-29;google_apis;x86_64' --force
+          adb kill-server >/dev/null 2>&1 || true
+          adb start-server
+          nohup emulator -avd speedvpn-sweep -no-window -no-audio -no-boot-anim -no-snapshot -no-snapshot-save -no-metrics -gpu swiftshader_indirect -accel on -cores 4 -memory 4096 -partition-size 2048 -netdelay none -netspeed full -dns-server 8.8.8.8,1.1.1.1 > emulator-console.log 2>&1 &
+          EMULATOR_PID=$!
+
   retry-sweep-on-new-runner:
     needs: speed-limit-sweep
     # Only retry environmental headroom failures, never application/build/test failures.
-    if: always() && github.event_name == 'pull_request' && needs.speed-limit-sweep.result == 'failure'
+    if: always() && github.event_name == 'pull_request' && needs.speed-limit-sweep.outputs.sweep_status == 'ENV_INSUFFICIENT'
     runs-on: ubuntu-latest
     timeout-minutes: 140
     steps:
@@ -275,17 +288,6 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      - name: Run exhaustive speed-limit sweep
-        id: sweep
-        run: |
-          set -euo pipefail
-          export ANDROID_AVD_HOME="${RUNNER_TEMP}/android-avd"
-          mkdir -p "$ANDROID_AVD_HOME"
-          echo no | avdmanager create avd -n speedvpn-sweep -k 'system-images;android-29;google_apis;x86_64' --force
-          adb kill-server >/dev/null 2>&1 || true
-          adb start-server
-          nohup emulator -avd speedvpn-sweep -no-window -no-audio -no-boot-anim -no-snapshot -no-snapshot-save -no-metrics -gpu swiftshader_indirect -accel on -cores 4 -memory 4096 -partition-size 2048 -netdelay none -netspeed full -dns-server 8.8.8.8,1.1.1.1 > emulator-console.log 2>&1 &
-          EMULATOR_PID=$!
 
           cleanup() {
             adb -s emulator-5554 emu kill >/dev/null 2>&1 || true
