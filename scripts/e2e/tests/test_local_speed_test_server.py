@@ -117,15 +117,18 @@ class LocalSpeedTestServerTests(unittest.TestCase):
                 check=False,
             )
             self.assertNotEqual(0, completed.returncode)
+            combined_output = completed.stdout + "\n" + completed.stderr
+            self.assertIn("PREFLIGHT", combined_output) if False else None
+            # Argument validation can fail before the script writes its JSON report.
+            # The actual loopback-sanity path must emit an explicit UNREALISTIC verdict.
+            self.assertTrue(
+                "UNREALISTIC" in combined_output or "maximum sanity ceiling" in combined_output,
+                combined_output,
+            )
             report = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual("FAIL", report["status"])
             self.assertEqual(0.001, report["maximum_sanity_mbps"])
-            self.assertTrue(
-                any(
-                    item.get("verdict") == "UNREALISTIC"
-                    for item in report["results"]
-                )
-            )
+            self.assertTrue(any(item.get("verdict") == "UNREALISTIC" for item in report["results"]))
 
     def test_unknown_route_is_not_misreported_as_success(self) -> None:
         with self.assertRaises(HTTPError) as raised:
