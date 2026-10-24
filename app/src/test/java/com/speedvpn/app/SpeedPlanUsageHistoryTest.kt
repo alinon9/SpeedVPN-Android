@@ -654,6 +654,14 @@ class SpeedPlanUsageHistoryTest {
 
         // Switching limits notifies the tracker synchronously through the production callback.
         SpeedLimiter.setLimitsKbps(null, null)
+        SpeedPlanUsageTracker.flushPendingWritesForTests()
+        val afterPlanChange = UsageRepository.readAllSpeedPlanUsageSessions(context)
+        assertEquals(
+            "After plan change expected segments 1 and 2, got " +
+                afterPlanChange.joinToString { "index=${it.segmentIndex},status=${it.status},reason=${it.closeReason}" },
+            listOf(1, 2),
+            afterPlanChange.map { it.segmentIndex },
+        )
 
         SpeedLimiter.download.recordForwardedForApp(500_000, gen, uid = 10150, packages = setOf("app.one"))
         SpeedLimiter.upload.recordForwardedForApp(200_000, gen, uid = 10150, packages = setOf("app.one"))
@@ -663,6 +671,14 @@ class SpeedPlanUsageHistoryTest {
         SpeedPlanUsageTracker.closeActiveSegmentForTransition(
             "SEGMENT_PAUSED",
             nowMillis = System.currentTimeMillis(),
+        )
+        SpeedPlanUsageTracker.flushPendingWritesForTests()
+        val afterClose = UsageRepository.readAllSpeedPlanUsageSessions(context)
+        assertEquals(
+            "After close expected two completed segments, got " +
+                afterClose.joinToString { "index=${it.segmentIndex},status=${it.status},reason=${it.closeReason}" },
+            listOf(SpeedPlanRecordStatus.COMPLETED, SpeedPlanRecordStatus.COMPLETED),
+            afterClose.map { it.status },
         )
         SpeedLimiter.download.recordForwardedForApp(300_000, gen, uid = 10150, packages = setOf("app.one"))
         SpeedLimiter.upload.recordForwardedForApp(60_000, gen, uid = 10150, packages = setOf("app.one"))
