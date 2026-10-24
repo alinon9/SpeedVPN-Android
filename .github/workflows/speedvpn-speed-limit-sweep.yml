@@ -179,6 +179,17 @@ jobs:
       - name: Benchmark local fixture throughput before emulator execution
         run: python3 scripts/e2e/benchmark_local_speed_test_server.py --base-url http://127.0.0.1:18765 --rounds 3 --streams 6 --bytes-per-stream 8000000 --min-mbps 211.2 --output fixture-throughput-benchmark.json
 
+      - name: Upload fixture benchmark diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: speedvpn-fixture-benchmark-diagnostics
+          path: |
+            fixture-throughput-benchmark.json
+            speed-test-server.log
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: Run exhaustive speed-limit sweep
         id: sweep
         run: |
