@@ -60,7 +60,6 @@ concurrency:
 
 jobs:
   retry-sweep-on-new-runner:
-    if: github.event_name == 'pull_request'
     needs: speed-limit-sweep
     # Only retry environmental headroom failures, never application/build/test failures.
     if: always() && github.event_name == 'pull_request' && needs.speed-limit-sweep.result == 'failure'
@@ -499,6 +498,8 @@ jobs:
 jobs:
   speed-limit-sweep:
     runs-on: ubuntu-latest
+    outputs:
+      sweep_status: ${{ steps.sweep.outputs.sweep_status }}
     timeout-minutes: 140
     steps:
       - name: Checkout repository
