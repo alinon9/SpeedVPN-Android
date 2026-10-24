@@ -74,6 +74,29 @@ class PreflightBaselineTests(unittest.TestCase):
             self.assertIn("105.6 Mbps baseline needed for 11 MB/s upload verification", result["env_note"])
             self.assertIn("105.6 Mbps", result["env_note"])
 
+    def test_retryable_runner_profile_passes_only_after_a_fresh_stable_sample_set(self):
+        # A retry must gather a new independent set of measurements; the rejected
+        # first attempt is not mixed into this set and no thresholds are relaxed.
+        with tempfile.TemporaryDirectory() as temp:
+            samples = [
+                {"baseline_preflight_download_value": "110.0 Mbps",
+                 "baseline_preflight_upload_value": "112.0 Mbps"},
+                {"baseline_preflight_download_value": "111.0 Mbps",
+                 "baseline_preflight_upload_value": "113.0 Mbps"},
+                {"baseline_preflight_download_value": "109.0 Mbps",
+                 "baseline_preflight_upload_value": "111.0 Mbps"},
+            ]
+            paths = []
+            for index, payload in enumerate(samples, start=1):
+                path = Path(temp) / f"retry-round-{index}.json"
+                path.write_text(json.dumps(payload), encoding="utf-8")
+                paths.append(path)
+            result = validate_files(paths)
+            self.assertEqual(result["status"], "PASS")
+            self.assertEqual(result["directions"]["download"]["median_mbps"], 110.0)
+            self.assertEqual(result["directions"]["upload"]["median_mbps"], 112.0)
+            self.assertTrue(all(result["directions"][d]["passed"] for d in ("download", "upload")))
+
     def test_default_preflight_requires_105_6_mbps_in_both_directions(self):
         with tempfile.TemporaryDirectory() as temp:
             samples = [
