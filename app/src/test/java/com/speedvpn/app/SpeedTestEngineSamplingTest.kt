@@ -147,10 +147,10 @@ class SpeedTestEngineSamplingTest {
 
     @Test
     fun highCapacityAndUnlimitedVerificationUseThreeStreamsButLowPlansStaySingleStream() {
-        assertEquals(3, SpeedTestEngine.sampleParallelismFor(32_000L, verificationProfile = true))
-        assertEquals(3, SpeedTestEngine.sampleParallelismFor(88_000L, verificationProfile = true))
-        assertEquals(3, SpeedTestEngine.sampleParallelismFor(null, verificationProfile = true))
-        assertEquals(3, SpeedTestEngine.sampleParallelismFor(0L, verificationProfile = true))
+        assertEquals(5, SpeedTestEngine.sampleParallelismFor(32_000L, verificationProfile = true))
+        assertEquals(5, SpeedTestEngine.sampleParallelismFor(88_000L, verificationProfile = true))
+        assertEquals(5, SpeedTestEngine.sampleParallelismFor(null, verificationProfile = true))
+        assertEquals(5, SpeedTestEngine.sampleParallelismFor(0L, verificationProfile = true))
         assertEquals(1, SpeedTestEngine.sampleParallelismFor(800L, verificationProfile = true))
         assertEquals(1, SpeedTestEngine.sampleParallelismFor(88_000L, verificationProfile = false))
     }
