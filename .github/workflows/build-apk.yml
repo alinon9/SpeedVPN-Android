@@ -93,10 +93,18 @@ jobs:
                   print(f'Could not parse {path}: {exc}')
                   continue
               for case in suite.iter('testcase'):
-                  for failure in list(case.findall('failure')) + list(case.findall('error')):
-                      print(f'FAILED TEST: {case.get("classname")}.{case.get("name")}')
+                  failures = list(case.findall('failure')) + list(case.findall('error'))
+                  if not failures:
+                      continue
+                  print(f'FAILED TEST: {case.get("classname")}.{case.get("name")}')
+                  for failure in failures:
                       print('MESSAGE:', failure.get('message', ''))
                       print(failure.text or '')
+                  for output in list(case.findall('system-out')) + list(case.findall('system-err')):
+                      print('TEST OUTPUT:', output.text or '')
+              for output in list(suite.findall('system-out')) + list(suite.findall('system-err')):
+                  if output.text:
+                      print('SUITE OUTPUT:', output.text)
           PY
 
       - name: Run lint
