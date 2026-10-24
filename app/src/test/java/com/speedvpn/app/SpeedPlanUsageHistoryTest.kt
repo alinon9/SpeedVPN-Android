@@ -475,7 +475,7 @@ class SpeedPlanUsageHistoryTest {
         )
         assertTrue(udpUpDelivery.delivered)
         SpeedLimiter.upload.recordForwardedForApp(
-            bytes = 60_000,
+            n = 60_000,
             generation = gen,
             uid = null,
             packages = emptySet(),
@@ -496,7 +496,7 @@ class SpeedPlanUsageHistoryTest {
         )
         assertTrue(udpDownDelivery.delivered)
         SpeedLimiter.download.recordForwardedForApp(
-            bytes = 120_000,
+            n = 120_000,
             generation = gen,
             uid = null,
             packages = emptySet(),
@@ -509,7 +509,7 @@ class SpeedPlanUsageHistoryTest {
         // 3. Real non-probe traffic from SpeedVPN's own UID (10999) to the EXACT SAME IP:port (1.1.1.1:443) as the probe:
         //    50 KB DL + 30 KB UL -> MUST NOT be lost!
         SpeedLimiter.download.recordForwardedForApp(
-            bytes = 50_000,
+            n = 50_000,
             generation = gen,
             uid = 10999,
             packages = setOf("com.speedvpn.app"),
@@ -519,7 +519,7 @@ class SpeedPlanUsageHistoryTest {
             flowMarker = "tcp:own-nonprobe:1.1.1.1:443",
         )
         SpeedLimiter.upload.recordForwardedForApp(
-            bytes = 30_000,
+            n = 30_000,
             generation = gen,
             uid = 10999,
             packages = setOf("com.speedvpn.app"),
