@@ -330,6 +330,20 @@ object SpeedPlanUsageTracker {
     private var highestSegmentIndexInGeneration: Int = 0
     private var activeSegment: ActiveSegment? = null
 
+    /**
+     * Preserves the byte-counter boundary when a segment is closed before the next meter
+     * sample. Traffic can continue between those two events, so the next segment must start
+     * from the counters captured at close time rather than from a later sample.
+     */
+    private data class PendingSegmentStart(
+        val generation: Long,
+        val startedAtMillis: Long,
+        val baselineDownBytes: Long,
+        val baselineUpBytes: Long,
+    )
+
+    private var pendingSegmentStart: PendingSegmentStart? = null
+
     private val persistenceRevisionCounter = AtomicLong(0L)
     private val _persistedHistoryRevision = MutableStateFlow(0L)
     val persistedHistoryRevision: StateFlow<Long> = _persistedHistoryRevision.asStateFlow()
@@ -414,9 +428,9 @@ object SpeedPlanUsageTracker {
     }
 
     fun registerContext(context: Context) {
-        if (appContext == null) {
-            appContext = context.applicationContext
-        }
+        // Always retain the current application context. Android keeps this stable in
+        // production, while Robolectric supplies a fresh context for each test sandbox.
+        appContext = context.applicationContext
         SpeedLimiter.registerOwnAppIdentity(context)
     }
 
@@ -464,6 +478,7 @@ object SpeedPlanUsageTracker {
                 activeGeneration = generation
                 highestSegmentIndexInGeneration = 0
             }
+            pendingSegmentStart = null
             val nextIndex = allocateNextSegmentIndexLocked(generation)
             val opened = openNewSegmentLocked(
                 generation = generation,
@@ -518,14 +533,20 @@ object SpeedPlanUsageTracker {
                 )
             }
 
+            val pendingStart = pendingSegmentStart?.takeIf { it.generation == gen }
             val nextIndex = allocateNextSegmentIndexLocked(gen)
             val opened = openNewSegmentLocked(
                 generation = gen,
                 segmentIndex = nextIndex,
                 downloadKbps = normalizedDown,
                 uploadKbps = normalizedUp,
-                nowMillis = nowMillis,
+                nowMillis = pendingStart?.startedAtMillis ?: nowMillis,
+                baselineDownBytes = pendingStart?.baselineDownBytes
+                    ?: SpeedLimiter.download.planSessionBytes(gen),
+                baselineUpBytes = pendingStart?.baselineUpBytes
+                    ?: SpeedLimiter.upload.planSessionBytes(gen),
             )
+            if (pendingStart != null) pendingSegmentStart = null
             activeSegment = opened
             recordsToPersist += opened.snapshotRecord(
                 status = SpeedPlanRecordStatus.ONGOING,
@@ -557,6 +578,12 @@ object SpeedPlanUsageTracker {
                 endedAtMillis = nowMillis,
                 nowMillis = nowMillis,
             )
+            pendingSegmentStart = PendingSegmentStart(
+                generation = current.vpnGeneration,
+                startedAtMillis = nowMillis,
+                baselineDownBytes = SpeedLimiter.download.planSessionBytes(current.vpnGeneration),
+                baselineUpBytes = SpeedLimiter.upload.planSessionBytes(current.vpnGeneration),
+            )
             activeSegment = null
         }
         closedRecord?.let { persistRecords(ctx, listOf(it), synchronous = false) }
@@ -577,16 +604,25 @@ object SpeedPlanUsageTracker {
             if (activeGeneration != generation) {
                 activeGeneration = generation
                 highestSegmentIndexInGeneration = 0
+                pendingSegmentStart = null
             }
             val current = activeSegment ?: run {
+                val pendingStart = pendingSegmentStart?.takeIf { it.generation == generation }
                 val nextIndex = allocateNextSegmentIndexLocked(generation)
                 openNewSegmentLocked(
                     generation = generation,
                     segmentIndex = nextIndex,
                     downloadKbps = SpeedLimiter.currentDownloadLimitKbps(),
                     uploadKbps = SpeedLimiter.currentUploadLimitKbps(),
-                    nowMillis = nowMillis,
-                ).also { activeSegment = it }
+                    nowMillis = pendingStart?.startedAtMillis ?: nowMillis,
+                    baselineDownBytes = pendingStart?.baselineDownBytes
+                        ?: SpeedLimiter.download.planSessionBytes(generation),
+                    baselineUpBytes = pendingStart?.baselineUpBytes
+                        ?: SpeedLimiter.upload.planSessionBytes(generation),
+                ).also {
+                    if (pendingStart != null) pendingSegmentStart = null
+                    activeSegment = it
+                }
             }
 
             val prevDown = current.currentDownBytes
@@ -764,6 +800,8 @@ object SpeedPlanUsageTracker {
             activeGeneration = 0L
             highestSegmentIndexInGeneration = 0
             activeSegment = null
+            pendingSegmentStart = null
+            appContext = null
         }
     }
 
@@ -782,10 +820,12 @@ object SpeedPlanUsageTracker {
         downloadKbps: Long?,
         uploadKbps: Long?,
         nowMillis: Long,
+        baselineDownBytes: Long = SpeedLimiter.download.planSessionBytes(generation),
+        baselineUpBytes: Long = SpeedLimiter.upload.planSessionBytes(generation),
     ): ActiveSegment {
         val classification = SpeedPlanClassifier.classify(downloadKbps, uploadKbps)
-        val baseDown = SpeedLimiter.download.planSessionBytes(generation)
-        val baseUp = SpeedLimiter.upload.planSessionBytes(generation)
+        val baseDown = baselineDownBytes.coerceAtLeast(0L)
+        val baseUp = baselineUpBytes.coerceAtLeast(0L)
         if (segmentIndex > highestSegmentIndexInGeneration) {
             highestSegmentIndexInGeneration = segmentIndex
         }
