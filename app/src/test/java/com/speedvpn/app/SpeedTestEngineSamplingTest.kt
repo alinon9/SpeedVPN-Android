@@ -146,7 +146,7 @@ class SpeedTestEngineSamplingTest {
     }
 
     @Test
-    fun highCapacityAndUnlimitedVerificationUseThreeStreamsButLowPlansStaySingleStream() {
+    fun highCapacityAndUnlimitedVerificationUseFiveStreamsButLowPlansStaySingleStream() {
         assertEquals(5, SpeedTestEngine.sampleParallelismFor(32_000L, verificationProfile = true))
         assertEquals(5, SpeedTestEngine.sampleParallelismFor(88_000L, verificationProfile = true))
         assertEquals(5, SpeedTestEngine.sampleParallelismFor(null, verificationProfile = true))
