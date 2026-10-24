@@ -367,8 +367,8 @@ jobs:
 
   retry-sweep-on-new-runner:
     needs: speed-limit-sweep
-    # Run only after the primary sweep reports an environment-only headroom block.
-    if: always() && github.event_name == 'pull_request' && needs.speed-limit-sweep.outputs.sweep_status == 'ENV_INSUFFICIENT'
+    # Retry only preflight exits; build/unit-test or strict-gate failures must not be retried as environment errors.
+    if: always() && github.event_name == 'pull_request' && needs.speed-limit-sweep.result == 'failure' && needs.speed-limit-sweep.outputs.sweep_status == 'ENV_INSUFFICIENT'
     runs-on: ubuntu-latest
     timeout-minutes: 140
     steps:
