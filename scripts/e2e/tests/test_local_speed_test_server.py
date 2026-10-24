@@ -107,8 +107,8 @@ class LocalSpeedTestServerTests(unittest.TestCase):
                     "--rounds", "1",
                     "--streams", "2",
                     "--bytes-per-stream", "200000",
-                    "--min-mbps", "1",
-                    "--max-mbps", "0.001",
+                    "--min-mbps", "0.0001",
+                    "--max-mbps", "1",
                     "--timeout-seconds", "5",
                     "--output", str(output),
                 ],
@@ -127,7 +127,7 @@ class LocalSpeedTestServerTests(unittest.TestCase):
             )
             report = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual("FAIL", report["status"])
-            self.assertEqual(0.001, report["maximum_sanity_mbps"])
+            self.assertEqual(1.0, report["maximum_sanity_mbps"])
             self.assertTrue(any(item.get("verdict") == "UNREALISTIC" for item in report["results"]))
 
     def test_unknown_route_is_not_misreported_as_success(self) -> None:
