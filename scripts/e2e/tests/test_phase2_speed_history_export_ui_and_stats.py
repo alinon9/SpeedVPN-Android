@@ -638,6 +638,8 @@ class TestPhase2SpeedHistoryExportUiAndStats(unittest.TestCase):
         self.assertIn("val isMarkedProbeForProtocol = SpeedLimiter.isMarkedProbeClientSocket(", poc_kt)
         self.assertIn("protocol = protocol,", poc_kt)
         self.assertIn('return "$protocol|$localPort|$norm:$remotePort"', limiter_kt)
+        self.assertIn("import hev.htproxy.TProxyService", limiter_kt)
+        self.assertNotIn("hev.htproxy.TProxyService.", limiter_kt)
         self.assertIn("encodeUidDecision(resolution.uid, resolution.shouldBlock, resolution.isVerificationProbe)", poc_kt)
         self.assertIn("(if (isVerificationProbe) 2L else 0L)", poc_kt)
         self.assertIn("internal fun socksUsernameForDecision(baseUsername: String, encodedDecision: Long): String", poc_kt)

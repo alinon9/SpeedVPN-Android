@@ -171,10 +171,10 @@ internal class UidDetectionPoc(
         )
 
         val isMarkedProbeForProtocol = SpeedLimiter.isMarkedProbeClientSocket(
-            protocol = protocol,
             localPort = srcPort,
             remoteHostOrIp = destination,
             remotePort = dstPort,
+            protocol = protocol,
         )
         var uid = Process.INVALID_UID
         var outcome = "returned"
@@ -379,10 +379,10 @@ internal class UidDetectionPoc(
         )
         val isProbeClientSocket = isMarkedProbeForProtocol ||
             SpeedLimiter.isMarkedProbeClientSocket(
-                protocol = protocol,
                 localPort = srcPort,
                 remoteHostOrIp = dst,
                 remotePort = dstPort,
+                protocol = protocol,
             )
         if (uid != Process.INVALID_UID || isProbeClientSocket) {
             service.recordDetectedFlow(

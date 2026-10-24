@@ -674,10 +674,10 @@ class Socks5Server internal constructor(
         if (endpoint != null) {
             val tupleTag = sessionUid?.let { "SOCKS5_UID_AUTH:$it" } ?: "UID_UNRESOLVED"
             val isClientSocketProbe = SpeedLimiter.isMarkedProbeClientSocket(
-                protocol = IPPROTO_TCP,
                 localPort = clientSourcePort,
                 remoteHostOrIp = remoteAddress,
                 remotePort = remotePort,
+                protocol = IPPROTO_TCP,
             )
             val flowMarker = "tcp-relay:${System.identityHashCode(socket)}:$IPPROTO_TCP|$clientSourcePort->$remoteAddress:$remotePort"
             val isProbeFlow = sessionIsProbe || isClientSocketProbe
@@ -2000,10 +2000,10 @@ class Socks5Server internal constructor(
                 val remoteHost = remote.address.hostAddress ?: ""
                 val isClientSocketProbe =
                     SpeedLimiter.isMarkedProbeClientSocket(
-                        protocol = IPPROTO_UDP,
                         localPort = flow.clientEndpoint.port,
                         remoteHostOrIp = remoteHost,
                         remotePort = remote.port,
+                        protocol = IPPROTO_UDP,
                     )
                 val isProbe = sessionIsProbe ||
                     isClientSocketProbe ||

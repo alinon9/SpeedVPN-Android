@@ -1301,42 +1301,42 @@ class SpeedPlanUsageHistoryTest {
             SpeedLimiter.registerProbeEndpoint("127.0.0.1", sharedTargetPort)
             // Mark ONLY the TCP probe socket (protocol = IPPROTO_TCP = 6)
             SpeedLimiter.markProbeClientSocket(
-                protocol = SpeedLimiter.IPPROTO_TCP,
                 localPort = sharedClientPort,
                 remoteHostOrIp = "127.0.0.1",
                 remotePort = sharedTargetPort,
+                protocol = SpeedLimiter.IPPROTO_TCP,
             )
 
             assertTrue(
                 SpeedLimiter.isMarkedProbeClientSocket(
-                    protocol = SpeedLimiter.IPPROTO_TCP,
                     localPort = sharedClientPort,
                     remoteHostOrIp = "127.0.0.1",
                     remotePort = sharedTargetPort,
+                    protocol = SpeedLimiter.IPPROTO_TCP,
                 ),
             )
             assertFalse(
                 "Real UDP flow sharing the same local port and destination must NOT match TCP probe mark",
                 SpeedLimiter.isMarkedProbeClientSocket(
-                    protocol = SpeedLimiter.IPPROTO_UDP,
                     localPort = sharedClientPort,
                     remoteHostOrIp = "127.0.0.1",
                     remotePort = sharedTargetPort,
+                    protocol = SpeedLimiter.IPPROTO_UDP,
                 ),
             )
 
             // Unresolved UID (-1 / null) for both the marked TCP probe flow and the unmarked real UDP flow
             val tcpProbeIsMarked = SpeedLimiter.isMarkedProbeClientSocket(
-                protocol = UidDetectionPoc.IPPROTO_TCP,
                 localPort = sharedClientPort,
                 remoteHostOrIp = "127.0.0.1",
                 remotePort = sharedTargetPort,
+                protocol = UidDetectionPoc.IPPROTO_TCP,
             )
             val udpRealIsMarked = SpeedLimiter.isMarkedProbeClientSocket(
-                protocol = UidDetectionPoc.IPPROTO_UDP,
                 localPort = sharedClientPort,
                 remoteHostOrIp = "127.0.0.1",
                 remotePort = sharedTargetPort,
+                protocol = UidDetectionPoc.IPPROTO_UDP,
             )
             val tcpDecision = (-1L shl 32) or (if (tcpProbeIsMarked) 2L else 0L)
             val udpDecision = (-1L shl 32) or (if (udpRealIsMarked) 2L else 0L)
@@ -1424,10 +1424,10 @@ class SpeedPlanUsageHistoryTest {
             )
         } finally {
             SpeedLimiter.unmarkProbeClientSocket(
-                protocol = SpeedLimiter.IPPROTO_TCP,
                 localPort = sharedClientPort,
                 remoteHostOrIp = "127.0.0.1",
                 remotePort = sharedTargetPort,
+                protocol = SpeedLimiter.IPPROTO_TCP,
             )
             SpeedLimiter.endProbeMeasurementSession(probeToken)
             runCatching { tcpProbeClient.close() }

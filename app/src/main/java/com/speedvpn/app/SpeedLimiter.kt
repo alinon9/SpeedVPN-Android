@@ -2,6 +2,7 @@ package com.speedvpn.app
 
 import android.content.Context
 import android.os.Process
+import hev.htproxy.TProxyService
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.ReentrantLock
@@ -407,7 +408,7 @@ object SpeedLimiter {
                         lo = (lo shl 8) or (addrBytes[i + 8].toLong() and 0xffL)
                     }
                 }
-                hev.htproxy.TProxyService.TProxySetUidPocProbeSocket(
+                TProxyService.TProxySetUidPocProbeSocket(
                     protocol,
                     localPort,
                     hi,
@@ -439,7 +440,7 @@ object SpeedLimiter {
     private fun syncNativeClearProbeSockets() {
         if (!nativeProbeSyncSupported) return
         try {
-            hev.htproxy.TProxyService.TProxyClearUidPocProbeSockets()
+            TProxyService.TProxyClearUidPocProbeSockets()
         } catch (_: LinkageError) {
             nativeProbeSyncSupported = false
         } catch (_: Throwable) {
@@ -620,15 +621,6 @@ object SpeedLimiter {
         syncNativeProbeSocket(protocol, localPort, remoteHostOrIp, remotePort, true)
     }
 
-    fun markProbeClientSocket(
-        protocol: Int,
-        localPort: Int,
-        remoteHostOrIp: String,
-        remotePort: Int,
-    ) {
-        markProbeClientSocket(localPort, remoteHostOrIp, remotePort, protocol)
-    }
-
     @JvmOverloads
     fun unmarkProbeClientSocket(
         localPort: Int,
@@ -649,15 +641,6 @@ object SpeedLimiter {
         syncNativeProbeSocket(protocol, localPort, remoteHostOrIp, remotePort, false)
     }
 
-    fun unmarkProbeClientSocket(
-        protocol: Int,
-        localPort: Int,
-        remoteHostOrIp: String,
-        remotePort: Int,
-    ) {
-        unmarkProbeClientSocket(localPort, remoteHostOrIp, remotePort, protocol)
-    }
-
     @JvmOverloads
     fun isMarkedProbeClientSocket(
         localPort: Int,
@@ -669,13 +652,6 @@ object SpeedLimiter {
         val key = probeClientSocketKey(protocol, localPort, remoteHostOrIp, remotePort) ?: return false
         return activeProbeClientSockets.contains(key)
     }
-
-    fun isMarkedProbeClientSocket(
-        protocol: Int,
-        localPort: Int,
-        remoteHostOrIp: String?,
-        remotePort: Int,
-    ): Boolean = isMarkedProbeClientSocket(localPort, remoteHostOrIp, remotePort, protocol)
 
     fun markProbeFlow(flowMarker: String) {
         val norm = flowMarker.trim()
