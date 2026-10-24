@@ -202,7 +202,7 @@ object SpeedTestEngine {
     private const val MIN_SAMPLE_DURATION_MS = 10L
     private const val TARGET_STABLE_DURATION_MS = 250L
     private const val MIN_VALID_SAMPLES = 2
-    private const val HIGH_CAPACITY_VERIFICATION_STREAMS = 3
+    private const val HIGH_CAPACITY_VERIFICATION_STREAMS = 5
     private const val MIN_CAPPED_RANGE_SAMPLES = 3
     private const val BASELINE_STABLE_DURATION_MS = 250L
     internal const val FINITE_SAMPLE_TARGET_DURATION_MS = 1_500L
