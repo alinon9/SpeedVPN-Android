@@ -325,8 +325,9 @@ jobs:
             75)
               echo "sweep_status=ENV_INSUFFICIENT" >> "$GITHUB_OUTPUT"
               echo "ACCEPTANCE_BLOCKED: ENV_INSUFFICIENT — no speed-limiter acceptance result is available because the runner did not establish required network headroom. This is an inconclusive run, not a pass; select a suitable runner/network and rerun the full 38/38 gate." | tee -a "$GITHUB_STEP_SUMMARY"
-              # Do not let a skipped sweep be reported as a successful release check.
-              exit 1
+              # The acceptance sweep itself is correctly blocked. Keep its environment
+              # status distinct from code failures so the caller can decide whether to retry.
+              exit 75
               ;;
             *)
               echo "SPEED_SWEEP_ERROR: speed-limit-sweep.sh exited with code ${SWEEP_RC}; only exit 0 plus a passing 38/38 validator is acceptable. Exit 75 means inconclusive network headroom and blocks release acceptance." | tee -a "$GITHUB_STEP_SUMMARY"
