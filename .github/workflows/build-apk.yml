@@ -75,6 +75,30 @@ jobs:
       - name: Run unit tests
         run: ./gradlew :app:testDebugUnitTest --stacktrace --no-daemon
 
+      - name: Print unit-test failure details
+        if: failure()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          root = Path('app/build/test-results/testDebugUnitTest')
+          files = sorted(root.glob('TEST-*.xml')) if root.exists() else []
+          if not files:
+              print('No JUnit XML reports found at', root)
+          for path in files:
+              try:
+                  suite = ET.parse(path).getroot()
+              except Exception as exc:
+                  print(f'Could not parse {path}: {exc}')
+                  continue
+              for case in suite.iter('testcase'):
+                  for failure in list(case.findall('failure')) + list(case.findall('error')):
+                      print(f'FAILED TEST: {case.get("classname")}.{case.get("name")}')
+                      print('MESSAGE:', failure.get('message', ''))
+                      print(failure.text or '')
+          PY
+
       - name: Run lint
         run: ./gradlew :app:lintDebug --stacktrace --no-daemon
 
