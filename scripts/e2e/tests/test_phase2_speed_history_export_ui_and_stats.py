@@ -865,7 +865,41 @@ class TestPhase2SpeedHistoryExportUiAndStats(unittest.TestCase):
         recover_idx = service_kt.index("private fun recoverDataPlaneLocked(")
         self.assertIn("dnsIpv4Only = recoveryCompatibility.dnsIpv4Only", service_kt[recover_idx:recover_idx + 2500])
         cleanup_idx = service_kt.index("private fun cleanupLocked(")
-        self.assertIn("quotaMonitor?.cancel()", service_kt[cleanup_idx:cleanup_idx + 900])
+        cleanup_end = service_kt.index("private fun failLocked(", cleanup_idx)
+        cleanup_body = service_kt[cleanup_idx:cleanup_end]
+        self.assertIn("quotaMonitor?.cancel()", cleanup_body[:900])
+        self.assertIn("preserveLimiterUntilUsageSnapshot", cleanup_body)
+        self.assertIn("stopNative(", cleanup_body)
+        relay_stop_idx = cleanup_body.index("runCatching { relay?.stop() }")
+        final_snapshot_idx = cleanup_body.index("afterTrafficStopped?.invoke()")
+        self.assertLess(
+            relay_stop_idx,
+            final_snapshot_idx,
+            "terminal usage must be snapshotted only after the native/relay traffic path is stopped",
+        )
+        self.assertIn("endLimiterSession = !preserveLimiterUntilUsageSnapshot", cleanup_body)
+
+        # Both normal disconnect and error cleanup pass a terminal callback into
+        # cleanupLocked; the final snapshot precedes clearing SpeedLimiter generation state.
+        disconnect_idx = service_kt.index("private suspend fun disconnect(")
+        revoke_idx = service_kt.index("override fun onRevoke()", disconnect_idx)
+        disconnect_body = service_kt[disconnect_idx:revoke_idx]
+        self.assertIn("cleanupLocked {", disconnect_body)
+        self.assertIn("SpeedPlanUsageTracker.onVpnDisconnected(", disconnect_body)
+        self.assertIn("SpeedLimiter.endSession(generation)", disconnect_body)
+        fail_idx = service_kt.index("private fun failLocked(")
+        fail_end = service_kt.index("private suspend fun disconnect(", fail_idx)
+        fail_body = service_kt[fail_idx:fail_end]
+        self.assertIn("cleanupLocked {", fail_body)
+        self.assertIn("SpeedPlanUsageTracker.onVpnDisconnected(", fail_body)
+        self.assertIn("SpeedLimiter.endSession(generation)", fail_body)
+
+        # Terminal rows are synchronously persisted before the caller tears down session counters.
+        tracker_kt = (REPO_ROOT / "app/src/main/java/com/speedvpn/app/SpeedPlanUsage.kt").read_text(encoding="utf-8")
+        terminal_idx = tracker_kt.index("fun onVpnDisconnected(")
+        abnormal_idx = tracker_kt.index("fun onProcessAbnormalExit(", terminal_idx)
+        terminal_body = tracker_kt[terminal_idx:abnormal_idx]
+        self.assertIn("persistRecords(context.applicationContext, listOf(it), synchronous = true)", terminal_body)
         self.assertIn("SmartSettings.setOverlayEnabled(this, false)", overlay_kt)
 
     def test_07_jvm_execution_of_limiter_and_exceedance_wave_logic(self):
