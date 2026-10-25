@@ -70,8 +70,53 @@ jobs:
             echo "speed_test_base_url=http://10.0.2.2:18765"
           } | tee speedvpn-debug-apk-fingerprint.txt
 
-      - name: Run Android JVM unit tests
-        run: ./gradlew :app:testDebugUnitTest -PspeedTestBaseUrl=http://10.0.2.2:18765 --stacktrace --no-daemon
+      - name: Repeat speed-plan TCP/UDP accounting regression 10 times and run JVM suite twice
+        shell: bash
+        run: |
+          set -uo pipefail
+          LOG=speed-plan-usage-repeat.log
+          : > "$LOG"
+          FAILURES=0
+          TEST_NAME='com.speedvpn.app.SpeedPlanUsageHistoryTest.socks5ServerLoopbackIntegration_preservesRealTcpAndUdpFromOtherAppOwnUidAndUnattributedToSameEndpointAndExcludesProbesDuringVerifySpeed'
+
+          run_gradle_check() {
+            local label="$1"
+            shift
+            {
+              echo
+              echo "===== $label ====="
+              echo "commit=$(git rev-parse HEAD)"
+              echo "started_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            } | tee -a "$LOG"
+
+            # Remove only test result files, making Gradle rerun the tests while
+            # preserving incremental compilation and native build outputs.
+            rm -rf app/build/test-results/testDebugUnitTest app/build/reports/tests/testDebugUnitTest
+            "$@" >> "$LOG" 2>&1
+            local rc=$?
+            if [ "$rc" -eq 0 ]; then
+              echo "RESULT=PASS label=$label" | tee -a "$LOG"
+            else
+              echo "RESULT=FAIL label=$label exit_code=$rc" | tee -a "$LOG"
+              FAILURES=$((FAILURES + 1))
+            fi
+          }
+
+          for attempt in $(seq 1 10); do
+            run_gradle_check "Focused accounting regression attempt $attempt/10" \
+              ./gradlew :app:testDebugUnitTest --tests "$TEST_NAME" \
+              -PspeedTestBaseUrl=http://10.0.2.2:18765 --stacktrace --no-daemon
+          done
+
+          for pass in 1 2; do
+            run_gradle_check "Complete JVM unit suite pass $pass/2" \
+              ./gradlew :app:testDebugUnitTest \
+              -PspeedTestBaseUrl=http://10.0.2.2:18765 --stacktrace --no-daemon
+          done
+
+          echo "SUMMARY failures=$FAILURES focused_runs=10 full_suite_runs=2 commit=$(git rev-parse HEAD)" | tee -a "$LOG"
+          tail -n 180 "$LOG"
+          test "$FAILURES" -eq 0
 
       - name: Install Android Emulator
         run: |
@@ -443,6 +488,7 @@ jobs:
           path: |
             emulator-console.log
             speed-test-server.log
+            speed-plan-usage-repeat.log
             speedvpn-debug-apk-fingerprint.txt
             app/build/outputs/apk/debug/app-debug.apk
             fixture-throughput-benchmark.json
