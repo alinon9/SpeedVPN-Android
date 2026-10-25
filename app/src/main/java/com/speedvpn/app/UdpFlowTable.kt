@@ -1,6 +1,7 @@
 package com.speedvpn.app
 
 import java.net.InetAddress
+import java.net.Inet6Address
 import java.net.InetSocketAddress
 
 internal data class UdpFlow(
@@ -173,6 +174,28 @@ internal class UdpFlowTable(
         }
     }
 
-    private fun endpointKey(address: InetAddress, port: Int): String =
-        address.hostAddress + ":" + port
+    /**
+     * Creates an unambiguous, DNS-free identity for a UDP endpoint.
+     *
+     * Do not key this table from InetAddress.hostAddress: Android exposes that
+     * property as nullable to Kotlin, and IPv6 scope/presentation formatting
+     * should not be allowed to change how an endpoint is indexed. The address
+     * family, raw bytes, IPv6 scope, and port are all part of the key.
+     */
+    private fun endpointKey(address: InetAddress, port: Int): String {
+        val bytes = address.address
+        val encodedAddress = buildString(bytes.size * 2) {
+            bytes.forEach { byte ->
+                val value = byte.toInt() and 0xff
+                append(HEX_DIGITS[value ushr 4])
+                append(HEX_DIGITS[value and 0x0f])
+            }
+        }
+        val scopeId = (address as? Inet6Address)?.scopeId ?: 0
+        return "${bytes.size}:$encodedAddress:$scopeId:$port"
+    }
+
+    private companion object {
+        const val HEX_DIGITS = "0123456789abcdef"
+    }
 }

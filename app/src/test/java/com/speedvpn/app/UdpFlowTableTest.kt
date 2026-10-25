@@ -159,4 +159,52 @@ class UdpFlowTableTest {
         )
         assertEquals(first, second)
     }
+
+    @Test
+    fun clearRemovesUdpFlowAndReplyMappingBeforeTheNextSession() {
+        val table = UdpFlowTable(maxFlows = 4, ttlMs = 60_000)
+        val flow = table.getOrCreate(
+            "session-one",
+            5353,
+            InetSocketAddress("10.0.0.2", 50001),
+            listOf(a),
+            1,
+        )!!
+
+        assertEquals(flow, table.findByDestination(a, 5353, 2))
+        table.clear()
+
+        assertEquals(0, table.size(3))
+        assertNull(table.findByDestination(a, 5353, 3))
+        val next = table.getOrCreate(
+            "session-two",
+            5353,
+            InetSocketAddress("10.0.0.2", 50002),
+            listOf(a),
+            4,
+        )!!
+        assertEquals(next, table.findByDestination(a, 5353, 5))
+    }
+
+    @Test
+    fun ipv6EndpointIdentityIncludesScopeAndDoesNotRelyOnStringFormatting() {
+        val raw = ByteArray(16).apply {
+            this[0] = 0xfe.toByte()
+            this[1] = 0x80.toByte()
+            this[15] = 1
+        }
+        val scopedOne = java.net.Inet6Address.getByAddress(null, raw, 1)
+        val scopedTwo = java.net.Inet6Address.getByAddress(null, raw, 2)
+        val table = UdpFlowTable(maxFlows = 4, ttlMs = 60_000)
+        val flow = table.getOrCreate(
+            "scoped-v6",
+            5353,
+            InetSocketAddress("10.0.0.2", 50003),
+            listOf(scopedOne),
+            1,
+        )!!
+
+        assertEquals(flow, table.findByDestination(scopedOne, 5353, 2))
+        assertNull(table.findByDestination(scopedTwo, 5353, 3))
+    }
 }
