@@ -1432,13 +1432,16 @@ class SpeedVpnService : VpnService() {
         logE("Connection error: $reason", t)
         cleanupLocked {
             if (generation > 0L) {
-                SpeedPlanUsageTracker.onVpnDisconnected(
-                    context = this,
-                    generation = generation,
-                    closeReason = "CONNECT_FAILED",
-                    abnormal = true,
-                )
-                SpeedLimiter.endSession(generation)
+                try {
+                    SpeedPlanUsageTracker.onVpnDisconnected(
+                        context = this,
+                        generation = generation,
+                        closeReason = "CONNECT_FAILED",
+                        abnormal = true,
+                    )
+                } finally {
+                    SpeedLimiter.endSession(generation)
+                }
             }
         }
         val ownsRuntime = synchronized(processNativeLifecycleLock) {
@@ -1517,13 +1520,16 @@ class SpeedVpnService : VpnService() {
 
         cleanupLocked {
             if (generation > 0L) {
-                SpeedPlanUsageTracker.onVpnDisconnected(
-                    context = this@SpeedVpnService,
-                    generation = generation,
-                    closeReason = "VPN_DISCONNECTED",
-                    abnormal = false,
-                )
-                SpeedLimiter.endSession(generation)
+                try {
+                    SpeedPlanUsageTracker.onVpnDisconnected(
+                        context = this@SpeedVpnService,
+                        generation = generation,
+                        closeReason = "VPN_DISCONNECTED",
+                        abnormal = false,
+                    )
+                } finally {
+                    SpeedLimiter.endSession(generation)
+                }
             }
         }
         val shouldReconnect = reconnectAfterDisconnect
@@ -1616,15 +1622,18 @@ class SpeedVpnService : VpnService() {
                 runCatching { relay?.stop() }
                 runCatching { configFile?.delete() }
                 if (ownedGeneration > 0L) {
-                    runCatching {
+                    try {
                         SpeedPlanUsageTracker.onVpnDisconnected(
                             context = this@SpeedVpnService,
                             generation = ownedGeneration,
                             closeReason = "SERVICE_DESTROYED",
                             abnormal = true,
                         )
+                    } catch (error: Throwable) {
+                        logE("Unable to finalize usage after emergency cleanup", error)
+                    } finally {
                         SpeedLimiter.endSession(ownedGeneration)
-                    }.onFailure { logE("Unable to finalize usage after emergency cleanup", it) }
+                    }
                 }
             }
         }
