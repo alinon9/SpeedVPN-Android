@@ -760,7 +760,10 @@ object SpeedPlanUsageTracker {
                 highestSegmentIndexInGeneration = 0
             }
         }
-        finalRecord?.let { persistRecords(context.applicationContext, listOf(it), synchronous = false) }
+        // A terminal VPN snapshot is the durable boundary for this usage segment.
+        // Persist it before callers clear the limiter counters or allow the app to restart;
+        // this path runs from the service's IO cleanup worker, not the UI meter loop.
+        finalRecord?.let { persistRecords(context.applicationContext, listOf(it), synchronous = true) }
     }
 
     fun onProcessAbnormalExit(
