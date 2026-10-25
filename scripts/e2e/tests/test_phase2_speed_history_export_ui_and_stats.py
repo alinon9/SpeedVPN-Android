@@ -657,9 +657,35 @@ class TestPhase2SpeedHistoryExportUiAndStats(unittest.TestCase):
         self.assertIn("val flowMarker = owner?.flowMarker?.ifBlank { flowId } ?: flowId", socks_kt)
         self.assertIn("isVerificationProbe = isProbeChunk,", socks_kt)
         self.assertIn("flowMarker = flowMarker,", socks_kt)
-        self.assertIn("val sessionPackages = mux.packagesForFlow(flow)", socks_kt)
-        self.assertIn('val isProbeUdpFlow = mux.isProbeFlow(flow, addr.hostAddress ?: "", port)', socks_kt)
+        # UDP byte counters must be committed inside UdpUpstreamMux.send's binding lock,
+        # not in the caller after send returns: a local echo/reply may otherwise be observed
+        # before the upload counter is published. Assert against the flow's own binding
+        # metadata so same-endpoint traffic remains isolated by flow identity.
+        udp_send_start = socks_kt.index("        fun send(")
+        udp_send_end = socks_kt.index("        fun trimClosedFlows", udp_send_start)
+        udp_send_body = socks_kt[udp_send_start:udp_send_end]
+        self.assertIn("val delivery = deliverAdmittedUdpDatagramDetailed(", udp_send_body)
+        self.assertIn("SpeedLimiter.upload.recordForwardedForApp(", udp_send_body)
+        self.assertIn("isVerificationProbeFlow = activeBinding.isVerificationProbe,", udp_send_body)
+        self.assertIn("flowMarker = flow.logicalKey,", udp_send_body)
+        self.assertLess(
+            udp_send_body.index("val delivery = deliverAdmittedUdpDatagramDetailed("),
+            udp_send_body.index("SpeedLimiter.upload.recordForwardedForApp("),
+        )
+
+        udp_upload_loop_start = socks_kt.index("val forwarded = mux.send(")
+        udp_upload_loop_end = socks_kt.index("udpFlows.touchSent(flow", udp_upload_loop_start)
+        self.assertNotIn(
+            "SpeedLimiter.upload.recordForwardedForApp(",
+            socks_kt[udp_upload_loop_start:udp_upload_loop_end],
+            "UDP upload accounting must not be duplicated after the mux lock has been released",
+        )
+
+        # UDP downloads are also counted immediately inside the locked successful relay send,
+        # rather than after the receiving client may already have observed the response.
+        self.assertIn("SpeedLimiter.download.recordForwardedForApp(", socks_kt)
         self.assertIn("isVerificationProbeFlow = binding.isVerificationProbe,", socks_kt)
+        self.assertIn("flowMarker = binding.flow.logicalKey,", socks_kt)
 
         # 4. Verify SpeedLimiter.isSyntheticProbeTraffic NEVER relies on IP:port match or ownAppUid alone
         self.assertNotIn("return isOwnApp || isVerificationActive()", limiter_kt)
