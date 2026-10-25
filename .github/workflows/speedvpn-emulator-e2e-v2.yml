@@ -465,7 +465,8 @@ jobs:
               ;;
             75)
               echo "sweep_status=ENV_INSUFFICIENT" >> "$GITHUB_OUTPUT"
-              echo "ACCEPTANCE_PASS: ENV_INSUFFICIENT — runner preflight could not establish required network headroom. APK build, JVM tests, app smoke test, and speed-test UI checks completed; the exhaustive speed sweep did not run, so no speed metrics are claimed." | tee -a "$GITHUB_STEP_SUMMARY"
+              echo "ACCEPTANCE_BLOCKED: ENV_INSUFFICIENT — runner preflight could not establish required network headroom. This is inconclusive, not a pass; no speed acceptance result is claimed and the release gate remains blocked." | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 75
               ;;
             *)
               echo "SPEED_SWEEP_ERROR: speed-limit-sweep.sh exited with code ${SWEEP_RC}; only exit 75 (ENV_INSUFFICIENT) is accepted as an environmental limitation." | tee -a "$GITHUB_STEP_SUMMARY"
@@ -474,7 +475,7 @@ jobs:
           esac
 
       - name: Strict 38/38 speed-limiter gate
-        if: ${{ !cancelled() && steps.e2e.outputs.sweep_status != 'ENV_INSUFFICIENT' }}
+        if: ${{ success() && steps.e2e.outcome == 'success' && steps.e2e.outputs.sweep_status != 'ENV_INSUFFICIENT' }}
         run: |
           set -euo pipefail
           test -s speed-limit-sweep-results.csv || { echo "Missing speed-limit-sweep-results.csv"; exit 1; }
