@@ -44,3 +44,8 @@ The UDP flow table previously formed endpoint keys from the display string `Inet
 ## Release recommendation
 
 Use this as a **candidate build** only after the PR checks pass and a hands-on test is completed on the exact phone that will be used at the exhibition. Do not claim the exhaustive speed-plan sweep or physical-device compatibility until those checks have actually passed.
+
+## Follow-up validation
+
+- A standalone Kotlin/JVM harness compiled the changed `UdpFlowTable.kt` and passed checks for flow-table cleanup and scoped IPv6 endpoint identity.
+- Build and full emulator workflows now also accept follow-up PRs targeting this feature branch, so the new PR can run the repository's Android checks instead of having no checks due to the base-branch filter. Their results must be reviewed before this branch is accepted.
