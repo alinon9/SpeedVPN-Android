@@ -1284,27 +1284,60 @@ class SpeedPlanUsageHistoryTest {
             ioPool.awaitTermination(2, TimeUnit.SECONDS)
         }
 
-        SpeedLimiter.endVerification(null, null)
-        SpeedPlanUsageTracker.onVpnDisconnected(context, gen, nowMillis = t0 + 5_000L)
-        SpeedPlanUsageTracker.flushPendingWritesForTests()
-
         // Expected real user bytes (other app + own UID non-probe + unattributed real, all hitting the SAME IP:port as the probe):
         // DL = (8,000 + 2,400) + (5,000 + 1,600) + (6,000 + 2,000) = 25,000
         // UL = (4,000 + 1,200) + (2,500 + 800) + (3,000 + 1,000) = 12,500
         // Expected synthetic probe bytes (unattributed probe + attributed probe):
         // DL = (7,000 + 1,800) + (10,000 + 3,000) = 21,800
         // UL = (3,500 + 900) + (5,000 + 1,500) = 10,900
-        assertEquals(25_000L, SpeedLimiter.download.planSessionBytes(gen))
-        assertEquals(
-            "Unexpected upload counters: plan=${SpeedLimiter.upload.planSessionBytes(gen)}, " +
-                "probes=${SpeedLimiter.upload.verificationProbeBytes(gen)}, " +
-                "downloadPlan=${SpeedLimiter.download.planSessionBytes(gen)}, " +
-                "downloadProbes=${SpeedLimiter.download.verificationProbeBytes(gen)}",
-            12_500L,
-            SpeedLimiter.upload.planSessionBytes(gen),
+        val expectedDownloadPlan = 25_000L
+        val expectedUploadPlan = 12_500L
+        val expectedDownloadProbes = 21_800L
+        val expectedUploadProbes = 10_900L
+        val expectedDownloadSession = expectedDownloadPlan + expectedDownloadProbes
+        val expectedUploadSession = expectedUploadPlan + expectedUploadProbes
+
+        fun counterSnapshot(): String =
+            "expected(downloadPlan=$expectedDownloadPlan, uploadPlan=$expectedUploadPlan, " +
+                "downloadProbe=$expectedDownloadProbes, uploadProbe=$expectedUploadProbes, " +
+                "downloadSession=$expectedDownloadSession, uploadSession=$expectedUploadSession); " +
+                "actual(downloadPlan=${SpeedLimiter.download.planSessionBytes(gen)}, " +
+                "uploadPlan=${SpeedLimiter.upload.planSessionBytes(gen)}, " +
+                "downloadProbe=${SpeedLimiter.download.verificationProbeBytes(gen)}, " +
+                "uploadProbe=${SpeedLimiter.upload.verificationProbeBytes(gen)}, " +
+                "downloadSession=${SpeedLimiter.download.sessionBytes(gen)}, " +
+                "uploadSession=${SpeedLimiter.upload.sessionBytes(gen)}, " +
+                "downloadLifetime=${SpeedLimiter.download.total.get()}, " +
+                "uploadLifetime=${SpeedLimiter.upload.total.get()})"
+
+        // Transfers can complete at the peer just before the worker returns from its final
+        // accounting instruction. Wait for exact conservation, not merely for non-zero counters:
+        // lost events, duplicate counts, or misclassified probes must still fail this assertion.
+        val expectedCountersReached = {
+            SpeedLimiter.download.planSessionBytes(gen) == expectedDownloadPlan &&
+                SpeedLimiter.upload.planSessionBytes(gen) == expectedUploadPlan &&
+                SpeedLimiter.download.verificationProbeBytes(gen) == expectedDownloadProbes &&
+                SpeedLimiter.upload.verificationProbeBytes(gen) == expectedUploadProbes &&
+                SpeedLimiter.download.sessionBytes(gen) == expectedDownloadSession &&
+                SpeedLimiter.upload.sessionBytes(gen) == expectedUploadSession
+        }
+        val counterDeadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        while (!expectedCountersReached() && System.nanoTime() < counterDeadlineNanos) {
+            Thread.sleep(10)
+        }
+        assertTrue(
+            "Forwarded-byte counters did not converge to the exact TCP/UDP payload totals: ${counterSnapshot()}",
+            expectedCountersReached(),
         )
-        assertEquals(21_800L, SpeedLimiter.download.verificationProbeBytes(gen))
-        assertEquals(10_900L, SpeedLimiter.upload.verificationProbeBytes(gen))
+
+        SpeedLimiter.endVerification(null, null)
+        SpeedPlanUsageTracker.onVpnDisconnected(context, gen, nowMillis = t0 + 5_000L)
+        SpeedPlanUsageTracker.flushPendingWritesForTests()
+
+        assertEquals("download plan mismatch: ${counterSnapshot()}", expectedDownloadPlan, SpeedLimiter.download.planSessionBytes(gen))
+        assertEquals("upload plan mismatch: ${counterSnapshot()}", expectedUploadPlan, SpeedLimiter.upload.planSessionBytes(gen))
+        assertEquals("download probe mismatch: ${counterSnapshot()}", expectedDownloadProbes, SpeedLimiter.download.verificationProbeBytes(gen))
+        assertEquals("upload probe mismatch: ${counterSnapshot()}", expectedUploadProbes, SpeedLimiter.upload.verificationProbeBytes(gen))
 
         val rec = UsageRepository.readAllSpeedPlanUsageSessions(context).single()
         assertEquals(25_000L, rec.downloadBytes)
