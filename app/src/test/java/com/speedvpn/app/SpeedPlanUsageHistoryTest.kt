@@ -859,6 +859,55 @@ class SpeedPlanUsageHistoryTest {
     }
 
     @Test
+    fun terminalUsageSnapshot_waitsForQueuedCheckpointAndPersistsFinalDirectionalTotals() {
+        val gen = 44L
+        val t0 = 1_729_600_500_000L
+        SpeedLimiter.beginSession(gen)
+        SpeedLimiter.setLimitsKbps(8_000L, 8_000L)
+        SpeedPlanUsageTracker.onVpnConnected(context, gen, nowMillis = t0)
+
+        // Cross the byte-delta checkpoint threshold so an ONGOING DB write is queued.
+        SpeedLimiter.download.recordForwardedForApp(
+            300_000,
+            gen,
+            uid = 10150,
+            packages = setOf("org.telegram.messenger"),
+        )
+        SpeedPlanUsageTracker.onMeterSample(
+            context,
+            gen,
+            2_400_000L,
+            0L,
+            1_000L,
+            nowMillis = t0 + 1_000L,
+        )
+
+        // These bytes arrive after the checkpoint was queued but before VPN teardown.
+        SpeedLimiter.upload.recordForwardedForApp(
+            12_345,
+            gen,
+            uid = 10150,
+            packages = setOf("org.telegram.messenger"),
+        )
+        SpeedPlanUsageTracker.onVpnDisconnected(
+            context,
+            gen,
+            closeReason = "VPN_DISCONNECTED",
+            nowMillis = t0 + 2_000L,
+        )
+        SpeedLimiter.endSession(gen)
+        SpeedPlanUsageTracker.flushPendingWritesForTests()
+
+        val stored = UsageRepository.readAllSpeedPlanUsageSessions(context).single()
+        assertEquals(SpeedPlanRecordStatus.COMPLETED, stored.status)
+        assertEquals("VPN_DISCONNECTED", stored.closeReason)
+        assertEquals(300_000L, stored.downloadBytes)
+        assertEquals(12_345L, stored.uploadBytes)
+        assertEquals(312_345L, stored.totalBytes)
+        assertEquals(t0 + 2_000L, stored.endedAtMillis)
+    }
+
+    @Test
     fun liveUiCounterReads_doNotTriggerSqliteWritesOrFullHistoryReadsOnEveryMeterTick() {
         val gen = 1L
         val t0 = 1_729_600_600_000L
