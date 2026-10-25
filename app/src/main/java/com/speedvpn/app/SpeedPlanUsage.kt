@@ -7,6 +7,7 @@ import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.max
 import kotlin.math.roundToLong
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -313,8 +314,12 @@ object SpeedPlanUsageTracker {
     internal const val MAX_CONTIGUOUS_SAMPLE_INTERVAL_MS = 1_500L
 
     private val lock = Any()
+    private val ioExecutorThread = AtomicReference<Thread?>()
     private val ioExecutor = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "SpeedPlanUsageTracker-IO").apply { isDaemon = true }
+        Thread({
+            ioExecutorThread.set(Thread.currentThread())
+            r.run()
+        }, "SpeedPlanUsageTracker-IO").apply { isDaemon = true }
     }
 
     @Volatile
@@ -953,10 +958,18 @@ object SpeedPlanUsageTracker {
                 bumpPersistedRevision()
             }
         }
-        if (synchronous) {
+        if (!synchronous) {
+            ioExecutor.execute(task)
+            return
+        }
+
+        // Serialize terminal snapshots behind any queued ONGOING checkpoints. Running the
+        // task directly on the caller could let an older queued checkpoint race after the
+        // terminal write (or let the process exit before the queued write is durable).
+        if (Thread.currentThread() === ioExecutorThread.get()) {
             task.run()
         } else {
-            ioExecutor.execute(task)
+            ioExecutor.submit(task).get(15, java.util.concurrent.TimeUnit.SECONDS)
         }
     }
 }
