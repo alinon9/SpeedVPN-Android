@@ -94,11 +94,32 @@ jobs:
             rm -rf app/build/test-results/testDebugUnitTest app/build/reports/tests/testDebugUnitTest
             "$@" >> "$LOG" 2>&1
             local rc=$?
-            if [ "$rc" -eq 0 ]; then
-              echo "RESULT=PASS label=$label" | tee -a "$LOG"
-            else
+            if [ "$rc" -ne 0 ]; then
+              # Gradle normally prints only the failed source line; emit the JUnit assertion
+              # message so expected/actual byte counters survive in Actions logs and artifacts.
+              python3 - <<'PY' >> "$LOG" 2>&1
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          reports = sorted(Path("app/build/test-results/testDebugUnitTest").glob("TEST-*.xml"))
+          if not reports:
+              print("JUNIT_FAILURE_DETAIL_MISSING: no TEST-*.xml report generated")
+          for report in reports:
+              try:
+                  root = ET.parse(report).getroot()
+              except Exception as exc:
+                  print(f"JUNIT_REPORT_PARSE_ERROR: {report}: {exc}")
+                  continue
+              for case in root.iter("testcase"):
+                  for failure in list(case.findall("failure")) + list(case.findall("error")):
+                      message = failure.get("message", "")
+                      detail = (failure.text or "").strip()
+                      print(f"JUNIT_FAILURE: {case.get('classname')}.{case.get('name')} message={message}\\n{detail}")
+          PY
               echo "RESULT=FAIL label=$label exit_code=$rc" | tee -a "$LOG"
               FAILURES=$((FAILURES + 1))
+            else
+              echo "RESULT=PASS label=$label" | tee -a "$LOG"
             fi
           }
 
@@ -490,6 +511,8 @@ jobs:
             emulator-console.log
             speed-test-server.log
             speed-plan-usage-repeat.log
+            app/build/test-results/testDebugUnitTest/
+            app/build/reports/tests/testDebugUnitTest/
             speedvpn-debug-apk-fingerprint.txt
             app/build/outputs/apk/debug/app-debug.apk
             fixture-throughput-benchmark.json
