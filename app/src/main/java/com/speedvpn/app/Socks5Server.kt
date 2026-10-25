@@ -139,9 +139,10 @@ internal fun writeAdmittedTcpRelayChunk(
         }
         throw error
     }
-    // Publish forwarded-byte accounting immediately after the successful socket write.
-    // The peer can answer before this relay worker resumes; notify the timing observer only
-    // after accounting so a fast reverse flow cannot outrun the upload counter.
+    // Capture the socket-write completion time before accounting so diagnostics measure
+    // only the write itself. Publish forwarded bytes before notifying the reverse-flow timing
+    // observer; a fast peer reply must not outrun the upload counter.
+    val finishedNs = System.nanoTime()
     bucket.recordForwardedForApp(
         n = allowedBytes,
         generation = generation,
@@ -152,7 +153,6 @@ internal fun writeAdmittedTcpRelayChunk(
         remotePort = remotePort,
         flowMarker = flowMarker,
     )
-    val finishedNs = System.nanoTime()
     onWriteCompleted(finishedNs)
     if (hasOwner) {
         runCatching {
