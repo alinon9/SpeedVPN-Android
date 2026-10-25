@@ -139,8 +139,9 @@ internal fun writeAdmittedTcpRelayChunk(
         }
         throw error
     }
-    val finishedNs = System.nanoTime()
-    onWriteCompleted(finishedNs)
+    // Publish forwarded-byte accounting immediately after the successful socket write.
+    // The peer can answer before this relay worker resumes; notify the timing observer only
+    // after accounting so a fast reverse flow cannot outrun the upload counter.
     bucket.recordForwardedForApp(
         n = allowedBytes,
         generation = generation,
@@ -151,6 +152,8 @@ internal fun writeAdmittedTcpRelayChunk(
         remotePort = remotePort,
         flowMarker = flowMarker,
     )
+    val finishedNs = System.nanoTime()
+    onWriteCompleted(finishedNs)
     if (hasOwner) {
         runCatching {
             settleQuotaBytes(
@@ -1675,18 +1678,6 @@ class Socks5Server internal constructor(
                                 log("SOCKS_UDP_FORWARD_SENT uid=${sessionUid ?: "UNRESOLVED"} dst=${addr.hostAddress}:$port bytes=$payloadLen")
                                 loggedForwardResult = true
                             }
-                            val sessionPackages = mux.packagesForFlow(flow)
-                            val isProbeUdpFlow = mux.isProbeFlow(flow, addr.hostAddress ?: "", port)
-                            SpeedLimiter.upload.recordForwardedForApp(
-                                n = payloadLen,
-                                generation = generation,
-                                uid = sessionUid,
-                                packages = sessionPackages,
-                                isVerificationProbeFlow = isProbeUdpFlow,
-                                remoteAddress = addr.hostAddress,
-                                remotePort = port,
-                                flowMarker = flow.logicalKey,
-                            )
                             udpFlows.touchSent(flow, System.currentTimeMillis())
                             mux.trimClosedFlows(System.currentTimeMillis())
                         }
@@ -1915,6 +1906,21 @@ class Socks5Server internal constructor(
                     settleQuotaBytes = settleQuotaBytes,
                 )
                 exceededPackages = delivery.settledDecision.exhaustedPackages
+                if (delivery.delivered) {
+                    // Count a successfully sent datagram before releasing the UDP binding lock.
+                    // The selector uses the same lock to process its echo/reply; recording here
+                    // prevents an immediate reply from becoming observable before upload accounting.
+                    SpeedLimiter.upload.recordForwardedForApp(
+                        n = length,
+                        generation = generation,
+                        uid = activeBinding.uid,
+                        packages = activeBinding.packages,
+                        isVerificationProbeFlow = activeBinding.isVerificationProbe,
+                        remoteAddress = activeBinding.remote.address.hostAddress,
+                        remotePort = activeBinding.remote.port,
+                        flowMarker = flow.logicalKey,
+                    )
+                }
                 delivery.delivered
             }
             if (exceededPackages.isNotEmpty()) {
@@ -2127,6 +2133,19 @@ class Socks5Server internal constructor(
                                                 )
                                             )
                                             udpFlows.markReply(binding.flow, System.currentTimeMillis())
+                                            // Publish the delivered reply while this binding is still
+                                            // protected from replacement/teardown and before the
+                                            // receiving client can trigger its next accounting check.
+                                            SpeedLimiter.download.recordForwardedForApp(
+                                                n = count,
+                                                generation = generation,
+                                                uid = binding.uid,
+                                                packages = binding.packages,
+                                                isVerificationProbeFlow = binding.isVerificationProbe,
+                                                remoteAddress = binding.remote.address.hostAddress,
+                                                remotePort = binding.remote.port,
+                                                flowMarker = binding.flow.logicalKey,
+                                            )
                                             sent = true
                                         }
                                     }
@@ -2138,18 +2157,6 @@ class Socks5Server internal constructor(
                             if (delivery.settledDecision.exhaustedPackages.isNotEmpty()) {
                                 runCatching { onQuotaExceeded(delivery.settledDecision.exhaustedPackages) }
                                     .onFailure { logE("Immediate quota block callback failed for UDP download", it) }
-                            }
-                            if (delivery.delivered) {
-                                SpeedLimiter.download.recordForwardedForApp(
-                                    n = count,
-                                    generation = generation,
-                                    uid = binding.uid,
-                                    packages = binding.packages,
-                                    isVerificationProbeFlow = binding.isVerificationProbe,
-                                    remoteAddress = binding.remote.address.hostAddress,
-                                    remotePort = binding.remote.port,
-                                    flowMarker = binding.flow.logicalKey,
-                                )
                             }
                         } catch (error: Exception) {
                             if (runningMux.get() && running && policyEpoch == expectedPolicyEpoch) {
