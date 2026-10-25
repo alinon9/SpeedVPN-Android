@@ -92,8 +92,12 @@ jobs:
             # Remove only test result files, making Gradle rerun the tests while
             # preserving incremental compilation and native build outputs.
             rm -rf app/build/test-results/testDebugUnitTest app/build/reports/tests/testDebugUnitTest
+            # Actions shells enable errexit by default; disable it for the test command so
+            # every required repetition runs even when an earlier attempt fails.
+            set +e
             "$@" >> "$LOG" 2>&1
             local rc=$?
+            set -e
             if [ "$rc" -ne 0 ]; then
               # Gradle normally prints only the failed source line; emit the JUnit assertion
               # message so expected/actual byte counters survive in Actions logs and artifacts.
