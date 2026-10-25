@@ -1342,7 +1342,7 @@ class SpeedVpnService : VpnService() {
     private fun isNativeRunning(expectedGeneration: Long? = null): Boolean =
         probeNativeState(expectedGeneration) == NativeProbe.RUNNING
 
-    private fun cleanupLocked() {
+    private fun cleanupLocked(afterTrafficStopped: (() -> Unit)? = null) {
         meter?.cancel(); meter = null
         quotaMonitor?.cancel(); quotaMonitor = null
         healthMonitor?.cancel(); healthMonitor = null
@@ -1356,53 +1356,72 @@ class SpeedVpnService : VpnService() {
             socks = null
             detachedTun to detachedSocks
         }
+        val preserveLimiterUntilUsageSnapshot = afterTrafficStopped != null
+
+        fun releaseResourcesAndFinalizeUsage() {
+            runCatching { pfd?.close() }
+            runCatching { relay?.stop() }
+            runCatching { configFile?.delete() }
+            if (tunnelConfigFile == configFile) tunnelConfigFile = null
+            // Keep directional counters alive until the usage tracker has captured the
+            // terminal record. This callback is also used by the asynchronous stop retry.
+            runCatching { afterTrafficStopped?.invoke() }
+                .onFailure { logE("Unable to finalize usage after traffic stopped", it) }
+        }
 
         // Snapshot only this Service instance's native generation. Never read the
         // process-wide native generation here: a newer Service instance may already
         // own the engine, and stale cleanup must be unable to target that generation.
         val generation = nativeGeneration
         if (generation > 0L) {
-            if (!stopNative(generation)) {
+            if (!stopNative(
+                    expectedGeneration = generation,
+                    endLimiterSession = !preserveLimiterUntilUsageSnapshot,
+                )
+            ) {
                 val ownerChanged = synchronized(processNativeLifecycleLock) {
                     nativeOwnerGeneration.get() != generation
                 }
                 if (ownerChanged) {
-                    runCatching { pfd?.close() }
-                    runCatching { relay?.stop() }
-                    runCatching { configFile?.delete() }
+                    releaseResourcesAndFinalizeUsage()
                     return
                 }
                 // Do not close a TUN FD while the native engine may still own it.
                 // Retry asynchronously; owner checks prevent this stale cleanup from
-                // touching a newer generation.
+                // touching a newer generation. When a terminal usage callback is present,
+                // the limiter session is deliberately retained through the final snapshot.
                 thread(name = "speedvpn-native-stop-retry", isDaemon = true) {
                     repeat(20) {
                         Thread.sleep(100)
-                        if (stopNative(generation)) {
-                            runCatching { pfd?.close() }
-                            runCatching { relay?.stop() }
-                            runCatching { configFile?.delete() }
+                        if (stopNative(
+                                expectedGeneration = generation,
+                                endLimiterSession = !preserveLimiterUntilUsageSnapshot,
+                            )
+                        ) {
+                            releaseResourcesAndFinalizeUsage()
                             return@thread
                         }
                         val ownerNow = synchronized(processNativeLifecycleLock) {
                             nativeOwnerGeneration.get()
                         }
                         if (ownerNow != generation) {
-                            runCatching { pfd?.close() }
-                            runCatching { relay?.stop() }
-                            runCatching { configFile?.delete() }
+                            releaseResourcesAndFinalizeUsage()
                             return@thread
                         }
+                    }
+                    if (preserveLimiterUntilUsageSnapshot) {
+                        // Native liveness is still unknown, so do not claim a final
+                        // snapshot or clear the counters. Persist a safe checkpoint;
+                        // recovery can close this still-ongoing record as abnormal.
+                        runCatching { SpeedPlanUsageTracker.flushActiveSegment(this@SpeedVpnService) }
+                            .onFailure { logE("Unable to checkpoint usage after unconfirmed native stop", it) }
                     }
                     logE("Native generation $generation did not stop after retries; resources retained to avoid TUN use-after-close")
                 }
                 return
             }
         }
-        runCatching { pfd?.close() }
-        runCatching { relay?.stop() }
-        runCatching { configFile?.delete() }
-        if (tunnelConfigFile == configFile) tunnelConfigFile = null
+        releaseResourcesAndFinalizeUsage()
     }
 
     private fun failLocked(reason: String, t: Throwable? = null) {
@@ -1411,17 +1430,17 @@ class SpeedVpnService : VpnService() {
         val generation = serviceGeneration
         sessionId.incrementAndGet()
         logE("Connection error: $reason", t)
-        if (generation > 0L) {
-            runCatching {
+        cleanupLocked {
+            if (generation > 0L) {
                 SpeedPlanUsageTracker.onVpnDisconnected(
                     context = this,
                     generation = generation,
                     closeReason = "CONNECT_FAILED",
                     abnormal = true,
                 )
+                SpeedLimiter.endSession(generation)
             }
         }
-        cleanupLocked()
         val ownsRuntime = synchronized(processNativeLifecycleLock) {
             if (generation <= 0L || !activeServiceGeneration.compareAndSet(generation, 0L)) {
                 false
@@ -1496,17 +1515,17 @@ class SpeedVpnService : VpnService() {
             return@withLock
         }
 
-        if (generation > 0L) {
-            runCatching {
+        cleanupLocked {
+            if (generation > 0L) {
                 SpeedPlanUsageTracker.onVpnDisconnected(
                     context = this@SpeedVpnService,
                     generation = generation,
                     closeReason = "VPN_DISCONNECTED",
                     abnormal = false,
                 )
+                SpeedLimiter.endSession(generation)
             }
         }
-        cleanupLocked()
         val shouldReconnect = reconnectAfterDisconnect
         reconnectAfterDisconnect = false
         val released = synchronized(processNativeLifecycleLock) {
@@ -1550,17 +1569,6 @@ class SpeedVpnService : VpnService() {
         quotaMonitor?.cancel(); quotaMonitor = null
         healthMonitor?.cancel(); healthMonitor = null
         uidPolicyMonitor?.cancel(); uidPolicyMonitor = null
-        if (serviceGeneration > 0L) {
-            runCatching {
-                SpeedPlanUsageTracker.onVpnDisconnected(
-                    context = this,
-                    generation = serviceGeneration,
-                    closeReason = "SERVICE_DESTROYED",
-                    abnormal = true,
-                )
-            }
-        }
-
         // Snapshot and detach this instance's resources on the main thread, then do
         // blocking teardown off-main. Process-wide ownership prevents stale cleanup
         // from stopping a newer Native generation.
@@ -1585,24 +1593,39 @@ class SpeedVpnService : VpnService() {
             socks = null
             detachedTun to detachedSocks
         }
-        if (generation > 0L || pfd != null || relay != null) {
+        if (generation > 0L || pfd != null || relay != null || ownedGeneration > 0L) {
             thread(name = "speedvpn-emergency-cleanup", isDaemon = true) {
                 if (generation > 0L) {
-                    var stopped = stopNative(generation)
+                    var stopped = stopNative(generation, endLimiterSession = false)
                     var attempts = 0
                     while (!stopped && attempts++ < 20) {
                         Thread.sleep(100)
                         val ownerNow = synchronized(processNativeLifecycleLock) { nativeOwnerGeneration.get() }
-                        stopped = if (ownerNow != generation) true else stopNative(generation)
+                        stopped = if (ownerNow != generation) true else stopNative(generation, endLimiterSession = false)
                     }
                     if (!stopped) {
-                        logE("Emergency native cleanup could not stop generation $generation; TUN FD retained")
+                        if (ownedGeneration > 0L) {
+                            runCatching { SpeedPlanUsageTracker.flushActiveSegment(this@SpeedVpnService) }
+                                .onFailure { logE("Unable to checkpoint usage after unconfirmed emergency native stop", it) }
+                        }
+                        logE("Emergency native cleanup could not stop generation $generation; TUN FD and counters retained")
                         return@thread
                     }
                 }
                 runCatching { pfd?.close() }
                 runCatching { relay?.stop() }
                 runCatching { configFile?.delete() }
+                if (ownedGeneration > 0L) {
+                    runCatching {
+                        SpeedPlanUsageTracker.onVpnDisconnected(
+                            context = this@SpeedVpnService,
+                            generation = ownedGeneration,
+                            closeReason = "SERVICE_DESTROYED",
+                            abnormal = true,
+                        )
+                        SpeedLimiter.endSession(ownedGeneration)
+                    }.onFailure { logE("Unable to finalize usage after emergency cleanup", it) }
+                }
             }
         }
 
