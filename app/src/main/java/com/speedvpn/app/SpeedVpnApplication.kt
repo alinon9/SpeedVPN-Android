@@ -49,11 +49,19 @@ class SpeedVpnApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        SpeedPlanUsageTracker.registerContext(this)
+        runCatching { SpeedPlanUsageTracker.ensureRecovered(this) }
         logHistoricalProcessExitReasons()
         UidPocDiagnostics.log(this, "Application.onCreate; API=${Build.VERSION.SDK_INT}; package=$packageName")
         val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
             UidPocDiagnostics.recordCrash(this, thread, throwable)
+            runCatching {
+                SpeedPlanUsageTracker.onProcessAbnormalExit(
+                    context = this,
+                    closeReason = "UNCAUGHT_EXCEPTION",
+                )
+            }
             runCatching {
                 DiagnosticsRepository.record(
                     this,
@@ -66,11 +74,15 @@ class SpeedVpnApplication : Application() {
             defaultHandler?.uncaughtException(thread, throwable) ?: Process.killProcess(Process.myPid())
         }
         UidPocDiagnostics.log(this, "Default uncaught-exception handler installed")
-        if (SmartSettings.isStatsEnabled(this)) {
-            runCatching {
+        runCatching {
+            if (SmartSettings.isStatsEnabled(this)) {
                 UsageCollectionScheduler.schedule(this)
-                QuotaWorkScheduler.schedule(this)
-            }.onFailure { UidPocDiagnostics.error(this, "Unable to schedule application workers", it) }
-        }
+            } else {
+                UsageCollectionScheduler.cancel(this)
+            }
+            // Quota enforcement must remain active whenever any app quota policy exists,
+            // even when optional statistics collection is turned off.
+            QuotaWorkScheduler.syncWithConfiguredPolicies(this)
+        }.onFailure { UidPocDiagnostics.error(this, "Unable to schedule application workers", it) }
     }
 }

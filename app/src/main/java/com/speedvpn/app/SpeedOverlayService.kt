@@ -147,7 +147,10 @@ internal class SpeedOverlayService : Service() {
             textSize = 20f
             gravity = Gravity.CENTER
             background = roundedBackground(Color.rgb(28, 42, 66), dp(12))
-            setOnClickListener { stopSelf() }
+            setOnClickListener {
+                SmartSettings.setOverlayEnabled(this@SpeedOverlayService, false)
+                stopSelf()
+            }
         }
         header.addView(close, LinearLayout.LayoutParams(dp(28), dp(28)))
         parent.addView(header, LinearLayout.LayoutParams(-1, dp(30)))
@@ -184,6 +187,7 @@ internal class SpeedOverlayService : Service() {
 
         runCatching { wm.addView(parent, params) }.onFailure {
             root = null
+            SmartSettings.setOverlayEnabled(this, false)
             DiagnosticsRepository.record(this, "ERROR", "SpeedOverlay", "OVERLAY_ATTACH_FAILED", it.message ?: "unable to attach overlay")
             stopSelf()
         }
@@ -288,8 +292,12 @@ internal class SpeedOverlayService : Service() {
     private fun set(download: Boolean, kbps: Long?) {
         if (SpeedLimiter.verificationInProgress.value) return
         if (targetPackage == null) {
-            if (download) SpeedLimitStore.saveDownload(this, kbps) else SpeedLimitStore.saveUpload(this, kbps)
-            if (download) SpeedLimiter.setDownloadKbps(kbps) else SpeedLimiter.setUploadKbps(kbps)
+            val applied = if (download) {
+                SpeedLimiter.setDownloadKbps(kbps) { SpeedLimitStore.saveDownload(this, kbps) }
+            } else {
+                SpeedLimiter.setUploadKbps(kbps) { SpeedLimitStore.saveUpload(this, kbps) }
+            }
+            if (!applied) return
             DiagnosticsRepository.record(this, "INFO", "SpeedOverlay", "GLOBAL_SPEED_CHANGED", "Global ${if (download) "download" else "upload"} changed by overlay")
         } else {
             val existing = AiRepository.getSpeedProfile(this, targetPackage)

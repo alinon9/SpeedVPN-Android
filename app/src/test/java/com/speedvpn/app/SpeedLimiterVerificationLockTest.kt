@@ -90,4 +90,37 @@ class SpeedLimiterVerificationLockTest {
         assertFalse(SpeedLimiter.beginExternalVpnCommand())
         SpeedLimiter.endVerification(6_000L, 4_000L)
     }
+
+    @Test
+    fun stagedLimitStoreReflectsAcceptedLiveLimitsAndRejectsUpdatesDuringVerification() {
+        val context = androidx.test.core.app.ApplicationProvider.getApplicationContext<android.content.Context>()
+        SpeedLimitStore.resetStagedForTests()
+        SpeedLimitStore.save(context, 2_000L, 1_000L)
+
+        // Stage a new download limit inside SpeedLimiter.setDownloadKbps callback before disk write.
+        assertTrue(
+            SpeedLimiter.setDownloadKbps(8_000L) {
+                SpeedLimitStore.stageDownload(context, 8_000L)
+            },
+        )
+        assertEquals(8_000L to 1_000L, SpeedLimitStore.load(context))
+
+        // While verification owns the limiter, UI/overlay stage callbacks must not run.
+        assertTrue(SpeedLimiter.beginVerification(null, null))
+        try {
+            assertFalse(
+                SpeedLimiter.setDownloadKbps(16_000L) {
+                    SpeedLimitStore.stageDownload(context, 16_000L)
+                },
+            )
+            assertFalse(
+                SpeedLimiter.setUploadKbps(16_000L) {
+                    SpeedLimitStore.stageUpload(context, 16_000L)
+                },
+            )
+            assertEquals(8_000L to 1_000L, SpeedLimitStore.load(context))
+        } finally {
+            SpeedLimiter.endVerification(8_000L, 1_000L)
+        }
+    }
 }

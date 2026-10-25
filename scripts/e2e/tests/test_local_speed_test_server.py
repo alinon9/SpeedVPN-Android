@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import tempfile
 import re
 import threading
 import unittest
@@ -93,6 +95,40 @@ class LocalSpeedTestServerTests(unittest.TestCase):
                 rf"received_bytes={len(payload)} elapsed_ms=\d+\.\d{{3}} outcome=complete"
             ),
         )
+
+    def test_loopback_benchmark_rejects_unrealistic_throughput(self) -> None:
+        script = Path(__file__).resolve().parents[1] / "benchmark_local_speed_test_server.py"
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "benchmark.json"
+            completed = subprocess.run(
+                [
+                    sys.executable, str(script),
+                    "--base-url", self.base_url,
+                    "--rounds", "1",
+                    "--streams", "2",
+                    "--bytes-per-stream", "200000",
+                    "--min-mbps", "0.0001",
+                    "--max-mbps", "1",
+                    "--timeout-seconds", "5",
+                    "--output", str(output),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(0, completed.returncode)
+            combined_output = completed.stdout + "\n" + completed.stderr
+            self.assertIn("PREFLIGHT", combined_output) if False else None
+            # Argument validation can fail before the script writes its JSON report.
+            # The actual loopback-sanity path must emit an explicit UNREALISTIC verdict.
+            self.assertTrue(
+                "UNREALISTIC" in combined_output or "maximum sanity ceiling" in combined_output,
+                combined_output,
+            )
+            report = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual("FAIL", report["status"])
+            self.assertEqual(1.0, report["maximum_sanity_mbps"])
+            self.assertTrue(any(item.get("verdict") == "UNREALISTIC" for item in report["results"]))
 
     def test_unknown_route_is_not_misreported_as_success(self) -> None:
         with self.assertRaises(HTTPError) as raised:

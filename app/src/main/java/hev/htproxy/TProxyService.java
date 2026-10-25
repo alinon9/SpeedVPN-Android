@@ -25,8 +25,25 @@ public final class TProxyService {
                          byte[] dstAddress, int dstPort);
     }
 
-    /** Temporary POC JNI hook. Present only on poc/uid-detection-test. */
+    /** UID resolver hook used by the app-level firewall. */
     public static native boolean TProxySetUidPocCallback(Object callback);
+
+    /** Atomically update fail-closed UID policy and invalidate cached flow decisions. */
+    public static native boolean TProxySetUidPocPolicyEnabled(boolean enabled);
+
+    /** Register or unregister a synthetic speed-probe socket 5-tuple in the native JNI flow cache. */
+    public static native boolean TProxySetUidPocProbeSocket(
+        int protocol,
+        int srcPort,
+        long dstHi,
+        long dstLo,
+        int dstLen,
+        int dstPort,
+        boolean registered
+    );
+
+    /** Clear all registered synthetic speed-probe sockets in the native JNI flow cache. */
+    public static native boolean TProxyClearUidPocProbeSockets();
 
     /** [txPackets, txBytes, rxPackets, rxBytes] */
     public static native long[] TProxyGetStats();

@@ -4,7 +4,7 @@ on:
   push:
     branches: [main, master]
   pull_request:
-    branches: [main]
+    branches: [main, 'feature/speed-plan-usage-history-export-20261023']
 
 permissions:
   contents: read
@@ -45,6 +45,7 @@ jobs:
           bash ./setup.sh
           test "$(git -C app/src/main/jni/hev-socks5-tunnel rev-parse HEAD)" = 'd9dca26c7ad0e494492244f0309e80ee583e739e'
           python3 scripts/e2e/patch_hev_tcp_buffers.py --check app/src/main/jni/hev-socks5-tunnel/third-part/lwip/src/ports/include/lwipopts.h
+          python3 scripts/poc/uid_detection/patch_hev_uid_detection_poc.py --check app/src/main/jni/hev-socks5-tunnel
 
       - name: Validate E2E harness helpers
         run: |
@@ -69,8 +70,78 @@ jobs:
             echo "speed_test_base_url=http://10.0.2.2:18765"
           } | tee speedvpn-debug-apk-fingerprint.txt
 
-      - name: Run Android JVM unit tests
-        run: ./gradlew :app:testDebugUnitTest -PspeedTestBaseUrl=http://10.0.2.2:18765 --stacktrace --no-daemon
+      - name: Repeat speed-plan TCP/UDP accounting regression 10 times and run JVM suite twice
+        shell: bash
+        run: |
+          set -uo pipefail
+          LOG=speed-plan-usage-repeat.log
+          : > "$LOG"
+          FAILURES=0
+          TEST_NAME='com.speedvpn.app.SpeedPlanUsageHistoryTest.socks5ServerLoopbackIntegration_preservesRealTcpAndUdpFromOtherAppOwnUidAndUnattributedToSameEndpointAndExcludesProbesDuringVerifySpeed'
+
+          run_gradle_check() {
+            local label="$1"
+            shift
+            {
+              echo
+              echo "===== $label ====="
+              echo "commit=$(git rev-parse HEAD)"
+              echo "started_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            } | tee -a "$LOG"
+
+            # Remove only test result files, making Gradle rerun the tests while
+            # preserving incremental compilation and native build outputs.
+            rm -rf app/build/test-results/testDebugUnitTest app/build/reports/tests/testDebugUnitTest
+            # Actions shells enable errexit by default; disable it for the test command so
+            # every required repetition runs even when an earlier attempt fails.
+            set +e
+            "$@" >> "$LOG" 2>&1
+            local rc=$?
+            set -e
+            if [ "$rc" -ne 0 ]; then
+              # Gradle normally prints only the failed source line; emit the JUnit assertion
+              # message so expected/actual byte counters survive in Actions logs and artifacts.
+              python3 - <<'PY' >> "$LOG" 2>&1
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          reports = sorted(Path("app/build/test-results/testDebugUnitTest").glob("TEST-*.xml"))
+          if not reports:
+              print("JUNIT_FAILURE_DETAIL_MISSING: no TEST-*.xml report generated")
+          for report in reports:
+              try:
+                  root = ET.parse(report).getroot()
+              except Exception as exc:
+                  print(f"JUNIT_REPORT_PARSE_ERROR: {report}: {exc}")
+                  continue
+              for case in root.iter("testcase"):
+                  for failure in list(case.findall("failure")) + list(case.findall("error")):
+                      message = failure.get("message", "")
+                      detail = (failure.text or "").strip()
+                      print(f"JUNIT_FAILURE: {case.get('classname')}.{case.get('name')} message={message}\\n{detail}")
+          PY
+              echo "RESULT=FAIL label=$label exit_code=$rc" | tee -a "$LOG"
+              FAILURES=$((FAILURES + 1))
+            else
+              echo "RESULT=PASS label=$label" | tee -a "$LOG"
+            fi
+          }
+
+          for attempt in $(seq 1 10); do
+            run_gradle_check "Focused accounting regression attempt $attempt/10" \
+              ./gradlew :app:testDebugUnitTest --tests "$TEST_NAME" \
+              -PspeedTestBaseUrl=http://10.0.2.2:18765 --stacktrace --no-daemon
+          done
+
+          for pass in 1 2; do
+            run_gradle_check "Complete JVM unit suite pass $pass/2" \
+              ./gradlew :app:testDebugUnitTest \
+              -PspeedTestBaseUrl=http://10.0.2.2:18765 --stacktrace --no-daemon
+          done
+
+          echo "SUMMARY failures=$FAILURES focused_runs=10 full_suite_runs=2 commit=$(git rev-parse HEAD)" | tee -a "$LOG"
+          tail -n 180 "$LOG"
+          test "$FAILURES" -eq 0
 
       - name: Install Android Emulator
         run: |
@@ -419,7 +490,8 @@ jobs:
               ;;
             75)
               echo "sweep_status=ENV_INSUFFICIENT" >> "$GITHUB_OUTPUT"
-              echo "ACCEPTANCE_PASS: ENV_INSUFFICIENT — runner preflight could not establish required network headroom. APK build, JVM tests, app smoke test, and speed-test UI checks completed; the exhaustive speed sweep did not run, so no speed metrics are claimed." | tee -a "$GITHUB_STEP_SUMMARY"
+              echo "ACCEPTANCE_BLOCKED: ENV_INSUFFICIENT — runner preflight could not establish required network headroom. This is inconclusive, not a pass; no speed acceptance result is claimed and the release gate remains blocked." | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 75
               ;;
             *)
               echo "SPEED_SWEEP_ERROR: speed-limit-sweep.sh exited with code ${SWEEP_RC}; only exit 75 (ENV_INSUFFICIENT) is accepted as an environmental limitation." | tee -a "$GITHUB_STEP_SUMMARY"
@@ -428,7 +500,7 @@ jobs:
           esac
 
       - name: Strict 38/38 speed-limiter gate
-        if: ${{ !cancelled() && steps.e2e.outputs.sweep_status != 'ENV_INSUFFICIENT' }}
+        if: ${{ success() && steps.e2e.outcome == 'success' && steps.e2e.outputs.sweep_status != 'ENV_INSUFFICIENT' }}
         run: |
           set -euo pipefail
           test -s speed-limit-sweep-results.csv || { echo "Missing speed-limit-sweep-results.csv"; exit 1; }
@@ -442,6 +514,9 @@ jobs:
           path: |
             emulator-console.log
             speed-test-server.log
+            speed-plan-usage-repeat.log
+            app/build/test-results/testDebugUnitTest/
+            app/build/reports/tests/testDebugUnitTest/
             speedvpn-debug-apk-fingerprint.txt
             app/build/outputs/apk/debug/app-debug.apk
             fixture-throughput-benchmark.json

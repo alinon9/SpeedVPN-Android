@@ -139,7 +139,7 @@ internal class UidDetectionPoc(
     }
 
     internal fun isUidBlocked(uid: Int): Boolean =
-        uid > 0 && blockedUids.contains(uid)
+        VpnApplicationPolicy.shouldDropUid(uid, blockedUids)
 
     init {
         Log.i(TAG, "START Android API=${Build.VERSION.SDK_INT}; package=${service.packageName}")
@@ -170,13 +170,27 @@ internal class UidDetectionPoc(
             "KOTLIN_RESOLVER_ENTRY id=$callId protocol=$protocolName src=$source:$srcPort dst=$destination:$dstPort srcBytes=${srcAddress.size} dstBytes=${dstAddress.size}",
         )
 
+        val isMarkedProbeForProtocol = SpeedLimiter.isMarkedProbeClientSocket(
+            localPort = srcPort,
+            remoteHostOrIp = destination,
+            remotePort = dstPort,
+            protocol = protocol,
+        )
         var uid = Process.INVALID_UID
         var outcome = "returned"
         try {
-            val resolution = resolveUid(protocol, srcAddress, srcPort, dstAddress, dstPort, callId)
+            val resolution = resolveUid(
+                protocol = protocol,
+                srcAddress = srcAddress,
+                srcPort = srcPort,
+                dstAddress = dstAddress,
+                dstPort = dstPort,
+                callId = callId,
+                isMarkedProbeForProtocol = isMarkedProbeForProtocol,
+            )
             uid = resolution.uid
             val action = if (resolution.shouldBlock) "BLOCK" else "ALLOW"
-            val encoded = encodeUidDecision(resolution.uid, resolution.shouldBlock)
+            val encoded = encodeUidDecision(resolution.uid, resolution.shouldBlock, resolution.isVerificationProbe)
             UidPocDiagnostics.jniEvent(
                 service,
                 "KOTLIN_RESOLVER_DECISION id=$callId verdict=${resolution.verdict} uid=${resolution.uid} action=$action hookMode=HOOK_BLOCKING packetBlocking=IMPLEMENTED",
@@ -186,7 +200,17 @@ internal class UidDetectionPoc(
         } catch (error: Throwable) {
             outcome = "throwable:${error.javaClass.simpleName}"
             reportException(protocol, source, srcPort, destination, dstPort, callId, error)
-            return encodeUidDecision(Process.INVALID_UID, false)
+            return encodeUidDecision(
+                Process.INVALID_UID,
+                VpnApplicationPolicy.shouldDropUnresolvedUid(
+                    blockedUids = blockPolicy.uids,
+                    attributionExhausted = true,
+                    protocol = protocol,
+                    dstIp = destination,
+                    dstPort = dstPort,
+                ),
+                isVerificationProbe = isMarkedProbeForProtocol,
+            )
         } finally {
             UidPocDiagnostics.jniEvent(
                 service,
@@ -199,17 +223,43 @@ internal class UidDetectionPoc(
         val uid: Int,
         val verdict: String,
         val shouldBlock: Boolean,
+        val isVerificationProbe: Boolean = false,
     )
 
     /**
-     * JNI wire format: signed UID in the high 32 bits; low bit 1 = BLOCK/DROP,
-     * low bit 0 = allow/observe. This keeps the resolver decision attached to its UID.
+     * JNI wire format:
+     * - High 32 bits: signed UID (`-1` when unresolved).
+     * - Bit 1 (`2L`): `1` when the packet's exact 5-tuple belongs to a verified probe socket
+     *   registered via `SpeedLimiter.markProbeClientSocket`, `0` for normal user/app traffic.
+     * - Bit 0 (`1L`): `1` = BLOCK/DROP, `0` = ALLOW.
      */
-    private fun encodeUidDecision(uid: Int, shouldBlock: Boolean): Long =
-        (uid.toLong() shl 32) or (if (shouldBlock) 1L else 0L)
+    internal fun encodeUidDecision(
+        uid: Int,
+        shouldBlock: Boolean,
+        isVerificationProbe: Boolean = false,
+    ): Long =
+        (uid.toLong() shl 32) or
+            (if (isVerificationProbe) 2L else 0L) or
+            (if (shouldBlock) 1L else 0L)
 
-    private fun unresolvedUid(): UidResolution =
-        UidResolution(Process.INVALID_UID, "INVALID_UID", false)
+    private fun unresolvedUid(
+        protocol: Int = -1,
+        dstIp: String = "",
+        dstPort: Int = -1,
+    ): UidResolution {
+        val shouldBlock = VpnApplicationPolicy.shouldDropUnresolvedUid(
+            blockedUids = blockPolicy.uids,
+            attributionExhausted = true,
+            protocol = protocol,
+            dstIp = dstIp,
+            dstPort = dstPort,
+        )
+        return UidResolution(
+            Process.INVALID_UID,
+            if (shouldBlock) "UID_UNRESOLVED_FAIL_CLOSED" else "INVALID_UID",
+            shouldBlock,
+        )
+    }
 
     /** Runs only on the dedicated native UID worker, never on the TUN coroutine. */
     private fun resolveUid(
@@ -219,11 +269,8 @@ internal class UidDetectionPoc(
         dstAddress: ByteArray,
         dstPort: Int,
         callId: Long,
+        isMarkedProbeForProtocol: Boolean = false,
     ): UidResolution {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-            UidPocDiagnostics.log(service, "OWNER_UID_QUERY_SKIPPED id=$callId reason=API_BELOW_29")
-            return unresolvedUid()
-        }
         if (protocol != IPPROTO_TCP && protocol != IPPROTO_UDP) {
             UidPocDiagnostics.log(service, "OWNER_UID_QUERY_SKIPPED id=$callId reason=UNSUPPORTED_PROTOCOL protocol=$protocol")
             return unresolvedUid()
@@ -242,19 +289,69 @@ internal class UidDetectionPoc(
         val remote = InetSocketAddress(InetAddress.getByAddress(dstAddress), dstPort)
 
         UidPocDiagnostics.log(service, "OWNER_UID_QUERY_BEGIN id=$callId tuple=$tuple thread=${Thread.currentThread().name}")
-        val uid = connectivity.getConnectionOwnerUid(protocol, local, remote)
+        val androidUid = if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            UidPocDiagnostics.log(service, "OWNER_UID_QUERY_SKIPPED id=$callId reason=API_BELOW_29; trying procfs")
+            Process.INVALID_UID
+        } else {
+            runCatching { connectivity.getConnectionOwnerUid(protocol, local, remote) }
+                .onFailure {
+                    UidPocDiagnostics.error(service, "OWNER_UID_API_FAILED id=$callId; trying procfs", it)
+                }
+                .getOrDefault(Process.INVALID_UID)
+        }
+        val procUid = if (androidUid == Process.INVALID_UID) {
+            runCatching {
+                ProcSocketUidResolver.resolve(
+                    protocol = protocol,
+                    srcAddress = srcAddress,
+                    srcPort = srcPort,
+                    dstAddress = dstAddress,
+                    dstPort = dstPort,
+                )
+            }.onFailure {
+                UidPocDiagnostics.error(service, "PROC_UID_FALLBACK_FAILED id=$callId tuple=$tuple", it)
+            }.getOrNull().also { fallbackUid ->
+                UidPocDiagnostics.log(
+                    service,
+                    "PROC_UID_FALLBACK id=$callId tuple=$tuple uid=${fallbackUid ?: Process.INVALID_UID} " +
+                        "result=${if (fallbackUid == null) "UNRESOLVED" else "MATCH"}",
+                )
+            }
+        } else {
+            null
+        }
+        val uid = androidUid.takeIf { it != Process.INVALID_UID }
+            ?: procUid
+            ?: Process.INVALID_UID
+        val uidSource = when {
+            androidUid != Process.INVALID_UID -> "ANDROID_API"
+            procUid != null -> "PROC_NET"
+            else -> "UNRESOLVED"
+        }
         val packages = if (uid == Process.INVALID_UID) {
             emptyList()
         } else {
-            packageManager.getPackagesForUid(uid)?.sorted().orEmpty()
+            runCatching { packageManager.getPackagesForUid(uid)?.sorted().orEmpty() }
+                .getOrDefault(emptyList())
         }
         val policy = blockPolicy
         val policyPackagesForUid = policy.packagesByUid[uid].orEmpty()
         val knownPackages = (packages + policyPackagesForUid).distinct().sorted()
         val blockedPackageMatches = knownPackages.filter { it in policy.packages }
-        val shouldBlock = uid != Process.INVALID_UID && uid in policy.uids
+        val shouldBlock = if (uid == Process.INVALID_UID) {
+            VpnApplicationPolicy.shouldDropUnresolvedUid(
+                blockedUids = policy.uids,
+                attributionExhausted = true,
+                protocol = protocol,
+                dstIp = dst,
+                dstPort = dstPort,
+            )
+        } else {
+            VpnApplicationPolicy.shouldDropUid(uid, policy.uids)
+        }
         val targetMatch = blockedPackageMatches.joinToString(",").ifBlank { "-" }
         val verdict = when {
+            uid == Process.INVALID_UID && shouldBlock -> "UID_UNRESOLVED_FAIL_CLOSED"
             uid == Process.INVALID_UID -> "INVALID_UID"
             shouldBlock -> "BLOCKED_UID"
             else -> "UID_FOUND_OTHER_OR_UNLISTED"
@@ -262,8 +359,13 @@ internal class UidDetectionPoc(
         val action = if (shouldBlock) "BLOCK" else "ALLOW"
         UidDetectionPocResultStore.add(
             protocol, src, srcPort, dst, dstPort, uid, knownPackages,
-            if (uid == Process.INVALID_UID) "INVALID" else "MATCH",
-            "resolverCall=$callId; targetMatch=$targetMatch; action=$action; thread=${Thread.currentThread().name}",
+            when {
+                uid == Process.INVALID_UID && shouldBlock -> "BLOCKED_UNRESOLVED"
+                uid == Process.INVALID_UID -> "INVALID"
+                shouldBlock -> "BLOCKED"
+                else -> "MATCH"
+            },
+            "resolverCall=$callId; uidSource=$uidSource; targetMatch=$targetMatch; action=$action; thread=${Thread.currentThread().name}",
         )
         Log.i(
             TAG,
@@ -275,8 +377,24 @@ internal class UidDetectionPoc(
             service,
             "OWNER_UID_QUERY_RESULT id=$callId verdict=$verdict uid=$uid packages=${knownPackages.joinToString(",").ifBlank { "-" }} action=$action hookMode=HOOK_BLOCKING packetBlocking=IMPLEMENTED",
         )
-        if (uid != Process.INVALID_UID) {
-            service.recordDetectedFlow(protocol, src, srcPort, dst, dstPort, uid, knownPackages)
+        val isProbeClientSocket = isMarkedProbeForProtocol ||
+            SpeedLimiter.isMarkedProbeClientSocket(
+                localPort = srcPort,
+                remoteHostOrIp = dst,
+                remotePort = dstPort,
+                protocol = protocol,
+            )
+        if (uid != Process.INVALID_UID || isProbeClientSocket) {
+            service.recordDetectedFlow(
+                protocol = protocol,
+                srcIp = src,
+                srcPort = srcPort,
+                dstIp = dst,
+                dstPort = dstPort,
+                uid = uid,
+                packages = knownPackages,
+                isVerificationProbe = isProbeClientSocket,
+            )
         }
         if (shouldBlock) {
             Log.w(TAG, "BLOCKED_UID uid=$uid packages=${blockedPackageMatches.joinToString(",").ifBlank { "-" }} tuple=$tuple hookMode=HOOK_BLOCKING packetBlocking=IMPLEMENTED")
@@ -292,7 +410,7 @@ internal class UidDetectionPoc(
                 permanent = false,
             )
         }
-        return UidResolution(uid, verdict, shouldBlock)
+        return UidResolution(uid, verdict, shouldBlock, isVerificationProbe = isProbeClientSocket)
     }
 
     private fun reportException(
@@ -336,10 +454,25 @@ internal class UidDetectionPoc(
         Log.i(TAG, "STOP resolverCalls=${nativeCallbackSequence.get()}")
     }
 
-    private companion object {
-        const val TAG = "UidDetectionPOC"
-        const val IPPROTO_TCP = 6
-        const val IPPROTO_UDP = 17
+    companion object {
+        private const val TAG = "UidDetectionPOC"
+        internal const val IPPROTO_TCP = 6
+        internal const val IPPROTO_UDP = 17
+
+        /**
+         * Mirrors the native C `hev_socks5_session_run` 5-tuple session bridge:
+         * converts the packed 64-bit `onTunPacket` decision for an exact 5-tuple into
+         * the per-session SOCKS5 authentication username (`user#uid#probe`, `user#probe`,
+         * `user#uid`, or `user`).
+         */
+        internal fun socksUsernameForDecision(baseUsername: String, encodedDecision: Long): String {
+            val uid = (encodedDecision ushr 32).toInt().takeIf { it >= 0 }
+            val isProbe = (encodedDecision and 2L) != 0L
+            return when {
+                isProbe -> Socks5Server.probeUsername(baseUsername, uid)
+                uid != null -> "$baseUsername#$uid"
+                else -> baseUsername
+            }
+        }
     }
 }
-

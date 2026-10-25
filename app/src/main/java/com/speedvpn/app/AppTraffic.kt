@@ -9,15 +9,26 @@ import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.provider.Settings
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 
 /**
- * Per-app traffic view for the current VPN session.
+ * Per-app traffic view for the current VPN session and daily statistics.
  *
- * Android's NetworkStatsManager is a historical accounting API. It is useful for
- * session consumption totals, but the platform can update its buckets with delay,
- * so this screen intentionally labels the values as session usage rather than
- * a packet-perfect live counter.
+ * Android's NetworkStatsManager is a historical accounting API whose buckets
+ * can lag behind live traffic by several minutes. AppTrafficManager therefore
+ * combines NetworkStatsManager snapshots with real-time per-UID/per-package
+ * bytes observed directly by Socks5Server during the current calendar day.
  */
+internal data class UidTrafficCounters(
+    val downloadBytes: Long,
+    val uploadBytes: Long,
+) {
+    val totalBytes: Long
+        get() = if (Long.MAX_VALUE - downloadBytes < uploadBytes) Long.MAX_VALUE
+        else downloadBytes + uploadBytes
+}
+
 data class AppTrafficUsage(
     val packageName: String,
     val label: String,
@@ -40,6 +51,83 @@ object AppTrafficManager {
         android.net.ConnectivityManager.TYPE_WIFI,
         android.net.ConnectivityManager.TYPE_ETHERNET,
     )
+
+    private class LiveDirectionalAccumulator {
+        val download = AtomicLong(0L)
+        val upload = AtomicLong(0L)
+
+        fun add(direction: QuotaTrafficDirection, bytes: Int) {
+            if (bytes <= 0) return
+            val delta = bytes.toLong()
+            val target = if (direction == QuotaTrafficDirection.DOWNLOAD) download else upload
+            target.updateAndGet { current ->
+                if (Long.MAX_VALUE - current < delta) Long.MAX_VALUE else current + delta
+            }
+        }
+
+        fun snapshot(): UidTrafficCounters = UidTrafficCounters(download.get(), upload.get())
+    }
+
+    @Volatile
+    private var liveDayKey: String = ""
+    private val liveByUid = ConcurrentHashMap<Int, LiveDirectionalAccumulator>()
+    private val liveByPackage = ConcurrentHashMap<String, LiveDirectionalAccumulator>()
+
+    private fun ensureCurrentDay(today: String = UsageDate.today()) {
+        if (liveDayKey == today) return
+        synchronized(this) {
+            if (liveDayKey != today) {
+                liveByUid.clear()
+                liveByPackage.clear()
+                liveDayKey = today
+            }
+        }
+    }
+
+    /**
+     * Records bytes forwarded by the local SOCKS5 relay for immediate UI visibility
+     * before Android's NetworkStatsManager flushes its periodic accounting buckets.
+     */
+    internal fun recordLiveRelayTraffic(
+        uid: Int?,
+        packages: Set<String>,
+        direction: QuotaTrafficDirection,
+        bytes: Int,
+        today: String = UsageDate.today(),
+    ) {
+        if (bytes <= 0) return
+        ensureCurrentDay(today)
+        if (uid != null && uid > 0) {
+            liveByUid.computeIfAbsent(uid) { LiveDirectionalAccumulator() }.add(direction, bytes)
+        }
+        packages.forEach { pkg ->
+            if (pkg.isNotBlank()) {
+                liveByPackage.computeIfAbsent(pkg) { LiveDirectionalAccumulator() }.add(direction, bytes)
+            }
+        }
+    }
+
+    internal fun liveRelayUsage(
+        uid: Int,
+        packageName: String? = null,
+        today: String = UsageDate.today(),
+    ): UidTrafficCounters {
+        ensureCurrentDay(today)
+        val pkgSnapshot = packageName?.let { liveByPackage[it]?.snapshot() }
+        val uidSnapshot = if (uid > 0) liveByUid[uid]?.snapshot() else null
+        return UidTrafficCounters(
+            downloadBytes = maxOf(pkgSnapshot?.downloadBytes ?: 0L, uidSnapshot?.downloadBytes ?: 0L),
+            uploadBytes = maxOf(pkgSnapshot?.uploadBytes ?: 0L, uidSnapshot?.uploadBytes ?: 0L),
+        )
+    }
+
+    internal fun clearLiveRelayTrafficForTests() {
+        synchronized(this) {
+            liveByUid.clear()
+            liveByPackage.clear()
+            liveDayKey = ""
+        }
+    }
 
     fun hasUsageAccess(context: Context): Boolean {
         val appOps = context.getSystemService(AppOpsManager::class.java) ?: return false
@@ -115,10 +203,19 @@ object AppTrafficManager {
         uid: Int,
         startTimeMs: Long,
         endTimeMs: Long = System.currentTimeMillis(),
-    ): Long? {
+    ): Long? = queryUidUsageBreakdown(context, uid, startTimeMs, endTimeMs)?.totalBytes
+
+    /** One-shot historical baseline for a quota period; live accounting stays in Socks5Server. */
+    internal fun queryUidUsageBreakdown(
+        context: Context,
+        uid: Int,
+        startTimeMs: Long,
+        endTimeMs: Long = System.currentTimeMillis(),
+    ): UidTrafficCounters? {
         if (uid < 0 || endTimeMs <= startTimeMs || !hasUsageAccess(context)) return null
         val manager = context.getSystemService(NetworkStatsManager::class.java) ?: return null
-        var total = 0L
+        var download = 0L
+        var upload = 0L
         var queried = false
         for (networkType in NETWORK_TYPES) {
             runCatching {
@@ -133,14 +230,15 @@ object AppTrafficManager {
                     val bucket = NetworkStats.Bucket()
                     while (stream.hasNextBucket()) {
                         stream.getNextBucket(bucket)
-                        total = safeAdd(total, safeAdd(bucket.rxBytes, bucket.txBytes))
+                        download = safeAdd(download, bucket.rxBytes)
+                        upload = safeAdd(upload, bucket.txBytes)
                     }
                 }
             }.onFailure {
                 log("UID quota query failed for uid=" + uid + " type=" + networkType + ": " + it.message)
             }
         }
-        return if (queried) total else null
+        return if (queried) UidTrafficCounters(download, upload) else null
     }
 
     fun querySessionUsage(context: Context, startTimeMs: Long, endTimeMs: Long = System.currentTimeMillis()): List<AppTrafficUsage> {
@@ -176,14 +274,16 @@ object AppTrafficManager {
             }
         }
 
+        val today = UsageDate.today()
         return apps.map { app ->
             val counter = bytesByUid[app.uid]
+            val live = liveRelayUsage(app.uid, app.packageName, today)
             AppTrafficUsage(
                 packageName = app.packageName,
                 label = app.loadLabel(pm).toString(),
                 uid = app.uid,
-                downloadBytes = counter?.getOrNull(0) ?: 0L,
-                uploadBytes = counter?.getOrNull(1) ?: 0L,
+                downloadBytes = maxOf(counter?.getOrNull(0) ?: 0L, live.downloadBytes),
+                uploadBytes = maxOf(counter?.getOrNull(1) ?: 0L, live.uploadBytes),
             )
         }.sortedByDescending { it.totalBytes }
     }
@@ -193,11 +293,14 @@ object AppTrafficManager {
 }
 
 data class VpnAppControlSettings(
+    /** Legacy global preference retained for compatibility; it does not gate per-app blocks. */
     val firewallEnabled: Boolean = false,
     val blockedPackages: Set<String> = emptySet(),
 )
 
 object VpnAppControl {
+    private val quotaBlockLock = Any()
+
     const val PREFS = "app_control"
     const val FIREWALL_ENABLED = "firewall_enabled"
     const val BLOCKED_PACKAGES = "blocked_packages"
@@ -240,17 +343,34 @@ object VpnAppControl {
             .getStringSet(QUOTA_BLOCKED_PACKAGES, emptySet()).orEmpty().toSet()
 
     fun setQuotaBlocked(context: Context, packageName: String, blocked: Boolean) {
-        val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val set = p.getStringSet(QUOTA_BLOCKED_PACKAGES, emptySet()).orEmpty().toMutableSet()
-        if (blocked) set.add(packageName) else set.remove(packageName)
-        p.edit().putStringSet(QUOTA_BLOCKED_PACKAGES, set).commit()
+        synchronized(quotaBlockLock) {
+            val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            val set = p.getStringSet(QUOTA_BLOCKED_PACKAGES, emptySet()).orEmpty().toMutableSet()
+            if (blocked) set.add(packageName) else set.remove(packageName)
+            p.edit().putStringSet(QUOTA_BLOCKED_PACKAGES, set).commit()
+        }
     }
 
+    /** Atomically merges newly exhausted packages and returns just the newly added blocks. */
+    fun addQuotaBlockedPackages(context: Context, packages: Set<String>): Set<String> =
+        synchronized(quotaBlockLock) {
+            val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            val current = p.getStringSet(QUOTA_BLOCKED_PACKAGES, emptySet()).orEmpty().toSet()
+            val next = current + packages
+            val added = next - current
+            if (added.isNotEmpty()) {
+                p.edit().putStringSet(QUOTA_BLOCKED_PACKAGES, next).commit()
+            }
+            added
+        }
+
     fun replaceQuotaBlockedPackages(context: Context, packages: Set<String>) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .edit()
-            .putStringSet(QUOTA_BLOCKED_PACKAGES, packages.toSet())
-            .commit()
+        synchronized(quotaBlockLock) {
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .putStringSet(QUOTA_BLOCKED_PACKAGES, packages.toSet())
+                .commit()
+        }
     }
 }
 

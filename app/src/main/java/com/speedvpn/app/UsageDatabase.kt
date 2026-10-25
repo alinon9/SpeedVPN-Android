@@ -7,7 +7,7 @@ import android.database.sqlite.SQLiteOpenHelper
 import java.util.Calendar
 
 private const val USAGE_DB_NAME = "speedvpn_usage.db"
-private const val USAGE_DB_VERSION = 2
+private const val USAGE_DB_VERSION = 5
 
 internal data class AppPolicy(
     val packageName: String,
@@ -70,6 +70,7 @@ internal class UsageDbHelper(
             """.trimIndent(),
         )
         db.execSQL("CREATE INDEX idx_daily_usage_date_total ON daily_usage(date, download_bytes, upload_bytes)")
+        createSpeedPlanUsageSessionTable(db)
     }
 
     private fun createQuotaTable(db: SQLiteDatabase) {
@@ -82,6 +83,9 @@ internal class UsageDbHelper(
                 period_start_millis INTEGER NOT NULL,
                 period_end_millis INTEGER NOT NULL,
                 used_bytes INTEGER NOT NULL DEFAULT 0 CHECK (used_bytes >= 0),
+                download_bytes INTEGER NOT NULL DEFAULT 0 CHECK (download_bytes >= 0),
+                upload_bytes INTEGER NOT NULL DEFAULT 0 CHECK (upload_bytes >= 0),
+                baseline_initialized INTEGER NOT NULL DEFAULT 0 CHECK (baseline_initialized IN (0, 1)),
                 reset_behavior TEXT NOT NULL DEFAULT 'AUTO_RESET'
                     CHECK (reset_behavior IN ('AUTO_RESET', 'BLOCK_UNTIL_RESET')),
                 updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000),
@@ -91,6 +95,72 @@ internal class UsageDbHelper(
             """.trimIndent(),
         )
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_app_quota_type ON app_quota_policy(package_name, quota_type)")
+        createPendingReservationTable(db)
+    }
+
+    internal fun createPendingReservationTable(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS app_quota_pending_reservation (
+                reservation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                process_token TEXT NOT NULL,
+                transport TEXT NOT NULL CHECK (transport IN ('TCP', 'UDP')),
+                package_name TEXT NOT NULL,
+                quota_type TEXT NOT NULL CHECK (quota_type IN ('DAILY', 'WEEKLY', 'MONTHLY')),
+                period_start_millis INTEGER NOT NULL,
+                direction TEXT NOT NULL CHECK (direction IN ('DOWNLOAD', 'UPLOAD')),
+                reserved_bytes INTEGER NOT NULL CHECK (reserved_bytes > 0),
+                created_at INTEGER NOT NULL
+            )
+            """.trimIndent(),
+        )
+        db.execSQL(
+            "CREATE INDEX IF NOT EXISTS idx_quota_pending_token ON app_quota_pending_reservation(process_token, transport)",
+        )
+    }
+
+    internal fun createSpeedPlanUsageSessionTable(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS speed_plan_usage_session (
+                session_id TEXT PRIMARY KEY NOT NULL,
+                vpn_generation INTEGER NOT NULL,
+                segment_index INTEGER NOT NULL DEFAULT 1,
+                process_token TEXT NOT NULL,
+                started_at_millis INTEGER NOT NULL,
+                ended_at_millis INTEGER,
+                last_checkpoint_millis INTEGER NOT NULL,
+                duration_millis INTEGER NOT NULL DEFAULT 0 CHECK (duration_millis >= 0),
+                plan_option_category TEXT NOT NULL,
+                plan_option_label TEXT NOT NULL,
+                download_limit_kbps INTEGER,
+                upload_limit_kbps INTEGER,
+                download_limit_unit_label TEXT NOT NULL,
+                upload_limit_unit_label TEXT NOT NULL,
+                download_bytes INTEGER NOT NULL DEFAULT 0 CHECK (download_bytes >= 0),
+                upload_bytes INTEGER NOT NULL DEFAULT 0 CHECK (upload_bytes >= 0),
+                total_bytes INTEGER NOT NULL DEFAULT 0 CHECK (total_bytes >= 0),
+                avg_download_bps INTEGER NOT NULL DEFAULT 0 CHECK (avg_download_bps >= 0),
+                avg_upload_bps INTEGER NOT NULL DEFAULT 0 CHECK (avg_upload_bps >= 0),
+                peak_download_bps INTEGER NOT NULL DEFAULT 0 CHECK (peak_download_bps >= 0),
+                peak_upload_bps INTEGER NOT NULL DEFAULT 0 CHECK (peak_upload_bps >= 0),
+                status TEXT NOT NULL CHECK (status IN ('ONGOING', 'COMPLETED', 'ABNORMAL_END')),
+                close_reason TEXT NOT NULL DEFAULT 'ACTIVE',
+                limit_exceeded INTEGER NOT NULL DEFAULT 0 CHECK (limit_exceeded IN (0, 1)),
+                max_exceedance_pct REAL NOT NULL DEFAULT 0.0 CHECK (max_exceedance_pct >= 0.0),
+                exceedance_duration_millis INTEGER NOT NULL DEFAULT 0 CHECK (exceedance_duration_millis >= 0)
+            )
+            """.trimIndent(),
+        )
+        db.execSQL(
+            "CREATE INDEX IF NOT EXISTS idx_speed_plan_session_started ON speed_plan_usage_session(started_at_millis DESC)",
+        )
+        db.execSQL(
+            "CREATE INDEX IF NOT EXISTS idx_speed_plan_session_status ON speed_plan_usage_session(status, process_token)",
+        )
+        db.execSQL(
+            "CREATE INDEX IF NOT EXISTS idx_speed_plan_session_category ON speed_plan_usage_session(plan_option_category)",
+        )
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -114,10 +184,44 @@ internal class UsageDbHelper(
                 db.endTransaction()
             }
         }
+        // Version 2 stored only a combined quota counter. Add durable directional
+        // counters without resetting the pre-existing total.
+        if (oldVersion >= 2 && oldVersion < 3) {
+            db.beginTransaction()
+            try {
+                db.execSQL("ALTER TABLE app_quota_policy ADD COLUMN download_bytes INTEGER NOT NULL DEFAULT 0 CHECK (download_bytes >= 0)")
+                db.execSQL("ALTER TABLE app_quota_policy ADD COLUMN upload_bytes INTEGER NOT NULL DEFAULT 0 CHECK (upload_bytes >= 0)")
+                db.setTransactionSuccessful()
+            } finally {
+                db.endTransaction()
+            }
+        }
+        if (oldVersion >= 2 && oldVersion < 4) {
+            db.beginTransaction()
+            try {
+                db.execSQL("ALTER TABLE app_quota_policy ADD COLUMN baseline_initialized INTEGER NOT NULL DEFAULT 0 CHECK (baseline_initialized IN (0, 1))")
+                createPendingReservationTable(db)
+                db.setTransactionSuccessful()
+            } finally {
+                db.endTransaction()
+            }
+        }
+        if (oldVersion < 5 && newVersion >= 5) {
+            db.beginTransaction()
+            try {
+                createSpeedPlanUsageSessionTable(db)
+                db.setTransactionSuccessful()
+            } finally {
+                db.endTransaction()
+            }
+        }
     }
 }
 
 internal object UsageRepository {
+    internal val speedPlanDbWriteCount = java.util.concurrent.atomic.AtomicLong(0L)
+    internal val speedPlanDbReadCount = java.util.concurrent.atomic.AtomicLong(0L)
+
     private fun helper(context: Context) = UsageDbHelper(context.applicationContext)
 
     fun upsertAppPolicy(
@@ -210,7 +314,24 @@ internal object UsageRepository {
             }
             return
         }
-        val bounds = QuotaPeriod.current(quotaType)
+        val nowMillis = System.currentTimeMillis()
+        val bounds = QuotaPeriod.current(quotaType, nowMillis)
+        val existingPolicy = readQuotaPolicies(context, packageName)
+            .firstOrNull { it.quotaType == quotaType }
+            ?.takeIf {
+                it.periodStartMillis == bounds.startMillis && it.periodEndMillis == bounds.endMillis
+            }
+        val historical = if (existingPolicy == null) {
+            val startDate = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US)
+                .format(java.util.Date(bounds.startMillis))
+            val endDate = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US)
+                .format(java.util.Date(nowMillis))
+            runCatching {
+                AppTrafficManager.queryUidUsageBreakdown(context, uid, bounds.startMillis, nowMillis)
+            }.getOrNull() ?: sumDirectionalUsageInPeriod(context, packageName, startDate, endDate)
+        } else {
+            UidTrafficCounters(existingPolicy.downloadBytes, existingPolicy.uploadBytes)
+        }
         helper(context).use { h ->
             val values = ContentValues().apply {
                 put("package_name", packageName)
@@ -218,9 +339,17 @@ internal object UsageRepository {
                 put("limit_bytes", limitBytes)
                 put("period_start_millis", bounds.startMillis)
                 put("period_end_millis", bounds.endMillis)
-                put("used_bytes", 0L)
+                // Editing a quota must not erase bytes already consumed in the same period.
+                // New or expired policies are seeded once from historical usage before live relay
+                // byte accounting takes over.
+                put("used_bytes", existingPolicy?.usedBytes ?: historical.totalBytes)
+                put("download_bytes", if (existingPolicy != null) existingPolicy.downloadBytes else historical.downloadBytes)
+                put("upload_bytes", if (existingPolicy != null) existingPolicy.uploadBytes else historical.uploadBytes)
+                put("baseline_initialized", if (existingPolicy != null) {
+                    if (existingPolicy.baselineInitialized) 1 else 0
+                } else 1)
                 put("reset_behavior", resetBehavior.name)
-                put("updated_at", System.currentTimeMillis())
+                put("updated_at", nowMillis)
             }
             h.writableDatabase.insertWithOnConflict(
                 "app_quota_policy",
@@ -237,6 +366,8 @@ internal object UsageRepository {
                 )
             }
         }
+        QuotaEnforcementEngine.invalidateQuotaBaselineCache(packageName)
+        runCatching { QuotaWorkScheduler.syncWithConfiguredPolicies(context) }
     }
 
     fun deleteQuotaPolicy(context: Context, packageName: String, quotaType: QuotaType) {
@@ -247,6 +378,8 @@ internal object UsageRepository {
                 arrayOf(packageName, quotaType.name),
             )
         }
+        QuotaEnforcementEngine.invalidateQuotaBaselineCache(packageName)
+        runCatching { QuotaWorkScheduler.syncWithConfiguredPolicies(context) }
     }
 
     fun resetQuotaPeriod(
@@ -256,20 +389,25 @@ internal object UsageRepository {
         periodStartMillis: Long,
         periodEndMillis: Long,
     ): Boolean {
-        helper(context).use { h ->
+        val updated = helper(context).use { h ->
             val values = ContentValues().apply {
                 put("period_start_millis", periodStartMillis)
                 put("period_end_millis", periodEndMillis)
                 put("used_bytes", 0L)
+                put("download_bytes", 0L)
+                put("upload_bytes", 0L)
+                put("baseline_initialized", 0)
                 put("updated_at", System.currentTimeMillis())
             }
-            return h.writableDatabase.update(
+            h.writableDatabase.update(
                 "app_quota_policy",
                 values,
                 "package_name = ? AND quota_type = ?",
                 arrayOf(packageName, quotaType.name),
             ) == 1
         }
+        QuotaEnforcementEngine.invalidateQuotaBaselineCache(packageName)
+        return updated
     }
 
     fun readQuotaPolicies(context: Context, packageName: String? = null): List<AppQuotaPolicy> {
@@ -281,6 +419,7 @@ internal object UsageRepository {
                 arrayOf(
                     "package_name", "quota_type", "limit_bytes",
                     "period_start_millis", "period_end_millis", "used_bytes", "reset_behavior",
+                    "download_bytes", "upload_bytes", "baseline_initialized",
                 ),
                 selection,
                 args,
@@ -301,10 +440,413 @@ internal object UsageRepository {
                                 periodEndMillis = c.getLong(4),
                                 usedBytes = c.getLong(5),
                                 resetBehavior = reset,
+                                downloadBytes = c.getLong(7),
+                                uploadBytes = c.getLong(8),
+                                baselineInitialized = c.getInt(9) != 0,
                             ),
                         )
                     }
                 }
+            }
+        }
+    }
+
+
+    /**
+     * Atomically reserves relay payload bytes against every current quota for the resolved
+     * owner packages. The DB transaction serializes concurrent TCP/UDP flows and persists
+     * directional counters before the relay forwards any admitted bytes.
+     */
+    fun reserveQuotaBytes(
+        context: Context,
+        packageNames: Set<String>,
+        direction: QuotaTrafficDirection,
+        requestedBytes: Int,
+        nowMillis: Long = System.currentTimeMillis(),
+        transport: QuotaTransport = QuotaTransport.TCP,
+        processToken: String = "",
+    ): QuotaTrafficDecision {
+        val requested = requestedBytes.coerceAtLeast(0)
+        val packages = packageNames.filter { it.isNotBlank() }.toSet()
+        if (requested == 0 || packages.isEmpty()) return QuotaTrafficDecision(requested)
+
+        data class Counter(
+            val packageName: String,
+            val quotaType: QuotaType,
+            val limitBytes: Long,
+            val periodStartMillis: Long,
+            val usedBytes: Long,
+            val downloadBytes: Long,
+            val uploadBytes: Long,
+        )
+
+        return helper(context).use { h ->
+            val db = h.writableDatabase
+            h.createPendingReservationTable(db)
+            db.beginTransaction()
+            try {
+                val placeholders = packages.joinToString(",") { "?" }
+                val sql = """
+                    SELECT package_name, quota_type, limit_bytes, period_start_millis,
+                           period_end_millis, used_bytes, download_bytes, upload_bytes
+                    FROM app_quota_policy
+                    WHERE package_name IN ($placeholders)
+                """.trimIndent()
+                val counters = db.rawQuery(sql, packages.toTypedArray()).use { c ->
+                    buildList {
+                        while (c.moveToNext()) {
+                            val packageName = c.getString(0)
+                            val type = runCatching { QuotaType.valueOf(c.getString(1)) }.getOrNull()
+                                ?: continue
+                            val limit = c.getLong(2)
+                            val period = QuotaPeriod.current(type, nowMillis)
+                            val stale = c.getLong(3) != period.startMillis ||
+                                c.getLong(4) != period.endMillis
+                            val used = if (stale) 0L else c.getLong(5)
+                            val download = if (stale) 0L else c.getLong(6)
+                            val upload = if (stale) 0L else c.getLong(7)
+
+                            if (stale) {
+                                db.update(
+                                    "app_quota_policy",
+                                    ContentValues().apply {
+                                        put("period_start_millis", period.startMillis)
+                                        put("period_end_millis", period.endMillis)
+                                        put("used_bytes", 0L)
+                                        put("download_bytes", 0L)
+                                        put("upload_bytes", 0L)
+                                        put("baseline_initialized", 0)
+                                        put("updated_at", nowMillis)
+                                    },
+                                    "package_name = ? AND quota_type = ?",
+                                    arrayOf(packageName, type.name),
+                                )
+                            }
+                            add(
+                                Counter(
+                                    packageName = packageName,
+                                    quotaType = type,
+                                    limitBytes = limit,
+                                    periodStartMillis = period.startMillis,
+                                    usedBytes = used,
+                                    downloadBytes = download,
+                                    uploadBytes = upload,
+                                ),
+                            )
+                        }
+                    }
+                }
+
+                val decision = if (counters.isEmpty()) {
+                    QuotaTrafficDecision(requested)
+                } else {
+                    val remaining = counters.minOf { (it.limitBytes - it.usedBytes).coerceAtLeast(0L) }
+                    // Atomic UDP datagrams cannot be truncated to a partial prefix. If the
+                    // full datagram does not fit in the remaining quota, admit 0 bytes
+                    // immediately without charging the uncommitted prefix to used_bytes.
+                    val rawAllowed = minOf(requested.toLong(), remaining).toInt()
+                    val allowed = if (transport == QuotaTransport.UDP && rawAllowed < requested) {
+                        0
+                    } else {
+                        rawAllowed
+                    }
+                    val newlyReached = counters
+                        .filter { it.usedBytes >= it.limitBytes || (allowed > 0 && it.usedBytes + allowed.toLong() >= it.limitBytes) }
+                        .map { it.packageName }
+                        .toSet()
+
+                    val reservations = ArrayList<QuotaPolicyReservation>(counters.size)
+                    if (allowed > 0) {
+                        val delta = allowed.toLong()
+                        counters.forEach { counter ->
+                            val nextUsed = counter.usedBytes + delta
+                            val nextDownload = counter.downloadBytes +
+                                if (direction == QuotaTrafficDirection.DOWNLOAD) delta else 0L
+                            val nextUpload = counter.uploadBytes +
+                                if (direction == QuotaTrafficDirection.UPLOAD) delta else 0L
+                            db.update(
+                                "app_quota_policy",
+                                ContentValues().apply {
+                                    put("used_bytes", nextUsed)
+                                    put("download_bytes", nextDownload)
+                                    put("upload_bytes", nextUpload)
+                                    put("updated_at", nowMillis)
+                                },
+                                "package_name = ? AND quota_type = ? AND period_start_millis = ?",
+                                arrayOf(
+                                    counter.packageName,
+                                    counter.quotaType.name,
+                                    counter.periodStartMillis.toString(),
+                                ),
+                            )
+                            val reservationId = if (transport == QuotaTransport.UDP && processToken.isNotBlank()) {
+                                db.insert(
+                                    "app_quota_pending_reservation",
+                                    null,
+                                    ContentValues().apply {
+                                        put("process_token", processToken)
+                                        put("transport", transport.name)
+                                        put("package_name", counter.packageName)
+                                        put("quota_type", counter.quotaType.name)
+                                        put("period_start_millis", counter.periodStartMillis)
+                                        put("direction", direction.name)
+                                        put("reserved_bytes", allowed)
+                                        put("created_at", nowMillis)
+                                    },
+                                ).coerceAtLeast(0L)
+                            } else {
+                                0L
+                            }
+                            reservations.add(
+                                QuotaPolicyReservation(
+                                    packageName = counter.packageName,
+                                    quotaType = counter.quotaType,
+                                    periodStartMillis = counter.periodStartMillis,
+                                    direction = direction,
+                                    reservedBytes = allowed,
+                                    transport = transport,
+                                    reservationId = reservationId,
+                                ),
+                            )
+                        }
+                    } else {
+                        counters.forEach { counter ->
+                            reservations.add(
+                                QuotaPolicyReservation(
+                                    packageName = counter.packageName,
+                                    quotaType = counter.quotaType,
+                                    periodStartMillis = counter.periodStartMillis,
+                                    direction = direction,
+                                    reservedBytes = 0,
+                                    transport = transport,
+                                    reservationId = 0L,
+                                ),
+                            )
+                        }
+                    }
+                    QuotaTrafficDecision(allowed, newlyReached, reservations)
+                }
+                db.setTransactionSuccessful()
+                decision
+            } finally {
+                db.endTransaction()
+            }
+        }
+    }
+
+    /**
+     * Atomically releases uncommitted reserved bytes (e.g. when an atomic UDP datagram is
+     * dropped because allowedBytes < payloadBytes or its socket send fails) for the exact
+     * policy period rows that were incremented, and returns the packages that remain at or
+     * above their quota limit after the release.
+     */
+    fun releaseQuotaReservation(
+        context: Context,
+        decision: QuotaTrafficDecision,
+        bytesToRelease: Int = decision.allowedBytes,
+        nowMillis: Long = System.currentTimeMillis(),
+    ): Set<String> {
+        val candidatePackages = (
+            decision.exhaustedPackages + decision.reservations.map { it.packageName }
+        ).filter { it.isNotBlank() }.toSet()
+        if (candidatePackages.isEmpty()) return emptySet()
+
+        return helper(context).use { h ->
+            val db = h.writableDatabase
+            h.createPendingReservationTable(db)
+            db.beginTransaction()
+            try {
+                val reservationIds = decision.reservations.mapNotNull { it.reservationId.takeIf { id -> id > 0L } }
+                if (reservationIds.isNotEmpty()) {
+                    val idPlaceholders = reservationIds.joinToString(",") { "?" }
+                    db.delete(
+                        "app_quota_pending_reservation",
+                        "reservation_id IN ($idPlaceholders)",
+                        reservationIds.map { it.toString() }.toTypedArray(),
+                    )
+                }
+                val releaseBounded = bytesToRelease.coerceAtLeast(0)
+                if (releaseBounded > 0) {
+                    decision.reservations.forEach { reservation ->
+                        val delta = minOf(releaseBounded, reservation.reservedBytes.coerceAtLeast(0)).toLong()
+                        if (delta > 0L) {
+                            val directionalColumn = if (reservation.direction == QuotaTrafficDirection.DOWNLOAD) {
+                                "download_bytes"
+                            } else {
+                                "upload_bytes"
+                            }
+                            db.execSQL(
+                                """
+                                UPDATE app_quota_policy
+                                SET used_bytes = CASE WHEN used_bytes > ? THEN used_bytes - ? ELSE 0 END,
+                                    $directionalColumn = CASE WHEN $directionalColumn > ? THEN $directionalColumn - ? ELSE 0 END,
+                                    updated_at = ?
+                                WHERE package_name = ? AND quota_type = ? AND period_start_millis = ?
+                                """.trimIndent(),
+                                arrayOf<Any>(
+                                    delta,
+                                    delta,
+                                    delta,
+                                    delta,
+                                    nowMillis,
+                                    reservation.packageName,
+                                    reservation.quotaType.name,
+                                    reservation.periodStartMillis,
+                                ),
+                            )
+                        }
+                    }
+                }
+
+                val placeholders = candidatePackages.joinToString(",") { "?" }
+                val sql = """
+                    SELECT package_name, quota_type, limit_bytes, period_start_millis, period_end_millis, used_bytes
+                    FROM app_quota_policy
+                    WHERE package_name IN ($placeholders)
+                """.trimIndent()
+                val stillExhausted = mutableSetOf<String>()
+                db.rawQuery(sql, candidatePackages.toTypedArray()).use { c ->
+                    while (c.moveToNext()) {
+                        val pkg = c.getString(0)
+                        val type = runCatching { QuotaType.valueOf(c.getString(1)) }.getOrNull() ?: continue
+                        val limit = c.getLong(2)
+                        val startMillis = c.getLong(3)
+                        val endMillis = c.getLong(4)
+                        val used = c.getLong(5)
+                        val currentPeriod = QuotaPeriod.current(type, nowMillis)
+                        val activeUsed = if (startMillis == currentPeriod.startMillis && endMillis == currentPeriod.endMillis) {
+                            used
+                        } else {
+                            0L
+                        }
+                        if (activeUsed >= limit) {
+                            stillExhausted.add(pkg)
+                        }
+                    }
+                }
+                db.setTransactionSuccessful()
+                stillExhausted
+            } finally {
+                db.endTransaction()
+            }
+        }
+    }
+
+    /**
+     * Marks a pending UDP reservation as durably committed by removing its journal entry
+     * from [app_quota_pending_reservation] once the datagram has been sent on the wire.
+     */
+    fun commitQuotaReservation(
+        context: Context,
+        decision: QuotaTrafficDecision,
+    ) {
+        val reservationIds = decision.reservations.mapNotNull { it.reservationId.takeIf { id -> id > 0L } }
+        if (reservationIds.isEmpty()) return
+        helper(context).use { h ->
+            val db = h.writableDatabase
+            h.createPendingReservationTable(db)
+            val idPlaceholders = reservationIds.joinToString(",") { "?" }
+            db.delete(
+                "app_quota_pending_reservation",
+                "reservation_id IN ($idPlaceholders)",
+                reservationIds.map { it.toString() }.toTypedArray(),
+            )
+        }
+    }
+
+    /**
+     * Resolves orphaned pending UDP reservation journal entries from a previous process
+     * instance that terminated between [reserveQuotaBytes] and [QuotaEnforcementEngine.settleRelayBytes].
+     *
+     * Fundamental crash-safety invariant:
+     * Because kernel socket transmission (DatagramChannel.write / DatagramSocket.send) and
+     * user-space SQLite commits are not mutually atomic, an orphaned reservation in
+     * [app_quota_pending_reservation] has an UNCERTAIN wire outcome — the datagram may have
+     * already been transmitted right before the process died. Rolling back used_bytes on
+     * process restart would undercount delivered UDP traffic and allow quota bypass.
+     *
+     * Therefore:
+     * 1. Oversized UDP datagrams (rawAllowed < requested) are rejected synchronously at
+     *    admission before any reservation is written.
+     * 2. Confirmed UDP send failures observed while the process is alive are rolled back
+     *    via [releaseQuotaReservation].
+     * 3. Orphaned reservations from a dead process are CONSERVATIVELY RETAINED in
+     *    [app_quota_policy.used_bytes], their stale journal rows are retired from
+     *    [app_quota_pending_reservation], and any package at or above its limit remains blocked.
+     */
+    fun recoverOrphanedUdpReservations(
+        context: Context,
+        activeProcessToken: String,
+        nowMillis: Long = System.currentTimeMillis(),
+    ): Pair<Set<String>, Set<String>> {
+        if (activeProcessToken.isBlank()) return emptySet<String>() to emptySet()
+        return helper(context).use { h ->
+            val db = h.writableDatabase
+            h.createPendingReservationTable(db)
+            db.beginTransaction()
+            try {
+                val affectedPackages = db.rawQuery(
+                    """
+                    SELECT DISTINCT package_name
+                    FROM app_quota_pending_reservation
+                    WHERE process_token != ?
+                    """.trimIndent(),
+                    arrayOf(activeProcessToken),
+                ).use { c ->
+                    buildSet {
+                        while (c.moveToNext()) {
+                            val pkg = c.getString(0)
+                            if (!pkg.isNullOrBlank()) add(pkg)
+                        }
+                    }
+                }
+
+                if (affectedPackages.isEmpty()) {
+                    db.setTransactionSuccessful()
+                    return@use emptySet<String>() to emptySet()
+                }
+
+                // Retire stale pending journal entries from the dead process without
+                // subtracting their bytes from app_quota_policy.used_bytes.
+                db.delete(
+                    "app_quota_pending_reservation",
+                    "process_token != ?",
+                    arrayOf(activeProcessToken),
+                )
+
+                val placeholders = affectedPackages.joinToString(",") { "?" }
+                val stillExhausted = mutableSetOf<String>()
+                db.rawQuery(
+                    """
+                    SELECT package_name, quota_type, limit_bytes, period_start_millis, period_end_millis, used_bytes
+                    FROM app_quota_policy
+                    WHERE package_name IN ($placeholders)
+                    """.trimIndent(),
+                    affectedPackages.toTypedArray(),
+                ).use { c ->
+                    while (c.moveToNext()) {
+                        val pkg = c.getString(0)
+                        val type = runCatching { QuotaType.valueOf(c.getString(1)) }.getOrNull() ?: continue
+                        val limit = c.getLong(2)
+                        val startMillis = c.getLong(3)
+                        val endMillis = c.getLong(4)
+                        val used = c.getLong(5)
+                        val currentPeriod = QuotaPeriod.current(type, nowMillis)
+                        val activeUsed = if (startMillis == currentPeriod.startMillis && endMillis == currentPeriod.endMillis) {
+                            used
+                        } else {
+                            0L
+                        }
+                        if (activeUsed >= limit) {
+                            stillExhausted.add(pkg)
+                        }
+                    }
+                }
+
+                db.setTransactionSuccessful()
+                affectedPackages to stillExhausted
+            } finally {
+                db.endTransaction()
             }
         }
     }
@@ -366,6 +908,60 @@ internal object UsageRepository {
         }
     }
 
+    /**
+     * Batches all daily usage and app_policy rows for a collection cycle into a single
+     * SQLite connection and transaction, avoiding hundreds of per-app open/commit/close
+     * cycles while preserving higher previously-recorded live relay counters.
+     */
+    fun upsertDailyUsageBatch(context: Context, rows: List<DailyUsageRow>) {
+        if (rows.isEmpty()) return
+        val nowMillis = System.currentTimeMillis()
+        helper(context).use { h ->
+            val db = h.writableDatabase
+            db.beginTransaction()
+            try {
+                val dates = rows.map { it.date }.distinct()
+                val existingByKey = HashMap<String, Pair<Long, Long>>()
+                if (dates.isNotEmpty()) {
+                    val placeholders = dates.joinToString(",") { "?" }
+                    db.rawQuery(
+                        "SELECT date, package_name, download_bytes, upload_bytes FROM daily_usage WHERE date IN ($placeholders)",
+                        dates.toTypedArray(),
+                    ).use { c ->
+                        while (c.moveToNext()) {
+                            existingByKey["${c.getString(0)}|${c.getString(1)}"] =
+                                c.getLong(2) to c.getLong(3)
+                        }
+                    }
+                }
+                rows.forEach { row ->
+                    val existing = existingByKey["${row.date}|${row.packageName}"]
+                    val download = maxOf(row.downloadBytes.coerceAtLeast(0L), existing?.first ?: 0L)
+                    val upload = maxOf(row.uploadBytes.coerceAtLeast(0L), existing?.second ?: 0L)
+                    val usageValues = ContentValues().apply {
+                        put("date", row.date)
+                        put("package_name", row.packageName)
+                        put("label", row.label)
+                        put("uid", row.uid)
+                        put("download_bytes", download)
+                        put("upload_bytes", upload)
+                        put("updated_at", nowMillis)
+                    }
+                    db.insertWithOnConflict("daily_usage", null, usageValues, SQLiteDatabase.CONFLICT_REPLACE)
+                    val appValues = ContentValues().apply {
+                        put("package_name", row.packageName)
+                        put("label", row.label)
+                        put("uid", row.uid)
+                    }
+                    db.insertWithOnConflict("app_policy", null, appValues, SQLiteDatabase.CONFLICT_IGNORE)
+                }
+                db.setTransactionSuccessful()
+            } finally {
+                db.endTransaction()
+            }
+        }
+    }
+
     fun topUsage(context: Context, date: String, limit: Int = 20): List<DailyUsageRow> {
         helper(context).use { h ->
             return h.readableDatabase.query(
@@ -376,7 +972,7 @@ internal object UsageRepository {
                 null,
                 null,
                 "(download_bytes + upload_bytes) DESC",
-                limit.coerceIn(1, 100).toString(),
+                limit.coerceIn(1, 500).toString(),
             ).use { c ->
                 buildList {
                     while (c.moveToNext()) {
@@ -413,6 +1009,65 @@ internal object UsageRepository {
         }
     }
 
+    fun sumDirectionalUsageInPeriod(
+        context: Context,
+        packageName: String,
+        startDate: String,
+        endDate: String,
+    ): UidTrafficCounters {
+        helper(context).use { h ->
+            return h.readableDatabase.query(
+                "daily_usage",
+                arrayOf("SUM(download_bytes)", "SUM(upload_bytes)"),
+                "package_name = ? AND date >= ? AND date <= ?",
+                arrayOf(packageName, startDate, endDate),
+                null,
+                null,
+                null,
+            ).use { c ->
+                if (c.moveToFirst()) {
+                    UidTrafficCounters(
+                        downloadBytes = if (c.isNull(0)) 0L else c.getLong(0),
+                        uploadBytes = if (c.isNull(1)) 0L else c.getLong(1),
+                    )
+                } else {
+                    UidTrafficCounters(0L, 0L)
+                }
+            }
+        }
+    }
+
+    /** Compare-and-set so a one-shot baseline is never applied twice to a concurrent relay. */
+    fun initializeQuotaBaseline(
+        context: Context,
+        policy: AppQuotaPolicy,
+        counters: UidTrafficCounters,
+        minimumUsedBytes: Long = 0L,
+        nowMillis: Long = System.currentTimeMillis(),
+    ): Boolean {
+        if (policy.baselineInitialized) return false
+        helper(context).use { h ->
+            return h.writableDatabase.update(
+                "app_quota_policy",
+                ContentValues().apply {
+                    put("used_bytes", maxOf(counters.totalBytes, minimumUsedBytes))
+                    put("download_bytes", counters.downloadBytes)
+                    put("upload_bytes", counters.uploadBytes)
+                    put("baseline_initialized", 1)
+                    put("updated_at", nowMillis)
+                },
+                "package_name = ? AND quota_type = ? AND period_start_millis = ? " +
+                    "AND period_end_millis = ? AND baseline_initialized = 0",
+                arrayOf(
+                    policy.packageName,
+                    policy.quotaType.name,
+                    policy.periodStartMillis.toString(),
+                    policy.periodEndMillis.toString(),
+                ),
+            ) == 1
+        }
+    }
+
     fun sumUsageInPeriod(
         context: Context,
         packageName: String,
@@ -429,6 +1084,314 @@ internal object UsageRepository {
                 null,
                 null,
             ).use { c -> if (c.moveToFirst() && !c.isNull(0)) c.getLong(0) else 0L }
+        }
+    }
+
+    /**
+     * Persists or updates a speed-plan usage session row idempotently inside a transaction.
+     * Monotonic byte counters and terminal statuses (`COMPLETED`, `ABNORMAL_END`) are preserved
+     * against out-of-order background checkpoints so retries never lose data or reopen a closed row.
+     */
+    fun upsertSpeedPlanUsageSession(context: Context, record: SpeedPlanUsageRecord) {
+        speedPlanDbWriteCount.incrementAndGet()
+        helper(context).use { h ->
+            val db = h.writableDatabase
+            h.createSpeedPlanUsageSessionTable(db)
+            db.beginTransaction()
+            try {
+                var existingDown = 0L
+                var existingUp = 0L
+                var existingCheckpoint = record.startedAtMillis
+                var existingEnded: Long? = null
+                var existingStatus: SpeedPlanRecordStatus? = null
+                var existingReason: String? = null
+                var existingPeakDown = 0L
+                var existingPeakUp = 0L
+                var existingExceeded = false
+                var existingMaxPct = 0.0
+                var existingExcDur = 0L
+
+                db.query(
+                    "speed_plan_usage_session",
+                    arrayOf(
+                        "download_bytes",
+                        "upload_bytes",
+                        "last_checkpoint_millis",
+                        "ended_at_millis",
+                        "status",
+                        "close_reason",
+                        "peak_download_bps",
+                        "peak_upload_bps",
+                        "limit_exceeded",
+                        "max_exceedance_pct",
+                        "exceedance_duration_millis",
+                    ),
+                    "session_id = ?",
+                    arrayOf(record.sessionId),
+                    null,
+                    null,
+                    null,
+                ).use { c ->
+                    if (c.moveToFirst()) {
+                        existingDown = c.getLong(0)
+                        existingUp = c.getLong(1)
+                        existingCheckpoint = c.getLong(2)
+                        existingEnded = if (c.isNull(3)) null else c.getLong(3)
+                        existingStatus = SpeedPlanRecordStatus.fromDb(c.getString(4))
+                        existingReason = c.getString(5)
+                        existingPeakDown = c.getLong(6)
+                        existingPeakUp = c.getLong(7)
+                        existingExceeded = c.getInt(8) != 0
+                        existingMaxPct = c.getDouble(9)
+                        existingExcDur = c.getLong(10)
+                    }
+                }
+
+                val mergedDown = maxOf(existingDown, record.downloadBytes.coerceAtLeast(0L))
+                val mergedUp = maxOf(existingUp, record.uploadBytes.coerceAtLeast(0L))
+                val mergedTotal = if (Long.MAX_VALUE - mergedDown < mergedUp) Long.MAX_VALUE else mergedDown + mergedUp
+
+                val keepExistingTerminal = existingStatus != null &&
+                    existingStatus != SpeedPlanRecordStatus.ONGOING &&
+                    record.status == SpeedPlanRecordStatus.ONGOING
+
+                val finalStatus = if (keepExistingTerminal) existingStatus!! else record.status
+                val finalReason = if (keepExistingTerminal) existingReason.orEmpty() else record.closeReason
+                val finalEnded = if (keepExistingTerminal) existingEnded else record.endedAtMillis
+                val finalCheckpoint = maxOf(
+                    record.startedAtMillis,
+                    existingCheckpoint,
+                    record.lastCheckpointMillis,
+                    finalEnded ?: 0L,
+                )
+                val finalDuration = ((finalEnded ?: finalCheckpoint) - record.startedAtMillis).coerceAtLeast(0L)
+                val finalAvgDown = if (finalDuration > 0L) {
+                    ((mergedDown.toDouble() * 8_000.0) / finalDuration.toDouble()).toLong().coerceAtLeast(0L)
+                } else {
+                    record.avgDownloadBps.coerceAtLeast(0L)
+                }
+                val finalAvgUp = if (finalDuration > 0L) {
+                    ((mergedUp.toDouble() * 8_000.0) / finalDuration.toDouble()).toLong().coerceAtLeast(0L)
+                } else {
+                    record.avgUploadBps.coerceAtLeast(0L)
+                }
+                val finalPeakDown = maxOf(existingPeakDown, record.peakDownloadBps, finalAvgDown)
+                val finalPeakUp = maxOf(existingPeakUp, record.peakUploadBps, finalAvgUp)
+                val finalExceeded = existingExceeded || record.limitExceeded
+                val finalMaxPct = if (finalExceeded) maxOf(existingMaxPct, record.maxExceedancePct) else 0.0
+                val finalExcDur = if (finalExceeded) maxOf(existingExcDur, record.exceedanceDurationMillis) else 0L
+
+                val values = ContentValues().apply {
+                    put("session_id", record.sessionId)
+                    put("vpn_generation", record.vpnGeneration)
+                    put("segment_index", record.segmentIndex)
+                    put("process_token", record.processToken)
+                    put("started_at_millis", record.startedAtMillis)
+                    if (finalEnded == null) putNull("ended_at_millis") else put("ended_at_millis", finalEnded)
+                    put("last_checkpoint_millis", finalCheckpoint)
+                    put("duration_millis", finalDuration)
+                    put("plan_option_category", record.planOptionCategory.dbValue)
+                    put("plan_option_label", record.planOptionLabel)
+                    if (record.downloadLimitKbps == null) putNull("download_limit_kbps") else put("download_limit_kbps", record.downloadLimitKbps)
+                    if (record.uploadLimitKbps == null) putNull("upload_limit_kbps") else put("upload_limit_kbps", record.uploadLimitKbps)
+                    put("download_limit_unit_label", record.downloadLimitUnitLabel)
+                    put("upload_limit_unit_label", record.uploadLimitUnitLabel)
+                    put("download_bytes", mergedDown)
+                    put("upload_bytes", mergedUp)
+                    put("total_bytes", mergedTotal)
+                    put("avg_download_bps", finalAvgDown)
+                    put("avg_upload_bps", finalAvgUp)
+                    put("peak_download_bps", finalPeakDown)
+                    put("peak_upload_bps", finalPeakUp)
+                    put("status", finalStatus.dbValue)
+                    put("close_reason", finalReason)
+                    put("limit_exceeded", if (finalExceeded) 1 else 0)
+                    put("max_exceedance_pct", finalMaxPct)
+                    put("exceedance_duration_millis", finalExcDur)
+                }
+                db.insertWithOnConflict(
+                    "speed_plan_usage_session",
+                    null,
+                    values,
+                    SQLiteDatabase.CONFLICT_REPLACE,
+                )
+                db.setTransactionSuccessful()
+            } finally {
+                db.endTransaction()
+            }
+        }
+    }
+
+    /**
+     * Marks any `ONGOING` speed-plan session rows left behind by a terminated process instance
+     * as `ABNORMAL_END` while retaining their last checkpointed byte counts and duration.
+     */
+    fun recoverOrphanedSpeedPlanSessions(
+        context: Context,
+        activeProcessToken: String,
+        nowMillis: Long = System.currentTimeMillis(),
+    ): Int {
+        if (activeProcessToken.isBlank()) return 0
+        val dbFile = runCatching { context.getDatabasePath(USAGE_DB_NAME) }.getOrNull()
+        if (dbFile != null && !dbFile.exists()) return 0
+        return helper(context).use { h ->
+            val db = h.writableDatabase
+            h.createSpeedPlanUsageSessionTable(db)
+            db.beginTransaction()
+            try {
+                data class OrphanRow(
+                    val sessionId: String,
+                    val startedAtMillis: Long,
+                    val lastCheckpointMillis: Long,
+                    val downloadBytes: Long,
+                    val uploadBytes: Long,
+                )
+                val orphans = db.query(
+                    "speed_plan_usage_session",
+                    arrayOf("session_id", "started_at_millis", "last_checkpoint_millis", "download_bytes", "upload_bytes"),
+                    "status = 'ONGOING' AND process_token != ?",
+                    arrayOf(activeProcessToken),
+                    null,
+                    null,
+                    null,
+                ).use { c ->
+                    buildList {
+                        while (c.moveToNext()) {
+                            add(
+                                OrphanRow(
+                                    sessionId = c.getString(0),
+                                    startedAtMillis = c.getLong(1),
+                                    lastCheckpointMillis = c.getLong(2),
+                                    downloadBytes = c.getLong(3),
+                                    uploadBytes = c.getLong(4),
+                                ),
+                            )
+                        }
+                    }
+                }
+                orphans.forEach { orphan ->
+                    val endedAt = maxOf(orphan.startedAtMillis, orphan.lastCheckpointMillis.takeIf { it > 0L } ?: nowMillis)
+                    val duration = (endedAt - orphan.startedAtMillis).coerceAtLeast(0L)
+                    val avgDown = if (duration > 0L) ((orphan.downloadBytes.toDouble() * 8_000.0) / duration.toDouble()).toLong() else 0L
+                    val avgUp = if (duration > 0L) ((orphan.uploadBytes.toDouble() * 8_000.0) / duration.toDouble()).toLong() else 0L
+                    db.update(
+                        "speed_plan_usage_session",
+                        ContentValues().apply {
+                            put("ended_at_millis", endedAt)
+                            put("last_checkpoint_millis", endedAt)
+                            put("duration_millis", duration)
+                            put("avg_download_bps", avgDown.coerceAtLeast(0L))
+                            put("avg_upload_bps", avgUp.coerceAtLeast(0L))
+                            put("status", SpeedPlanRecordStatus.ABNORMAL_END.dbValue)
+                            put("close_reason", "PROCESS_KILLED_OR_REBOOTED")
+                        },
+                        "session_id = ?",
+                        arrayOf(orphan.sessionId),
+                    )
+                }
+                db.setTransactionSuccessful()
+                orphans.size
+            } finally {
+                db.endTransaction()
+            }
+        }
+    }
+
+    fun readSpeedPlanUsageSessions(context: Context, limit: Int = 50): List<SpeedPlanUsageRecord> =
+        querySpeedPlanUsageSessions(
+            context = context,
+            orderBy = "started_at_millis DESC, vpn_generation DESC, segment_index DESC",
+            limit = limit.coerceIn(1, 5_000).toString(),
+        )
+
+    fun readAllSpeedPlanUsageSessions(context: Context): List<SpeedPlanUsageRecord> =
+        querySpeedPlanUsageSessions(
+            context = context,
+            orderBy = "started_at_millis ASC, vpn_generation ASC, segment_index ASC",
+            limit = null,
+        )
+
+    private fun querySpeedPlanUsageSessions(
+        context: Context,
+        orderBy: String,
+        limit: String?,
+    ): List<SpeedPlanUsageRecord> {
+        speedPlanDbReadCount.incrementAndGet()
+        helper(context).use { h ->
+            val db = h.writableDatabase
+            h.createSpeedPlanUsageSessionTable(db)
+            return db.query(
+                "speed_plan_usage_session",
+                arrayOf(
+                    "session_id",
+                    "vpn_generation",
+                    "segment_index",
+                    "process_token",
+                    "started_at_millis",
+                    "ended_at_millis",
+                    "last_checkpoint_millis",
+                    "duration_millis",
+                    "plan_option_category",
+                    "plan_option_label",
+                    "download_limit_kbps",
+                    "upload_limit_kbps",
+                    "download_limit_unit_label",
+                    "upload_limit_unit_label",
+                    "download_bytes",
+                    "upload_bytes",
+                    "total_bytes",
+                    "avg_download_bps",
+                    "avg_upload_bps",
+                    "peak_download_bps",
+                    "peak_upload_bps",
+                    "status",
+                    "close_reason",
+                    "limit_exceeded",
+                    "max_exceedance_pct",
+                    "exceedance_duration_millis",
+                ),
+                null,
+                null,
+                null,
+                null,
+                orderBy,
+                limit,
+            ).use { c ->
+                buildList {
+                    while (c.moveToNext()) {
+                        add(
+                            SpeedPlanUsageRecord(
+                                sessionId = c.getString(0),
+                                vpnGeneration = c.getLong(1),
+                                segmentIndex = c.getInt(2),
+                                processToken = c.getString(3),
+                                startedAtMillis = c.getLong(4),
+                                endedAtMillis = if (c.isNull(5)) null else c.getLong(5),
+                                lastCheckpointMillis = c.getLong(6),
+                                durationMillis = c.getLong(7),
+                                planOptionCategory = SpeedPlanOptionCategory.fromDb(c.getString(8)),
+                                planOptionLabel = c.getString(9),
+                                downloadLimitKbps = if (c.isNull(10)) null else c.getLong(10),
+                                uploadLimitKbps = if (c.isNull(11)) null else c.getLong(11),
+                                downloadLimitUnitLabel = c.getString(12),
+                                uploadLimitUnitLabel = c.getString(13),
+                                downloadBytes = c.getLong(14),
+                                uploadBytes = c.getLong(15),
+                                totalBytes = c.getLong(16),
+                                avgDownloadBps = c.getLong(17),
+                                avgUploadBps = c.getLong(18),
+                                peakDownloadBps = c.getLong(19),
+                                peakUploadBps = c.getLong(20),
+                                status = SpeedPlanRecordStatus.fromDb(c.getString(21)),
+                                closeReason = c.getString(22),
+                                limitExceeded = c.getInt(23) != 0,
+                                maxExceedancePct = c.getDouble(24),
+                                exceedanceDurationMillis = c.getLong(25),
+                            ),
+                        )
+                    }
+                }
+            }
         }
     }
 }

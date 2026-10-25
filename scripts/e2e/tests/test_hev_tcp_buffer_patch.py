@@ -7,9 +7,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from patch_hev_tcp_buffers import (
     PatchError,
+    SOCKS5_CLIENT_AUTH_UNPATCHED_METHODS,
+    SOCKS5_CLIENT_HANDSHAKE_UNPATCHED,
     check_lwip_options_content,
+    check_socks5_client_content,
     check_tcp_session_content,
     patch_lwip_options_content,
+    patch_socks5_client_content,
     patch_tcp_session_content,
 )
 
@@ -159,6 +163,28 @@ class HevTcpBufferPatchTests(unittest.TestCase):
     def test_verification_rejects_unpatched_config(self) -> None:
         with self.assertRaises(PatchError):
             check_lwip_options_content(BASELINE)
+
+    def test_socks5_client_msg_more_patch_and_idempotence(self) -> None:
+        baseline_client = (
+            SOCKS5_CLIENT_AUTH_UNPATCHED_METHODS
+            + "\n\n"
+            + SOCKS5_CLIENT_HANDSHAKE_UNPATCHED
+            + "\n"
+        )
+        with self.assertRaises(PatchError):
+            check_socks5_client_content(baseline_client)
+
+        patched, changed = patch_socks5_client_content(baseline_client)
+        self.assertTrue(changed)
+        check_socks5_client_content(patched)
+
+        patched_again, changed_again = patch_socks5_client_content(patched)
+        self.assertFalse(changed_again)
+        self.assertEqual(patched, patched_again)
+
+        broken = baseline_client.replace("MSG_WAITALL | MSG_MORE", "0", 1)
+        with self.assertRaises(PatchError):
+            patch_socks5_client_content(broken)
 
 
 if __name__ == "__main__":

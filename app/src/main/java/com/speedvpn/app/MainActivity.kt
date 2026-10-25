@@ -2,6 +2,7 @@ package com.speedvpn.app
 
 import android.Manifest
 import android.content.Context
+import android.content.Intent
 import android.graphics.Paint
 import android.net.VpnService
 import android.os.Build
@@ -87,8 +88,8 @@ private val TextPrimary = Color(0xFFF3F7FF)
 private val TextSecondary = Color(0xFF95A6C3)
 
 class MainActivity : ComponentActivity() {
-    // UI speeds are expressed as KB/s and converted to the backend's Kbps representation.
-    private fun kbpsFromKBps(value: Long): Long = value.coerceAtLeast(1L) * 8L
+    // UI speeds are expressed as KB/s; share the overflow-safe conversion with unit tests.
+    private fun kbpsFromKBps(value: Long): Long = SpeedLimiter.kilobytesPerSecondToKbps(value)
     private val slowPresets = listOf(
         "10 KB" to kbpsFromKBps(10),
         "25 KB" to kbpsFromKBps(25),
@@ -124,6 +125,20 @@ class MainActivity : ComponentActivity() {
     // Refresh the installed-app catalog whenever the Activity resumes.
     private val appCatalogRefreshTrigger = mutableStateOf(0)
     private val showVpnDisclosure = mutableStateOf(false)
+    private val exportExcelBusyState = mutableStateOf(false)
+    private val exportExcelStatusState = mutableStateOf<String?>(null)
+    private val exportExcelErrorState = mutableStateOf(false)
+    private val createExcelDocument = registerForActivityResult(
+        ActivityResultContracts.CreateDocument(SpeedHistoryExcelExporter.XLSX_MIME_TYPE),
+    ) { uri ->
+        if (uri == null) {
+            exportExcelBusyState.value = false
+            exportExcelErrorState.value = false
+            exportExcelStatusState.value = "تم إلغاء عملية تصدير سجل السرعات."
+            return@registerForActivityResult
+        }
+        exportSpeedHistoryToUri(uri)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -169,6 +184,147 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+        handleE2eIntent(getIntent())
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleE2eIntent(intent)
+    }
+
+    /**
+     * Debug-only E2E controls. The emulator workflow uses separate-UID fixture APKs.
+     * These commands are inert in Release builds.
+     */
+    private fun handleE2eIntent(command: Intent?) {
+        if (!BuildConfig.DEBUG || command == null) return
+        val action = command.getStringExtra("e2e_action")?.trim().orEmpty()
+        if (action.isBlank()) return
+        val eventId = command.getStringExtra("e2e_id").orEmpty().ifBlank { action }
+        val pkg = command.getStringExtra("e2e_package").orEmpty()
+        val enabled = command.getBooleanExtra("e2e_enabled", false)
+        val bytes = command.getLongExtra("e2e_bytes", 0L)
+        val appContext = applicationContext
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                when (action) {
+                    "manual_block" -> {
+                        require(pkg.isNotBlank())
+                        val info = packageManager.getApplicationInfo(pkg, 0)
+                        // Individual package blocks must work even when the optional global
+                        // firewall preference is off. Do not silently force that preference on.
+                        VpnAppControl.setBlocked(appContext, pkg, enabled)
+                        UsageRepository.setBlocked(
+                            appContext, pkg, info.loadLabel(packageManager).toString(), info.uid, enabled,
+                        )
+                    }
+                    "set_quota" -> {
+                        require(pkg.isNotBlank())
+                        val info = packageManager.getApplicationInfo(pkg, 0)
+                        VpnAppControl.setQuotaBlocked(appContext, pkg, false)
+                        UsageRepository.setDailyLimitBytes(
+                            appContext, pkg, info.loadLabel(packageManager).toString(), info.uid,
+                            bytes.takeIf { it > 0L },
+                        )
+                    }
+                    "reset_policy" -> {
+                        require(pkg.isNotBlank())
+                        val info = packageManager.getApplicationInfo(pkg, 0)
+                        VpnAppControl.setBlocked(appContext, pkg, false)
+                        VpnAppControl.setQuotaBlocked(appContext, pkg, false)
+                        UsageRepository.readQuotaPolicies(appContext, pkg).forEach { policy ->
+                            UsageRepository.deleteQuotaPolicy(appContext, pkg, policy.quotaType)
+                        }
+                        UsageRepository.setDailyLimitBytes(
+                            appContext, pkg, info.loadLabel(packageManager).toString(), info.uid, null,
+                        )
+                        // Start the E2E policy scenario with the optional global preference off.
+                        // The following probe proves that per-app blocking works independently.
+                        VpnAppControl.save(
+                            appContext,
+                            VpnAppControlSettings(
+                                firewallEnabled = false,
+                                blockedPackages = VpnAppControl.read(appContext).blockedPackages - pkg,
+                            ),
+                        )
+                    }
+                    "connect" -> SpeedVpnService.start(appContext)
+                    "restart" -> {
+                        SpeedVpnService.stop(appContext)
+                        if (!waitForE2eTunnel(connected = false)) {
+                            throw IllegalStateException("VPN did not stop before restart")
+                        }
+                        SpeedVpnService.start(appContext)
+                    }
+                    "set_stats_enabled" -> {
+                        SmartSettings.setStatsEnabled(appContext, enabled)
+                    }
+                    "set_speed_limits" -> {
+                        val dl = command.getLongExtra("e2e_download_kbps", -1L).takeIf { it > 0L }
+                        val ul = command.getLongExtra("e2e_upload_kbps", -1L).takeIf { it > 0L }
+                        SpeedLimiter.setLimitsKbps(dl, ul) {
+                            SpeedLimitStore.stageDownload(appContext, dl)
+                            SpeedLimitStore.stageUpload(appContext, ul)
+                        }
+                        SpeedLimitStore.save(appContext, dl, ul)
+                    }
+                    "export_speed_history_xlsx" -> {
+                        val outFile = java.io.File(appContext.cacheDir, "e2e_speed_history.xlsx")
+                        SpeedPlanUsageTracker.flushActiveSegment(appContext)
+                        val records = UsageRepository.readAllSpeedPlanUsageSessions(appContext)
+                        val res = SpeedHistoryExcelExporter.exportToFile(outFile, records)
+                        if (res is SpeedHistoryExportResult.Failure) {
+                            throw IllegalStateException(res.userMessage)
+                        }
+                    }
+                    "status" -> Unit
+                    else -> throw IllegalArgumentException("Unknown E2E action: $action")
+                }
+
+                val expectsConnected = action == "connect" || action == "restart"
+                val tunnelReady = if (expectsConnected) waitForE2eTunnel(connected = true) else true
+                val state = VpnRuntime.state.value
+                val settings = VpnAppControl.read(appContext)
+                val effectiveBlocked = pkg.isNotBlank() && pkg in settings.blockedPackages
+                val quotaBlocked = pkg.isNotBlank() && pkg in VpnAppControl.quotaBlockedPackages(appContext)
+                val quotaSummary = if (pkg.isBlank()) "none" else {
+                    UsageRepository.readQuotaPolicies(appContext, pkg).joinToString(",") {
+                        "${it.quotaType}:${it.limitBytes}:${it.usedBytes}"
+                    }.ifBlank { "none" }
+                }
+                val passed = tunnelReady && (!expectsConnected || state.status == VpnStatus.CONNECTED)
+                android.util.Log.i(
+                    "SpeedVPN-E2E",
+                    "E2E_CONTROL id=$eventId action=$action package=$pkg result=${if (passed) "PASS" else "FAIL"} " +
+                        "vpn=${state.status} firewall=${settings.firewallEnabled} " +
+                        "effectiveBlocked=$effectiveBlocked quotaBlocked=$quotaBlocked quota=$quotaSummary",
+                )
+            } catch (error: Exception) {
+                android.util.Log.e(
+                    "SpeedVPN-E2E",
+                    "E2E_CONTROL id=$eventId action=$action package=$pkg result=FAIL error=${error.message}",
+                    error,
+                )
+            }
+        }
+    }
+
+    private suspend fun waitForE2eTunnel(connected: Boolean, timeoutMs: Long = 30_000L): Boolean {
+        val deadline = android.os.SystemClock.elapsedRealtime() + timeoutMs
+        while (android.os.SystemClock.elapsedRealtime() < deadline) {
+            val state = VpnRuntime.state.value.status
+            val matches = if (connected) {
+                state == VpnStatus.CONNECTED
+            } else {
+                state in setOf(VpnStatus.DISCONNECTED, VpnStatus.ERROR) &&
+                    SpeedVpnService.isNativeTunnelStopped()
+            }
+            if (matches) return true
+            delay(250L)
+        }
+        return false
     }
 
     override fun onResume() {
@@ -178,10 +334,23 @@ class MainActivity : ComponentActivity() {
         VpnRuntime.update { it.copy(permissionGranted = VpnService.prepare(this) == null) }
     }
 
-    private fun loadLocalLimits() = SpeedLimitStore.applyToLimiter(this)
+    private fun loadLocalLimits() = SpeedLimitStore.restoreToLimiterIfUninitialized(this)
 
     private val settingsWriteMutex = Mutex()
     private val appControlWriteGeneration = AtomicLong(0L)
+    private val limitWriteGeneration = AtomicLong(0L)
+
+    // Keep speed-test and verification UI state across tab navigation and recomposition
+    // so switching tabs cannot reset busy flags or launch overlapping runs.
+    private val speedTestBusyState = mutableStateOf(false)
+    private val speedTestProgressState = mutableStateOf<String?>(null)
+    private val lastSpeedTestState = mutableStateOf<SpeedTestResult?>(null)
+    private val preflightBusyState = mutableStateOf(false)
+    private val preflightProgressState = mutableStateOf<String?>(null)
+    private val lastPreflightState = mutableStateOf<SpeedTestResult?>(null)
+    private val verifyBusyState = mutableStateOf(false)
+    private val verifyProgressState = mutableStateOf<String?>(null)
+    private val lastVerificationState = mutableStateOf<SpeedVerificationResult?>(null)
 
     private fun saveAppControlSettings(settings: VpnAppControlSettings) {
         val generation = appControlWriteGeneration.incrementAndGet()
@@ -205,23 +374,99 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun saveLocalLimit(download: Boolean, kbps: Long?) {
-        if (SpeedLimiter.verificationInProgress.value) return
+        if (SpeedLimiter.verificationInProgress.value ||
+            verifyBusyState.value ||
+            speedTestBusyState.value ||
+            preflightBusyState.value
+        ) {
+            return
+        }
+        val applied = if (download) {
+            SpeedLimiter.setDownloadKbps(kbps) {
+                SpeedLimitStore.stageDownload(this, kbps)
+            }
+        } else {
+            SpeedLimiter.setUploadKbps(kbps) {
+                SpeedLimitStore.stageUpload(this, kbps)
+            }
+        }
+        if (!applied) return
+        val generation = limitWriteGeneration.incrementAndGet()
         // SharedPreferences.commit() is synchronous. Keep disk I/O off the main
         // thread while serializing writes so rapid slider changes cannot reorder
-        // the persisted value.
+        // the persisted value or overwrite a newer verification/remote state.
         lifecycleScope.launch(Dispatchers.IO) {
             settingsWriteMutex.withLock {
-                if (download) {
-                    SpeedLimitStore.saveDownload(this@MainActivity, kbps)
-                } else {
-                    SpeedLimitStore.saveUpload(this@MainActivity, kbps)
+                if (SpeedLimiter.verificationInProgress.value) return@withLock
+                val (stagedDownload, stagedUpload) = SpeedLimitStore.load(this@MainActivity)
+                if (generation == limitWriteGeneration.get()) {
+                    if (download) {
+                        SpeedLimitStore.saveDownload(this@MainActivity, stagedDownload)
+                    } else {
+                        SpeedLimitStore.saveUpload(this@MainActivity, stagedUpload)
+                    }
                 }
             }
         }
-        if (download) {
-            SpeedLimiter.setDownloadKbps(kbps)
-        } else {
-            SpeedLimiter.setUploadKbps(kbps)
+    }
+
+    private fun saveLocalLimitsBoth(downloadKbps: Long?, uploadKbps: Long?) {
+        if (SpeedLimiter.verificationInProgress.value ||
+            verifyBusyState.value ||
+            speedTestBusyState.value ||
+            preflightBusyState.value
+        ) {
+            return
+        }
+        val applied = SpeedLimiter.setLimitsKbps(downloadKbps, uploadKbps) {
+            SpeedLimitStore.stageDownload(this, downloadKbps)
+            SpeedLimitStore.stageUpload(this, uploadKbps)
+        }
+        if (!applied) return
+        val generation = limitWriteGeneration.incrementAndGet()
+        lifecycleScope.launch(Dispatchers.IO) {
+            settingsWriteMutex.withLock {
+                if (SpeedLimiter.verificationInProgress.value) return@withLock
+                val (stagedDownload, stagedUpload) = SpeedLimitStore.load(this@MainActivity)
+                if (generation == limitWriteGeneration.get()) {
+                    SpeedLimitStore.save(this@MainActivity, stagedDownload, stagedUpload)
+                }
+            }
+        }
+    }
+
+    private fun launchSpeedHistoryExcelExport() {
+        if (exportExcelBusyState.value) return
+        exportExcelStatusState.value = null
+        exportExcelErrorState.value = false
+        try {
+            createExcelDocument.launch(SpeedHistoryExcelExporter.suggestedFileName())
+        } catch (error: Exception) {
+            exportExcelBusyState.value = false
+            exportExcelErrorState.value = true
+            exportExcelStatusState.value = "تعذر فتح منتقي حفظ الملفات: ${error.message ?: error.javaClass.simpleName}"
+        }
+    }
+
+    private fun exportSpeedHistoryToUri(uri: android.net.Uri) {
+        exportExcelBusyState.value = true
+        exportExcelStatusState.value = "جاري إنشاء ملف Excel (.xlsx)…"
+        exportExcelErrorState.value = false
+        lifecycleScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                SpeedHistoryExcelExporter.exportToUri(this@MainActivity, uri)
+            }
+            exportExcelBusyState.value = false
+            when (result) {
+                is SpeedHistoryExportResult.Success -> {
+                    exportExcelErrorState.value = false
+                    exportExcelStatusState.value = result.message
+                }
+                is SpeedHistoryExportResult.Failure -> {
+                    exportExcelErrorState.value = true
+                    exportExcelStatusState.value = result.userMessage
+                }
+            }
         }
     }
 
@@ -250,10 +495,14 @@ class MainActivity : ComponentActivity() {
     private fun SpeedVpnApp(signedIn: Boolean, onLink: () -> Unit, onSignOut: () -> Unit) {
         val s by VpnRuntime.state.collectAsStateWithLifecycle()
         val verificationInProgress by SpeedLimiter.verificationInProgress.collectAsStateWithLifecycle()
+        val speedActionBusy = verificationInProgress ||
+            verifyBusyState.value ||
+            speedTestBusyState.value ||
+            preflightBusyState.value
         var tab by remember { mutableStateOf(0) }
         Scaffold(
             containerColor = Bg,
-            bottomBar = { BottomBar(tab, enabled = !verificationInProgress, onTab = { tab = it }) },
+            bottomBar = { BottomBar(tab, enabled = !speedActionBusy, onTab = { tab = it }) },
         ) { padding ->
             if (showVpnDisclosure.value) {
                 AlertDialog(
@@ -281,10 +530,19 @@ class MainActivity : ComponentActivity() {
             }
             Box(Modifier.fillMaxSize().padding(padding)) {
                 when (tab) {
-                    0 -> HomeScreen(signedIn, s) { requestVpnPermission() }
+                    0 -> HomeScreen(
+                        signedIn = signedIn,
+                        s = s,
+                        onOpenSpeedTab = { if (!speedActionBusy) tab = 1 },
+                        requestPermission = { requestVpnPermission() },
+                    )
                     1 -> SpeedScreen(s, verificationInProgress)
                     2 -> AppsScreen(s)
-                    3 -> SmartScreen(s, verificationInProgress)
+                    3 -> SmartScreen(
+                        s = s,
+                        verificationInProgress = verificationInProgress,
+                        onOpenSettingsTab = { if (!speedActionBusy) tab = 4 },
+                    )
                     else -> SettingsScreen(s, signedIn, onLink, onSignOut)
                 }
             }
@@ -292,7 +550,12 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun HomeScreen(signedIn: Boolean, s: Snapshot, requestPermission: () -> Unit) {
+    private fun HomeScreen(
+        signedIn: Boolean,
+        s: Snapshot,
+        onOpenSpeedTab: () -> Unit = {},
+        requestPermission: () -> Unit,
+    ) {
         Column(
             Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 18.dp, vertical = 16.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp),
@@ -302,7 +565,7 @@ class MainActivity : ComponentActivity() {
             StatusHero(s, requestPermission)
             LiveTraffic(s)
             SessionTrafficCard(s)
-            QuickSpeedCard(s)
+            QuickSpeedCard(s, onOpenSpeedTab)
             CompactNetworkCard()
             Text(
                 "اتصال محلي • تحكم كامل بالسرعة • بدون خادم VPN خارجي",
@@ -318,16 +581,57 @@ class MainActivity : ComponentActivity() {
     @OptIn(ExperimentalComposeUiApi::class)
     @Composable
     private fun SpeedScreen(s: Snapshot, verificationInProgress: Boolean) {
-        var testBusy by remember { mutableStateOf(false) }
-        var testProgress by remember { mutableStateOf<String?>(null) }
-        var lastTest by remember { mutableStateOf<SpeedTestResult?>(null) }
-        var preflightBusy by remember { mutableStateOf(false) }
-        var preflightProgress by remember { mutableStateOf<String?>(null) }
-        var lastPreflight by remember { mutableStateOf<SpeedTestResult?>(null) }
-        var verifyBusy by remember { mutableStateOf(false) }
-        var verifyProgress by remember { mutableStateOf<String?>(null) }
-        var lastVerification by remember { mutableStateOf<SpeedVerificationResult?>(null) }
+        var testBusy by speedTestBusyState
+        var testProgress by speedTestProgressState
+        var lastTest by lastSpeedTestState
+        var preflightBusy by preflightBusyState
+        var preflightProgress by preflightProgressState
+        var lastPreflight by lastPreflightState
+        var verifyBusy by verifyBusyState
+        var verifyProgress by verifyProgressState
+        var lastVerification by lastVerificationState
         var verificationHistory by remember { mutableStateOf(SpeedVerificationStore.loadRecent(this@MainActivity, 8)) }
+        var exportBusy by exportExcelBusyState
+        val exportStatus by exportExcelStatusState
+        val exportIsError by exportExcelErrorState
+        val persistedHistoryRevision by SpeedPlanUsageTracker.persistedHistoryRevision.collectAsStateWithLifecycle()
+        var persistedPlanHistory by remember { mutableStateOf<List<SpeedPlanUsageRecord>>(emptyList()) }
+
+        // Load persisted history from SQLite only on screen open or when persisted records
+        // actually change (connect, plan transition, 5s/256KB checkpoint flush, or disconnect).
+        // Never force a synchronous SQLite write or full-table read on every 500ms meter tick.
+        LaunchedEffect(
+            persistedHistoryRevision,
+            s.status,
+            s.downloadLimitKbps,
+            s.uploadLimitKbps,
+            verificationInProgress,
+        ) {
+            persistedPlanHistory = withContext(Dispatchers.IO) {
+                UsageRepository.readAllSpeedPlanUsageSessions(this@MainActivity)
+            }
+        }
+
+        val mergedPlanHistory = remember(
+            persistedPlanHistory,
+            s.status,
+            s.downloadLimitKbps,
+            s.uploadLimitKbps,
+            s.sessionDownloadBytes,
+            s.sessionUploadBytes,
+        ) {
+            SpeedPlanUsageTracker.mergePersistedWithLiveActive(persistedPlanHistory)
+        }
+        val speedPlanHistory = remember(mergedPlanHistory) {
+            mergedPlanHistory.sortedWith(
+                compareByDescending<SpeedPlanUsageRecord> { it.startedAtMillis }
+                    .thenByDescending { it.vpnGeneration }
+                    .thenByDescending { it.segmentIndex },
+            )
+        }
+        val speedPlanSummary = remember(mergedPlanHistory) {
+            SpeedHistoryExcelExporter.buildSummary(mergedPlanHistory)
+        }
 
         Column(
             Modifier.fillMaxSize()
@@ -394,12 +698,36 @@ class MainActivity : ComponentActivity() {
                             testBusy = true
                             lastTest = null
                             testProgress = "جاري بدء الفحص…"
-                            lastTest = SpeedTestEngine.measure(this@MainActivity) { phase ->
-                                val label = if (phase == SpeedTestPhase.DOWNLOAD) "جاري قياس Download…" else "جاري قياس Upload…"
-                                lifecycleScope.launch(Dispatchers.Main.immediate) { testProgress = label }
+                            val measurementStartedAt = android.os.SystemClock.elapsedRealtime()
+                            try {
+                                // Keep the busy label observable even when a local fixture or
+                                // a fast error completes before UIAutomator captures its first
+                                // hierarchy. SpeedTestEngine performs network IO on Dispatchers.IO.
+                                val result = SpeedTestEngine.measure(this@MainActivity) { phase ->
+                                    val label = if (phase == SpeedTestPhase.DOWNLOAD) "جاري قياس Download…" else "جاري قياس Upload…"
+                                    lifecycleScope.launch(Dispatchers.Main.immediate) {
+                                        if (testBusy) testProgress = label
+                                    }
+                                }
+                                lastTest = result
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (error: Exception) {
+                                lastTest = SpeedTestResult(
+                                    downloadBps = null,
+                                    uploadBps = null,
+                                    durationMs = android.os.SystemClock.elapsedRealtime() - measurementStartedAt,
+                                    error = error.message ?: error.javaClass.simpleName,
+                                )
+                            } finally {
+                                // Even a fast-fail retains a stable loading state for at least
+                                // three seconds from click; always update Compose on Main.
+                                val elapsed = android.os.SystemClock.elapsedRealtime() - measurementStartedAt
+                                val remaining = 3_000L - elapsed
+                                if (remaining > 0L) delay(remaining)
+                                testBusy = false
+                                testProgress = null
                             }
-                            testBusy = false
-                            testProgress = null
                         }
                     },
                     modifier = Modifier.fillMaxWidth(),
@@ -413,25 +741,58 @@ class MainActivity : ComponentActivity() {
                     onClick = {
                         if (!s.permissionGranted) {
                             requestVpnPermission()
-                        } else {
+                        } else if (!testBusy && !preflightBusy && !verifyBusy && !verificationInProgress) {
+                            val selectedDownloadKbps = s.downloadLimitKbps
+                            val selectedUploadKbps = s.uploadLimitKbps
                             lifecycleScope.launch {
                                 verifyBusy = true
                                 // Do not expose a previous run's tagged metrics while the new
                                 // baseline/VPN measurements are still in progress.
                                 lastVerification = null
                                 verifyProgress = "جاري تحضير التحقق…"
-                                lastVerification = SpeedVerificationEngine.verify(
-                                    context = this@MainActivity,
-                                    planDownloadKbps = s.downloadLimitKbps,
-                                    planUploadKbps = s.uploadLimitKbps,
-                                    onProgress = { message ->
-                                        lifecycleScope.launch(Dispatchers.Main.immediate) { verifyProgress = message }
-                                    },
-                                )
-                                SpeedVerificationStore.save(this@MainActivity, lastVerification!!)
-                                verificationHistory = SpeedVerificationStore.loadRecent(this@MainActivity, 8)
-                                verifyBusy = false
-                                verifyProgress = null
+                                val verificationStartedAt = System.currentTimeMillis()
+                                val loadingStartedAt = android.os.SystemClock.elapsedRealtime()
+                                try {
+                                    // A fast-fail can otherwise finish before Compose draws the
+                                    // loading label. Keep the state observable, then do blocking
+                                    // network work away from Main.
+                                    delay(2_000L)
+                                    val result = withContext(Dispatchers.IO) {
+                                        SpeedVerificationEngine.verify(
+                                            context = this@MainActivity,
+                                            planDownloadKbps = selectedDownloadKbps,
+                                            planUploadKbps = selectedUploadKbps,
+                                            onProgress = { message ->
+                                                lifecycleScope.launch(Dispatchers.Main.immediate) {
+                                                    if (verifyBusy) verifyProgress = message
+                                                }
+                                            },
+                                        )
+                                    }
+                                    lastVerification = result
+                                    SpeedVerificationStore.save(this@MainActivity, result)
+                                    verificationHistory = SpeedVerificationStore.loadRecent(this@MainActivity, 8)
+                                } catch (cancelled: CancellationException) {
+                                    throw cancelled
+                                } catch (error: Exception) {
+                                    val failed = SpeedVerificationEngine.unavailable(
+                                        started = verificationStartedAt,
+                                        note = "فشل التحقق: ${error.message ?: error.javaClass.simpleName}",
+                                        planDownloadKbps = selectedDownloadKbps,
+                                        planUploadKbps = selectedUploadKbps,
+                                    )
+                                    lastVerification = failed
+                                    SpeedVerificationStore.save(this@MainActivity, failed)
+                                    verificationHistory = SpeedVerificationStore.loadRecent(this@MainActivity, 8)
+                                } finally {
+                                    // The CI hierarchy dumper polls periodically; preserve a minimum
+                                    // visible interval even if the engine returns immediately.
+                                    val elapsed = android.os.SystemClock.elapsedRealtime() - loadingStartedAt
+                                    val remaining = 2_000L - elapsed
+                                    if (remaining > 0L) delay(remaining)
+                                    verifyBusy = false
+                                    verifyProgress = null
+                                }
                             }
                         }
                     },
@@ -466,7 +827,7 @@ class MainActivity : ComponentActivity() {
 
             lastTest?.let { result ->
                 GlassCard {
-                    SectionLabel("نتيجة فحص السرعة", "القياس على المسار الحالي بدون تغيير حالة VPN")
+                    SectionLabel("نتيجة فحص السرعة", "قياس سرعة الشبكة الفعلية خارج خنق VPN (لاختبار الخطة عبر النفق استخدم تحقق من السرعة)")
                     InfoRow("Download", result.downloadBps?.let(::formatBitRate) ?: "فشل القياس")
                     InfoRow("Upload", result.uploadBps?.let(::formatBitRate) ?: "فشل القياس")
                     InfoRow("المدة", "${result.durationMs / 1000.0} ثانية")
@@ -528,6 +889,16 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
+            SpeedPlanUsageHistoryCard(
+                records = speedPlanHistory,
+                summary = speedPlanSummary,
+                exportBusy = exportBusy,
+                exportStatus = exportStatus,
+                exportIsError = exportIsError,
+                controlsEnabled = !testBusy && !preflightBusy && !verifyBusy && !verificationInProgress,
+                onExportExcel = { launchSpeedHistoryExcelExport() },
+            )
+
             GlassCard {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("💡", fontSize = 20.sp)
@@ -544,9 +915,148 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
     @Composable
-    private fun SmartScreen(s: Snapshot, verificationInProgress: Boolean) {
-        var statsEnabled by remember { mutableStateOf(SmartSettings.isStatsEnabled(this@MainActivity)) }
+    private fun SpeedPlanUsageHistoryCard(
+        records: List<SpeedPlanUsageRecord>,
+        summary: SpeedHistoryReportSummary,
+        exportBusy: Boolean,
+        exportStatus: String?,
+        exportIsError: Boolean,
+        controlsEnabled: Boolean,
+        onExportExcel: () -> Unit,
+    ) {
+        GlassCard {
+            SectionLabel(
+                "سجل السرعات واستهلاك الخطط",
+                "البيانات الفعلية التي مرّت عبر VPN لكل خيار سرعة مطبق",
+            )
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                InfoPill("الفترات: ${summary.totalRecordsCount}", Blue, Modifier.weight(1f))
+                InfoPill("الجلسات: ${summary.distinctVpnSessionsCount}", Cyan, Modifier.weight(1f))
+                InfoPill("التغييرات: ${summary.planChangesCount}", Purple, Modifier.weight(1f))
+            }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                InfoPill("↓ ${formatDataBytes(summary.totalDownloadBytes)}", Cyan, Modifier.weight(1f))
+                InfoPill("↑ ${formatDataBytes(summary.totalUploadBytes)}", Purple, Modifier.weight(1f))
+                InfoPill("الإجمالي ${formatDataBytes(summary.totalBytes)}", Green, Modifier.weight(1f))
+            }
+
+            Button(
+                enabled = !exportBusy && controlsEnabled,
+                onClick = onExportExcel,
+                modifier = Modifier.fillMaxWidth().testTag("export_speed_history_excel_button"),
+                shape = RoundedCornerShape(14.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1B6B53)),
+            ) {
+                Text(
+                    if (exportBusy) "جاري تصدير سجل السرعات إلى Excel…"
+                    else "تصدير سجل السرعات إلى Excel",
+                    fontWeight = FontWeight.Bold,
+                )
+            }
+
+            exportStatus?.let { statusText ->
+                Text(
+                    text = statusText,
+                    color = if (exportIsError) Color(0xFFFF7D88) else Green,
+                    fontSize = 11.sp,
+                    modifier = Modifier.testTag("export_speed_history_status"),
+                )
+            }
+
+            if (records.isEmpty()) {
+                Text(
+                    "لا توجد سجلات سرعة محفوظة بعد — يبدأ التسجيل تلقائيًا عند اتصال VPN وتطبيق خيار السرعة.",
+                    color = TextSecondary,
+                    fontSize = 11.sp,
+                )
+            } else {
+                records.take(10).forEach { record ->
+                    Surface(
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
+                        shape = RoundedCornerShape(12.dp),
+                        color = Color(0xFF0A1426),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, StrokeColor.copy(alpha = 0.7f)),
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(10.dp),
+                            verticalArrangement = Arrangement.spacedBy(3.dp),
+                        ) {
+                            Row(
+                                Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    record.planOptionLabel,
+                                    color = TextPrimary,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 12.sp,
+                                )
+                                val statusColor = when (record.status) {
+                                    SpeedPlanRecordStatus.COMPLETED -> Green
+                                    SpeedPlanRecordStatus.ONGOING -> Cyan
+                                    SpeedPlanRecordStatus.ABNORMAL_END -> Amber
+                                }
+                                Text(
+                                    record.status.arabicLabel,
+                                    color = statusColor,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 10.sp,
+                                )
+                            }
+                            Text(
+                                "الحد المطبق — تنزيل: ${record.downloadLimitUnitLabel} • رفع: ${record.uploadLimitUnitLabel}",
+                                color = TextSecondary,
+                                fontSize = 10.sp,
+                            )
+                            Text(
+                                "الفترة: ${SpeedPlanClassifier.formatTimestamp(record.startedAtMillis)} ← " +
+                                    (record.endedAtMillis?.let(SpeedPlanClassifier::formatTimestamp) ?: "مستمر") +
+                                    " • المدة: ${record.formattedDuration()}",
+                                color = TextSecondary,
+                                fontSize = 9.5.sp,
+                            )
+                            Text(
+                                "↓ ${formatDataBytes(record.downloadBytes)} (${record.downloadBytes} B) • " +
+                                    "↑ ${formatDataBytes(record.uploadBytes)} (${record.uploadBytes} B) • " +
+                                    "الإجمالي: ${formatDataBytes(record.totalBytes)}",
+                                color = Cyan,
+                                fontSize = 10.sp,
+                            )
+                            Text(
+                                "متوسط الفعلي — تنزيل: ${record.formattedAvgDownloadRate()} • رفع: ${record.formattedAvgUploadRate()}",
+                                color = TextSecondary,
+                                fontSize = 9.5.sp,
+                            )
+                            if (record.limitExceeded) {
+                                Text(
+                                    "⚠️ ${record.formattedExceedanceSummary()}",
+                                    color = Amber,
+                                    fontSize = 9.5.sp,
+                                )
+                            }
+                        }
+                    }
+                }
+                if (records.size > 10) {
+                    Text(
+                        "يُعرض أحدث 10 سجلات من أصل ${records.size} سجل محفوظ. استخدم «تصدير سجل السرعات إلى Excel» لتصدير السجل الكامل.",
+                        color = TextSecondary,
+                        fontSize = 9.5.sp,
+                    )
+                }
+            }
+        }
+    }
+    @Composable
+    private fun SmartScreen(
+        s: Snapshot,
+        verificationInProgress: Boolean,
+        onOpenSettingsTab: () -> Unit = {},
+    ) {
+        val statsEnabled by SmartSettings.observeStatsEnabled(this@MainActivity).collectAsStateWithLifecycle()
         var today by remember { mutableStateOf(0L) }
         var week by remember { mutableStateOf(0L) }
         var month by remember { mutableStateOf(0L) }
@@ -582,6 +1092,23 @@ class MainActivity : ComponentActivity() {
         ) {
             ScreenTitle("المركز الذكي", "Usage + AI + Diagnostics في طبقات منفصلة")
 
+            if (!statsEnabled) {
+                GlassCard {
+                    Text(
+                        "جمع الإحصاءات الاختيارية متوقف حاليًا — لن تُجمع سجلات استهلاك جديدة ما دام الخيار متوقفًا، مع الاحتفاظ بالسجلات التاريخية السابقة واستمرار فرض حصص البيانات.",
+                        color = Amber,
+                        fontSize = 11.sp,
+                    )
+                    OutlinedButton(
+                        onClick = onOpenSettingsTab,
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text("إدارة جمع الإحصاءات من صفحة الإعدادات", fontSize = 11.sp)
+                    }
+                }
+            }
+
             GlassCard {
                 SectionLabel("استهلاك الإنترنت", "إحصاءات يومية وأسبوعية وشهرية")
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -606,8 +1133,7 @@ class MainActivity : ComponentActivity() {
                     InfoRow("تحميل", rec.downloadKbps?.let { fmt(it) } ?: "بدون حد")
                     InfoRow("رفع", rec.uploadKbps?.let { fmt(it) } ?: "بدون حد")
                     Button(enabled = !verificationInProgress, onClick = {
-                        saveLocalLimit(true, rec.downloadKbps)
-                        saveLocalLimit(false, rec.uploadKbps)
+                        saveLocalLimitsBoth(rec.downloadKbps, rec.uploadKbps)
                         DiagnosticsRepository.record(this@MainActivity, "INFO", "SmartOptimizer", "SMART_SPEED_APPLIED", "Smart speed recommendation applied")
                     }, modifier = Modifier.fillMaxWidth()) { Text("تطبيق الاقتراح") }
                 }
@@ -629,52 +1155,106 @@ class MainActivity : ComponentActivity() {
                 if (top.isEmpty()) Text("لا توجد بيانات بعد.", color = TextSecondary, fontSize = 11.sp)
                 else top.forEach { row -> InfoRow(row.label, formatDataBytes(row.totalBytes)) }
             }
+        }
+    }
 
-            GlassCard {
-                SectionLabel("حالة جمع البيانات", "يمكن إيقافها في أي وقت")
-                SettingSwitch("إحصاءات الإنترنت", "حفظ استهلاك التطبيقات محليًا", statsEnabled) {
-                    statsEnabled = it
-                    SmartSettings.setStatsEnabled(this@MainActivity, it)
-                    if (it) UsageCollectionScheduler.schedule(this@MainActivity) else UsageCollectionScheduler.cancel(this@MainActivity)
-                    lifecycleScope.launch(Dispatchers.IO) { if (it) UsageCollector.collectToday(this@MainActivity) }
+    @Composable
+    private fun InternetStatsSettingsCard() {
+        val usageAccess = usageAccessState.value
+        val statsEnabled by SmartSettings.observeStatsEnabled(this@MainActivity).collectAsStateWithLifecycle()
+        GlassCard {
+            SectionLabel("إحصاءات الإنترنت", "يوميًا لكل تطبيق مع إجمالي أسبوعي وشهري")
+            SettingSwitch("جمع الإحصاءات", "تسجيل استهلاك التطبيقات محليًا", statsEnabled) { enabled ->
+                SmartSettings.setStatsEnabled(this@MainActivity, enabled)
+                if (enabled) {
+                    UsageCollectionScheduler.schedule(this@MainActivity)
+                    lifecycleScope.launch(Dispatchers.IO) { UsageCollector.collectToday(this@MainActivity) }
+                } else {
+                    UsageCollectionScheduler.cancel(this@MainActivity)
                 }
+            }
+            Text(
+                "يتحكم هذا المفتاح بجمع وتخزين سجلات استهلاك التطبيقات اليومية وعينات التحليل الذكي الاختيارية. " +
+                    "عند إيقافه تتوقف السجلات الاختيارية الجديدة والمهام الدورية المخصصة لها دون حذف السجلات التاريخية، بينما تبقى عدادات فرض حصص البيانات وحظر التطبيقات نشطة.",
+                color = TextSecondary,
+                fontSize = 10.sp,
+            )
+            Text(
+                if (statsEnabled) {
+                    "حالة جمع الإحصاءات: مفعّل — تُحدّث سجلات الاستهلاك الاختيارية ضمن الحدود المعتمدة."
+                } else {
+                    "حالة جمع الإحصاءات: متوقف — لن تُجمع سجلات اختيارية جديدة ما دام الخيار متوقفًا."
+                },
+                color = if (statsEnabled) Green else Amber,
+                fontSize = 10.sp,
+                modifier = Modifier.testTag("stats_collection_status_text"),
+            )
+            if (!usageAccess) {
+                Button(
+                    onClick = { startActivity(AppTrafficManager.usageAccessIntent()) },
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth().testTag("allow_app_stats_button"),
+                ) { Text("السماح بإحصاءات التطبيقات", fontSize = 11.sp) }
+            } else {
+                Text("وصول NetworkStatsManager مفعّل", color = Green, fontSize = 10.sp)
             }
         }
     }
 
     @Composable
-    private fun SmartControlsCard() {
-        var statsEnabled by remember { mutableStateOf(SmartSettings.isStatsEnabled(this@MainActivity)) }
-        var overlayEnabled by remember { mutableStateOf(SmartSettings.isOverlayEnabled(this@MainActivity)) }
+    private fun GeneralVpnProtectionCard() {
         GlassCard {
-            SectionLabel("البيانات والنافذة العائمة", "إعدادات مستقلة للإحصاءات والتحكم أثناء التصفح")
-            SettingSwitch("إحصاءات الإنترنت", "تسجيل استهلاك التطبيقات يوميًا", statsEnabled) {
-                statsEnabled = it
-                SmartSettings.setStatsEnabled(this@MainActivity, it)
-                if (it) {
-                    UsageCollectionScheduler.schedule(this@MainActivity)
-                    lifecycleScope.launch(Dispatchers.IO) { UsageCollector.collectToday(this@MainActivity) }
-                } else UsageCollectionScheduler.cancel(this@MainActivity)
-            }
+            SectionLabel(
+                "حظر التطبيقات وحماية VPN",
+                "حظر التطبيق المختار مستقل عن إعداد جدار التطبيقات العام",
+            )
+            Text(
+                "يعمل الحظر لكل تطبيق أثناء اتصال SpeedVPN، ولا يلزم تفعيل مفتاح عام. " +
+                    "الحماية النظامية الإضافية اختيارية: من إعدادات Android فعّل Always-on VPN وBlock connections without VPN لمنع المرور خارج النفق إذا توقف VPN.",
+                color = TextSecondary,
+                fontSize = 10.sp,
+            )
+            OutlinedButton(
+                onClick = {
+                    runCatching { startActivity(AppTrafficManager.vpnSettingsIntent()) }
+                        .onFailure { log("Unable to open Android VPN settings: ${it.message}") }
+                },
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth().testTag("open_vpn_settings_button"),
+            ) { Text("فتح إعدادات VPN (اختياري)", fontSize = 11.sp) }
+        }
+    }
+
+    @Composable
+    private fun SmartControlsCard() {
+        val overlayEnabled by SmartSettings.observeOverlayEnabled(this@MainActivity).collectAsStateWithLifecycle()
+        GlassCard {
+            SectionLabel("النافذة العائمة", "تحكم سريع بالسرعة أثناء التصفح")
             SettingSwitch("نافذة السرعة العائمة", "تعمل كتحكم عام أو حسب التطبيق الذي فتحت منها", overlayEnabled) {
                 if (it && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this@MainActivity)) {
                     runCatching { startActivity(android.content.Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, android.net.Uri.parse("package:$packageName"))) }
                     return@SettingSwitch
                 }
-                overlayEnabled = it
                 SmartSettings.setOverlayEnabled(this@MainActivity, it)
                 if (it) SpeedOverlayService.start(this@MainActivity) else SpeedOverlayService.stop(this@MainActivity)
             }
         }
     }
 
+    @OptIn(ExperimentalComposeUiApi::class)
     @Composable
     private fun SettingsScreen(s: Snapshot, signedIn: Boolean, onLink: () -> Unit, onSignOut: () -> Unit) {
         Column(
-            Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(18.dp),
+            Modifier.fillMaxSize()
+                .semantics { testTagsAsResourceId = true }
+                .testTag("settings_screen")
+                .verticalScroll(rememberScrollState())
+                .padding(18.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            ScreenTitle("الإعدادات", "التوافق، البيانات، النافذة العائمة والحساب")
+            ScreenTitle("الإعدادات", "التوافق، إحصاءات الإنترنت، حماية VPN، النافذة العائمة والحساب")
+            InternetStatsSettingsCard()
+            GeneralVpnProtectionCard()
             CompatibilitySettingsCard()
             SmartControlsCard()
             AccountCard(signedIn, onLink, onSignOut)
@@ -858,7 +1438,8 @@ class MainActivity : ComponentActivity() {
                 InfoPill("↓ ${formatDataBytes(s.sessionDownloadBytes)}", Cyan, Modifier.weight(1f))
                 InfoPill("↑ ${formatDataBytes(s.sessionUploadBytes)}", Purple, Modifier.weight(1f))
             }
-            InfoPill("الإجمالي ${formatDataBytes(s.sessionDownloadBytes + s.sessionUploadBytes)}", Blue, Modifier.fillMaxWidth())
+            val safeTotal = if (Long.MAX_VALUE - s.sessionDownloadBytes < s.sessionUploadBytes) Long.MAX_VALUE else s.sessionDownloadBytes + s.sessionUploadBytes
+            InfoPill("الإجمالي ${formatDataBytes(safeTotal)}", Blue, Modifier.fillMaxWidth())
         }
     }
 
@@ -874,20 +1455,22 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    @OptIn(ExperimentalComposeUiApi::class)
     @Composable
     private fun AppsScreen(s: Snapshot) {
         val usageAccess = usageAccessState.value
         val catalogRefreshVersion = appCatalogRefreshTrigger.value
         var isLoadingAppCatalog by remember { mutableStateOf(true) }
-        var firewallEnabled by remember { mutableStateOf(VpnAppControl.read(this@MainActivity).firewallEnabled) }
         var blockedPackages by remember { mutableStateOf(VpnAppControl.read(this@MainActivity).blockedPackages) }
+        var quotaBlockedPackages by remember { mutableStateOf(VpnAppControl.quotaBlockedPackages(this@MainActivity)) }
         var apps by remember { mutableStateOf<List<AppTrafficUsage>>(emptyList()) }
         var policies by remember { mutableStateOf<Map<String, AppPolicy>>(emptyMap()) }
         var quotaPolicies by remember { mutableStateOf<Map<String, List<AppQuotaPolicy>>>(emptyMap()) }
+        var appSpeedProfiles by remember { mutableStateOf<Map<String, SpeedProfile>>(emptyMap()) }
         var appQuery by remember { mutableStateOf("") }
         var editingLimitApp by remember { mutableStateOf<AppTrafficUsage?>(null) }
         var editingSpeedApp by remember { mutableStateOf<AppTrafficUsage?>(null) }
-        var statsEnabled by remember { mutableStateOf(SmartSettings.isStatsEnabled(this@MainActivity)) }
+        val statsEnabled by SmartSettings.observeStatsEnabled(this@MainActivity).collectAsStateWithLifecycle()
 
         LaunchedEffect(s.connectedAtMillis, s.status, usageAccess, statsEnabled, catalogRefreshVersion) {
             isLoadingAppCatalog = true
@@ -919,19 +1502,25 @@ class MainActivity : ComponentActivity() {
 
             while (isActive) {
                 apps = withContext(Dispatchers.IO) {
-                    if (statsEnabled && usageAccess) UsageCollector.collectToday(this@MainActivity)
+                    if (statsEnabled) UsageCollector.collectToday(this@MainActivity)
+                    val todayKey = UsageDate.today()
                     val usageByPackage = if (statsEnabled) {
-                        UsageRepository.topUsage(this@MainActivity, UsageDate.today(), 100)
+                        UsageRepository.topUsage(this@MainActivity, todayKey, 500)
                             .associateBy { it.packageName }
                     } else emptyMap()
                     installedApps.map { app ->
                         val row = usageByPackage[app.packageName]
+                        val live = if (statsEnabled) {
+                            AppTrafficManager.liveRelayUsage(app.uid, app.packageName, todayKey)
+                        } else {
+                            UidTrafficCounters(0L, 0L)
+                        }
                         AppTrafficUsage(
                             packageName = app.packageName,
                             label = app.loadLabel(packageManager).toString(),
                             uid = app.uid,
-                            downloadBytes = row?.downloadBytes ?: 0L,
-                            uploadBytes = row?.uploadBytes ?: 0L,
+                            downloadBytes = maxOf(row?.downloadBytes ?: 0L, live.downloadBytes),
+                            uploadBytes = maxOf(row?.uploadBytes ?: 0L, live.uploadBytes),
                         )
                     }.sortedWith(
                         compareByDescending<AppTrafficUsage> { it.totalBytes }
@@ -944,56 +1533,41 @@ class MainActivity : ComponentActivity() {
                 quotaPolicies = withContext(Dispatchers.IO) {
                     UsageRepository.readQuotaPolicyMap(this@MainActivity)
                 }
+                appSpeedProfiles = withContext(Dispatchers.IO) {
+                    AiRepository.listAppSpeedProfiles(this@MainActivity)
+                        .mapNotNull { p -> p.packageName?.let { it to p } }
+                        .toMap()
+                }
+                blockedPackages = withContext(Dispatchers.IO) {
+                    VpnAppControl.read(this@MainActivity).blockedPackages
+                }
+                quotaBlockedPackages = withContext(Dispatchers.IO) {
+                    VpnAppControl.quotaBlockedPackages(this@MainActivity)
+                }
                 if (s.status != VpnStatus.CONNECTED) break
                 delay(if (statsEnabled && usageAccess) 5_000L else 15_000L)
             }
         }
 
         Column(
-            Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(18.dp),
+            Modifier.fillMaxSize()
+                .semantics { testTagsAsResourceId = true }
+                .testTag("apps_screen")
+                .verticalScroll(rememberScrollState())
+                .padding(18.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            ScreenTitle("التطبيقات", "حظر، حدود بيانات، سرعة خاصة، ونسبة الاستهلاك")
-
-            GlassCard {
-                SectionLabel("إحصاءات الإنترنت", "يوميًا لكل تطبيق مع إجمالي أسبوعي وشهري")
-                SettingSwitch("جمع الإحصاءات", "تسجيل استهلاك التطبيقات محليًا", statsEnabled) {
-                    statsEnabled = it
-                    SmartSettings.setStatsEnabled(this@MainActivity, it)
-                    if (it) {
-                        UsageCollectionScheduler.schedule(this@MainActivity)
-                        lifecycleScope.launch(Dispatchers.IO) { UsageCollector.collectToday(this@MainActivity) }
-                    } else UsageCollectionScheduler.cancel(this@MainActivity)
-                }
-                if (!usageAccess) {
-                    Button(
-                        onClick = { startActivity(AppTrafficManager.usageAccessIntent()) },
-                        shape = RoundedCornerShape(12.dp),
-                        modifier = Modifier.fillMaxWidth(),
-                    ) { Text("السماح بإحصاءات التطبيقات", fontSize = 11.sp) }
-                } else {
-                    Text("وصول NetworkStatsManager مفعّل", color = Green, fontSize = 10.sp)
-                }
-            }
-
-            GlassCard {
-                SectionLabel("جدار التطبيقات", "الحظر اليدوي وحد استخدام التطبيق يعملان كحالتين مستقلتين")
-                SettingSwitch("تفعيل جدار التطبيقات", "الحظر الفعلي يحتاج Always-on VPN + Lockdown", firewallEnabled) {
-                    firewallEnabled = it
-                    saveAppControlSettings(VpnAppControlSettings(it, blockedPackages))
-                }
-                if (firewallEnabled) {
-                    Text("فعّل Always-on VPN وBlock connections without VPN من إعدادات Android حتى يصبح الحظر فعليًا.", color = Amber, fontSize = 10.sp)
-                    OutlinedButton(
-                        onClick = { runCatching { startActivity(AppTrafficManager.vpnSettingsIntent()) } },
-                        shape = RoundedCornerShape(12.dp),
-                        modifier = Modifier.fillMaxWidth(),
-                    ) { Text("فتح إعدادات VPN", fontSize = 11.sp) }
-                }
-            }
+            ScreenTitle("التطبيقات", "إدارة التطبيقات المثبتة، الحظر، حدود البيانات، والسرعة الخاصة")
 
             GlassCard {
                 SectionLabel("قائمة التطبيقات", "النسبة محسوبة من إجمالي استهلاك التطبيقات المعروضة")
+                if (!statsEnabled) {
+                    Text(
+                        "جمع الإحصاءات الاختيارية متوقف من الإعدادات — لن تُجمع سجلات استهلاك جديدة، مع استمرار عمل حظر التطبيقات وفرض حصص البيانات.",
+                        color = Amber,
+                        fontSize = 10.sp,
+                    )
+                }
                 OutlinedTextField(
                     value = appQuery,
                     onValueChange = { appQuery = it },
@@ -1021,12 +1595,24 @@ class MainActivity : ComponentActivity() {
                         val dailyQuota = appQuotas.firstOrNull { it.quotaType == QuotaType.DAILY }
                         val weeklyQuota = appQuotas.firstOrNull { it.quotaType == QuotaType.WEEKLY }
                         val monthlyQuota = appQuotas.firstOrNull { it.quotaType == QuotaType.MONTHLY }
+                        val speedProfile = appSpeedProfiles[app.packageName]?.takeIf { it.enabled }
                         val limit = dailyQuota?.limitBytes ?: policy?.dailyLimitBytes
-                        val used = app.totalBytes
+                        val used = maxOf(app.totalBytes, dailyQuota?.usedBytes ?: 0L)
                         val remaining = limit?.let { (it - used).coerceAtLeast(0L) }
+                        val isQuotaBlocked = app.packageName in quotaBlockedPackages
+                        val isBlocked = app.packageName in blockedPackages
+                        val blockStatusLabel = when {
+                            isQuotaBlocked -> "محظور لتجاوز الحصة"
+                            isBlocked -> "محظور يدويًا"
+                            else -> "مسموح"
+                        }
+                        val blockStatusColor = if (isBlocked || isQuotaBlocked) Color(0xFFFF7D88) else Green
                         Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
                             Column(Modifier.weight(1f)) {
-                                Text(app.label, color = TextPrimary, fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
+                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    Text(app.label, color = TextPrimary, fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
+                                    Text(blockStatusLabel, color = blockStatusColor, fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                                }
                                 Text(
                                     "↓ ${formatDataBytes(app.downloadBytes)} • ↑ ${formatDataBytes(app.uploadBytes)} • ${formatDataBytes(used)} • ${usagePercent(used, totalConsumption)}%",
                                     color = TextSecondary,
@@ -1046,6 +1632,13 @@ class MainActivity : ComponentActivity() {
                                         fontSize = 9.sp,
                                     )
                                 }
+                                if (speedProfile != null) {
+                                    Text(
+                                        "سرعة خاصة — تنزيل: ${speedProfile.downloadKbps?.let(::fmt) ?: "بدون حد"} • رفع: ${speedProfile.uploadKbps?.let(::fmt) ?: "بدون حد"}",
+                                        color = Blue,
+                                        fontSize = 9.sp,
+                                    )
+                                }
                             }
                             Column(horizontalAlignment = Alignment.End) {
                                 Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
@@ -1053,13 +1646,18 @@ class MainActivity : ComponentActivity() {
                                     TextButton(onClick = { editingSpeedApp = app }) { Text("سرعة", color = Blue, fontSize = 10.sp) }
                                 }
                                 Switch(
-                                    checked = app.packageName in blockedPackages,
+                                    checked = isBlocked,
                                     onCheckedChange = { blocked ->
                                         val next = blockedPackages.toMutableSet().apply {
                                             if (blocked) add(app.packageName) else remove(app.packageName)
                                         }.toSet()
                                         blockedPackages = next
-                                        saveAppControlSettings(VpnAppControlSettings(firewallEnabled, next))
+                                        saveAppControlSettings(
+                                            VpnAppControlSettings(
+                                                firewallEnabled = VpnAppControl.read(this@MainActivity).firewallEnabled,
+                                                blockedPackages = next,
+                                            ),
+                                        )
                                     },
                                 )
                             }
@@ -1083,9 +1681,16 @@ class MainActivity : ComponentActivity() {
                         } else {
                             UsageRepository.setQuotaPolicy(this@MainActivity, app.packageName, app.label, app.uid, quotaType, bytes)
                         }
-                        UsageCollector.collectToday(this@MainActivity)
+                        // Always enforce quota limits immediately even when optional statistics collection is off.
+                        runCatching { QuotaEnforcementEngine.enforce(this@MainActivity) }
+                        runCatching { QuotaWorkScheduler.syncWithConfiguredPolicies(this@MainActivity) }
+                        if (statsEnabled) {
+                            UsageCollector.collectToday(this@MainActivity)
+                        }
                         policies = UsageRepository.readPolicies(this@MainActivity).associateBy { it.packageName }
                         quotaPolicies = UsageRepository.readQuotaPolicyMap(this@MainActivity)
+                        blockedPackages = VpnAppControl.read(this@MainActivity).blockedPackages
+                        quotaBlockedPackages = VpnAppControl.quotaBlockedPackages(this@MainActivity)
                         if (statsEnabled && usageAccess) {
                             val installed = AppTrafficManager.installedLaunchableApps(this@MainActivity)
                             val usageByPackage = UsageRepository.topUsage(this@MainActivity, UsageDate.today(), 500)
@@ -1122,6 +1727,9 @@ class MainActivity : ComponentActivity() {
                 onSave = { enabled, down, up ->
                     lifecycleScope.launch(Dispatchers.IO) {
                         AppSpeedProfiles(this@MainActivity).save(app.packageName, enabled, down, up)
+                        appSpeedProfiles = AiRepository.listAppSpeedProfiles(this@MainActivity)
+                            .mapNotNull { p -> p.packageName?.let { it to p } }
+                            .toMap()
                     }
                     editingSpeedApp = null
                 },
@@ -1180,7 +1788,8 @@ class MainActivity : ComponentActivity() {
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                         label = { Text("MB") },
                     )
-                    Text("الاستهلاك الحالي اليوم: ${formatDataBytes(app.totalBytes)}", color = TextSecondary, fontSize = 10.sp)
+                    val dialogUsedBytes = maxOf(app.totalBytes, selectedPolicy?.usedBytes ?: 0L)
+                    Text("الاستهلاك الحالي اليوم: ${formatDataBytes(dialogUsedBytes)}", color = TextSecondary, fontSize = 10.sp)
                     Text("اتركه فارغًا لإلغاء هذا النوع من الحد.", color = TextSecondary, fontSize = 10.sp)
                 }
             },
@@ -1348,8 +1957,8 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun QuickSpeedCard(s: Snapshot) {
-        GlassCard {
+    private fun QuickSpeedCard(s: Snapshot, onOpenSpeedTab: () -> Unit = {}) {
+        GlassCard(modifier = Modifier.clickable { onOpenSpeedTab() }) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Box(Modifier.size(40.dp).clip(CircleShape).background(Blue.copy(alpha = 0.12f)), contentAlignment = Alignment.Center) {
                     Text("↯", color = Blue, fontSize = 22.sp)

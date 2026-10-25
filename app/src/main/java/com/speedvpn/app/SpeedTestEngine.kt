@@ -16,6 +16,8 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import okhttp3.Call
 import okhttp3.ConnectionPool
@@ -62,6 +64,7 @@ data class SpeedTestResult(
 
 object SpeedTestEngine {
     private const val TAG = "SpeedTestEngine"
+    private val measurementMutex = Mutex()
 
     private data class SampleMeasurement(val throughputBps: Long, val payloadBytesWritten: Long)
     private data class PhaseMeasurement(val throughputBps: Long, val completedPayloadBytes: Long)
@@ -71,8 +74,95 @@ object SpeedTestEngine {
         val bytesWritten = AtomicLong(0L)
     }
 
+    /**
+     * Wraps sockets opened by [SpeedTestEngine] so each probe socket binds its local port
+     * before `connect()` and registers its exact `(localPort, remoteHost, remotePort)` flow marker
+     * in [SpeedLimiter] while the measurement window is active, cleaning up on `close()`.
+     */
+    internal class SpeedProbeSocketFactory(
+        private val delegate: javax.net.SocketFactory = javax.net.SocketFactory.getDefault(),
+    ) : javax.net.SocketFactory() {
+        private fun createTrackedProbeSocket(): java.net.Socket = object : java.net.Socket() {
+            @Volatile
+            private var registeredLocalPort: Int = -1
+            @Volatile
+            private var registeredRemoteHost: String = ""
+            @Volatile
+            private var registeredRemotePort: Int = -1
+
+            override fun connect(endpoint: java.net.SocketAddress?, timeout: Int) {
+                val inet = endpoint as? java.net.InetSocketAddress
+                if (inet != null && !isBound) {
+                    runCatching { bind(java.net.InetSocketAddress(0)) }
+                }
+                if (inet != null && SpeedLimiter.isProbeMeasurementSessionActive()) {
+                    val hostAddr = inet.address?.hostAddress ?: inet.hostString.orEmpty()
+                    val lPort = localPort
+                    if (lPort > 0 && hostAddr.isNotBlank() && inet.port > 0) {
+                        registeredLocalPort = lPort
+                        registeredRemoteHost = hostAddr
+                        registeredRemotePort = inet.port
+                        SpeedLimiter.markProbeClientSocket(lPort, hostAddr, inet.port, SpeedLimiter.IPPROTO_TCP)
+                    }
+                }
+                super.connect(endpoint, timeout)
+                if (inet != null && registeredLocalPort <= 0 && SpeedLimiter.isProbeMeasurementSessionActive()) {
+                    val hostAddr = inet.address?.hostAddress ?: inet.hostString.orEmpty()
+                    val lPort = localPort
+                    if (lPort > 0 && hostAddr.isNotBlank() && inet.port > 0) {
+                        registeredLocalPort = lPort
+                        registeredRemoteHost = hostAddr
+                        registeredRemotePort = inet.port
+                        SpeedLimiter.markProbeClientSocket(lPort, hostAddr, inet.port, SpeedLimiter.IPPROTO_TCP)
+                    }
+                }
+            }
+
+            override fun close() {
+                if (registeredLocalPort > 0 && registeredRemoteHost.isNotEmpty() && registeredRemotePort > 0) {
+                    SpeedLimiter.unmarkProbeClientSocket(
+                        registeredLocalPort,
+                        registeredRemoteHost,
+                        registeredRemotePort,
+                        SpeedLimiter.IPPROTO_TCP,
+                    )
+                }
+                super.close()
+            }
+        }
+
+        override fun createSocket(): java.net.Socket = createTrackedProbeSocket()
+        override fun createSocket(host: String?, port: Int): java.net.Socket =
+            createTrackedProbeSocket().apply { connect(java.net.InetSocketAddress(host, port)) }
+        override fun createSocket(host: String?, port: Int, localHost: java.net.InetAddress?, localPort: Int): java.net.Socket =
+            createTrackedProbeSocket().apply {
+                bind(java.net.InetSocketAddress(localHost, localPort))
+                connect(java.net.InetSocketAddress(host, port))
+            }
+        override fun createSocket(host: java.net.InetAddress?, port: Int): java.net.Socket =
+            createTrackedProbeSocket().apply { connect(java.net.InetSocketAddress(host, port)) }
+        override fun createSocket(address: java.net.InetAddress?, port: Int, localAddress: java.net.InetAddress?, localPort: Int): java.net.Socket =
+            createTrackedProbeSocket().apply {
+                bind(java.net.InetSocketAddress(localAddress, localPort))
+                connect(java.net.InetSocketAddress(address, port))
+            }
+    }
+
     private val uploadBodyEventListenerFactory: EventListener.Factory = EventListener.Factory { _ ->
         object : EventListener() {
+            override fun connectStart(
+                call: Call,
+                inetSocketAddress: java.net.InetSocketAddress,
+                proxy: java.net.Proxy,
+            ) {
+                if (SpeedLimiter.isVerificationActive()) {
+                    val hostAddr = inetSocketAddress.address?.hostAddress ?: inetSocketAddress.hostString
+                    if (!hostAddr.isNullOrBlank() && inetSocketAddress.port > 0) {
+                        SpeedLimiter.registerProbeEndpoint(hostAddr, inetSocketAddress.port)
+                    }
+                }
+            }
+
             override fun requestBodyEnd(call: Call, byteCount: Long) {
                 call.request().tag(UploadBodyByteCounter::class.java)?.let { counter ->
                     counter.bytesWritten.set(byteCount)
@@ -82,9 +172,10 @@ object SpeedTestEngine {
         }
     }
 
-    /** Installs the same byte-accounting callback on production and regression-test clients. */
+    /** Installs the same byte-accounting callback and probe socket factory on production and test clients. */
     internal fun createUploadAccountingClient(baseClient: OkHttpClient): OkHttpClient =
         baseClient.newBuilder()
+            .socketFactory(SpeedProbeSocketFactory())
             .eventListenerFactory(uploadBodyEventListenerFactory)
             .build()
     private const val DEFAULT_TEST_BASE_URL = "https://speed.cloudflare.com"
@@ -111,7 +202,7 @@ object SpeedTestEngine {
     private const val MIN_SAMPLE_DURATION_MS = 10L
     private const val TARGET_STABLE_DURATION_MS = 250L
     private const val MIN_VALID_SAMPLES = 2
-    private const val HIGH_CAPACITY_VERIFICATION_STREAMS = 3
+    private const val HIGH_CAPACITY_VERIFICATION_STREAMS = 5
     private const val MIN_CAPPED_RANGE_SAMPLES = 3
     private const val BASELINE_STABLE_DURATION_MS = 250L
     internal const val FINITE_SAMPLE_TARGET_DURATION_MS = 1_500L
@@ -158,6 +249,7 @@ object SpeedTestEngine {
         onProgress: (SpeedTestPhase) -> Unit = {},
     ): SpeedTestResult =
         withContext(Dispatchers.IO) {
+            measurementMutex.withLock {
             val startedAt = System.currentTimeMillis()
             Log.i(
                 TAG,
@@ -165,52 +257,65 @@ object SpeedTestEngine {
                     "downloadTargetKbps=${expectedDownloadKbps ?: "unlimited"} " +
                     "uploadTargetKbps=${expectedUploadKbps ?: "unlimited"}",
             )
-            var firstError: String? = null
-            val testClient = buildTestClient(context)
+            val probeSessionToken = SpeedLimiter.beginProbeMeasurementSession()
+            try {
+                var downloadError: String? = null
+                var uploadError: String? = null
+                val testClient = buildTestClient(context)
 
-            val download = try {
-                onProgress(SpeedTestPhase.DOWNLOAD)
-                measurePhase(
-                    testClient,
-                    isUpload = false,
-                    expectedKbps = expectedDownloadKbps,
-                    verificationProfile = verificationProfile,
+                val download = try {
+                    onProgress(SpeedTestPhase.DOWNLOAD)
+                    measurePhase(
+                        testClient,
+                        isUpload = false,
+                        expectedKbps = expectedDownloadKbps,
+                        verificationProfile = verificationProfile,
+                    )
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Throwable) {
+                    downloadError = errorMessage(error)
+                    Log.w(TAG, "Download failed: $downloadError", error)
+                    null
+                }
+
+                val upload = try {
+                    onProgress(SpeedTestPhase.UPLOAD)
+                    measurePhase(
+                        testClient,
+                        isUpload = true,
+                        expectedKbps = expectedUploadKbps,
+                        verificationProfile = verificationProfile,
+                    )
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Throwable) {
+                    uploadError = errorMessage(error)
+                    Log.w(TAG, "Upload failed: $uploadError", error)
+                    null
+                }
+
+                SpeedTestResult(
+                    downloadBps = download?.throughputBps,
+                    uploadBps = upload?.throughputBps,
+                    durationMs = System.currentTimeMillis() - startedAt,
+                    error = combinePhaseErrors(downloadError, uploadError),
+                    uploadPayloadBytesWritten = upload?.completedPayloadBytes ?: 0L,
                 )
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: Throwable) {
-                firstError = errorMessage(error)
-                Log.w(TAG, "Download failed: ${errorMessage(error)}", error)
-                null
+            } finally {
+                SpeedLimiter.endProbeMeasurementSession(probeSessionToken)
             }
-
-            val upload = try {
-                onProgress(SpeedTestPhase.UPLOAD)
-                measurePhase(
-                    testClient,
-                    isUpload = true,
-                    expectedKbps = expectedUploadKbps,
-                    verificationProfile = verificationProfile,
-                )
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: Throwable) {
-                firstError = firstError ?: errorMessage(error)
-                Log.w(TAG, "Upload failed: ${errorMessage(error)}", error)
-                null
             }
-
-            SpeedTestResult(
-                downloadBps = download?.throughputBps,
-                uploadBps = upload?.throughputBps,
-                durationMs = System.currentTimeMillis() - startedAt,
-                error = firstError,
-                uploadPayloadBytesWritten = upload?.completedPayloadBytes ?: 0L,
-            )
         }
 
     private fun errorMessage(error: Throwable): String =
         error.message?.takeIf { it.isNotBlank() } ?: error.javaClass.simpleName
+
+    internal fun combinePhaseErrors(downloadError: String?, uploadError: String?): String? =
+        listOfNotNull(
+            downloadError?.trim()?.takeIf { it.isNotEmpty() },
+            uploadError?.trim()?.takeIf { it.isNotEmpty() },
+        ).distinct().joinToString(" • ").takeIf { it.isNotEmpty() }
 
     private fun executeMeasuredRequest(
         client: OkHttpClient,
@@ -494,7 +599,7 @@ object SpeedTestEngine {
             }
         }
 
-    private fun warmupBytesFor(expectedKbps: Long?, verificationProfile: Boolean = false): Long =
+    internal fun warmupBytesFor(expectedKbps: Long?, verificationProfile: Boolean = false): Long =
         when {
             verificationProfile && (expectedKbps == null || expectedKbps <= 0L) -> min(
                 1_000_000L,
@@ -505,7 +610,7 @@ object SpeedTestEngine {
             expectedKbps <= 1_000L -> 16_000L
             else -> min(
                 1_000_000L,
-                requestSizesFor(expectedKbps).firstOrNull()?.div(4L) ?: WARMUP_BYTES,
+                requestSizesFor(expectedKbps, verificationProfile).firstOrNull()?.div(4L) ?: WARMUP_BYTES,
             ).coerceAtLeast(WARMUP_BYTES)
         }
 

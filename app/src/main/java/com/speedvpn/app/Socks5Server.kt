@@ -72,6 +72,241 @@ internal fun readRelayBatch(
     return RelayReadBatch(bytesRead, if (bytesRead < 0) 0 else 1)
 }
 
+internal data class UdpDatagramDeliveryResult(
+    val delivered: Boolean,
+    val settledDecision: QuotaTrafficDecision,
+)
+
+/**
+ * Writes the quota-admitted prefix of a TCP chunk and settles the reservation according to
+ * the explicit TCP settlement policy:
+ * - On normal return of [OutputStream.write], commits [allowedBytes] and records [allowedBytes]
+ *   in [bucket] and live traffic counters.
+ * - On an [OutputStream.write] exception, settles with [QuotaSettlementOutcome.TCP_WRITE_FAILED_CONSERVATIVE]
+ *   (retaining the durable quota reservation because Java sockets do not report partial bytes
+ *   flushed to the kernel before throwing, while recording 0 bytes in [bucket] and live stats).
+ */
+internal fun writeAdmittedTcpRelayChunk(
+    destination: OutputStream,
+    buffer: ByteArray,
+    requestedBytes: Int,
+    decision: QuotaTrafficDecision,
+    bucket: TokenBucket,
+    generation: Long,
+    packages: Set<String>,
+    uid: Int?,
+    direction: QuotaTrafficDirection,
+    hasOwner: Boolean,
+    isVerificationProbe: Boolean = false,
+    remoteAddress: String? = null,
+    remotePort: Int = 0,
+    flowMarker: String? = null,
+    recordForwardedBytes: (Set<String>, Int?, QuotaTrafficDirection, Int) -> Unit = { _, _, _, _ -> },
+    settleQuotaBytes: (
+        Set<String>,
+        Int?,
+        QuotaTrafficDirection,
+        QuotaTrafficDecision,
+        QuotaSettlementOutcome,
+        Int,
+    ) -> QuotaTrafficDecision = { pkgs, ownerUid, dir, dec, outcome, bytes ->
+        if (outcome == QuotaSettlementOutcome.TCP_WRITE_SUCCEEDED && bytes > 0) {
+            recordForwardedBytes(pkgs, ownerUid, dir, bytes)
+        }
+        dec
+    },
+    onWriteStarted: (Long) -> Unit = {},
+    onWriteCompleted: (Long) -> Unit = {},
+): Int {
+    val allowedBytes = decision.allowedBytes.coerceIn(0, requestedBytes)
+    if (allowedBytes <= 0) return 0
+    val startedNs = System.nanoTime()
+    onWriteStarted(startedNs)
+    try {
+        destination.write(buffer, 0, allowedBytes)
+    } catch (error: Throwable) {
+        if (hasOwner) {
+            runCatching {
+                settleQuotaBytes(
+                    packages,
+                    uid,
+                    direction,
+                    decision,
+                    QuotaSettlementOutcome.TCP_WRITE_FAILED_CONSERVATIVE,
+                    0,
+                )
+            }
+        }
+        throw error
+    }
+    // Capture the socket-write completion time before accounting so diagnostics measure
+    // only the write itself. Publish forwarded bytes before notifying the reverse-flow timing
+    // observer; a fast peer reply must not outrun the upload counter.
+    val finishedNs = System.nanoTime()
+    bucket.recordForwardedForApp(
+        n = allowedBytes,
+        generation = generation,
+        uid = uid,
+        packages = packages,
+        isVerificationProbeFlow = isVerificationProbe,
+        remoteAddress = remoteAddress,
+        remotePort = remotePort,
+        flowMarker = flowMarker,
+    )
+    onWriteCompleted(finishedNs)
+    if (hasOwner) {
+        runCatching {
+            settleQuotaBytes(
+                packages,
+                uid,
+                direction,
+                decision,
+                QuotaSettlementOutcome.TCP_WRITE_SUCCEEDED,
+                allowedBytes,
+            )
+        }
+    }
+    return allowedBytes
+}
+
+/**
+ * Atomic UDP datagram admission and post-delivery settlement. A UDP datagram whose size
+ * exceeds [decision].allowedBytes or whose channel/socket send returns false is not
+ * transmitted on the wire; its uncommitted durable quota reservation is released via
+ * [QuotaSettlementOutcome.UDP_DROPPED_OR_SEND_FAILED] and zero live bytes are recorded.
+ */
+internal fun deliverAdmittedUdpDatagramDetailed(
+    payloadBytes: Int,
+    decision: QuotaTrafficDecision,
+    packages: Set<String>,
+    uid: Int?,
+    direction: QuotaTrafficDirection,
+    hasOwner: Boolean,
+    sendDatagram: () -> Boolean,
+    recordForwardedBytes: (Set<String>, Int?, QuotaTrafficDirection, Int) -> Unit = { _, _, _, _ -> },
+    settleQuotaBytes: (
+        Set<String>,
+        Int?,
+        QuotaTrafficDirection,
+        QuotaTrafficDecision,
+        QuotaSettlementOutcome,
+        Int,
+    ) -> QuotaTrafficDecision = { pkgs, ownerUid, dir, dec, outcome, bytes ->
+        if (outcome == QuotaSettlementOutcome.UDP_DELIVERED && bytes > 0) {
+            recordForwardedBytes(pkgs, ownerUid, dir, bytes)
+            dec
+        } else {
+            dec.copy(allowedBytes = 0)
+        }
+    },
+): UdpDatagramDeliveryResult {
+    if (payloadBytes <= 0 || decision.allowedBytes < payloadBytes) {
+        val settled = if (hasOwner) {
+            runCatching {
+                settleQuotaBytes(
+                    packages,
+                    uid,
+                    direction,
+                    decision,
+                    QuotaSettlementOutcome.UDP_DROPPED_OR_SEND_FAILED,
+                    0,
+                )
+            }.getOrElse { decision.copy(allowedBytes = 0) }
+        } else {
+            decision.copy(allowedBytes = 0)
+        }
+        return UdpDatagramDeliveryResult(delivered = false, settledDecision = settled)
+    }
+
+    val delivered = try {
+        sendDatagram()
+    } catch (error: Throwable) {
+        if (hasOwner) {
+            runCatching {
+                settleQuotaBytes(
+                    packages,
+                    uid,
+                    direction,
+                    decision,
+                    QuotaSettlementOutcome.UDP_DROPPED_OR_SEND_FAILED,
+                    0,
+                )
+            }
+        }
+        throw error
+    }
+
+    if (!delivered) {
+        val settled = if (hasOwner) {
+            runCatching {
+                settleQuotaBytes(
+                    packages,
+                    uid,
+                    direction,
+                    decision,
+                    QuotaSettlementOutcome.UDP_DROPPED_OR_SEND_FAILED,
+                    0,
+                )
+            }.getOrElse { decision.copy(allowedBytes = 0) }
+        } else {
+            decision.copy(allowedBytes = 0)
+        }
+        return UdpDatagramDeliveryResult(delivered = false, settledDecision = settled)
+    }
+
+    val settled = if (hasOwner) {
+        runCatching {
+            settleQuotaBytes(
+                packages,
+                uid,
+                direction,
+                decision,
+                QuotaSettlementOutcome.UDP_DELIVERED,
+                payloadBytes,
+            )
+        }.getOrElse { decision }
+    } else {
+        decision
+    }
+    return UdpDatagramDeliveryResult(delivered = true, settledDecision = settled)
+}
+
+internal fun deliverAdmittedUdpDatagram(
+    payloadBytes: Int,
+    decision: QuotaTrafficDecision,
+    packages: Set<String>,
+    uid: Int?,
+    direction: QuotaTrafficDirection,
+    hasOwner: Boolean,
+    sendDatagram: () -> Boolean,
+    recordForwardedBytes: (Set<String>, Int?, QuotaTrafficDirection, Int) -> Unit = { _, _, _, _ -> },
+    settleQuotaBytes: (
+        Set<String>,
+        Int?,
+        QuotaTrafficDirection,
+        QuotaTrafficDecision,
+        QuotaSettlementOutcome,
+        Int,
+    ) -> QuotaTrafficDecision = { pkgs, ownerUid, dir, dec, outcome, bytes ->
+        if (outcome == QuotaSettlementOutcome.UDP_DELIVERED && bytes > 0) {
+            recordForwardedBytes(pkgs, ownerUid, dir, bytes)
+            dec
+        } else {
+            dec.copy(allowedBytes = 0)
+        }
+    },
+): Boolean = deliverAdmittedUdpDatagramDetailed(
+    payloadBytes = payloadBytes,
+    decision = decision,
+    packages = packages,
+    uid = uid,
+    direction = direction,
+    hasOwner = hasOwner,
+    sendDatagram = sendDatagram,
+    recordForwardedBytes = recordForwardedBytes,
+    settleQuotaBytes = settleQuotaBytes,
+).delivered
+
 /**
  * Local SOCKS5 relay used by the native tun2socks engine.
  *
@@ -79,12 +314,48 @@ internal fun readRelayBatch(
  * passed to hev through tunnel.yml. This prevents unrelated localhost clients
  * from using the relay as an unrestricted egress proxy.
  */
-class Socks5Server(
+class Socks5Server internal constructor(
     private val generation: Long,
     private val protectTcp: (Socket) -> Boolean,
     private val protectUdp: (DatagramSocket) -> Boolean,
     private val currentNetwork: () -> Network?,
     private val ipv6Enabled: Boolean,
+    private val dnsIpv4Only: Boolean = false,
+    private val accountQuotaBytes: (
+        packages: Set<String>,
+        uid: Int?,
+        direction: QuotaTrafficDirection,
+        requestedBytes: Int,
+        transport: QuotaTransport,
+    ) -> QuotaTrafficDecision = { _, _, _, requestedBytes, _ -> QuotaTrafficDecision(requestedBytes) },
+    private val recordForwardedBytes: (
+        packages: Set<String>,
+        uid: Int?,
+        direction: QuotaTrafficDirection,
+        forwardedBytes: Int,
+    ) -> Unit = { _, _, _, _ -> },
+    private val settleQuotaBytes: (
+        packages: Set<String>,
+        uid: Int?,
+        direction: QuotaTrafficDirection,
+        decision: QuotaTrafficDecision,
+        outcome: QuotaSettlementOutcome,
+        forwardedBytes: Int,
+    ) -> QuotaTrafficDecision = { pkgs, uid, dir, decision, outcome, forwardedBytes ->
+        if ((outcome == QuotaSettlementOutcome.TCP_WRITE_SUCCEEDED ||
+                outcome == QuotaSettlementOutcome.UDP_DELIVERED) && forwardedBytes > 0
+        ) {
+            recordForwardedBytes(pkgs, uid, dir, forwardedBytes)
+        }
+        if (outcome == QuotaSettlementOutcome.UDP_DROPPED_OR_SEND_FAILED) {
+            decision.copy(allowedBytes = 0)
+        } else {
+            decision
+        }
+    },
+    private val onQuotaExceeded: (Set<String>) -> Unit = {},
+    /** Refuse ownerless data sessions while at least one per-app quota is configured. */
+    private val requireUidAttribution: () -> Boolean = { false },
 ) {
     companion object {
         private const val MAX_SESSIONS = 80
@@ -94,12 +365,14 @@ class Socks5Server(
         private const val MAX_WORKERS = 192
         private const val HANDSHAKE_TIMEOUT_MS = 10_000
         private const val UDP_BUFFER_SIZE = 65_535
+        private const val UDP_SOCKET_BUFFER_SIZE = 256 * 1024
         private const val MAX_UDP_ASSOCIATIONS = 24
         private const val UDP_DNS_WORKERS = 4
         private const val UDP_FLOW_TTL_MS = 30_000L
         private const val UDP_CANDIDATE_FALLBACK_MS = 750L
         private const val CONNECT_TIMEOUT_MS = 12_000L
         private const val UDP_DNS_TIMEOUT_MS = 3_000L
+        private val HEALTH_PROBE_RESERVATION_TTL_NANOS = TimeUnit.SECONDS.toNanos(5L)
 
         private const val IPPROTO_TCP = 6
         private const val IPPROTO_UDP = 17
@@ -108,6 +381,43 @@ class Socks5Server(
             1 -> true
             4 -> ipv6Enabled
             else -> false
+        }
+
+        /** Defense-in-depth check for a SOCKS association whose owner became blocked. */
+        internal fun isSessionUidBlocked(sessionUid: Int?, blockedUids: Set<Int>): Boolean =
+            sessionUid != null && sessionUid > 0 && sessionUid in blockedUids
+
+        /** A health probe has a distinct authenticated identity, never a UID-less app identity. */
+        internal fun healthProbeUsername(baseUsername: String): String = "$baseUsername#health-probe"
+
+        /** Explicit flow-level identity for synthetic speed-test / verification probes (attributed or unattributed). */
+        internal fun probeUsername(baseUsername: String, uid: Int? = null): String =
+            if (uid != null && uid >= 0) "$baseUsername#$uid#probe" else "$baseUsername#probe"
+
+        internal fun isProbeUsername(suppliedUsername: String, baseUsername: String): Boolean =
+            suppliedUsername == "$baseUsername#probe" ||
+                (suppliedUsername.startsWith("$baseUsername#") && suppliedUsername.endsWith("#probe"))
+
+        internal fun healthProbeReservationIsValid(expiresAtNanos: Long?, nowNanos: Long): Boolean =
+            expiresAtNanos != null && nowNanos < expiresAtNanos
+
+        /**
+         * Permit the special control identity without a UID, but never let a port reservation
+         * accidentally turn an ordinary UID-less app session into an unmetered session.
+         */
+        internal fun usernameShapeAllowed(
+            suppliedUsername: String,
+            baseUsername: String,
+            sessionUid: Int?,
+            requireUidAttribution: Boolean,
+        ): Boolean = when {
+            suppliedUsername == healthProbeUsername(baseUsername) -> true
+            sessionUid != null ->
+                suppliedUsername == "$baseUsername#$sessionUid" ||
+                    suppliedUsername == probeUsername(baseUsername, sessionUid)
+            else ->
+                (suppliedUsername == baseUsername || suppliedUsername == probeUsername(baseUsername, null)) &&
+                    !requireUidAttribution
         }
 
         internal fun udpFlowKey(
@@ -129,6 +439,10 @@ class Socks5Server(
         @Volatile var uid: Int? = null,
         @Volatile var packages: Set<String> = emptySet(),
         @Volatile var tuple: String = "",
+        @Volatile var isVerificationProbe: Boolean = false,
+        val flowMarker: String = "",
+        val remoteAddress: String = "",
+        val remotePort: Int = 0,
     )
 
     private val server = ServerSocket(0, 128, InetAddress.getByName("127.0.0.1"))
@@ -146,7 +460,9 @@ class Socks5Server(
     // session table cannot make the health monitor report a false failure.
     private val sessions = Semaphore(MAX_SESSIONS, true)
     private val udpAssociations = Semaphore(MAX_UDP_ASSOCIATIONS, true)
-    private val probeSourcePorts = ConcurrentHashMap.newKeySet<Int>()
+    // Keep a short-lived reservation after the probe socket times out. The accept thread may
+    // be descheduled under load and must still recognize a just-accepted health socket.
+    private val probeSourcePorts = ConcurrentHashMap<Int, Long>()
     private val upstreamTcp = Collections.newSetFromMap(ConcurrentHashMap<Socket, Boolean>())
     private val upstreamUdp = Collections.newSetFromMap(ConcurrentHashMap<DatagramSocket, Boolean>())
     private val blockedDestinations = ConcurrentHashMap.newKeySet<String>()
@@ -157,6 +473,8 @@ class Socks5Server(
     private val upstreamTcpMetadata = ConcurrentHashMap<Socket, FlowOwnerMetadata>()
     private val activeUdpMuxes = ConcurrentHashMap.newKeySet<UdpUpstreamMux>()
     @Volatile private var blockedUids: Set<Int> = emptySet()
+    // Policy changes invalidate accepted SOCKS sessions and asynchronous DNS work.
+    @Volatile private var policyEpoch: Long = 0L
     // User-domain DNS resolution is encrypted DoH. The bounded pool prevents
     // stalled encrypted lookups from building an unbounded backlog.
     private val dnsPool: ExecutorService = ThreadPoolExecutor(
@@ -180,7 +498,7 @@ class Socks5Server(
             if (current != null && encryptedDnsNetwork == network) {
                 current
             } else {
-                EncryptedDnsResolver(network, protectTcp, ipv6Enabled).also {
+                EncryptedDnsResolver(network, protectTcp, ipv6Enabled, dnsIpv4Only).also {
                     encryptedDnsNetwork = network
                     encryptedDnsResolver = it
                 }
@@ -227,7 +545,10 @@ class Socks5Server(
                     break
                 }
                 val sourcePort = (client.remoteSocketAddress as? InetSocketAddress)?.port
-                val isHealthProbe = sourcePort != null && probeSourcePorts.remove(sourcePort)
+                val isHealthProbe = sourcePort?.let { port ->
+                    healthProbeReservationIsValid(probeSourcePorts.remove(port), System.nanoTime())
+                } == true
+                val acceptedPolicyEpoch = policyEpoch
 
                 if (!isHealthProbe && !sessions.tryAcquire()) {
                     runCatching { client.close() }
@@ -238,7 +559,7 @@ class Socks5Server(
                 try {
                     executor.execute {
                         try {
-                            handle(client)
+                            handle(client, acceptedPolicyEpoch, isHealthProbe)
                         } finally {
                             if (!isHealthProbe) sessions.release()
                         }
@@ -289,10 +610,11 @@ class Socks5Server(
             // Register a source-port reservation before connect(). The accept loop can
             // then recognize this in-process health check and bypass the user-session
             // semaphore even when MAX_SESSIONS is fully occupied.
+            pruneExpiredProbeReservations()
             socket.bind(InetSocketAddress("127.0.0.1", 0))
             sourcePort = (socket.localSocketAddress as? InetSocketAddress)?.port
             if (sourcePort == null) return false
-            probeSourcePorts.add(sourcePort)
+            probeSourcePorts[sourcePort] = System.nanoTime() + HEALTH_PROBE_RESERVATION_TTL_NANOS
 
             socket.soTimeout = timeoutMs
             socket.connect(InetSocketAddress("127.0.0.1", port), timeoutMs)
@@ -303,7 +625,7 @@ class Socks5Server(
             out.flush()
             if (input.readUnsignedByte() != 5 || input.readUnsignedByte() != 2) return false
 
-            val ub = username.toByteArray(Charsets.UTF_8)
+            val ub = healthProbeUsername(username).toByteArray(Charsets.UTF_8)
             val pb = password.toByteArray(Charsets.UTF_8)
             out.write(byteArrayOf(1, ub.size.toByte()))
             out.write(ub)
@@ -326,33 +648,69 @@ class Socks5Server(
         } catch (_: Exception) {
             false
         } finally {
-            sourcePort?.let(probeSourcePorts::remove)
+            // If connect failed, release the unused reservation. For a connected socket,
+            // let the accept loop consume it; removing it here races a delayed accept.
+            if (!socket.isConnected) sourcePort?.let(probeSourcePorts::remove)
             runCatching { socket.close() }
+        }
+    }
+
+    private fun pruneExpiredProbeReservations(nowNanos: Long = System.nanoTime()) {
+        probeSourcePorts.entries.forEach { entry ->
+            if (entry.value <= nowNanos) probeSourcePorts.remove(entry.key, entry.value)
         }
     }
 
     private fun track(socket: Socket): Socket = socket.also { openTcp.add(it) }
     private fun untrack(socket: Socket) { openTcp.remove(socket) }
-    private fun trackUpstream(socket: Socket, endpoint: String? = null): Socket {
+    private fun trackUpstream(
+        socket: Socket,
+        endpoint: String? = null,
+        sessionUid: Int? = null,
+        sessionIsProbe: Boolean = false,
+        clientSourcePort: Int = -1,
+        remoteAddress: String = "",
+        remotePort: Int = 0,
+    ): Socket {
         upstreamTcp.add(socket)
         openTcp.add(socket)
         if (endpoint != null) {
-            val owner = flowOwnersByEndpoint[endpoint]
-            val metadata = FlowOwnerMetadata(endpoint).also {
-                if (owner != null) {
-                    it.uid = owner.uid
-                    it.packages = owner.packages
-                    it.tuple = owner.tuple
-                }
+            val tupleTag = sessionUid?.let { "SOCKS5_UID_AUTH:$it" } ?: "UID_UNRESOLVED"
+            val isClientSocketProbe = SpeedLimiter.isMarkedProbeClientSocket(
+                localPort = clientSourcePort,
+                remoteHostOrIp = remoteAddress,
+                remotePort = remotePort,
+                protocol = IPPROTO_TCP,
+            )
+            val flowMarker = "tcp-relay:${System.identityHashCode(socket)}:$IPPROTO_TCP|$clientSourcePort->$remoteAddress:$remotePort"
+            val isProbeFlow = sessionIsProbe || isClientSocketProbe
+            if (isProbeFlow) {
+                SpeedLimiter.markProbeFlow(flowMarker)
             }
-            upstreamTcpMetadata[socket] = metadata
+            // Ownership and probe status are attached strictly to this specific SOCKS session
+            // (via per-5-tuple SOCKS auth or the bound client socket's source port), never via
+            // destination IP:port counters or UID alone.
+            upstreamTcpMetadata[socket] = FlowOwnerMetadata(
+                endpointKey = endpoint,
+                uid = sessionUid,
+                packages = emptySet(),
+                tuple = tupleTag,
+                isVerificationProbe = isProbeFlow,
+                flowMarker = flowMarker,
+                remoteAddress = remoteAddress,
+                remotePort = remotePort,
+            )
         }
         return socket
     }
     private fun untrackUpstream(socket: Socket) {
         upstreamTcp.remove(socket)
         openTcp.remove(socket)
-        upstreamTcpMetadata.remove(socket)
+        upstreamTcpMetadata.remove(socket)?.let { meta ->
+            if (meta.flowMarker.isNotBlank()) {
+                SpeedLimiter.unmarkProbeFlow(meta.flowMarker)
+            }
+        }
     }
     private fun track(socket: DatagramSocket): DatagramSocket = socket.also { openUdp.add(it) }
     private fun untrack(socket: DatagramSocket) { openUdp.remove(socket) }
@@ -386,6 +744,43 @@ class Socks5Server(
         log("BLOCKED_UID_CONNECTIONS_KILLED uidCount=${normalized.size} tcpClosed=$closedTcp")
     }
 
+
+    /**
+     * SOCKS destination metadata may be ambiguous when two apps contact one endpoint.
+     * On any policy change, invalidate every prior relay and cancel pending DoH requests.
+     */
+    internal fun closeActiveSessionsForPolicyChange() {
+        val dnsResolver = synchronized(this) {
+            policyEpoch += 1L
+            flowOwnersByEndpoint.clear()
+            encryptedDnsNetwork = null
+            encryptedDnsResolver.also { encryptedDnsResolver = null }
+        }
+        val dnsCancelled = dnsResolver != null
+        runCatching { dnsResolver?.cancelPendingRequests() }
+
+        val tcpSockets = openTcp.toList()
+        val udpSockets = openUdp.toList()
+        val muxes = activeUdpMuxes.toList()
+        muxes.forEach { runCatching { it.close() } }
+        tcpSockets.forEach { socket ->
+            runCatching { socket.close() }
+            untrackUpstream(socket)
+            untrack(socket)
+        }
+        udpSockets.forEach { socket ->
+            runCatching { socket.close() }
+            untrackUpstream(socket)
+            untrack(socket)
+        }
+        activeUdpMuxes.removeAll(muxes.toSet())
+        blockedFlowTuples.clear()
+        val tcpCount = tcpSockets.size
+        val udpCount = udpSockets.size
+        val muxCount = muxes.size
+        log("APP_POLICY_SESSIONS_CLOSED epoch=$policyEpoch tcp=$tcpCount udp=$udpCount udpMuxes=$muxCount dnsCancelled=$dnsCancelled")
+    }
+
     private fun endpointKey(protocol: Int, host: String, port: Int): String =
         protocol.toString() + "|" + host.substringBefore("%").trim('[', ']').lowercase() + "|" + port
 
@@ -403,10 +798,12 @@ class Socks5Server(
         dstPort: Int,
         uid: Int,
         packages: Collection<String>,
+        isVerificationProbe: Boolean = false,
     ) {
         val endpoint = endpointKey(protocol, dstIp, dstPort)
         val flowTuple = protocol.toString() + "|" + srcIp + ":" + srcPort + "->" +
             dstIp + ":" + dstPort + "|uid=" + uid
+
         val owner = flowOwnersByEndpoint.compute(endpoint) { _, existing ->
             when {
                 existing == null -> FlowOwnerMetadata(endpoint).also {
@@ -428,20 +825,10 @@ class Socks5Server(
             }
         } ?: return
 
-        // Do not overwrite a known different UID when two apps contact the same endpoint.
-        // The native per-flow table remains authoritative if the SOCKS endpoint is ambiguous.
-        val ownerUid = owner.uid ?: return
-        val ownerPackages = owner.packages
-        val ownerTuple = owner.tuple
-        upstreamTcpMetadata.values
-            .filter { it.endpointKey == endpoint && it.uid == null }
-            .forEach {
-                it.uid = ownerUid
-                it.packages = ownerPackages
-                it.tuple = ownerTuple
-            }
-        activeUdpMuxes.toList().forEach {
-            it.recordFlowOwner(endpoint, ownerUid, ownerPackages, ownerTuple)
+        // This endpoint table is diagnostic/policy state only. Never copy its owner to
+        // live relays: two apps can contact the same destination concurrently.
+        if (owner.uid == null) {
+            log("APP_FLOW_ENDPOINT_AMBIGUOUS endpoint=$endpoint; relay ownership stays per-session")
         }
     }
 
@@ -457,6 +844,12 @@ class Socks5Server(
         permanent: Boolean,
     ) {
         recordDetectedFlow(protocol, srcIp, srcPort, dstIp, dstPort, uid, packages)
+        if (!permanent) {
+            // An app blacklist is UID-scoped. Do not convert one blocked app's destination
+            // into a global endpoint block that also affects unblocked apps.
+            if (uid > 0 && uid in blockedUids) killConnectionsForBlockedUids(setOf(uid))
+            return
+        }
         val endpoint = endpointKey(protocol, dstIp, dstPort)
         val flowTuple = protocol.toString() + "|" + srcIp + ":" + srcPort + "->" +
             dstIp + ":" + dstPort + "|uid=" + uid
@@ -466,7 +859,7 @@ class Socks5Server(
             uid = uid,
             flowTuple = flowTuple,
             policyPackages = policyBlockedPackages,
-            permanent = permanent,
+            permanent = true,
         )
     }
 
@@ -554,8 +947,9 @@ class Socks5Server(
         }
     }
 
-    private fun handle(client: Socket) {
+    private fun handle(client: Socket, expectedPolicyEpoch: Long, isHealthProbe: Boolean) {
         try {
+            if (policyEpoch != expectedPolicyEpoch) return
             client.soTimeout = HANDSHAKE_TIMEOUT_MS
             client.tcpNoDelay = true
             val input = DataInputStream(client.getInputStream())
@@ -584,11 +978,48 @@ class Socks5Server(
             val passBytes = ByteArray(pLen)
             input.readFully(passBytes)
 
-            val authOk = MessageDigest.isEqual(userBytes, username.toByteArray(Charsets.UTF_8)) &&
+            val suppliedUsername = userBytes.toString(Charsets.UTF_8)
+            val isHealthProbeIdentity = suppliedUsername == healthProbeUsername(username)
+            val isSpeedProbeIdentity = isProbeUsername(suppliedUsername, username)
+            val uidPrefix = "$username#"
+            val normalizedForUid = if (isSpeedProbeIdentity) suppliedUsername.removeSuffix("#probe") else suppliedUsername
+            val sessionUid = if (isHealthProbeIdentity || normalizedForUid == username) {
+                null
+            } else if (normalizedForUid.startsWith(uidPrefix)) {
+                normalizedForUid.removePrefix(uidPrefix).toIntOrNull()?.takeIf { it >= 0 }
+            } else {
+                null
+            }
+            // The authenticated control identity needs no database quota lookup. Avoid competing
+            // with per-chunk SQLite quota transactions during active traffic.
+            val uidRequired = if (isHealthProbeIdentity) false else
+                runCatching { requireUidAttribution() }.getOrDefault(true)
+            val expectedUsername = when {
+                isHealthProbeIdentity -> healthProbeUsername(username)
+                isSpeedProbeIdentity -> probeUsername(username, sessionUid)
+                sessionUid != null -> "$username#$sessionUid"
+                else -> username
+            }
+            val usernameShapeValid = usernameShapeAllowed(
+                suppliedUsername = suppliedUsername,
+                baseUsername = username,
+                sessionUid = sessionUid,
+                requireUidAttribution = uidRequired,
+            )
+            val authOk = usernameShapeValid &&
+                MessageDigest.isEqual(userBytes, expectedUsername.toByteArray(Charsets.UTF_8)) &&
                 MessageDigest.isEqual(passBytes, password.toByteArray(Charsets.UTF_8))
+            if ((isHealthProbe || isHealthProbeIdentity) && !authOk) {
+                log("SOCKS_HEALTH_PROBE_AUTH_FAILED uidRequired=$uidRequired reservationRecognized=$isHealthProbe")
+            }
+            if (!authOk) {
+                logE("SOCKS_AUTH_REJECTED uidRequired=$uidRequired parsedUid=${sessionUid ?: "UNRESOLVED"} healthProbe=$isHealthProbeIdentity")
+            } else if (!isHealthProbeIdentity) {
+                log("SOCKS_AUTH_ACCEPTED uid=${sessionUid ?: "UNRESOLVED"} uidRequired=$uidRequired")
+            }
             out.write(byteArrayOf(1, if (authOk) 0 else 1))
             out.flush()
-            if (!authOk) return
+            if (!authOk || policyEpoch != expectedPolicyEpoch) return
 
             // Long-lived relays should not inherit the handshake timeout.
             client.soTimeout = 0
@@ -599,9 +1030,11 @@ class Socks5Server(
             val host = readAddress(input)
             val port = input.readUnsignedShort()
 
+            if (policyEpoch != expectedPolicyEpoch) return
+            val clientSourcePort = (client.remoteSocketAddress as? InetSocketAddress)?.port ?: -1
             when (cmd) {
-                1 -> connect(client, input, out, host, port)
-                3 -> udpAssociate(client, input, out)
+                1 -> connect(client, input, out, host, port, expectedPolicyEpoch, sessionUid, isSpeedProbeIdentity, clientSourcePort)
+                3 -> udpAssociate(client, input, out, expectedPolicyEpoch, sessionUid, isSpeedProbeIdentity, clientSourcePort)
                 else -> {
                     out.write(byteArrayOf(5, 7, 0, 1, 0, 0, 0, 0, 0, 0))
                     out.flush()
@@ -632,18 +1065,33 @@ class Socks5Server(
         else -> throw IllegalArgumentException("bad atyp")
     }
 
-    private fun resolveAll(host: String, timeoutMs: Long): List<InetAddress> {
+    private fun resolveAll(
+        host: String,
+        timeoutMs: Long,
+        expectedPolicyEpoch: Long? = null,
+    ): List<InetAddress> {
+        fun policyStillAllowsDns(): Boolean = expectedPolicyEpoch == null || policyEpoch == expectedPolicyEpoch
+        if (!policyStillAllowsDns()) throw UnknownHostException("DNS cancelled by app policy change")
         val network = currentNetwork()
             ?: throw UnknownHostException("No physical network available for encrypted DNS resolution: $host")
         if (timeoutMs <= 0L) throw SocketTimeoutException("DNS deadline exceeded for $host")
 
         val future = dnsPool.submit<List<InetAddress>> {
-            encryptedResolver(network).resolve(host)
+            if (!policyStillAllowsDns()) throw UnknownHostException("DNS cancelled by app policy change")
+            val resolver = encryptedResolver(network)
+            if (!policyStillAllowsDns()) {
+                resolver.cancelPendingRequests()
+                throw UnknownHostException("DNS cancelled by app policy change")
+            }
+            resolver.resolve(host, ::policyStillAllowsDns)
         }
         return try {
             future.get(timeoutMs, TimeUnit.MILLISECONDS)
                 .filter { ipv6Enabled || it is java.net.Inet4Address }
-                .also { if (it.isEmpty()) throw UnknownHostException("No usable DNS address for $host") }
+                .also {
+                    if (!policyStillAllowsDns()) throw UnknownHostException("DNS cancelled by app policy change")
+                    if (it.isEmpty()) throw UnknownHostException("No usable DNS address for $host")
+                }
         } catch (e: TimeoutException) {
             future.cancel(true)
             throw SocketTimeoutException("Encrypted DNS timeout for $host")
@@ -653,19 +1101,42 @@ class Socks5Server(
             throw UnknownHostException("Encrypted DNS failed for $host: ${e.cause?.message ?: e.message}")
         }
     }
-    private fun connect(client: Socket, cin: InputStream, cout: OutputStream, target: Any, port: Int) {
+    private fun connect(
+        client: Socket,
+        cin: InputStream,
+        cout: OutputStream,
+        target: Any,
+        port: Int,
+        expectedPolicyEpoch: Long,
+        sessionUid: Int?,
+        sessionIsProbe: Boolean = false,
+        clientSourcePort: Int = -1,
+    ) {
+        if (policyEpoch != expectedPolicyEpoch) {
+            runCatching { client.close() }
+            return
+        }
+        if (sessionUid != null && sessionUid in blockedUids) {
+            replyFailure(cout, 2)
+            runCatching { client.close() }
+            return
+        }
         val deadlineNs = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(CONNECT_TIMEOUT_MS)
         val candidates = when (target) {
             is InetAddress -> listOf(target)
             is String -> {
                 val remainingMs = TimeUnit.NANOSECONDS.toMillis(deadlineNs - System.nanoTime())
-                resolveAll(target, remainingMs)
+                resolveAll(target, remainingMs, expectedPolicyEpoch)
             }
             else -> emptyList()
         }
             .filter { ipv6Enabled || it is java.net.Inet4Address }
             .sortedBy { if (it.address.size == 4) 0 else 1 }
 
+        if (policyEpoch != expectedPolicyEpoch) {
+            runCatching { client.close() }
+            return
+        }
         if (candidates.isEmpty()) {
             replyFailure(cout, 4)
             client.close()
@@ -679,6 +1150,7 @@ class Socks5Server(
 
         var upstream: Socket? = null
         for (addr in candidates) {
+            if (policyEpoch != expectedPolicyEpoch) break
             val remainingMs = TimeUnit.NANOSECONDS.toMillis(deadlineNs - System.nanoTime())
                 .coerceAtMost(5_000L)
                 .toInt()
@@ -687,12 +1159,21 @@ class Socks5Server(
             val endpoint = endpointKey(IPPROTO_TCP, addr, port)
             if (endpoint in blockedDestinations) continue
             val socket = Socket()
-            trackUpstream(socket, endpoint)
+            trackUpstream(
+                socket = socket,
+                endpoint = endpoint,
+                sessionUid = sessionUid,
+                sessionIsProbe = sessionIsProbe,
+                clientSourcePort = clientSourcePort,
+                remoteAddress = addr.hostAddress ?: "",
+                remotePort = port,
+            )
             try {
                 val network = currentNetwork() ?: throw UnknownHostException("No physical network available")
                 network.bindSocket(socket)
                 if (!protectTcp(socket)) throw SocketException("VPN socket protection failed")
                 socket.connect(InetSocketAddress(addr, port), remainingMs)
+                if (policyEpoch != expectedPolicyEpoch) throw SocketException("Socket closed by app policy change")
                 if (endpoint in blockedDestinations) {
                     throw SocketException("connection blocked by app policy")
                 }
@@ -716,6 +1197,12 @@ class Socks5Server(
             return
         }
 
+        if (policyEpoch != expectedPolicyEpoch) {
+            runCatching { remote.close() }
+            untrackUpstream(remote)
+            runCatching { client.close() }
+            return
+        }
         cout.write(byteArrayOf(5, 0, 0, 1, 0, 0, 0, 0, 0, 0))
         cout.flush()
 
@@ -743,6 +1230,7 @@ class Socks5Server(
                     destination = client,
                     bucket = SpeedLimiter.download,
                     generation = generation,
+                    expectedPolicyEpoch = expectedPolicyEpoch,
                     other = remote,
                     remaining = remaining,
                     done = done,
@@ -756,6 +1244,7 @@ class Socks5Server(
                 destination = remote,
                 bucket = SpeedLimiter.upload,
                 generation = generation,
+                expectedPolicyEpoch = expectedPolicyEpoch,
                 other = client,
                 remaining = remaining,
                 done = done,
@@ -776,6 +1265,7 @@ class Socks5Server(
         destination: Socket,
         bucket: TokenBucket,
         generation: Long,
+        expectedPolicyEpoch: Long,
         other: Socket,
         remaining: AtomicInteger,
         done: CountDownLatch,
@@ -798,13 +1288,14 @@ class Socks5Server(
         var limiterCallNs = 0L
         var destinationWriteNs = 0L
         var destinationWriteInProgress = false
+        var exhaustedOnFailedWrite: Set<String> = emptySet()
         try {
             // Match relay read granularity to the current pacing bucket. A 16 KiB
             // read requires hundreds of scheduler wakeups per second at high rates;
             // larger reads reduce that overhead while staying inside the bucket's
             // bounded burst window. The bucket can change while the pipe is active.
             val buf = ByteArray(256 * 1024)
-            while (running && SpeedLimiter.isGenerationActive(generation)) {
+            while (running && policyEpoch == expectedPolicyEpoch && SpeedLimiter.isGenerationActive(generation)) {
                 destinationWriteInProgress = false
                 val readStartedNs = System.nanoTime()
                 val readSize = bucket.recommendedReadBytes().coerceAtMost(buf.size)
@@ -829,21 +1320,79 @@ class Socks5Server(
                     exitReason = "limiter_or_session_inactive"
                     break
                 }
-                if (!running || !SpeedLimiter.isGenerationActive(generation)) {
-                    exitReason = "session_stopped"
+                if (!running || policyEpoch != expectedPolicyEpoch || !SpeedLimiter.isGenerationActive(generation)) {
+                    exitReason = "session_or_policy_stopped"
                     break
                 }
-                val writeStartedNs = System.nanoTime()
-                destinationWriteInProgress = true
-                dst.write(buf, 0, n)
-                destinationWriteInProgress = false
-                writeCalls++
-                val writeFinishedNs = System.nanoTime()
-                destinationWriteNs += writeFinishedNs - writeStartedNs
-                if (firstForwardedNs == 0L) firstForwardedNs = writeStartedNs
-                lastForwardedNs = writeFinishedNs
-                bucket.recordForwarded(n, generation)
-                forwardedBytes += n.toLong()
+                // Account at the relay boundary and never write beyond the remaining quota.
+                // flowSocket is the physical upstream socket for both directions.
+                val owner = upstreamTcpMetadata[flowSocket]
+                val direction = if (bucket === SpeedLimiter.download) {
+                    QuotaTrafficDirection.DOWNLOAD
+                } else {
+                    QuotaTrafficDirection.UPLOAD
+                }
+                val flowMarker = owner?.flowMarker?.ifBlank { flowId } ?: flowId
+                val isProbeChunk = (owner?.isVerificationProbe == true) || SpeedLimiter.isMarkedProbeFlow(flowMarker)
+                val quotaDecision = if (owner == null) {
+                    QuotaTrafficDecision(n)
+                } else {
+                    try {
+                        accountQuotaBytes(owner.packages, owner.uid, direction, n, QuotaTransport.TCP)
+                    } catch (error: Exception) {
+                        logE("Quota accounting failed; dropping this relay chunk flowId=$flowId", error)
+                        exitReason = "quota_accounting_failed"
+                        QuotaTrafficDecision(0)
+                    }
+                }
+                var writeStartedNs = 0L
+                exhaustedOnFailedWrite = quotaDecision.exhaustedPackages
+                val allowedBytes = writeAdmittedTcpRelayChunk(
+                    destination = dst,
+                    buffer = buf,
+                    requestedBytes = n,
+                    decision = quotaDecision,
+                    bucket = bucket,
+                    generation = generation,
+                    packages = owner?.packages.orEmpty(),
+                    uid = owner?.uid,
+                    direction = direction,
+                    hasOwner = owner != null,
+                    isVerificationProbe = isProbeChunk,
+                    remoteAddress = owner?.remoteAddress?.ifBlank { flowRemoteHost } ?: flowRemoteHost,
+                    remotePort = owner?.remotePort?.takeIf { it > 0 } ?: flowSocket.port,
+                    flowMarker = flowMarker,
+                    recordForwardedBytes = recordForwardedBytes,
+                    settleQuotaBytes = settleQuotaBytes,
+                    onWriteStarted = { startedNs ->
+                        writeStartedNs = startedNs
+                        destinationWriteInProgress = true
+                    },
+                    onWriteCompleted = { finishedNs ->
+                        destinationWriteInProgress = false
+                        exhaustedOnFailedWrite = emptySet()
+                        writeCalls++
+                        destinationWriteNs += finishedNs - writeStartedNs
+                        if (firstForwardedNs == 0L) firstForwardedNs = writeStartedNs
+                        lastForwardedNs = finishedNs
+                    },
+                )
+                if (allowedBytes > 0) {
+                    forwardedBytes += allowedBytes.toLong()
+                }
+
+                if (quotaDecision.exhaustedPackages.isNotEmpty()) {
+                    exitReason = "quota_exhausted"
+                    runCatching { onQuotaExceeded(quotaDecision.exhaustedPackages) }
+                        .onFailure { logE("Immediate quota block callback failed", it) }
+                    closeBoth()
+                    break
+                }
+                if (allowedBytes < n) {
+                    if (exitReason != "quota_accounting_failed") exitReason = "quota_accounting_failed"
+                    closeBoth()
+                    break
+                }
             }
             runCatching { dst.flush() }
         } catch (error: SocketException) {
@@ -855,6 +1404,10 @@ class Socks5Server(
             exitReason = "relay_error"
             logPipeException(error, bucket, generation, flowId)
         } finally {
+            if (exhaustedOnFailedWrite.isNotEmpty()) {
+                runCatching { onQuotaExceeded(exhaustedOnFailedWrite) }
+                    .onFailure { logE("Immediate quota block callback failed after TCP write error", it) }
+            }
             val wallDurationNs = (System.nanoTime() - pipeStartedNs).coerceAtLeast(1L)
             val transferDurationNs = if (firstForwardedNs > 0L) {
                 (lastForwardedNs - firstForwardedNs).coerceAtLeast(1L)
@@ -950,7 +1503,25 @@ class Socks5Server(
         }
     }
 
-    private fun udpAssociate(client: Socket, cin: InputStream, cout: OutputStream) {
+    private fun udpAssociate(
+        client: Socket,
+        cin: InputStream,
+        cout: OutputStream,
+        expectedPolicyEpoch: Long,
+        sessionUid: Int?,
+        sessionIsProbe: Boolean = false,
+        controlClientPort: Int = -1,
+    ) {
+        if (policyEpoch != expectedPolicyEpoch) {
+            runCatching { client.close() }
+            return
+        }
+        log("SOCKS_UDP_ASSOC_START uid=${sessionUid ?: "UNRESOLVED"} blocked=${sessionUid != null && sessionUid in blockedUids} policyEpoch=$expectedPolicyEpoch")
+        if (sessionUid != null && sessionUid in blockedUids) {
+            replyFailure(cout, 2)
+            runCatching { client.close() }
+            return
+        }
         if (!udpAssociations.tryAcquire()) {
             replyFailure(cout, 1)
             client.close()
@@ -962,6 +1533,10 @@ class Socks5Server(
         try {
             relay = track(DatagramSocket(0, InetAddress.getByName("127.0.0.1")))
             val relaySocket = requireNotNull(relay)
+            runCatching {
+                relaySocket.receiveBufferSize = UDP_SOCKET_BUFFER_SIZE
+                relaySocket.sendBufferSize = UDP_SOCKET_BUFFER_SIZE
+            }
 
             // Fail closed at association creation time when there is no physical
             // network. Individual flow sockets also re-check the network before
@@ -978,6 +1553,7 @@ class Socks5Server(
                 )
             )
             cout.flush()
+            log("SOCKS_UDP_ASSOC_READY uid=${sessionUid ?: "UNRESOLVED"} relayPort=$relayPort")
 
             val clientAddr = AtomicReference<InetAddress?>(null)
             val udpFlows = UdpFlowTable(maxFlows = 256, ttlMs = UDP_FLOW_TTL_MS)
@@ -985,6 +1561,10 @@ class Socks5Server(
                 relaySocket = relaySocket,
                 udpFlows = udpFlows,
                 clientAddr = clientAddr,
+                expectedPolicyEpoch = expectedPolicyEpoch,
+                sessionUid = sessionUid,
+                sessionIsProbe = sessionIsProbe,
+                controlClientPort = controlClientPort,
             ).also { activeUdpMuxes.add(it) }
             val closeOnce = AtomicBoolean(false)
             val closeAll = {
@@ -1000,10 +1580,22 @@ class Socks5Server(
             try {
                 pool.execute {
                     val buf = ByteArray(UDP_BUFFER_SIZE)
+                    var loggedClientDatagram = false
+                    var loggedForwardResult = false
                     try {
-                        while (running && SpeedLimiter.isGenerationActive(generation) && !relaySocket.isClosed) {
+                        while (running && policyEpoch == expectedPolicyEpoch &&
+                            SpeedLimiter.isGenerationActive(generation) && !relaySocket.isClosed &&
+                            !Socks5Server.isSessionUidBlocked(sessionUid, blockedUids)
+                        ) {
                             val pkt = DatagramPacket(buf, buf.size)
                             relaySocket.receive(pkt)
+                            if (!loggedClientDatagram) {
+                                log("SOCKS_UDP_CLIENT_DATAGRAM uid=${sessionUid ?: "UNRESOLVED"} bytes=${pkt.length} sender=${pkt.address.hostAddress}:${pkt.port}")
+                                loggedClientDatagram = true
+                            }
+                            // A block may be installed while receive() is waiting. Re-check
+                            // immediately after wake-up before parsing or forwarding the packet.
+                            if (Socks5Server.isSessionUidBlocked(sessionUid, blockedUids)) break
                             val sender = pkt.address
                             val first = clientAddr.compareAndSet(null, sender)
                             // RFC 1928 requires source-IP validation for UDP ASSOCIATE.
@@ -1036,11 +1628,12 @@ class Socks5Server(
                                     val len = bb.get().toInt() and 0xff
                                     if (bb.remaining() < len) continue
                                     val host = ByteArray(len).also { bb.get(it) }.toString(Charsets.UTF_8)
-                                    runCatching { resolveAll(host, UDP_DNS_TIMEOUT_MS) }
+                                    runCatching { resolveAll(host, UDP_DNS_TIMEOUT_MS, expectedPolicyEpoch) }
                                         .getOrElse { emptyList() }
                                 }
                                 else -> continue
                             }
+                            if (policyEpoch != expectedPolicyEpoch) break
                             if (candidates.isEmpty() || bb.remaining() < 2) continue
 
                             val port = bb.short.toInt() and 0xffff
@@ -1066,18 +1659,25 @@ class Socks5Server(
                             if (!SpeedLimiter.acquire(SpeedLimiter.upload, payloadLen, generation)) break
                             if (!running || !SpeedLimiter.isGenerationActive(generation)) break
 
-                            if (!mux.send(
-                                    flow = flow,
-                                    address = addr,
-                                    port = port,
-                                    data = pkt.data,
-                                    offset = bb.position(),
-                                    length = payloadLen,
-                                )
-                            ) {
+                            val forwarded = mux.send(
+                                flow = flow,
+                                address = addr,
+                                port = port,
+                                data = pkt.data,
+                                offset = bb.position(),
+                                length = payloadLen,
+                            )
+                            if (!forwarded) {
+                                if (!loggedForwardResult) {
+                                    logE("SOCKS_UDP_FORWARD_REJECTED uid=${sessionUid ?: "UNRESOLVED"} dst=${addr.hostAddress}:$port bytes=$payloadLen")
+                                    loggedForwardResult = true
+                                }
                                 continue
                             }
-                            SpeedLimiter.upload.recordForwarded(payloadLen, generation)
+                            if (!loggedForwardResult) {
+                                log("SOCKS_UDP_FORWARD_SENT uid=${sessionUid ?: "UNRESOLVED"} dst=${addr.hostAddress}:$port bytes=$payloadLen")
+                                loggedForwardResult = true
+                            }
                             udpFlows.touchSent(flow, System.currentTimeMillis())
                             mux.trimClosedFlows(System.currentTimeMillis())
                         }
@@ -1088,14 +1688,17 @@ class Socks5Server(
                     }
                 }
 
-                while (cin.read() >= 0 && running && SpeedLimiter.isGenerationActive(generation)) { }
+                while (cin.read() >= 0 && running && policyEpoch == expectedPolicyEpoch && SpeedLimiter.isGenerationActive(generation)) { }
             } catch (_: Exception) {
                 // teardown
             } finally {
                 udpFlows.clear()
                 closeAll()
             }
-        } catch (_: Exception) {
+        } catch (error: Exception) {
+            if (running && policyEpoch == expectedPolicyEpoch) {
+                logE("SOCKS_UDP_ASSOC_FAILED uid=${sessionUid ?: "UNRESOLVED"}", error)
+            }
             runCatching { client.close() }
         } finally {
             relay?.let {
@@ -1117,6 +1720,7 @@ class Socks5Server(
         @Volatile var uid: Int? = null,
         @Volatile var packages: Set<String> = emptySet(),
         @Volatile var tuple: String = "",
+        @Volatile var isVerificationProbe: Boolean = false,
     )
 
     /**
@@ -1132,23 +1736,20 @@ class Socks5Server(
         private val relaySocket: DatagramSocket,
         private val udpFlows: UdpFlowTable,
         private val clientAddr: AtomicReference<InetAddress?>,
+        private val expectedPolicyEpoch: Long,
+        private val sessionUid: Int?,
+        private val sessionIsProbe: Boolean = false,
+        private val controlClientPort: Int = -1,
     ) : AutoCloseable {
         private val selector = Selector.open()
         private val lock = Any()
         private val bindings = HashMap<String, UdpBinding>()
         private val runningMux = AtomicBoolean(true)
+        private val selectorRegistrationGate = Any()
+        private val pendingSelectorRegistrations = AtomicInteger(0)
+
         private val worker = thread(name = "socks-udp-mux", isDaemon = true) {
             runLoop()
-        }
-
-        fun recordFlowOwner(endpoint: String, uid: Int?, packages: Set<String>, tuple: String) {
-            synchronized(lock) {
-                bindings.values.filter { it.endpointKey == endpoint }.forEach { binding ->
-                    binding.uid = uid
-                    binding.packages = packages
-                    binding.tuple = tuple
-                }
-            }
         }
 
         fun enforceBlockedPackages(blockedPackages: Set<String>) {
@@ -1171,6 +1772,14 @@ class Socks5Server(
         }
 
         fun killConnectionsForBlockedUids(blockedUids: Set<Int>) {
+            // Closing only current channels is insufficient for UDP: the SOCKS UDP
+            // association remains alive and could create a fresh channel on its next
+            // datagram. Close the association socket too, forcing its receive loop out.
+            if (Socks5Server.isSessionUidBlocked(sessionUid, blockedUids)) {
+                runCatching { relaySocket.close() }
+                close()
+                return
+            }
             synchronized(lock) {
                 val entries = bindings.entries.toList()
                 entries.forEach { entry ->
@@ -1207,6 +1816,15 @@ class Socks5Server(
             }
         }
 
+        fun packagesForFlow(flow: UdpFlow): Set<String> = synchronized(lock) {
+            bindings[flow.logicalKey]?.packages.orEmpty()
+        }
+
+        fun isProbeFlow(flow: UdpFlow, remoteAddress: String, remotePort: Int): Boolean = synchronized(lock) {
+            bindings[flow.logicalKey]?.isVerificationProbe
+                ?: (sessionIsProbe || SpeedLimiter.isMarkedProbeFlow(flow.logicalKey))
+        }
+
         fun send(
             flow: UdpFlow,
             address: InetAddress,
@@ -1215,37 +1833,101 @@ class Socks5Server(
             offset: Int,
             length: Int,
         ): Boolean {
-            if (!runningMux.get() || !running || !SpeedLimiter.isGenerationActive(generation)) return false
+            if (!runningMux.get() || !running || policyEpoch != expectedPolicyEpoch ||
+                !SpeedLimiter.isGenerationActive(generation) ||
+                Socks5Server.isSessionUidBlocked(sessionUid, blockedUids)
+            ) return false
             if (isDestinationBlocked(IPPROTO_UDP, address, port)) return false
 
             val remote = InetSocketAddress(address, port)
-            synchronized(lock) {
+            var exceededPackages: Set<String> = emptySet()
+            val sent = synchronized(lock) {
+                // Re-check inside the same critical section as channel creation/send.
+                if (Socks5Server.isSessionUidBlocked(sessionUid, blockedUids) ||
+                    !runningMux.get() || policyEpoch != expectedPolicyEpoch
+                ) return@synchronized false
                 var binding = bindings[flow.logicalKey]
                     ?.takeUnless { !it.channel.isOpen }
 
                 if (binding != null && binding.remote != remote) {
-                    // Never retarget a live channel. Cancel/close the old binding first
-                    // and publish a new immutable binding for the selected candidate.
                     if (bindings[flow.logicalKey] === binding) bindings.remove(flow.logicalKey)
                     closeBindingLocked(binding)
                     binding = null
                 }
 
                 if (binding == null) {
-                    binding = runCatching { createBindingLocked(flow, remote) }.getOrNull()
-                        ?: return false
+                    binding = try {
+                        createBindingLocked(flow, remote)
+                    } catch (error: Exception) {
+                        logE("SOCKS_UDP_BINDING_CREATE_FAILED uid=${sessionUid ?: "UNRESOLVED"} remote=${address.hostAddress}:$port", error)
+                        return@synchronized false
+                    }
                 }
 
                 val activeBinding = binding
-                return runCatching {
-                    val written = activeBinding.channel.write(ByteBuffer.wrap(data, offset, length))
-                    written == length
-                }.getOrElse {
-                    if (bindings[flow.logicalKey] === activeBinding) bindings.remove(flow.logicalKey)
-                    closeBindingLocked(activeBinding)
-                    false
+                val decision = try {
+                    if (activeBinding.uid != null || activeBinding.packages.isNotEmpty()) {
+                        accountQuotaBytes(
+                            activeBinding.packages,
+                            activeBinding.uid,
+                            QuotaTrafficDirection.UPLOAD,
+                            length,
+                            QuotaTransport.UDP,
+                        )
+                    } else {
+                        QuotaTrafficDecision(length)
+                    }
+                } catch (error: Exception) {
+                    logE("Quota accounting failed; dropping UDP upload datagram", error)
+                    return@synchronized false
                 }
+                if (decision.allowedBytes < length) {
+                    // UDP payloads are atomic: do not emit a malformed partial datagram.
+                    log("SOCKS_UDP_QUOTA_DROP uid=${sessionUid ?: "UNRESOLVED"} requested=$length allowed=${decision.allowedBytes}")
+                }
+                val delivery = deliverAdmittedUdpDatagramDetailed(
+                    payloadBytes = length,
+                    decision = decision,
+                    packages = activeBinding.packages,
+                    uid = activeBinding.uid,
+                    direction = QuotaTrafficDirection.UPLOAD,
+                    hasOwner = activeBinding.uid != null || activeBinding.packages.isNotEmpty(),
+                    sendDatagram = {
+                        runCatching {
+                            val written = activeBinding.channel.write(ByteBuffer.wrap(data, offset, length))
+                            written == length
+                        }.getOrElse {
+                            if (bindings[flow.logicalKey] === activeBinding) bindings.remove(flow.logicalKey)
+                            closeBindingLocked(activeBinding)
+                            false
+                        }
+                    },
+                    recordForwardedBytes = recordForwardedBytes,
+                    settleQuotaBytes = settleQuotaBytes,
+                )
+                exceededPackages = delivery.settledDecision.exhaustedPackages
+                if (delivery.delivered) {
+                    // Count a successfully sent datagram before releasing the UDP binding lock.
+                    // The selector uses the same lock to process its echo/reply; recording here
+                    // prevents an immediate reply from becoming observable before upload accounting.
+                    SpeedLimiter.upload.recordForwardedForApp(
+                        n = length,
+                        generation = generation,
+                        uid = activeBinding.uid,
+                        packages = activeBinding.packages,
+                        isVerificationProbeFlow = activeBinding.isVerificationProbe,
+                        remoteAddress = activeBinding.remote.address.hostAddress,
+                        remotePort = activeBinding.remote.port,
+                        flowMarker = flow.logicalKey,
+                    )
+                }
+                delivery.delivered
             }
+            if (exceededPackages.isNotEmpty()) {
+                runCatching { onQuotaExceeded(exceededPackages) }
+                    .onFailure { logE("Immediate quota block callback failed for UDP upload", it) }
+            }
+            return sent
         }
 
         fun trimClosedFlows(nowMs: Long) {
@@ -1270,40 +1952,85 @@ class Socks5Server(
                 bindings.clear()
             }
             selector.wakeup()
-            runCatching { worker.join(1_000) }
+            // Quota exhaustion may close this mux from its selector worker callback.
+            // Never join the current thread: the loop exits after this callback returns.
+            if (Thread.currentThread() !== worker) {
+                runCatching { worker.join(1_000) }
+            }
             runCatching { selector.close() }
         }
 
+        internal fun registerChannelWithSelector(
+            channel: DatagramChannel,
+            attachment: Any,
+        ) {
+            pendingSelectorRegistrations.incrementAndGet()
+            try {
+                selector.wakeup()
+                synchronized(selectorRegistrationGate) {
+                    selector.wakeup()
+                    channel.register(selector, SelectionKey.OP_READ, attachment)
+                }
+            } finally {
+                pendingSelectorRegistrations.decrementAndGet()
+                selector.wakeup()
+            }
+        }
+
+        internal fun yieldToPendingSelectorRegistrations() {
+            if (pendingSelectorRegistrations.get() <= 0) return
+            synchronized(selectorRegistrationGate) {
+                // Wait for channel registration to finish before selecting again.
+            }
+        }
+
         private fun createBindingLocked(flow: UdpFlow, remote: InetSocketAddress): UdpBinding {
+            if (policyEpoch != expectedPolicyEpoch) throw SocketException("Socket closed by app policy change")
             val network = currentNetwork()
                 ?: throw UnknownHostException("No physical network available")
             val channel = DatagramChannel.open()
             val socket = channel.socket()
             try {
-                socket.receiveBufferSize = 64 * 1024
-                socket.sendBufferSize = 64 * 1024
+                socket.receiveBufferSize = UDP_SOCKET_BUFFER_SIZE
+                socket.sendBufferSize = UDP_SOCKET_BUFFER_SIZE
                 network.bindSocket(socket)
                 socket.bind(InetSocketAddress(0))
                 if (!protectUdp(socket)) {
                     throw SocketException("VPN UDP socket protection failed")
                 }
+                if (policyEpoch != expectedPolicyEpoch) throw SocketException("Socket closed by app policy change")
                 channel.configureBlocking(false)
                 channel.connect(remote)
                 val endpoint = endpointKey(IPPROTO_UDP, remote.address, remote.port)
-                val owner = flowOwnersByEndpoint[endpoint]
+                val tupleTag = sessionUid?.let { "SOCKS5_UID_AUTH:$it" } ?: "UID_UNRESOLVED"
+                val remoteHost = remote.address.hostAddress ?: ""
+                val isClientSocketProbe =
+                    SpeedLimiter.isMarkedProbeClientSocket(
+                        localPort = flow.clientEndpoint.port,
+                        remoteHostOrIp = remoteHost,
+                        remotePort = remote.port,
+                        protocol = IPPROTO_UDP,
+                    )
+                val isProbe = sessionIsProbe ||
+                    isClientSocketProbe ||
+                    SpeedLimiter.isMarkedProbeFlow(flow.logicalKey)
+                if (isProbe) {
+                    SpeedLimiter.markProbeFlow(flow.logicalKey)
+                }
                 val binding = UdpBinding(
                     flow = flow,
                     channel = channel,
                     remote = remote,
                     endpointKey = endpoint,
-                    uid = owner?.uid,
-                    packages = owner?.packages.orEmpty(),
-                    tuple = owner?.tuple.orEmpty(),
+                    uid = sessionUid,
+                    packages = emptySet(),
+                    tuple = tupleTag,
+                    isVerificationProbe = isProbe,
                 )
-                synchronized(selector) {
-                    selector.wakeup()
-                    channel.register(selector, SelectionKey.OP_READ, binding)
-                }
+                // Selector registration is thread-safe. Do not synchronize on the
+                // Selector object: select() may hold that monitor while blocking, which
+                // prevents this thread from calling wakeup() and delays UDP setup.
+                registerChannelWithSelector(channel, binding)
                 trackUpstream(socket)
                 bindings[flow.logicalKey] = binding
                 return binding
@@ -1314,6 +2041,7 @@ class Socks5Server(
         }
 
         private fun closeBindingLocked(binding: UdpBinding) {
+            SpeedLimiter.unmarkProbeFlow(binding.flow.logicalKey)
             runCatching { binding.channel.keyFor(selector)?.cancel() }
             val socket = runCatching { binding.channel.socket() }.getOrNull()
             runCatching { binding.channel.close() }
@@ -1322,8 +2050,13 @@ class Socks5Server(
 
         private fun runLoop() {
             val buffer = ByteBuffer.allocate(UDP_BUFFER_SIZE)
+            var loggedUdpReply = false
             try {
-                while (runningMux.get() && running && SpeedLimiter.isGenerationActive(generation)) {
+                while (runningMux.get() && running && policyEpoch == expectedPolicyEpoch &&
+                    SpeedLimiter.isGenerationActive(generation) &&
+                    !Socks5Server.isSessionUidBlocked(sessionUid, blockedUids)
+                ) {
+                    yieldToPendingSelectorRegistrations()
                     selector.select(500)
                     val selected = selector.selectedKeys()
                     val iterator = selected.iterator()
@@ -1333,10 +2066,15 @@ class Socks5Server(
                         if (!key.isValid) continue
 
                         val binding = key.attachment() as? UdpBinding ?: continue
+                        if (Socks5Server.isSessionUidBlocked(sessionUid, blockedUids)) break
                         try {
                             buffer.clear()
                             val count = binding.channel.read(buffer)
                             if (count <= 0) continue
+                            if (!loggedUdpReply) {
+                                log("SOCKS_UDP_UPSTREAM_REPLY uid=${binding.uid ?: "UNRESOLVED"} remote=${binding.remote.address.hostAddress}:${binding.remote.port} bytes=$count")
+                                loggedUdpReply = true
+                            }
                             buffer.flip()
                             val payload = ByteArray(count)
                             buffer.get(payload)
@@ -1346,36 +2084,84 @@ class Socks5Server(
                             }
                             if (!running || !SpeedLimiter.isGenerationActive(generation)) continue
 
+                            val quotaDecision = try {
+                                if (binding.uid != null || binding.packages.isNotEmpty()) {
+                                    accountQuotaBytes(
+                                        binding.packages,
+                                        binding.uid,
+                                        QuotaTrafficDirection.DOWNLOAD,
+                                        count,
+                                        QuotaTransport.UDP,
+                                    )
+                                } else {
+                                    QuotaTrafficDecision(count)
+                                }
+                            } catch (error: Exception) {
+                                logE("Quota accounting failed; dropping UDP download datagram", error)
+                                continue
+                            }
                             // Candidate fallback may replace this binding while the
                             // selector still has a queued event. Serialize the final
                             // ownership check with candidate replacement and relay send.
-                            var delivered = false
-                            synchronized(lock) {
-                                if (bindings[binding.flow.logicalKey] === binding && binding.channel.isOpen) {
-                                    val destination = binding.flow.clientEndpoint
-                                    val address = binding.remote.address.address
-                                    val type = if (address.size == 4) 1 else 4
-                                    val header = ByteBuffer.allocate(4 + address.size + 2 + count)
-                                        .put(byteArrayOf(0, 0, 0, type.toByte()))
-                                        .put(address)
-                                        .putShort(binding.remote.port.toShort())
-                                        .put(payload)
+                            val delivery = deliverAdmittedUdpDatagramDetailed(
+                                payloadBytes = count,
+                                decision = quotaDecision,
+                                packages = binding.packages,
+                                uid = binding.uid,
+                                direction = QuotaTrafficDirection.DOWNLOAD,
+                                hasOwner = binding.uid != null || binding.packages.isNotEmpty(),
+                                sendDatagram = {
+                                    var sent = false
+                                    synchronized(lock) {
+                                        if (bindings[binding.flow.logicalKey] === binding && binding.channel.isOpen) {
+                                            val destination = binding.flow.clientEndpoint
+                                            val address = binding.remote.address.address
+                                            val type = if (address.size == 4) 1 else 4
+                                            val header = ByteBuffer.allocate(4 + address.size + 2 + count)
+                                                .put(byteArrayOf(0, 0, 0, type.toByte()))
+                                                .put(address)
+                                                .putShort(binding.remote.port.toShort())
+                                                .put(payload)
 
-                                    relaySocket.send(
-                                        DatagramPacket(
-                                            header.array(),
-                                            0,
-                                            header.position(),
-                                            destination.address,
-                                            destination.port,
-                                        )
-                                    )
-                                    udpFlows.markReply(binding.flow, System.currentTimeMillis())
-                                    delivered = true
-                                }
+                                            relaySocket.send(
+                                                DatagramPacket(
+                                                    header.array(),
+                                                    0,
+                                                    header.position(),
+                                                    destination.address,
+                                                    destination.port,
+                                                )
+                                            )
+                                            udpFlows.markReply(binding.flow, System.currentTimeMillis())
+                                            // Publish the delivered reply while this binding is still
+                                            // protected from replacement/teardown and before the
+                                            // receiving client can trigger its next accounting check.
+                                            SpeedLimiter.download.recordForwardedForApp(
+                                                n = count,
+                                                generation = generation,
+                                                uid = binding.uid,
+                                                packages = binding.packages,
+                                                isVerificationProbeFlow = binding.isVerificationProbe,
+                                                remoteAddress = binding.remote.address.hostAddress,
+                                                remotePort = binding.remote.port,
+                                                flowMarker = binding.flow.logicalKey,
+                                            )
+                                            sent = true
+                                        }
+                                    }
+                                    sent
+                                },
+                                recordForwardedBytes = recordForwardedBytes,
+                                settleQuotaBytes = settleQuotaBytes,
+                            )
+                            if (delivery.settledDecision.exhaustedPackages.isNotEmpty()) {
+                                runCatching { onQuotaExceeded(delivery.settledDecision.exhaustedPackages) }
+                                    .onFailure { logE("Immediate quota block callback failed for UDP download", it) }
                             }
-                            if (delivered) SpeedLimiter.download.recordForwarded(count, generation)
-                        } catch (_: Exception) {
+                        } catch (error: Exception) {
+                            if (runningMux.get() && running && policyEpoch == expectedPolicyEpoch) {
+                                logE("SOCKS_UDP_RESPONSE_RELAY_FAILED uid=${binding.uid ?: "UNRESOLVED"} remote=${binding.remote.address.hostAddress}:${binding.remote.port}", error)
+                            }
                             synchronized(lock) {
                                 bindings.remove(binding.flow.logicalKey)
                                 closeBindingLocked(binding)

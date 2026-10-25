@@ -149,4 +149,33 @@ class SpeedVerificationPolicyTest {
         assertEquals(SpeedVerificationStatus.NOT_VERIFIABLE, invalidated.download.status)
         assertEquals(SpeedVerificationStatus.NOT_VERIFIABLE, invalidated.upload.status)
     }
+
+    @Test
+    fun lowRatePresetsUseOneTimesHeadroomFloorAndReportAccurateReason() {
+        for (lowRatePlanKbps in listOf(600L, 800L)) {
+            val targetBps = lowRatePlanKbps * 1_000L
+            val atOneTimes = SpeedVerificationPolicy.evaluate(
+                planKbps = lowRatePlanKbps,
+                baselineBps = targetBps,
+                vpnBps = targetBps,
+            )
+            assertEquals(SpeedVerificationStatus.MATCH, atOneTimes.status)
+
+            val belowOneTimes = SpeedVerificationPolicy.evaluate(
+                planKbps = lowRatePlanKbps,
+                baselineBps = targetBps - 1L,
+                vpnBps = targetBps,
+            )
+            assertEquals(SpeedVerificationStatus.NOT_VERIFIABLE, belowOneTimes.status)
+            assertTrue(belowOneTimes.reason?.contains("1.0 مرة") == true)
+        }
+
+        val standardPlanBelowHeadroom = SpeedVerificationPolicy.evaluate(
+            planKbps = 1_000L,
+            baselineBps = 1_100_000L,
+            vpnBps = 1_000_000L,
+        )
+        assertEquals(SpeedVerificationStatus.NOT_VERIFIABLE, standardPlanBelowHeadroom.status)
+        assertTrue(standardPlanBelowHeadroom.reason?.contains("1.2 مرة") == true)
+    }
 }

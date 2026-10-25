@@ -2,6 +2,9 @@
 """Apply the temporary UID-detection hook to the pinned hev-socks5-tunnel checkout."""
 
 from pathlib import Path
+import re
+import subprocess
+import tempfile
 import sys
 
 BEGIN = "/* SPEEDVPN_UID_POC_BEGIN */"
@@ -118,13 +121,307 @@ def inject_native_start_step_logs(jni_text: str) -> str:
     jni_text = jni_text[:line_start] + logline + jni_text[line_start:]
     return jni_text
 
+def verify_patched_markers(
+    jni_c: Path,
+    session_c: Path,
+    session_tcp_c: Path,
+    session_udp_c: Path,
+    tunnel_c: Path,
+    client_c: Path,
+) -> None:
+    for source_path, marker in (
+        (jni_c, "uid_poc_is_internal_mapdns"),
+        (session_c, "hev_socks5_session_resolve_uid"),
+        (session_c, "Normalize IPv4-mapped IPv6 tuples to their four-byte IPv4 form."),
+        (jni_c, "hev_jni_uid_poc_resolve_probe"),
+        (jni_c, "hev_jni_uid_poc_set_probe_socket"),
+        (jni_c, "uid_poc_is_registered_probe_locked"),
+        (jni_c, "uid_poc_cache[index].is_probe = 0;"),
+        (jni_c, "uid_poc_cache[slot].is_probe = (!should_drop && known_probe) ? 1 : 0;"),
+        (session_c, "hev_socks5_session_resolve_probe"),
+        (session_c, "%s#%d#probe"),
+        (session_c, "%s#probe"),
+        (session_tcp_c, "self->data.uid = hev_socks5_session_resolve_uid (6"),
+        (session_tcp_c, "self->data.is_probe = hev_socks5_session_resolve_probe (6"),
+        (session_tcp_c, "siptr->get_is_probe = hev_socks5_session_tcp_get_is_probe;"),
+        (session_udp_c, "self->data.uid = hev_socks5_session_resolve_uid (17, &pcb->remote_ip,"),
+        (session_udp_c, "self->data.is_probe = hev_socks5_session_resolve_probe (17, &pcb->remote_ip,"),
+        (session_udp_c, "hev_socks5_session_udp_has_pbuf (self, p)"),
+        (session_udp_c, "siptr->get_uid = hev_socks5_session_udp_get_uid;"),
+        (session_udp_c, "siptr->get_is_probe = hev_socks5_session_udp_get_is_probe;"),
+        (tunnel_c, "hev_socks5_session_udp_new (pcb, addr, port, &mutex)"),
+        (client_c, "hev_socks5_client_write_auth_methods (HevSocks5Client *self, int pipeline)"),
+        (client_c, "hev_socks5_client_write_auth_creds (HevSocks5Client *self, int pipeline)"),
+        (client_c, "int flags = MSG_WAITALL | (pipeline ? MSG_MORE : 0);"),
+        (client_c, "hev_socks5_client_write_auth_methods (self, 0);"),
+        (client_c, "hev_socks5_client_write_auth_creds (self, 0);"),
+        (client_c, "hev_socks5_client_write_auth_methods (self, 1);"),
+        (client_c, "hev_socks5_client_write_auth_creds (self, 1);"),
+    ):
+        if marker not in source_path.read_text():
+            raise SystemExit(f"Refusing incomplete per-session UID bridge: missing {marker}")
+
+    jni_src = jni_c.read_text()
+    # 1. Reject any legacy/conflicting JNI signatures or duplicate forward declarations
+    for forbidden in ("(II[BIZ)Z", "jbyteArray dst_addr"):
+        if forbidden in jni_src:
+            raise SystemExit(f"Refusing stale or conflicting JNI signature in {jni_c}: {forbidden}")
+
+    proto_names = re.findall(
+        r"^[ \t]*static\s+(?:jboolean|jlongArray)\s+(native_[a-z0-9_]+)\s*\([^;]*\);",
+        jni_src,
+        flags=re.MULTILINE,
+    )
+    if len(proto_names) != len(set(proto_names)):
+        raise SystemExit(f"Refusing duplicate JNI forward declarations in {jni_c}: {proto_names}")
+
+    # 2. Dynamically parse TProxyService.java and verify native_methods[] + C function signatures in hev-jni.c
+    java_to_jni = {
+        "void": "V",
+        "boolean": "Z",
+        "byte": "B",
+        "char": "C",
+        "short": "S",
+        "int": "I",
+        "long": "J",
+        "float": "F",
+        "double": "D",
+        "String": "Ljava/lang/String;",
+        "java.lang.String": "Ljava/lang/String;",
+        "Object": "Ljava/lang/Object;",
+        "java.lang.Object": "Ljava/lang/Object;",
+    }
+    jni_to_c_type = {
+        "V": "void",
+        "Z": "jboolean",
+        "B": "jbyte",
+        "I": "jint",
+        "J": "jlong",
+        "[B": "jbyteArray",
+        "[J": "jlongArray",
+        "Ljava/lang/String;": "jstring",
+        "Ljava/lang/Object;": "jobject",
+    }
+
+    def java_type_to_jni(jtype: str) -> str:
+        cleaned = re.sub(r"\s+", "", jtype.strip())
+        dims = 0
+        while cleaned.endswith("[]"):
+            dims += 1
+            cleaned = cleaned[:-2]
+        if cleaned not in java_to_jni:
+            raise SystemExit(f"Unsupported Java native type in TProxyService.java: {jtype}")
+        return ("[" * dims) + java_to_jni[cleaned]
+
+    def split_jni_signature_tokens(sig: str) -> tuple[list[str], str]:
+        if not sig.startswith("(") or ")" not in sig:
+            raise SystemExit(f"Malformed JNI signature: {sig}")
+        params_part, ret_part = sig[1:].split(")", 1)
+        tokens: list[str] = []
+        idx = 0
+        while idx < len(params_part):
+            start = idx
+            while idx < len(params_part) and params_part[idx] == "[":
+                idx += 1
+            if idx < len(params_part) and params_part[idx] == "L":
+                semi = params_part.find(";", idx)
+                if semi < 0:
+                    raise SystemExit(f"Unterminated object descriptor in JNI signature: {sig}")
+                idx = semi + 1
+            else:
+                idx += 1
+            tokens.append(params_part[start:idx])
+        return tokens, ret_part
+
+    candidate_java_paths = [
+        jni_c.parent.parent / "TProxyService.java",
+        *(
+            [jni_c.parents[3] / "java/hev/htproxy/TProxyService.java"]
+            if len(jni_c.parents) > 3
+            else []
+        ),
+        Path(__file__).resolve().parents[3] / "app/src/main/java/hev/htproxy/TProxyService.java",
+    ]
+    tproxy_java = next((cand for cand in candidate_java_paths if cand.is_file()), None)
+    if tproxy_java is None:
+        raise SystemExit(f"Could not locate TProxyService.java for JNI verification from {jni_c}")
+
+    java_src = tproxy_java.read_text(encoding="utf-8")
+    java_clean = re.sub(r"/\*.*?\*/", "", java_src, flags=re.DOTALL)
+    java_clean = re.sub(r"//[^\n]*", "", java_clean)
+    java_native_decls: dict[str, str] = {}
+    for m in re.finditer(
+        r"\bpublic\s+static\s+native\s+([A-Za-z0-9_.\[\]]+)\s+([A-Za-z0-9_]+)\s*\(([^)]*)\)\s*;",
+        java_clean,
+    ):
+        ret_t, m_name, raw_params = m.group(1), m.group(2), m.group(3).strip()
+        p_descs: list[str] = []
+        if raw_params:
+            for p_item in raw_params.split(","):
+                parts = p_item.strip().split()
+                if len(parts) < 2:
+                    raise SystemExit(f"Cannot parse parameter {p_item!r} of {m_name} in {tproxy_java}")
+                p_descs.append(java_type_to_jni("".join(parts[:-1])))
+        computed_sig = f"({''.join(p_descs)}){java_type_to_jni(ret_t)}"
+        if m_name in java_native_decls:
+            raise SystemExit(f"Overloaded or duplicate native method {m_name} in {tproxy_java}")
+        java_native_decls[m_name] = computed_sig
+
+    if not java_native_decls:
+        raise SystemExit(f"No public static native declarations found in {tproxy_java}")
+
+    table_match = re.search(
+        r"static\s+JNINativeMethod\s+native_methods\[\]\s*=\s*\{(.*?)\};",
+        jni_src,
+        flags=re.DOTALL,
+    )
+    if not table_match:
+        raise SystemExit(f"Could not find native_methods[] table in {jni_c}")
+    jni_entries = re.findall(
+        r'\{\s*"([^"]+)"\s*,\s*"([^"]+)"\s*,\s*\(void\s*\*\)\s*([a-zA-Z0-9_]+)\s*\}',
+        table_match.group(1),
+    )
+    jni_map = {name: sig for name, sig, _ in jni_entries}
+    if len(jni_entries) != len(jni_map) or jni_map != java_native_decls:
+        raise SystemExit(
+            f"Refusing mismatched native_methods[] table in {jni_c} vs {tproxy_java}:\n"
+            f"  hev-jni.c:          {jni_map}\n"
+            f"  TProxyService.java: {java_native_decls}"
+        )
+
+    # Also verify each C handler function signature in hev-jni.c matches its JNI descriptor
+    for java_name, jni_sig, c_fn in jni_entries:
+        param_tokens, ret_token = split_jni_signature_tokens(jni_sig)
+        expected_c_ret = jni_to_c_type.get(ret_token)
+        expected_c_params = ["JNIEnv*", "jobject", *[jni_to_c_type.get(tok, "") for tok in param_tokens]]
+        if not expected_c_ret or any(not p for p in expected_c_params):
+            raise SystemExit(f"Unsupported JNI token in {java_name} {jni_sig}")
+        fn_matches = list(
+            re.finditer(
+                rf"^[ \t]*static\s+([A-Za-z0-9_]+)\s+{re.escape(c_fn)}\s*\(([^)]*)\)\s*(?:;|\{{)",
+                jni_src,
+                flags=re.MULTILINE,
+            )
+        )
+        if not fn_matches:
+            raise SystemExit(f"Missing C definition for JNI handler {c_fn} ({java_name}) in {jni_c}")
+        for fm in fn_matches:
+            actual_c_ret = fm.group(1).strip()
+            raw_c_params = [p.strip() for p in fm.group(2).split(",") if p.strip()]
+            actual_c_params: list[str] = []
+            for cp in raw_c_params:
+                cp_norm = re.sub(r"\s+", " ", cp)
+                if "*" in cp_norm:
+                    prefix = cp_norm[: cp_norm.rfind("*") + 1].replace(" ", "")
+                    actual_c_params.append(prefix)
+                else:
+                    actual_c_params.append(cp_norm.split()[0])
+            if actual_c_ret != expected_c_ret or actual_c_params != expected_c_params:
+                raise SystemExit(
+                    f"C signature mismatch for {c_fn} ({java_name} {jni_sig}) in {jni_c}: "
+                    f"got {actual_c_ret}({actual_c_params}), expected {expected_c_ret}({expected_c_params})"
+                )
+
+    # 3. Compile the ENTIRE hev-jni.c translation unit with gcc -fsyntax-only -DANDROID -D__ANDROID__
+    with tempfile.TemporaryDirectory() as tmpdir:
+        inc_dir = Path(tmpdir)
+        (inc_dir / "android").mkdir(parents=True, exist_ok=True)
+        (inc_dir / "android/log.h").write_text(
+            "#ifndef _ANDROID_LOG_H\n#define _ANDROID_LOG_H\n"
+            "#define ANDROID_LOG_INFO 4\n#define ANDROID_LOG_WARN 5\n"
+            "#define ANDROID_LOG_ERROR 6\n#define ANDROID_LOG_FATAL 7\n"
+            "int __android_log_print(int prio, const char *tag, const char *fmt, ...);\n"
+            "#endif\n",
+            encoding="utf-8",
+        )
+        (inc_dir / "jni.h").write_text(
+            "#ifndef _JNI_STUB_H\n#define _JNI_STUB_H\n"
+            "#include <stddef.h>\n#include <stdint.h>\n"
+            "typedef unsigned char jboolean;\n"
+            "typedef signed char jbyte;\n"
+            "typedef int32_t jint;\n"
+            "typedef int64_t jlong;\n"
+            "typedef jint jsize;\n"
+            "typedef void *jobject;\n"
+            "typedef jobject jclass;\n"
+            "typedef jobject jstring;\n"
+            "typedef jobject jbyteArray;\n"
+            "typedef jobject jlongArray;\n"
+            "typedef void *jmethodID;\n"
+            "#define JNI_FALSE 0\n#define JNI_TRUE 1\n"
+            "#define JNI_OK 0\n#define JNI_ERR (-1)\n#define JNI_VERSION_1_4 0x00010004\n"
+            "typedef struct { const char *name; const char *signature; void *fnPtr; } JNINativeMethod;\n"
+            "struct JNINativeInterface;\n"
+            "typedef const struct JNINativeInterface *JNIEnv;\n"
+            "struct JNIInvokeInterface;\n"
+            "typedef const struct JNIInvokeInterface *JavaVM;\n"
+            "struct JNINativeInterface {\n"
+            "    jclass (*FindClass)(JNIEnv *, const char *);\n"
+            "    jint (*RegisterNatives)(JNIEnv *, jclass, const JNINativeMethod *, jint);\n"
+            "    void (*DeleteLocalRef)(JNIEnv *, jobject);\n"
+            "    const char *(*GetStringUTFChars)(JNIEnv *, jstring, jboolean *);\n"
+            "    void (*ReleaseStringUTFChars)(JNIEnv *, jstring, const char *);\n"
+            "    jclass (*GetObjectClass)(JNIEnv *, jobject);\n"
+            "    jmethodID (*GetMethodID)(JNIEnv *, jclass, const char *, const char *);\n"
+            "    jboolean (*ExceptionCheck)(JNIEnv *);\n"
+            "    void (*ExceptionDescribe)(JNIEnv *);\n"
+            "    void (*ExceptionClear)(JNIEnv *);\n"
+            "    jobject (*NewGlobalRef)(JNIEnv *, jobject);\n"
+            "    void (*DeleteGlobalRef)(JNIEnv *, jobject);\n"
+            "    jbyteArray (*NewByteArray)(JNIEnv *, jsize);\n"
+            "    void (*SetByteArrayRegion)(JNIEnv *, jbyteArray, jsize, jsize, const jbyte *);\n"
+            "    jlong (*CallLongMethod)(JNIEnv *, jobject, jmethodID, ...);\n"
+            "    jlongArray (*NewLongArray)(JNIEnv *, jsize);\n"
+            "    void (*SetLongArrayRegion)(JNIEnv *, jlongArray, jsize, jsize, const jlong *);\n"
+            "};\n"
+            "struct JNIInvokeInterface {\n"
+            "    jint (*GetEnv)(JavaVM *, void **, jint);\n"
+            "    jint (*AttachCurrentThread)(JavaVM *, JNIEnv **, void *);\n"
+            "    jint (*DetachCurrentThread)(JavaVM *);\n"
+            "};\n"
+            "#endif\n",
+            encoding="utf-8",
+        )
+        subprocess.run(
+            [
+                "gcc",
+                "-fsyntax-only",
+                "-Wall",
+                "-Werror",
+                "-Wno-unused-function",
+                "-Wno-unused-parameter",
+                "-DANDROID",
+                "-D__ANDROID__",
+                f"-I{inc_dir}",
+                f"-I{jni_c.parent}",
+                str(jni_c),
+            ],
+            check=True,
+        )
+
+
 def main() -> None:
-    if len(sys.argv) != 2:
-        raise SystemExit("usage: patch_hev_uid_detection_poc.py <hev-socks5-tunnel-dir>")
-    root = Path(sys.argv[1]).resolve()
+    check_only = False
+    args = sys.argv[1:]
+    if args and args[0] == "--check":
+        check_only = True
+        args = args[1:]
+    if len(args) != 1:
+        raise SystemExit("usage: patch_hev_uid_detection_poc.py [--check] <hev-socks5-tunnel-dir>")
+    root = Path(args[0]).resolve()
     tunnel_c = root / "src/hev-socks5-tunnel.c"
     jni_c = root / "src/hev-jni.c"
-    for required in (tunnel_c, jni_c):
+    session_c = root / "src/hev-socks5-session.c"
+    session_h = root / "src/hev-socks5-session.h"
+    session_tcp_c = root / "src/hev-socks5-session-tcp.c"
+    session_tcp_h = root / "src/hev-socks5-session-tcp.h"
+    session_udp_c = root / "src/hev-socks5-session-udp.c"
+    session_udp_h = root / "src/hev-socks5-session-udp.h"
+    client_c = root / "src/core/src/hev-socks5-client.c"
+    for required in (
+        tunnel_c, jni_c, session_c, session_h,
+        session_tcp_c, session_tcp_h, session_udp_c, session_udp_h, client_c,
+    ):
         if not required.is_file():
             raise SystemExit(f"Missing pinned hev source file: {required}")
 
@@ -132,6 +429,10 @@ def main() -> None:
     android_mk = root / "Android.mk"
     if not android_mk.is_file():
         raise SystemExit(f"Missing native Android.mk: {android_mk}")
+    if check_only:
+        verify_patched_markers(jni_c, session_c, session_tcp_c, session_udp_c, tunnel_c, client_c)
+        print("OK - per-session UID propagation, UID detection hook, and SOCKS5 client MSG_MORE patch verified")
+        return
     android_text = android_mk.read_text()
     link_flags = "LOCAL_LDLIBS += -llog -ldl"
     if link_flags not in android_text:
@@ -173,18 +474,22 @@ uid_poc_report_packet (const struct pbuf *buf)
             return 0;
         ip_header_len = (ip[0] & 0x0f) * 4;
         if (ip_header_len < 20 || ip_header_len > sizeof (ip) ||
-            total < ip_header_len + 8 ||
+            total < ip_header_len ||
             pbuf_copy_partial (buf, ip, ip_header_len, 0) != ip_header_len)
             return 0;
         fragment_field = ((unsigned int) ip[6] << 8) | ip[7];
-        /* Non-initial IPv4 fragments do not contain the TCP/UDP ports. */
-        if (fragment_field & 0x1fff)
-            return 0;
         protocol = ip[9];
         src_len = 4;
         offset = ip_header_len;
         memcpy (src, ip + 12, 4);
         memcpy (dst, ip + 16, 4);
+        /* Portless fragments fail closed while the app UID policy is active. */
+        if (fragment_field & 0x1fff) {
+            if (protocol == 6 || protocol == 17)
+                return hev_jni_uid_poc_packet (protocol, src, src_len, -1,
+                                               dst, src_len, -1);
+            return 0;
+        }
     } else if (version == 6) {
         unsigned int extensions;
         if (total < 40 || pbuf_copy_partial (buf, ip, 40, 0) != 40)
@@ -212,9 +517,12 @@ uid_poc_report_packet (const struct pbuf *buf)
                     return 0;
                 next_header = ip[0];
                 fragment_offset = (((unsigned int) ip[2] << 8) | ip[3]) & 0xfff8u;
-                /* Non-initial IPv6 fragments do not contain the TCP/UDP ports. */
-                if (fragment_offset != 0)
-                    return 0;
+                /* Portless IPv6 fragments fail closed while UID enforcement is active. */
+                if (fragment_offset != 0) {
+                    int fragment_protocol = (next_header == 6 || next_header == 17) ? (int) next_header : 17;
+                    return hev_jni_uid_poc_packet (fragment_protocol, src, src_len, -1,
+                                                   dst, src_len, -1);
+                }
                 extension_length = 8;
             } else if (protocol == 51) {
                 if (total < offset + 2 ||
@@ -249,7 +557,7 @@ uid_poc_report_packet (const struct pbuf *buf)
     return hev_jni_uid_poc_packet (protocol, src, src_len, src_port,
                                    dst, src_len, dst_port);
 }
- /* SPEEDVPN_UID_POC_END */
+/* SPEEDVPN_UID_POC_END */
 #else
 #define uid_poc_report_packet(buf) 0
 #endif
@@ -273,6 +581,40 @@ task_io_yielder (HevTaskYieldType type, void *data)
 
     # JNI bridge: callback invocations are rate-limited and moved off the TUN thread in Kotlin.
     jni_text = jni_c.read_text()
+    if BEGIN in jni_text or "/* SPEEDVPN_NATIVE_CRASH_BEGIN */" in jni_text or "native_set_uid_poc_" in jni_text:
+        # Strip any previously injected crash/POC blocks, prototypes, and JNI table entries
+        # (including legacy signatures from non-git archives) so re-patching is 100% idempotent.
+        jni_text = re.sub(
+            r"[ \t]*\n?[ \t]*/\* SPEEDVPN_NATIVE_CRASH_BEGIN \*/.*?/\* SPEEDVPN_UID_POC_END \*/\n?",
+            "",
+            jni_text,
+            count=1,
+            flags=re.DOTALL,
+        )
+        jni_text = re.sub(
+            r"/\* SPEEDVPN_UID_POC_BEGIN \*/.*?/\* SPEEDVPN_UID_POC_END \*/\n*",
+            "",
+            jni_text,
+            flags=re.DOTALL,
+        )
+        jni_text = re.sub(
+            r"^[ \t]*static\s+jboolean\s+native_(?:set|clear)_uid_poc_[a-z0-9_]+\s*\([^;]*\);[ \t]*\n",
+            "",
+            jni_text,
+            flags=re.MULTILINE,
+        )
+        jni_text = re.sub(
+            r'^[ \t]*\{\s*"TProxy(?:Set|Clear)UidPoc[^"]*"[^}]*\},?[ \t]*\n',
+            "",
+            jni_text,
+            flags=re.MULTILINE,
+        )
+        # Clean up any stray blank-space lines after current_jni_env
+        jni_text = re.sub(
+            r"(static pthread_key_t current_jni_env;\n)(?:[ \t]+\n)+",
+            r"\1",
+            jni_text,
+        )
     if BEGIN not in jni_text:
         crash_handler = r''' 
 /* SPEEDVPN_NATIVE_CRASH_BEGIN */
@@ -434,10 +776,12 @@ static void native_install_crash_handler (void)
     (void) sigaction (SIGABRT, &action, &native_prev_abrt);
     (void) sigaction (SIGBUS, &action, &native_prev_bus);
 }
+#if !defined(__SANITIZE_ADDRESS__)
 __attribute__((constructor)) static void native_poc_crash_init (void)
 {
     native_install_crash_handler ();
 }
+#endif
 /* SPEEDVPN_NATIVE_CRASH_END */
 '''
         jni_text = jni_text.replace(
@@ -451,22 +795,28 @@ __attribute__((constructor)) static void native_poc_crash_init (void)
             + "#define UID_POC_UID_PENDING (-2)\n"
             + "#define UID_POC_ACTION_ALLOW 0\n"
             + "#define UID_POC_ACTION_BLOCK 1\n"
+            + "#define UID_POC_FLAG_PROBE 2\n"
             + "#define UID_POC_FLOW_IDLE_MS 30000ULL\n"
             + "#define UID_POC_NEGATIVE_CACHE_MS 750ULL\n"
             + "#define UID_POC_PENDING_TIMEOUT_MS 10000ULL\n"
+            + "#define UID_POC_DECISION_TIMEOUT_MS 50ULL\n"
+            + "#define UID_POC_MAX_REGISTERED_PROBES 64u\n"
             + "typedef struct { int protocol; int addr_len; unsigned char a[16]; unsigned char b[16]; unsigned short port_a; unsigned short port_b; } uid_poc_flow_key;\n"
-            + "typedef struct { int state; uid_poc_flow_key key; int uid; int action; int drop_logged; unsigned long long updated_ms; unsigned long long request_id; } uid_poc_cache_entry;\n"
+            + "typedef struct { int state; uid_poc_flow_key key; int uid; int action; int is_probe; int drop_logged; unsigned long long updated_ms; unsigned long long request_id; } uid_poc_cache_entry;\n"
             + "typedef struct { uid_poc_flow_key key; int protocol; int src_len; unsigned char src[16]; int src_port; int dst_len; unsigned char dst[16]; int dst_port; unsigned long long request_id; } uid_poc_request;\n"
+            + "typedef struct { int used; int protocol; int src_port; int dst_len; unsigned char dst[16]; int dst_port; } uid_poc_probe_socket_entry;\n"
             + "static pthread_mutex_t uid_poc_mutex = PTHREAD_MUTEX_INITIALIZER;\n"
             + "static pthread_cond_t uid_poc_condition = PTHREAD_COND_INITIALIZER;\n"
             + "static jobject uid_poc_callback = NULL;\n"
             + "static jmethodID uid_poc_method = NULL;\n"
             + "static uid_poc_cache_entry uid_poc_cache[UID_POC_FLOW_TABLE_SLOTS];\n"
             + "static uid_poc_request uid_poc_queue[UID_POC_QUEUE_CAPACITY];\n"
+            + "static uid_poc_probe_socket_entry uid_poc_probe_sockets[UID_POC_MAX_REGISTERED_PROBES];\n"
             + "static unsigned int uid_poc_queue_head = 0, uid_poc_queue_tail = 0, uid_poc_queue_count = 0;\n"
             + "static unsigned int uid_poc_active_flows = 0;\n"
             + "static pthread_t uid_poc_worker_thread;\n"
             + "static int uid_poc_worker_started = 0, uid_poc_worker_ready = 0, uid_poc_worker_stop_requested = 0;\n"
+            + "static int uid_poc_policy_active = 0;\n"
             + "static volatile unsigned long long uid_poc_next_request_id = 0;\n"
             + "static volatile unsigned long long uid_poc_packets = 0, uid_poc_cache_hits = 0, uid_poc_cache_misses = 0;\n"
             + "static volatile unsigned long long uid_poc_pending_hits = 0, uid_poc_unique_requests = 0, uid_poc_jni_lookups = 0;\n"
@@ -477,7 +827,10 @@ __attribute__((constructor)) static void native_poc_crash_init (void)
         jni_text = jni_text.replace(
             "static jlongArray native_get_stats (JNIEnv *env, jobject thiz);\n",
             "static jlongArray native_get_stats (JNIEnv *env, jobject thiz);\n"
-            "static jboolean native_set_uid_poc_callback (JNIEnv *env, jobject thiz, jobject callback);\n",
+            "static jboolean native_set_uid_poc_callback (JNIEnv *env, jobject thiz, jobject callback);\n"
+            "static jboolean native_set_uid_poc_policy_enabled (JNIEnv *env, jobject thiz, jboolean enabled);\n"
+            "static jboolean native_set_uid_poc_probe_socket (JNIEnv *env, jobject thiz, jint protocol, jint src_port, jlong dst_hi, jlong dst_lo, jint dst_len, jint dst_port, jboolean registered);\n"
+            "static jboolean native_clear_uid_poc_probe_sockets (JNIEnv *env, jobject thiz);\n",
             1,
         )
         anchor = '    { "TProxyGetStats", "()[J", (void *)native_get_stats },\n'
@@ -485,7 +838,11 @@ __attribute__((constructor)) static void native_poc_crash_init (void)
             raise SystemExit("Refusing unsafe patch: JNI method table anchor is not unique")
         jni_text = jni_text.replace(
             anchor,
-            anchor + '    { "TProxySetUidPocCallback", "(Ljava/lang/Object;)Z", (void *)native_set_uid_poc_callback },\n',
+            anchor +
+                '    { "TProxySetUidPocCallback", "(Ljava/lang/Object;)Z", (void *)native_set_uid_poc_callback },\n' +
+                '    { "TProxySetUidPocPolicyEnabled", "(Z)Z", (void *)native_set_uid_poc_policy_enabled },\n' +
+                '    { "TProxySetUidPocProbeSocket", "(IIJJIIZ)Z", (void *)native_set_uid_poc_probe_socket },\n' +
+                '    { "TProxyClearUidPocProbeSockets", "()Z", (void *)native_clear_uid_poc_probe_sockets },\n',
             1,
         )
         fn_anchor = "static jboolean\nnative_is_running (JNIEnv *env, jobject thiz)\n"
@@ -534,6 +891,14 @@ uid_poc_format_address (const unsigned char *address, int addr_len,
     }
 }
 
+static int
+uid_poc_is_internal_mapdns (int protocol, const unsigned char *dst,
+                            int dst_len, int dst_port)
+{
+    return protocol == 17 && dst != NULL && dst_len == 4 && dst_port == 53 &&
+           dst[0] == 198 && dst[1] == 18 && dst[2] == 0 && dst[3] == 2;
+}
+
 static unsigned long long
 uid_poc_now_ms (void)
 {
@@ -561,21 +926,120 @@ uid_poc_make_key (uid_poc_flow_key *key, int protocol,
                   const unsigned char *dst, int dst_len, int dst_port)
 {
     int reverse;
+    int safe_src_len = (src_len == 4 || src_len == 16) ? src_len : 0;
+    int safe_dst_len = (dst_len == safe_src_len) ? dst_len : 0;
     memset (key, 0, sizeof (*key));
+    if (safe_src_len == 0 || safe_dst_len == 0 || !src || !dst)
+        return;
     key->protocol = protocol;
-    key->addr_len = src_len;
-    reverse = uid_poc_endpoint_compare (src, src_port, dst, dst_port, src_len) > 0;
+    key->addr_len = safe_src_len;
+    reverse = uid_poc_endpoint_compare (src, src_port, dst, dst_port, safe_src_len) > 0;
     if (reverse) {
-        memcpy (key->a, dst, (size_t) dst_len);
-        memcpy (key->b, src, (size_t) src_len);
+        memcpy (key->a, dst, (size_t) safe_dst_len);
+        memcpy (key->b, src, (size_t) safe_src_len);
         key->port_a = (unsigned short) dst_port;
         key->port_b = (unsigned short) src_port;
     } else {
-        memcpy (key->a, src, (size_t) src_len);
-        memcpy (key->b, dst, (size_t) dst_len);
+        memcpy (key->a, src, (size_t) safe_src_len);
+        memcpy (key->b, dst, (size_t) safe_dst_len);
         key->port_a = (unsigned short) src_port;
         key->port_b = (unsigned short) dst_port;
     }
+}
+
+static void
+uid_poc_clear_probe_sockets_locked (void)
+{
+    memset (uid_poc_probe_sockets, 0, sizeof (uid_poc_probe_sockets));
+}
+
+static int
+uid_poc_is_registered_probe_locked (int protocol, int src_port,
+                                    const unsigned char *dst, int dst_len,
+                                    int dst_port)
+{
+    unsigned int i;
+    if ((protocol != 6 && protocol != 17) ||
+        src_port <= 0 || src_port > 65535 ||
+        dst_port <= 0 || dst_port > 65535 ||
+        !dst || (dst_len != 4 && dst_len != 16))
+        return 0;
+    for (i = 0; i < UID_POC_MAX_REGISTERED_PROBES; i++) {
+        const uid_poc_probe_socket_entry *p = &uid_poc_probe_sockets[i];
+        if (p->used &&
+            p->protocol == protocol &&
+            p->src_port == src_port &&
+            p->dst_port == dst_port &&
+            p->dst_len == dst_len &&
+            memcmp (p->dst, dst, (size_t) dst_len) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int
+hev_jni_uid_poc_set_probe_socket (int protocol, int src_port,
+                                  const unsigned char *dst, int dst_len,
+                                  int dst_port, int registered)
+{
+    unsigned int i;
+    int free_slot = -1;
+    if ((protocol != 6 && protocol != 17) ||
+        src_port <= 0 || src_port > 65535 ||
+        dst_port <= 0 || dst_port > 65535 ||
+        !dst || (dst_len != 4 && dst_len != 16))
+        return 0;
+
+    pthread_mutex_lock (&uid_poc_mutex);
+    for (i = 0; i < UID_POC_MAX_REGISTERED_PROBES; i++) {
+        uid_poc_probe_socket_entry *p = &uid_poc_probe_sockets[i];
+        if (p->used) {
+            if (p->protocol == protocol &&
+                p->src_port == src_port &&
+                p->dst_port == dst_port &&
+                p->dst_len == dst_len &&
+                memcmp (p->dst, dst, (size_t) dst_len) == 0) {
+                if (!registered)
+                    memset (p, 0, sizeof (*p));
+                pthread_mutex_unlock (&uid_poc_mutex);
+                return 1;
+            }
+        } else if (free_slot < 0) {
+            free_slot = (int) i;
+        }
+    }
+    if (!registered) {
+        pthread_mutex_unlock (&uid_poc_mutex);
+        return 1;
+    }
+    if (free_slot < 0) {
+        __android_log_print (ANDROID_LOG_WARN, "SpeedVPN-POC-JNI",
+            "UID_PROBE_SOCKET_TABLE_FULL max=%u protocol=%d src_port=%d dst_port=%d",
+            (unsigned int) UID_POC_MAX_REGISTERED_PROBES, protocol, src_port, dst_port);
+        pthread_mutex_unlock (&uid_poc_mutex);
+        return 0;
+    }
+    {
+        uid_poc_probe_socket_entry *p = &uid_poc_probe_sockets[free_slot];
+        memset (p, 0, sizeof (*p));
+        p->used = 1;
+        p->protocol = protocol;
+        p->src_port = src_port;
+        p->dst_len = dst_len;
+        memcpy (p->dst, dst, (size_t) dst_len);
+        p->dst_port = dst_port;
+    }
+    pthread_mutex_unlock (&uid_poc_mutex);
+    return 1;
+}
+
+void
+hev_jni_uid_poc_clear_probe_sockets (void)
+{
+    pthread_mutex_lock (&uid_poc_mutex);
+    uid_poc_clear_probe_sockets_locked ();
+    pthread_mutex_unlock (&uid_poc_mutex);
 }
 
 static int
@@ -611,11 +1075,11 @@ uid_poc_entry_expired (const uid_poc_cache_entry *entry, unsigned long long now)
     unsigned long long age = now >= entry->updated_ms ? now - entry->updated_ms : 0;
     if (entry->uid == UID_POC_UID_PENDING)
         return age > UID_POC_PENDING_TIMEOUT_MS;
-    if (entry->uid < 0)
-        return age > UID_POC_NEGATIVE_CACHE_MS;
-    /* A confirmed DROP flow is pinned until the callback/session is reset. */
+    /* DROP entries, including unresolved owners, remain cached while the flow is active. */
     if (entry->action == UID_POC_ACTION_BLOCK)
-        return 0;
+        return age > UID_POC_FLOW_IDLE_MS;
+    if (entry->uid < 0 && !entry->is_probe)
+        return age > UID_POC_NEGATIVE_CACHE_MS;
     return age > UID_POC_FLOW_IDLE_MS;
 }
 
@@ -624,6 +1088,12 @@ uid_poc_delete_cache_slot_locked (unsigned int index)
 {
     if (uid_poc_cache[index].state == UID_POC_CACHE_USED) {
         uid_poc_cache[index].state = UID_POC_CACHE_DELETED;
+        uid_poc_cache[index].uid = -1;
+        uid_poc_cache[index].action = UID_POC_ACTION_ALLOW;
+        uid_poc_cache[index].is_probe = 0;
+        uid_poc_cache[index].drop_logged = 0;
+        uid_poc_cache[index].updated_ms = 0;
+        uid_poc_cache[index].request_id = 0;
         if (uid_poc_active_flows > 0)
             uid_poc_active_flows--;
     }
@@ -695,10 +1165,13 @@ uid_poc_store_result_locked (const uid_poc_flow_key *key, int uid, int action,
     if (entry->uid != UID_POC_UID_PENDING || entry->request_id != request_id)
         return;
     entry->uid = uid;
-    entry->action = (uid >= 0 && action == UID_POC_ACTION_BLOCK)
+    entry->is_probe = (action & UID_POC_FLAG_PROBE) ? 1 : 0;
+    /* A BLOCK decision may intentionally have UID=-1 when attribution fails. */
+    entry->action = (action & UID_POC_ACTION_BLOCK)
         ? UID_POC_ACTION_BLOCK : UID_POC_ACTION_ALLOW;
     entry->drop_logged = 0;
     entry->updated_ms = now;
+    pthread_cond_broadcast (&uid_poc_condition);
     if (entry->action == UID_POC_ACTION_BLOCK) {
         __android_log_print (ANDROID_LOG_WARN, "SpeedVPN-POC-JNI",
             "UID_POLICY_RESULT uid=%d action=BLOCK packetBlocking=IMPLEMENTED",
@@ -707,6 +1180,48 @@ uid_poc_store_result_locked (const uid_poc_flow_key *key, int uid, int action,
         __android_log_print (ANDROID_LOG_INFO, "SpeedVPN-POC-JNI",
             "UID_POLICY_RESULT uid=%d action=ALLOW hookMode=HOOK_BLOCKING packetBlocking=IMPLEMENTED",
             uid);
+    }
+}
+
+/* Caller holds uid_poc_mutex. Wait only for a bounded first-packet UID decision. */
+static int
+uid_poc_wait_for_decision_locked (const uid_poc_flow_key *key,
+                                  unsigned long long request_id,
+                                  int *should_drop)
+{
+    struct timespec deadline;
+    if (!should_drop || clock_gettime (CLOCK_REALTIME, &deadline) != 0)
+        return 0;
+
+    deadline.tv_nsec += (long) UID_POC_DECISION_TIMEOUT_MS * 1000000L;
+    deadline.tv_sec += deadline.tv_nsec / 1000000000L;
+    deadline.tv_nsec %= 1000000000L;
+
+    for (;;) {
+        int found = 0;
+        int slot = uid_poc_find_slot_locked (key, uid_poc_now_ms (), &found);
+        uid_poc_cache_entry *entry;
+        int wait_result;
+        if (slot < 0 || !found)
+            return 0;
+        entry = &uid_poc_cache[slot];
+        if (entry->request_id != request_id)
+            return 0;
+        if (entry->uid != UID_POC_UID_PENDING) {
+            *should_drop = entry->action == UID_POC_ACTION_BLOCK;
+            entry->updated_ms = uid_poc_now_ms ();
+            return 1;
+        }
+
+        wait_result = pthread_cond_timedwait (&uid_poc_condition, &uid_poc_mutex, &deadline);
+        if (wait_result != 0) {
+            /* Drop this packet but keep the pending lookup alive. A late result may safely
+             * allow an unblocked app; future packets remain fail-closed until that result. */
+            __android_log_print (ANDROID_LOG_WARN, "SpeedVPN-POC-JNI",
+                "UID_DECISION_TIMEOUT protocol=%d action=DROP pending_lookup_retained=1",
+                key->protocol);
+            return 0;
+        }
     }
 }
 
@@ -803,10 +1318,8 @@ uid_poc_worker_main (void *unused)
                 } else {
                     unsigned long long packed_bits = (unsigned long long) packed_result;
                     uid = (jint) (packed_bits >> 32);
-                    action = (packed_bits & 1ULL)
-                        ? UID_POC_ACTION_BLOCK : UID_POC_ACTION_ALLOW;
-                    if (uid < 0)
-                        action = UID_POC_ACTION_ALLOW;
+                    action = ((packed_bits & 1ULL) ? UID_POC_ACTION_BLOCK : UID_POC_ACTION_ALLOW) |
+                             ((packed_bits & 2ULL) ? UID_POC_FLAG_PROBE : 0);
                     call_ok = 1;
                 }
             } else {
@@ -821,10 +1334,19 @@ uid_poc_worker_main (void *unused)
         if (!call_ok || uid < 0)
             __sync_add_and_fetch (&uid_poc_lookup_failures, 1ULL);
 
+        if ((!call_ok || uid < 0) &&
+            uid_poc_is_internal_mapdns (request.protocol, request.dst,
+                                        request.dst_len, request.dst_port)) {
+            action = UID_POC_ACTION_ALLOW | (action & UID_POC_FLAG_PROBE);
+        } else if (!call_ok) {
+            action = uid_poc_policy_active ? UID_POC_ACTION_BLOCK : UID_POC_ACTION_ALLOW;
+        }
+
         pthread_mutex_lock (&uid_poc_mutex);
         uid_poc_store_result_locked (&request.key, call_ok ? (int) uid : -1,
-                                     call_ok ? action : UID_POC_ACTION_ALLOW,
+                                     action,
                                      uid_poc_now_ms (), request.request_id);
+        pthread_cond_broadcast (&uid_poc_condition);
         pthread_mutex_unlock (&uid_poc_mutex);
     }
 
@@ -962,9 +1484,63 @@ native_set_uid_poc_callback (JNIEnv *env, jobject thiz, jobject callback)
     return JNI_TRUE;
 }
 
+static jboolean
+native_set_uid_poc_policy_enabled (JNIEnv *env, jobject thiz, jboolean enabled)
+{
+    (void) env;
+    (void) thiz;
+    pthread_mutex_lock (&uid_poc_mutex);
+    uid_poc_policy_active = enabled == JNI_TRUE;
+    /* Publish policy and flush cached ALLOW decisions in one critical section. */
+    uid_poc_reset_locked ();
+    pthread_cond_broadcast (&uid_poc_condition);
+    pthread_mutex_unlock (&uid_poc_mutex);
+    __android_log_print (ANDROID_LOG_INFO, "SpeedVPN-POC-JNI",
+        "UID_POLICY_ENFORCEMENT enabled=%d cache=FLUSHED", enabled == JNI_TRUE ? 1 : 0);
+    return JNI_TRUE;
+}
+
+static jboolean
+native_set_uid_poc_probe_socket (JNIEnv *env, jobject thiz, jint protocol,
+                                 jint src_port, jlong dst_hi, jlong dst_lo,
+                                 jint dst_len, jint dst_port, jboolean registered)
+{
+    unsigned char dst_buf[16];
+    unsigned long long hi = (unsigned long long) dst_hi;
+    unsigned long long lo = (unsigned long long) dst_lo;
+    int i;
+    (void) env;
+    (void) thiz;
+    memset (dst_buf, 0, sizeof (dst_buf));
+    if (dst_len == 4) {
+        for (i = 0; i < 4; i++)
+            dst_buf[3 - i] = (unsigned char) ((hi >> (i * 8)) & 0xffULL);
+    } else if (dst_len == 16) {
+        for (i = 0; i < 8; i++) {
+            dst_buf[7 - i] = (unsigned char) ((hi >> (i * 8)) & 0xffULL);
+            dst_buf[15 - i] = (unsigned char) ((lo >> (i * 8)) & 0xffULL);
+        }
+    } else {
+        return JNI_FALSE;
+    }
+    return hev_jni_uid_poc_set_probe_socket ((int) protocol, (int) src_port,
+                                             dst_buf, (int) dst_len, (int) dst_port,
+                                             registered == JNI_TRUE ? 1 : 0)
+        ? JNI_TRUE : JNI_FALSE;
+}
+
+static jboolean
+native_clear_uid_poc_probe_sockets (JNIEnv *env, jobject thiz)
+{
+    (void) env;
+    (void) thiz;
+    hev_jni_uid_poc_clear_probe_sockets ();
+    return JNI_TRUE;
+}
+
 /* Called for each candidate TCP/UDP packet by the HEV coroutine.
- * It does only a native cache lookup and bounded queue operation; JNI is worker-only.
- * Return 1 only when the known UID policy says to drop this packet. */
+ * With enforcement active, wait briefly for first-packet UID attribution; timeout drops.
+ * Return 1 when the decision denies the packet or cannot be resolved safely. */
 int
 hev_jni_uid_poc_packet (int protocol,
                         const unsigned char *src, int src_len, int src_port,
@@ -974,14 +1550,27 @@ hev_jni_uid_poc_packet (int protocol,
     uid_poc_request request;
     unsigned long long now, packet_count;
     int found = 0, slot, should_drop = 0;
+    int is_internal_mapdns = 0;
+    unsigned long long request_id = 0;
     char src_text[64], dst_text[64], tuple_text[200];
 
     if (!src || !dst || src_len != dst_len ||
         (src_len != 4 && src_len != 16) ||
-        (protocol != 6 && protocol != 17) ||
-        src_port < 0 || src_port > 65535 || dst_port < 0 || dst_port > 65535)
+        (protocol != 6 && protocol != 17))
         return 0;
 
+    /* Non-initial IP fragments have no socket ports. Deny them while UID policy is active. */
+    if (src_port < 0 || dst_port < 0) {
+        int deny_fragment;
+        pthread_mutex_lock (&uid_poc_mutex);
+        deny_fragment = uid_poc_policy_active;
+        pthread_mutex_unlock (&uid_poc_mutex);
+        return deny_fragment;
+    }
+    if (src_port > 65535 || dst_port > 65535)
+        return 0;
+
+    is_internal_mapdns = uid_poc_is_internal_mapdns (protocol, dst, dst_len, dst_port);
     uid_poc_make_key (&key, protocol, src, src_len, src_port, dst, dst_len, dst_port);
     memset (&request, 0, sizeof (request));
     request.key = key;
@@ -996,8 +1585,11 @@ hev_jni_uid_poc_packet (int protocol,
     pthread_mutex_lock (&uid_poc_mutex);
     if (!uid_poc_worker_started || !uid_poc_worker_ready ||
         uid_poc_worker_stop_requested || !uid_poc_callback || !uid_poc_method) {
+        should_drop = uid_poc_policy_active && !is_internal_mapdns;
+        if (should_drop)
+            __sync_add_and_fetch (&uid_poc_dropped_packets, 1ULL);
         pthread_mutex_unlock (&uid_poc_mutex);
-        return 0;
+        return should_drop;
     }
     packet_count = __sync_add_and_fetch (&uid_poc_packets, 1ULL);
     now = uid_poc_now_ms ();
@@ -1006,9 +1598,19 @@ hev_jni_uid_poc_packet (int protocol,
         uid_poc_cache_entry *entry = &uid_poc_cache[slot];
         if (entry->uid == UID_POC_UID_PENDING) {
             __sync_add_and_fetch (&uid_poc_pending_hits, 1ULL);
+            if (uid_poc_policy_active) {
+                request_id = entry->request_id;
+                if (!uid_poc_wait_for_decision_locked (&key, request_id, &should_drop)) {
+                    should_drop = !is_internal_mapdns;
+                    if (should_drop)
+                        __sync_add_and_fetch (&uid_poc_dropped_packets, 1ULL);
+                }
+            }
         } else {
             __sync_add_and_fetch (&uid_poc_cache_hits, 1ULL);
-            if (entry->uid >= 0 && entry->action == UID_POC_ACTION_BLOCK) {
+            if (entry->action == UID_POC_ACTION_BLOCK &&
+                !(is_internal_mapdns && entry->uid < 0)) {
+                entry->updated_ms = now;
                 should_drop = 1;
                 __sync_add_and_fetch (&uid_poc_dropped_packets, 1ULL);
                 if (!entry->drop_logged) {
@@ -1038,31 +1640,44 @@ hev_jni_uid_poc_packet (int protocol,
         slot = uid_poc_find_slot_locked (&key, now, &found);
     }
     if (uid_poc_queue_count >= UID_POC_QUEUE_CAPACITY) {
-        /* Briefly negative-cache overload so every packet does not retry the full queue. */
+        /* Overloaded attribution fails closed while block enforcement is active.
+         * When UID block enforcement is disabled, a new flow reuses zeroed is_probe=0
+         * unless its exact (protocol, src_port, dst_ip, dst_port) is a currently
+         * registered synthetic probe socket in uid_poc_probe_sockets. */
+        int known_probe = uid_poc_is_registered_probe_locked (
+            protocol, src_port, dst, dst_len, dst_port);
         __sync_add_and_fetch (&uid_poc_queue_full, 1ULL);
+        should_drop = uid_poc_policy_active && !is_internal_mapdns;
         if (slot >= 0) {
             if (!found)
                 uid_poc_active_flows++;
             uid_poc_cache[slot].state = UID_POC_CACHE_USED;
             uid_poc_cache[slot].key = key;
             uid_poc_cache[slot].uid = -1;
-            uid_poc_cache[slot].action = UID_POC_ACTION_ALLOW;
+            uid_poc_cache[slot].action = should_drop ? UID_POC_ACTION_BLOCK : UID_POC_ACTION_ALLOW;
+            uid_poc_cache[slot].is_probe = (!should_drop && known_probe) ? 1 : 0;
             uid_poc_cache[slot].drop_logged = 0;
             uid_poc_cache[slot].updated_ms = now;
             uid_poc_cache[slot].request_id = 0;
         }
+        if (should_drop)
+            __sync_add_and_fetch (&uid_poc_dropped_packets, 1ULL);
         pthread_mutex_unlock (&uid_poc_mutex);
         uid_poc_log_metrics (packet_count);
-        return 0;
+        return should_drop;
     }
     if (slot >= 0) {
+        int known_probe = uid_poc_is_registered_probe_locked (
+            protocol, src_port, dst, dst_len, dst_port);
         if (!found)
             uid_poc_active_flows++;
         request.request_id = __sync_add_and_fetch (&uid_poc_next_request_id, 1ULL);
+        request_id = request.request_id;
         uid_poc_cache[slot].state = UID_POC_CACHE_USED;
         uid_poc_cache[slot].key = key;
         uid_poc_cache[slot].uid = UID_POC_UID_PENDING;
         uid_poc_cache[slot].action = UID_POC_ACTION_ALLOW;
+        uid_poc_cache[slot].is_probe = known_probe ? 1 : 0;
         uid_poc_cache[slot].drop_logged = 0;
         uid_poc_cache[slot].updated_ms = now;
         uid_poc_cache[slot].request_id = request.request_id;
@@ -1073,11 +1688,275 @@ hev_jni_uid_poc_packet (int protocol,
         pthread_cond_signal (&uid_poc_condition);
     } else {
         __sync_add_and_fetch (&uid_poc_queue_full, 1ULL);
+        should_drop = uid_poc_policy_active && !is_internal_mapdns;
+    }
+    if (uid_poc_policy_active && request_id != 0) {
+        if (!uid_poc_wait_for_decision_locked (&key, request_id, &should_drop)) {
+            /* A timed-out or invalidated first lookup must not leak a packet. */
+            should_drop = !is_internal_mapdns;
+            if (should_drop)
+                __sync_add_and_fetch (&uid_poc_dropped_packets, 1ULL);
+        } else if (should_drop) {
+            __sync_add_and_fetch (&uid_poc_dropped_packets, 1ULL);
+        }
+    } else if (should_drop) {
+        __sync_add_and_fetch (&uid_poc_dropped_packets, 1ULL);
     }
     pthread_mutex_unlock (&uid_poc_mutex);
     uid_poc_log_metrics (packet_count);
-    return 0;
+    return should_drop;
 }
+
+/* Resolve the cached UID for one exact original app tuple. HEV calls this when it
+ * creates a TCP session or a per-flow UDP association, then passes the UID to SOCKS5
+ * as username#UID. A bounded wait lets the first-packet Android callback finish. */
+int
+hev_jni_uid_poc_resolve_uid (int protocol,
+                             const unsigned char *src, int src_len, int src_port,
+                             const unsigned char *dst, int dst_len, int dst_port)
+{
+    uid_poc_flow_key key;
+    struct timespec deadline;
+    int found = 0, slot, result_uid = -1;
+    int exact_seen = 0, fallback_used = 0, ambiguous = 0;
+    char src_text[64], dst_text[64];
+
+    if (!src || !dst || src_len != dst_len ||
+        (src_len != 4 && src_len != 16) ||
+        (protocol != 6 && protocol != 17) ||
+        src_port < 0 || src_port > 65535 ||
+        dst_port < 0 || dst_port > 65535)
+        return -1;
+
+    uid_poc_make_key (&key, protocol, src, src_len, src_port, dst, dst_len, dst_port);
+    if (clock_gettime (CLOCK_REALTIME, &deadline) != 0)
+        return -1;
+    deadline.tv_nsec += 1000L * 1000000L;
+    deadline.tv_sec += deadline.tv_nsec / 1000000000L;
+    deadline.tv_nsec %= 1000000000L;
+
+    pthread_mutex_lock (&uid_poc_mutex);
+    for (;;) {
+        uid_poc_cache_entry *entry;
+        int wait_result;
+
+        slot = uid_poc_find_slot_locked (&key, uid_poc_now_ms (), &found);
+        if (slot < 0 || !found)
+            break;
+        exact_seen = 1;
+        entry = &uid_poc_cache[slot];
+        if (entry->uid != UID_POC_UID_PENDING) {
+            if (entry->uid >= 0 && entry->action != UID_POC_ACTION_BLOCK)
+                result_uid = entry->uid;
+            break;
+        }
+
+        wait_result = pthread_cond_timedwait (&uid_poc_condition, &uid_poc_mutex, &deadline);
+        if (wait_result != 0)
+            break;
+    }
+
+    /*
+     * The transparent UDP listener may expose a destination tuple that differs
+     * from the original TUN packet on some lwIP paths. If the exact 5-tuple was
+     * not cached, attribute UDP only when every live cache entry for the same
+     * source IP:port resolves to the same unblocked UID. Ambiguous, blocked,
+     * unresolved, and timed-out entries remain fail-closed.
+     */
+    if (protocol == 17 && !exact_seen) {
+        for (;;) {
+            unsigned int i;
+            unsigned long long now = uid_poc_now_ms ();
+            int candidate_uid = -1, candidate_seen = 0, pending_seen = 0;
+            int wait_result;
+
+            ambiguous = 0;
+            for (i = 0; i < UID_POC_FLOW_TABLE_SLOTS; i++) {
+                uid_poc_cache_entry *entry = &uid_poc_cache[i];
+                int source_matches;
+
+                if (entry->state != UID_POC_CACHE_USED ||
+                    uid_poc_entry_expired (entry, now) ||
+                    entry->key.protocol != protocol ||
+                    entry->key.addr_len != src_len)
+                    continue;
+
+                source_matches =
+                    (entry->key.port_a == (unsigned short) src_port &&
+                     memcmp (entry->key.a, src, (size_t) src_len) == 0) ||
+                    (entry->key.port_b == (unsigned short) src_port &&
+                     memcmp (entry->key.b, src, (size_t) src_len) == 0);
+                if (!source_matches)
+                    continue;
+
+                if (entry->uid == UID_POC_UID_PENDING) {
+                    pending_seen = 1;
+                    continue;
+                }
+                if (entry->uid < 0 || entry->action == UID_POC_ACTION_BLOCK) {
+                    ambiguous = 1;
+                    break;
+                }
+                if (!candidate_seen) {
+                    candidate_uid = entry->uid;
+                    candidate_seen = 1;
+                } else if (candidate_uid != entry->uid) {
+                    ambiguous = 1;
+                    break;
+                }
+            }
+
+            if (ambiguous)
+                break;
+            if (pending_seen) {
+                wait_result = pthread_cond_timedwait (&uid_poc_condition,
+                                                      &uid_poc_mutex, &deadline);
+                if (wait_result == 0)
+                    continue;
+                break;
+            }
+            if (candidate_seen) {
+                result_uid = candidate_uid;
+                fallback_used = 1;
+            }
+            break;
+        }
+    }
+
+    pthread_mutex_unlock (&uid_poc_mutex);
+    uid_poc_format_address (src, src_len, src_text, sizeof (src_text));
+    uid_poc_format_address (dst, dst_len, dst_text, sizeof (dst_text));
+    __android_log_print (ANDROID_LOG_INFO, "SpeedVPN-POC-JNI",
+        "UID_SESSION_RESOLVE protocol=%d tuple=%s:%d->%s:%d exact=%d fallback=%d ambiguous=%d uid=%d",
+        protocol, src_text, src_port, dst_text, dst_port,
+        exact_seen, fallback_used, ambiguous, result_uid);
+    return result_uid;
+}
+
+/* Resolve the cached synthetic-probe flag (1 = probe, 0 = normal user flow)
+ * for one exact original app 5-tuple. Works for both attributed (uid >= 0)
+ * and unattributed (uid == -1) probe flows. */
+int
+hev_jni_uid_poc_resolve_probe (int protocol,
+                               const unsigned char *src, int src_len, int src_port,
+                               const unsigned char *dst, int dst_len, int dst_port)
+{
+    uid_poc_flow_key key;
+    struct timespec deadline;
+    int found = 0, slot, result_probe = 0;
+    int exact_seen = 0, ambiguous = 0;
+
+    if (!src || !dst || src_len != dst_len ||
+        (src_len != 4 && src_len != 16) ||
+        (protocol != 6 && protocol != 17) ||
+        src_port < 0 || src_port > 65535 ||
+        dst_port < 0 || dst_port > 65535)
+        return 0;
+
+    uid_poc_make_key (&key, protocol, src, src_len, src_port, dst, dst_len, dst_port);
+    if (clock_gettime (CLOCK_REALTIME, &deadline) != 0)
+        return 0;
+    deadline.tv_nsec += 1000L * 1000000L;
+    deadline.tv_sec += deadline.tv_nsec / 1000000000L;
+    deadline.tv_nsec %= 1000000000L;
+
+    pthread_mutex_lock (&uid_poc_mutex);
+    for (;;) {
+        uid_poc_cache_entry *entry;
+        int wait_result;
+
+        slot = uid_poc_find_slot_locked (&key, uid_poc_now_ms (), &found);
+        if (slot < 0 || !found)
+            break;
+        exact_seen = 1;
+        entry = &uid_poc_cache[slot];
+        if (entry->uid != UID_POC_UID_PENDING) {
+            if (entry->action != UID_POC_ACTION_BLOCK &&
+                (entry->is_probe ||
+                 uid_poc_is_registered_probe_locked (protocol, src_port, dst, dst_len, dst_port))) {
+                entry->is_probe = 1;
+                result_probe = 1;
+            }
+            break;
+        }
+
+        wait_result = pthread_cond_timedwait (&uid_poc_condition, &uid_poc_mutex, &deadline);
+        if (wait_result != 0) {
+            if (entry->action != UID_POC_ACTION_BLOCK &&
+                uid_poc_is_registered_probe_locked (protocol, src_port, dst, dst_len, dst_port)) {
+                result_probe = 1;
+            }
+            break;
+        }
+    }
+    if (!exact_seen && !uid_poc_policy_active &&
+        uid_poc_is_registered_probe_locked (protocol, src_port, dst, dst_len, dst_port)) {
+        result_probe = 1;
+        exact_seen = 1;
+    }
+
+    if (protocol == 17 && !exact_seen) {
+        for (;;) {
+            unsigned int i;
+            unsigned long long now = uid_poc_now_ms ();
+            int candidate_probe = 0, candidate_seen = 0, pending_seen = 0;
+            int wait_result;
+
+            ambiguous = 0;
+            for (i = 0; i < UID_POC_FLOW_TABLE_SLOTS; i++) {
+                uid_poc_cache_entry *entry = &uid_poc_cache[i];
+                int source_matches;
+
+                if (entry->state != UID_POC_CACHE_USED ||
+                    uid_poc_entry_expired (entry, now) ||
+                    entry->key.protocol != protocol ||
+                    entry->key.addr_len != src_len)
+                    continue;
+
+                source_matches =
+                    (entry->key.port_a == (unsigned short) src_port &&
+                     memcmp (entry->key.a, src, (size_t) src_len) == 0) ||
+                    (entry->key.port_b == (unsigned short) src_port &&
+                     memcmp (entry->key.b, src, (size_t) src_len) == 0);
+                if (!source_matches)
+                    continue;
+
+                if (entry->uid == UID_POC_UID_PENDING) {
+                    pending_seen = 1;
+                    continue;
+                }
+                if (entry->action == UID_POC_ACTION_BLOCK) {
+                    ambiguous = 1;
+                    break;
+                }
+                if (!candidate_seen) {
+                    candidate_probe = entry->is_probe ? 1 : 0;
+                    candidate_seen = 1;
+                } else if (candidate_probe != (entry->is_probe ? 1 : 0)) {
+                    ambiguous = 1;
+                    break;
+                }
+            }
+
+            if (ambiguous)
+                break;
+            if (pending_seen) {
+                wait_result = pthread_cond_timedwait (&uid_poc_condition,
+                                                      &uid_poc_mutex, &deadline);
+                if (wait_result == 0)
+                    continue;
+                break;
+            }
+            if (candidate_seen)
+                result_probe = candidate_probe;
+            break;
+        }
+    }
+
+    pthread_mutex_unlock (&uid_poc_mutex);
+    return result_probe;
+}
+
 /* SPEEDVPN_UID_POC_END */
 
 static jboolean
@@ -1097,11 +1976,23 @@ native_is_running (JNIEnv *env, jobject thiz)
         "DetachCurrentThread (java_vm)",
         "UID_WORKER_READY stack=1048576",
         "uid_poc_store_result_locked",
+        "hev_jni_uid_poc_resolve_uid",
+        "UID_SESSION_RESOLVE protocol=%d tuple=%s:%d",
+        "native_set_uid_poc_policy_enabled",
+        "UID_POC_DECISION_TIMEOUT_MS",
+        "pthread_cond_timedwait (&uid_poc_condition",
         "PACKET_DROPPED uid=%d tuple=%s",
         "if (uid_poc_report_packet (buf))",
     )
     for marker in required_native_markers:
-        source = Path(__file__).read_text() if marker == "if (uid_poc_report_packet (buf))" else jni_text
+        if marker == "if (uid_poc_report_packet (buf))":
+            source = Path(__file__).read_text()
+        elif marker == "Normalize IPv4-mapped IPv6 tuples to their four-byte IPv4 form.":
+            # Address normalization lives in the generated SOCKS session UID bridge,
+            # not in the JNI translation unit.
+            source = session_c_text
+        else:
+            source = jni_text
         if marker not in source:
             raise SystemExit(f"Refusing incomplete UID firewall patch: missing native marker: {marker}")
 
@@ -1130,18 +2021,19 @@ native_is_running (JNIEnv *env, jobject thiz)
         "    if (!tdata->path) {\n        close (tdata->fd);\n        free (tdata);\n        goto exit;\n    }",
         "path allocation cleanup",
     )
-    jni_text = replace_text_once(
-        jni_text,
-        "    hev_socks5_tunnel_main (tdata->path, tdata->fd);\n\n"
-        "    atomic_store_explicit (&is_running, 0, memory_order_release);",
-        "    /* Install SA_ONSTACK storage on the worker OS thread before HEV switches stacks. */\n"
-        "    native_install_alt_stack_for_thread ();\n"
-        "    hev_socks5_tunnel_main (tdata->path, tdata->fd);\n\n"
-        "    /* TUN FD is a native-owned dup; close only after the engine exits. */\n"
-        "    close (tdata->fd);\n\n"
-        "    atomic_store_explicit (&is_running, 0, memory_order_release);",
-        "native worker stack/FD lifetime",
-    )
+    if "/* TUN FD is a native-owned dup; close only after the engine exits. */" not in jni_text:
+        jni_text = replace_text_once(
+            jni_text,
+            "    hev_socks5_tunnel_main (tdata->path, tdata->fd);\n\n"
+            "    atomic_store_explicit (&is_running, 0, memory_order_release);",
+            "    /* Install SA_ONSTACK storage on the worker OS thread before HEV switches stacks. */\n"
+            "    native_install_alt_stack_for_thread ();\n"
+            "    hev_socks5_tunnel_main (tdata->path, tdata->fd);\n\n"
+            "    /* TUN FD is a native-owned dup; close only after the engine exits. */\n"
+            "    close (tdata->fd);\n\n"
+            "    atomic_store_explicit (&is_running, 0, memory_order_release);",
+            "native worker stack/FD lifetime",
+        )
     jni_text = replace_text_once(
         jni_text,
         "    if (res != 0) {\n"
@@ -1156,7 +2048,550 @@ native_is_running (JNIEnv *env, jobject thiz)
     jni_text = inject_native_start_step_logs(jni_text)
     jni_c.write_text(jni_text)
 
-    print("OK - temporary UID detection POC hook and native STEP 1-6 logging applied")
+
+    # Carry native-resolved ownership through the HEV SOCKS5 session authentication. The UID
+    # cache is keyed by the original 5-tuple; destination-only association is not authoritative.
+    session_h_text = session_h.read_text()
+    session_h_text = replace_text_once(
+        session_h_text,
+        "#define HEV_SOCKS5_SESSION(p)",
+        "#include <lwip/ip_addr.h>\n\n#define HEV_SOCKS5_SESSION(p)",
+        "session IP address type include",
+    )
+    session_h_text = replace_text_once(
+        session_h_text,
+        "    HevSocks5Session *self;\n};",
+        "    HevSocks5Session *self;\n"
+        "    int uid; /* Exact UID captured from the native 5-tuple cache, or -1. */\n"
+        "    int is_probe; /* Exact probe flag captured from the native 5-tuple cache (0 or 1). */\n};",
+        "session UID and probe storage",
+    )
+    session_h_text = replace_text_once(
+        session_h_text,
+        "    HevListNode *(*get_node) (HevSocks5Session *self);\n};",
+        "    HevListNode *(*get_node) (HevSocks5Session *self);\n"
+        "    int (*get_uid) (HevSocks5Session *self);\n"
+        "    int (*get_is_probe) (HevSocks5Session *self);\n};",
+        "session UID and probe interface",
+    )
+    if "int hev_socks5_session_resolve_probe (" not in session_h_text:
+        session_h_text = replace_text_once(
+            session_h_text,
+            "void hev_socks5_session_terminate (HevSocks5Session *self);\n",
+            "void hev_socks5_session_terminate (HevSocks5Session *self);\n"
+            "int hev_socks5_session_resolve_uid (int protocol, const ip_addr_t *src_ip, u16_t src_port,\n"
+            "                                    const ip_addr_t *dst_ip, u16_t dst_port);\n"
+            "int hev_socks5_session_resolve_probe (int protocol, const ip_addr_t *src_ip, u16_t src_port,\n"
+            "                                      const ip_addr_t *dst_ip, u16_t dst_port);\n",
+            "session UID and probe resolver declarations",
+        )
+    session_h.write_text(session_h_text)
+
+    session_c_text = session_c.read_text()
+    session_uid_helper = r'''#include <stdio.h>
+#ifdef __ANDROID__
+extern int hev_jni_uid_poc_resolve_uid (int protocol,
+                                        const unsigned char *src, int src_len, int src_port,
+                                        const unsigned char *dst, int dst_len, int dst_port);
+extern int hev_jni_uid_poc_resolve_probe (int protocol,
+                                          const unsigned char *src, int src_len, int src_port,
+                                          const unsigned char *dst, int dst_len, int dst_port);
+#endif
+
+static int
+hev_socks5_session_copy_ip (const ip_addr_t *addr, unsigned char *out)
+{
+    int i;
+    if (!addr || !out)
+        return 0;
+    if (addr->type == IPADDR_TYPE_V4) {
+        for (i = 0; i < 4; i++)
+            out[i] = ip4_addr_get_byte (ip_2_ip4 (addr), i);
+        return 4;
+    }
+    if (addr->type == IPADDR_TYPE_V6) {
+        /* ip6_addr_t stores its four network-order words contiguously. */
+        memcpy (out, ip_2_ip6 (addr)->addr, 16);
+        /*
+         * Normalize IPv4-mapped IPv6 tuples to their four-byte IPv4 form.
+         * The original TUN packet parser records IPv4 addresses as four bytes;
+         * retaining ::ffff:a.b.c.d here would create a different native cache
+         * key for the same socket and make SOCKS UID attribution miss.
+         */
+        if (out[0] == 0 && out[1] == 0 && out[2] == 0 && out[3] == 0 &&
+            out[4] == 0 && out[5] == 0 && out[6] == 0 && out[7] == 0 &&
+            out[8] == 0 && out[9] == 0 && out[10] == 0xff && out[11] == 0xff) {
+            memmove (out, out + 12, 4);
+            return 4;
+        }
+        return 16;
+    }
+    return 0;
+}
+
+int
+hev_socks5_session_resolve_uid (int protocol,
+                                const ip_addr_t *src_ip, u16_t src_port,
+                                const ip_addr_t *dst_ip, u16_t dst_port)
+{
+#ifdef __ANDROID__
+    unsigned char src[16], dst[16];
+    int src_len, dst_len;
+    src_len = hev_socks5_session_copy_ip (src_ip, src);
+    dst_len = hev_socks5_session_copy_ip (dst_ip, dst);
+    if (src_len == 0 || src_len != dst_len)
+        return -1;
+    return hev_jni_uid_poc_resolve_uid (protocol, src, src_len, (int) src_port,
+                                        dst, dst_len, (int) dst_port);
+#else
+    (void) protocol;
+    (void) src_ip;
+    (void) src_port;
+    (void) dst_ip;
+    (void) dst_port;
+    return -1;
+#endif
+}
+
+int
+hev_socks5_session_resolve_probe (int protocol,
+                                  const ip_addr_t *src_ip, u16_t src_port,
+                                  const ip_addr_t *dst_ip, u16_t dst_port)
+{
+#ifdef __ANDROID__
+    unsigned char src[16], dst[16];
+    int src_len, dst_len;
+    src_len = hev_socks5_session_copy_ip (src_ip, src);
+    dst_len = hev_socks5_session_copy_ip (dst_ip, dst);
+    if (src_len == 0 || src_len != dst_len)
+        return 0;
+    return hev_jni_uid_poc_resolve_probe (protocol, src, src_len, (int) src_port,
+                                          dst, dst_len, (int) dst_port);
+#else
+    (void) protocol;
+    (void) src_ip;
+    (void) src_port;
+    (void) dst_ip;
+    (void) dst_port;
+    return 0;
+#endif
+}
+
+'''
+    session_c_text = replace_text_once(
+        session_c_text,
+        '#include "hev-socks5-session.h"\n',
+        '#include "hev-socks5-session.h"\n\n' + session_uid_helper,
+        "session UID and probe resolver implementation",
+    )
+    session_c_text = replace_text_once(
+        session_c_text,
+        "    HevConfigServer *srv;\n    int res;\n",
+        "    HevConfigServer *srv;\n    char flow_username[256];\n"
+        "    const char *auth_username;\n    int flow_uid;\n    int flow_is_probe;\n    int res;\n",
+        "per-session SOCKS auth locals",
+    )
+    session_c_text = replace_text_once(
+        session_c_text,
+        "    srv = hev_config_get_socks5_server ();\n\n    res = hev_socks5_client_connect",
+        "    srv = hev_config_get_socks5_server ();\n"
+        "    iface = HEV_OBJECT_GET_IFACE (self, HEV_SOCKS5_SESSION_TYPE);\n"
+        "    flow_uid = iface && iface->get_uid ? iface->get_uid (self) : -1;\n"
+        "    flow_is_probe = iface && iface->get_is_probe ? iface->get_is_probe (self) : 0;\n"
+        "    auth_username = srv->user;\n\n"
+        "    res = hev_socks5_client_connect",
+        "resolve session UID and probe flag before SOCKS auth",
+    )
+    session_c_text = replace_text_once(
+        session_c_text,
+        "    if (srv->user && srv->pass) {\n"
+        "        hev_socks5_client_set_auth (HEV_SOCKS5_CLIENT (self), srv->user,\n"
+        "                                    srv->pass);\n"
+        "        LOG_D (\"%p socks5 client auth %s:%s\", self, srv->user, srv->pass);\n"
+        "    }",
+        "    if (srv->user && srv->pass) {\n"
+        "        if (flow_is_probe) {\n"
+        "            if (flow_uid >= 0) {\n"
+        "                (void) snprintf (flow_username, sizeof (flow_username), \"%s#%d#probe\",\n"
+        "                                 srv->user, flow_uid);\n"
+        "            } else {\n"
+        "                (void) snprintf (flow_username, sizeof (flow_username), \"%s#probe\",\n"
+        "                                 srv->user);\n"
+        "            }\n"
+        "            auth_username = flow_username;\n"
+        "        } else if (flow_uid >= 0) {\n"
+        "            (void) snprintf (flow_username, sizeof (flow_username), \"%s#%d\",\n"
+        "                             srv->user, flow_uid);\n"
+        "            auth_username = flow_username;\n"
+        "        }\n"
+        "        hev_socks5_client_set_auth (HEV_SOCKS5_CLIENT (self), auth_username,\n"
+        "                                    srv->pass);\n"
+        "        LOG_D (\"%p socks5 client auth uid=%d probe=%d\", self, flow_uid, flow_is_probe);\n"
+        "    }",
+        "per-session UID and probe marker in SOCKS username",
+    )
+    session_c.write_text(session_c_text)
+
+    session_tcp_c_text = session_tcp_c.read_text()
+    session_tcp_c_text = replace_text_once(
+        session_tcp_c_text,
+        "int\nhev_socks5_session_tcp_construct (HevSocks5SessionTCP *self,",
+        "static int\nhev_socks5_session_tcp_get_uid (HevSocks5Session *base)\n"
+        "{\n    HevSocks5SessionTCP *self = HEV_SOCKS5_SESSION_TCP (base);\n"
+        "    return self->data.uid;\n}\n\n"
+        "static int\nhev_socks5_session_tcp_get_is_probe (HevSocks5Session *base)\n"
+        "{\n    HevSocks5SessionTCP *self = HEV_SOCKS5_SESSION_TCP (base);\n"
+        "    return self->data.is_probe;\n}\n\n"
+        "int\nhev_socks5_session_tcp_construct (HevSocks5SessionTCP *self,",
+        "TCP UID and probe accessors",
+    )
+    session_tcp_c_text = replace_text_once(
+        session_tcp_c_text,
+        "    self->data.self = self;\n\n    return 0;",
+        "    self->data.self = self;\n"
+        "    self->data.uid = hev_socks5_session_resolve_uid (6, &pcb->remote_ip,\n"
+        "        pcb->remote_port, &pcb->local_ip, pcb->local_port);\n"
+        "    self->data.is_probe = hev_socks5_session_resolve_probe (6, &pcb->remote_ip,\n"
+        "        pcb->remote_port, &pcb->local_ip, pcb->local_port);\n\n    return 0;",
+        "capture TCP flow UID and probe flag",
+    )
+    session_tcp_c_text = replace_text_once(
+        session_tcp_c_text,
+        "        siptr->get_node = hev_socks5_session_tcp_get_node;\n",
+        "        siptr->get_node = hev_socks5_session_tcp_get_node;\n"
+        "        siptr->get_uid = hev_socks5_session_tcp_get_uid;\n"
+        "        siptr->get_is_probe = hev_socks5_session_tcp_get_is_probe;\n",
+        "register TCP UID and probe accessors",
+    )
+    session_tcp_c.write_text(session_tcp_c_text)
+
+    session_udp_h_text = session_udp_h.read_text()
+    session_udp_h_text = replace_text_once(
+        session_udp_h_text,
+        "#include <hev-socks5-client-udp.h>",
+        "#include <lwip/pbuf.h>\n#include <hev-socks5-client-udp.h>",
+        "UDP initial datagram pbuf type",
+    )
+    session_udp_h_text = replace_text_once(
+        session_udp_h_text,
+        "int hev_socks5_session_udp_construct (HevSocks5SessionUDP *self,\n"
+        "                                      struct udp_pcb *pcb, HevTaskMutex *mutex);",
+        "int hev_socks5_session_udp_construct (HevSocks5SessionUDP *self,\n"
+        "                                      struct udp_pcb *pcb, const ip_addr_t *src_ip,\n"
+        "                                      u16_t src_port, HevTaskMutex *mutex);",
+        "UDP constructor UID parameters",
+    )
+    session_udp_h_text = replace_text_once(
+        session_udp_h_text,
+        "HevSocks5SessionUDP *hev_socks5_session_udp_new (struct udp_pcb *pcb,\n"
+        "                                                 HevTaskMutex *mutex);",
+        "HevSocks5SessionUDP *hev_socks5_session_udp_new (struct udp_pcb *pcb,\n"
+        "                                                 const ip_addr_t *src_ip,\n"
+        "                                                 u16_t src_port, HevTaskMutex *mutex);",
+        "UDP factory UID parameters",
+    )
+    session_udp_h_text = replace_text_once(
+        session_udp_h_text,
+        "HevSocks5SessionUDP *hev_socks5_session_udp_new (struct udp_pcb *pcb,\n"
+        "                                                 const ip_addr_t *src_ip,\n"
+        "                                                 u16_t src_port, HevTaskMutex *mutex);",
+        "HevSocks5SessionUDP *hev_socks5_session_udp_new (struct udp_pcb *pcb,\n"
+        "                                                 const ip_addr_t *src_ip,\n"
+        "                                                 u16_t src_port, HevTaskMutex *mutex);\n"
+        "int hev_socks5_session_udp_enqueue_initial (HevSocks5SessionUDP *self, struct pbuf *p,\n"
+        "                                              const ip_addr_t *dst_ip, u16_t dst_port);\n",
+        "UDP first packet enqueue declaration",
+    )
+    session_udp_h.write_text(session_udp_h_text)
+
+    session_udp_c_text = session_udp_c.read_text()
+    session_udp_c_text = replace_text_once(
+        session_udp_c_text,
+        "hev_socks5_session_udp_construct (HevSocks5SessionUDP *self,\n"
+        "                                  struct udp_pcb *pcb, HevTaskMutex *mutex)",
+        "hev_socks5_session_udp_construct (HevSocks5SessionUDP *self,\n"
+        "                                  struct udp_pcb *pcb, const ip_addr_t *src_ip,\n"
+        "                                  u16_t src_port, HevTaskMutex *mutex)",
+        "UDP constructor UID parameters",
+    )
+    session_udp_c_text = replace_text_once(
+        session_udp_c_text,
+        "hev_socks5_session_udp_construct (self, pcb, mutex)",
+        "hev_socks5_session_udp_construct (self, pcb, src_ip, src_port, mutex)",
+        "pass UDP source tuple",
+    )
+    session_udp_c_text = replace_text_once(
+        session_udp_c_text,
+        "hev_socks5_session_udp_new (struct udp_pcb *pcb, HevTaskMutex *mutex)",
+        "hev_socks5_session_udp_new (struct udp_pcb *pcb, const ip_addr_t *src_ip,\n"
+        "                            u16_t src_port, HevTaskMutex *mutex)",
+        "UDP factory UID parameters",
+    )
+    session_udp_c_text = replace_text_once(
+        session_udp_c_text,
+        "    self->data.self = self;\n\n    return 0;",
+        "    self->data.self = self;\n"
+        "        /*\n"
+        "         * On PRETEND_UDP, callback src_ip/src_port are the packet destination.\n"
+        "         * udp_input creates this PCB with remote_ip/remote_port from the original\n"
+        "         * TUN packet source, so use that as source and callback args as destination.\n"
+        "         * This preserves the exact 5-tuple used by the packet-policy cache.\n"
+        "         */\n"
+        "    self->data.uid = hev_socks5_session_resolve_uid (17, &pcb->remote_ip,\n"
+        "        pcb->remote_port, src_ip, src_port);\n"
+        "    self->data.is_probe = hev_socks5_session_resolve_probe (17, &pcb->remote_ip,\n"
+        "        pcb->remote_port, src_ip, src_port);\n"
+        "\n    return 0;",
+        "capture UDP flow UID and probe flag",
+    )
+    session_udp_c_text = replace_text_once(
+        session_udp_c_text,
+        "static HevListNode *\nhev_socks5_session_udp_get_node (HevSocks5Session *base)",
+        "static int\nhev_socks5_session_udp_get_uid (HevSocks5Session *base)\n"
+        "{\n    HevSocks5SessionUDP *self = HEV_SOCKS5_SESSION_UDP (base);\n"
+        "    return self->data.uid;\n}\n\n"
+        "static int\nhev_socks5_session_udp_get_is_probe (HevSocks5Session *base)\n"
+        "{\n    HevSocks5SessionUDP *self = HEV_SOCKS5_SESSION_UDP (base);\n"
+        "    return self->data.is_probe;\n}\n\n"
+        "static HevListNode *\nhev_socks5_session_udp_get_node (HevSocks5Session *base)",
+        "UDP UID and probe accessors",
+    )
+    session_udp_c_text = replace_text_once(
+        session_udp_c_text,
+        "        siptr->get_node = hev_socks5_session_udp_get_node;\n",
+        "        siptr->get_node = hev_socks5_session_udp_get_node;\n"
+        "        siptr->get_uid = hev_socks5_session_udp_get_uid;\n"
+        "        siptr->get_is_probe = hev_socks5_session_udp_get_is_probe;\n",
+        "register UDP UID and probe accessors",
+    )
+    session_udp_c_text = replace_text_once(
+        session_udp_c_text,
+        "static void\n"
+        "udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,\n"
+        "                  const ip_addr_t *addr, u16_t port)\n"
+        "{\n"
+        "    HevSocks5SessionUDP *self = arg;\n"
+        "    HevSocks5UDPFrame *frame;\n\n"
+        "    if (!p) {\n"
+        "        hev_socks5_session_terminate (HEV_SOCKS5_SESSION (self));\n"
+        "        return;\n"
+        "    }\n\n"
+        "    if (self->frames > UDP_POOL_SIZE) {",
+        "static int\n"
+        "hev_socks5_session_udp_has_pbuf (HevSocks5SessionUDP *self, const struct pbuf *p)\n"
+        "{\n"
+        "    HevListNode *node;\n\n"
+        "    if (!self || !p)\n"
+        "        return 0;\n"
+        "    for (node = hev_list_first (&self->frame_list); node;\n"
+        "         node = hev_list_node_next (node)) {\n"
+        "        HevSocks5UDPFrame *frame = container_of (node, HevSocks5UDPFrame, node);\n"
+        "        if (frame->data == p)\n"
+        "            return 1;\n"
+        "    }\n"
+        "    return 0;\n"
+        "}\n\n"
+        "static void\n"
+        "udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,\n"
+        "                  const ip_addr_t *addr, u16_t port)\n"
+        "{\n"
+        "    HevSocks5SessionUDP *self = arg;\n"
+        "    HevSocks5UDPFrame *frame;\n\n"
+        "    if (!p) {\n"
+        "        hev_socks5_session_terminate (HEV_SOCKS5_SESSION (self));\n"
+        "        return;\n"
+        "    }\n\n"
+        "    if (hev_socks5_session_udp_has_pbuf (self, p)) {\n"
+        "        pbuf_free (p);\n"
+        "        hev_task_wakeup (self->data.task);\n"
+        "        return;\n"
+        "    }\n\n"
+        "    if (self->frames > UDP_POOL_SIZE) {",
+        "deduplicate UDP session pbuf enqueue",
+    )
+    session_udp_c_text = replace_text_once(
+        session_udp_c_text,
+        "HevSocks5SessionUDP *\nhev_socks5_session_udp_new (struct udp_pcb *pcb, const ip_addr_t *src_ip,\n"
+        "                            u16_t src_port, HevTaskMutex *mutex)",
+        "int\n"
+        "hev_socks5_session_udp_enqueue_initial (HevSocks5SessionUDP *self, struct pbuf *p,\n"
+        "                                           const ip_addr_t *dst_ip, u16_t dst_port)\n"
+        "{\n"
+        "    HevSocks5UDPFrame *frame;\n"
+        "    int res;\n\n"
+        "    if (!self || !p)\n"
+        "        return -1;\n"
+        "    if (hev_socks5_session_udp_has_pbuf (self, p))\n"
+        "        return 0;\n"
+        "    /* udp_input retains its original reference and frees it after this\n"
+        "     * receive callback returns. Give the queued frame its own reference.\n"
+        "     * Every failure path below releases only this additional reference. */\n"
+        "    pbuf_ref (p);\n"
+        "    if (self->frames > UDP_POOL_SIZE) {\n"
+        "        pbuf_free (p);\n"
+        "        return -1;\n"
+        "    }\n"
+        "    frame = hev_malloc (sizeof (HevSocks5UDPFrame));\n"
+        "    if (!frame) {\n"
+        "        pbuf_free (p);\n"
+        "        return -1;\n"
+        "    }\n"
+        "    memset (&frame->node, 0, sizeof (frame->node));\n"
+        "    if (!dst_ip) {\n"
+        "        pbuf_free (p);\n"
+        "        hev_free (frame);\n"
+        "        return -1;\n"
+        "    }\n"
+        "    res = hev_socks5_addr_from_lwip (&frame->addr, dst_ip, dst_port);\n"
+        "    if (res < 0) {\n"
+        "        pbuf_free (p);\n"
+        "        hev_free (frame);\n"
+        "        return -1;\n"
+        "    }\n"
+        "    frame->data = p;\n"
+        "    if (frame->addr.atype == HEV_SOCKS5_ADDR_TYPE_NAME) {\n"
+        "        self->addr = ip_2_ip4 (&self->pcb->local_ip)->addr;\n"
+        "        self->port = self->pcb->local_port;\n"
+        "    }\n"
+        "    self->frames++;\n"
+        "    hev_list_add_tail (&self->frame_list, &frame->node);\n"
+        "    return 0;\n"
+        "}\n\n"
+        "HevSocks5SessionUDP *\nhev_socks5_session_udp_new (struct udp_pcb *pcb, const ip_addr_t *src_ip,\n"
+        "                            u16_t src_port, HevTaskMutex *mutex)",
+        "preserve first UDP datagram",
+    )
+    session_udp_c.write_text(session_udp_c_text)
+
+    tunnel_text = tunnel_c.read_text()
+    tunnel_text = replace_text_once(
+        tunnel_text,
+        "udp = hev_socks5_session_udp_new (pcb, &mutex);",
+        "udp = hev_socks5_session_udp_new (pcb, addr, port, &mutex);",
+        "pass original UDP tuple into session",
+    )
+    # Remove legacy duplicate initial UDP packet enqueue if present on an already-patched tree.
+    legacy_dup_enqueue = (
+        "    hev_socks5_session_set_task (HEV_SOCKS5_SESSION (udp), task);\n"
+        "    if (hev_socks5_session_udp_enqueue_initial (udp, p, addr, port) < 0)\n"
+        "        LOG_W (\"socks5 tunnel udp initial packet enqueue failed\");\n"
+        "    node = hev_socks5_session_get_node (HEV_SOCKS5_SESSION (udp));"
+    )
+    single_dispatch_comment = (
+        "    hev_socks5_session_set_task (HEV_SOCKS5_SESSION (udp), task);\n"
+        "    /* lwIP's PRETEND_UDP path (udp.c:goto again) strips UDP_HLEN and dispatches\n"
+        "     * this initial pbuf to the session's udp_recv_handler immediately after\n"
+        "     * this callback returns; do not enqueue it a second time here. */\n"
+        "    node = hev_socks5_session_get_node (HEV_SOCKS5_SESSION (udp));"
+    )
+    if legacy_dup_enqueue in tunnel_text:
+        tunnel_text = tunnel_text.replace(legacy_dup_enqueue, single_dispatch_comment, 1)
+    else:
+        tunnel_text = replace_text_once(
+            tunnel_text,
+            "    hev_socks5_session_set_task (HEV_SOCKS5_SESSION (udp), task);\n"
+            "    node = hev_socks5_session_get_node (HEV_SOCKS5_SESSION (udp));",
+            single_dispatch_comment,
+            "single UDP initial packet dispatch via lwIP pretend retry",
+        )
+    tunnel_c.write_text(tunnel_text)
+
+    client_c_text = client_c.read_text()
+    client_c_text = replace_text_once(
+        client_c_text,
+        "static int\n"
+        "hev_socks5_client_write_auth_methods (HevSocks5Client *self)\n"
+        "{\n"
+        "    HevSocks5Auth auth;\n"
+        "    int res;",
+        "static int\n"
+        "hev_socks5_client_write_auth_methods (HevSocks5Client *self, int pipeline)\n"
+        "{\n"
+        "    HevSocks5Auth auth;\n"
+        "    int flags = MSG_WAITALL | (pipeline ? MSG_MORE : 0);\n"
+        "    int res;",
+        "SOCKS5 client write_auth_methods pipeline signature",
+    )
+    client_c_text = replace_text_once(
+        client_c_text,
+        "    res = hev_task_io_socket_send (HEV_SOCKS5 (self)->fd, &auth, 3,\n"
+        "                                   MSG_WAITALL | MSG_MORE, task_io_yielder,\n"
+        "                                   self);",
+        "    res = hev_task_io_socket_send (HEV_SOCKS5 (self)->fd, &auth, 3,\n"
+        "                                   flags, task_io_yielder,\n"
+        "                                   self);",
+        "SOCKS5 client write_auth_methods conditional MSG_MORE flags",
+    )
+    client_c_text = replace_text_once(
+        client_c_text,
+        "static int\n"
+        "hev_socks5_client_write_auth_creds (HevSocks5Client *self)\n"
+        "{\n"
+        "    struct msghdr mh = { 0 };\n"
+        "    struct iovec iov[4];\n"
+        "    unsigned char ub[3];\n"
+        "    int res;",
+        "static int\n"
+        "hev_socks5_client_write_auth_creds (HevSocks5Client *self, int pipeline)\n"
+        "{\n"
+        "    struct msghdr mh = { 0 };\n"
+        "    struct iovec iov[4];\n"
+        "    unsigned char ub[3];\n"
+        "    int flags = MSG_WAITALL | (pipeline ? MSG_MORE : 0);\n"
+        "    int res;",
+        "SOCKS5 client write_auth_creds pipeline signature",
+    )
+    client_c_text = replace_text_once(
+        client_c_text,
+        "    res = hev_task_io_socket_sendmsg (HEV_SOCKS5 (self)->fd, &mh,\n"
+        "                                      MSG_WAITALL | MSG_MORE, task_io_yielder,\n"
+        "                                      self);",
+        "    res = hev_task_io_socket_sendmsg (HEV_SOCKS5 (self)->fd, &mh,\n"
+        "                                      flags, task_io_yielder,\n"
+        "                                      self);",
+        "SOCKS5 client write_auth_creds conditional MSG_MORE flags",
+    )
+    client_c_text = replace_text_once(
+        client_c_text,
+        "    LOG_D (\"%p socks5 client handshake standard\", self);\n\n"
+        "    res = hev_socks5_client_write_auth_methods (self);\n"
+        "    if (res < 0)\n"
+        "        return -1;\n\n"
+        "    res = hev_socks5_client_read_auth_method (self);\n"
+        "    if (res < 0)\n"
+        "        return -1;\n\n"
+        "    if (res == HEV_SOCKS5_AUTH_METHOD_USER) {\n"
+        "        res = hev_socks5_client_write_auth_creds (self);",
+        "    LOG_D (\"%p socks5 client handshake standard\", self);\n\n"
+        "    res = hev_socks5_client_write_auth_methods (self, 0);\n"
+        "    if (res < 0)\n"
+        "        return -1;\n\n"
+        "    res = hev_socks5_client_read_auth_method (self);\n"
+        "    if (res < 0)\n"
+        "        return -1;\n\n"
+        "    if (res == HEV_SOCKS5_AUTH_METHOD_USER) {\n"
+        "        res = hev_socks5_client_write_auth_creds (self, 0);",
+        "SOCKS5 client standard handshake non-pipeline auth calls",
+    )
+    client_c_text = replace_text_once(
+        client_c_text,
+        "    LOG_D (\"%p socks5 client handshake pipeline\", self);\n\n"
+        "    res = hev_socks5_client_write_auth_methods (self);\n"
+        "    if (res < 0)\n"
+        "        return -1;\n\n"
+        "    res = hev_socks5_client_write_auth_creds (self);",
+        "    LOG_D (\"%p socks5 client handshake pipeline\", self);\n\n"
+        "    res = hev_socks5_client_write_auth_methods (self, 1);\n"
+        "    if (res < 0)\n"
+        "        return -1;\n\n"
+        "    res = hev_socks5_client_write_auth_creds (self, 1);",
+        "SOCKS5 client pipeline handshake auth calls",
+    )
+    client_c.write_text(client_c_text)
+
+    # Refuse a broken generated native patch before Gradle builds an APK.
+    verify_patched_markers(jni_c, session_c, session_tcp_c, session_udp_c, tunnel_c, client_c)
+    print("OK - per-session UID propagation, UID detection hook, and native diagnostics applied")
 
 
 if __name__ == "__main__":

@@ -292,13 +292,297 @@ def check_tcp_session_content(content: str) -> None:
         raise PatchError("native TCP splice backpressure fix is not applied")
 
 
+SOCKS5_CLIENT_AUTH_UNPATCHED_METHODS = """static int
+hev_socks5_client_write_auth_methods (HevSocks5Client *self)
+{
+    HevSocks5Auth auth;
+    int res;
+
+    LOG_D ("%p socks5 client write auth methods", self);
+
+    auth.ver = HEV_SOCKS5_VERSION_5;
+    auth.method_len = 1;
+    if (!self->auth.user || !self->auth.pass)
+        auth.methods[0] = HEV_SOCKS5_AUTH_METHOD_NONE;
+    else
+        auth.methods[0] = HEV_SOCKS5_AUTH_METHOD_USER;
+
+    res = hev_task_io_socket_send (HEV_SOCKS5 (self)->fd, &auth, 3,
+                                   MSG_WAITALL | MSG_MORE, task_io_yielder,
+                                   self);
+    if (res <= 0) {
+        LOG_I ("%p socks5 client write auth methods", self);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int
+hev_socks5_client_write_auth_creds (HevSocks5Client *self)
+{
+    struct msghdr mh = { 0 };
+    struct iovec iov[4];
+    unsigned char ub[3];
+    int res;
+
+    LOG_D ("%p socks5 client write auth creds", self);
+
+    if (!self->auth.user || !self->auth.pass)
+        return 0;
+
+    ub[0] = HEV_SOCKS5_AUTH_VERSION_1;
+    ub[1] = strlen (self->auth.user);
+    ub[2] = strlen (self->auth.pass);
+    iov[0].iov_base = &ub[0];
+    iov[0].iov_len = 2;
+    iov[1].iov_base = (void *)self->auth.user;
+    iov[1].iov_len = ub[1];
+    iov[2].iov_base = &ub[2];
+    iov[2].iov_len = 1;
+    iov[3].iov_base = (void *)self->auth.pass;
+    iov[3].iov_len = ub[2];
+
+    mh.msg_iov = iov;
+    mh.msg_iovlen = 4;
+    res = hev_task_io_socket_sendmsg (HEV_SOCKS5 (self)->fd, &mh,
+                                      MSG_WAITALL | MSG_MORE, task_io_yielder,
+                                      self);
+    if (res <= 0) {
+        LOG_I ("%p socks5 client write auth creds", self);
+        return -1;
+    }
+
+    return 0;
+}"""
+
+SOCKS5_CLIENT_AUTH_PATCHED_METHODS = """static int
+hev_socks5_client_write_auth_methods (HevSocks5Client *self, int pipeline)
+{
+    HevSocks5Auth auth;
+    int flags = MSG_WAITALL | (pipeline ? MSG_MORE : 0);
+    int res;
+
+    LOG_D ("%p socks5 client write auth methods", self);
+
+    auth.ver = HEV_SOCKS5_VERSION_5;
+    auth.method_len = 1;
+    if (!self->auth.user || !self->auth.pass)
+        auth.methods[0] = HEV_SOCKS5_AUTH_METHOD_NONE;
+    else
+        auth.methods[0] = HEV_SOCKS5_AUTH_METHOD_USER;
+
+    res = hev_task_io_socket_send (HEV_SOCKS5 (self)->fd, &auth, 3,
+                                   flags, task_io_yielder,
+                                   self);
+    if (res <= 0) {
+        LOG_I ("%p socks5 client write auth methods", self);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int
+hev_socks5_client_write_auth_creds (HevSocks5Client *self, int pipeline)
+{
+    struct msghdr mh = { 0 };
+    struct iovec iov[4];
+    unsigned char ub[3];
+    int flags = MSG_WAITALL | (pipeline ? MSG_MORE : 0);
+    int res;
+
+    LOG_D ("%p socks5 client write auth creds", self);
+
+    if (!self->auth.user || !self->auth.pass)
+        return 0;
+
+    ub[0] = HEV_SOCKS5_AUTH_VERSION_1;
+    ub[1] = strlen (self->auth.user);
+    ub[2] = strlen (self->auth.pass);
+    iov[0].iov_base = &ub[0];
+    iov[0].iov_len = 2;
+    iov[1].iov_base = (void *)self->auth.user;
+    iov[1].iov_len = ub[1];
+    iov[2].iov_base = &ub[2];
+    iov[2].iov_len = 1;
+    iov[3].iov_base = (void *)self->auth.pass;
+    iov[3].iov_len = ub[2];
+
+    mh.msg_iov = iov;
+    mh.msg_iovlen = 4;
+    res = hev_task_io_socket_sendmsg (HEV_SOCKS5 (self)->fd, &mh,
+                                      flags, task_io_yielder,
+                                      self);
+    if (res <= 0) {
+        LOG_I ("%p socks5 client write auth creds", self);
+        return -1;
+    }
+
+    return 0;
+}"""
+
+SOCKS5_CLIENT_HANDSHAKE_UNPATCHED = """static int
+hev_socks5_client_handshake_standard (HevSocks5Client *self)
+{
+    int res;
+
+    LOG_D ("%p socks5 client handshake standard", self);
+
+    res = hev_socks5_client_write_auth_methods (self);
+    if (res < 0)
+        return -1;
+
+    res = hev_socks5_client_read_auth_method (self);
+    if (res < 0)
+        return -1;
+
+    if (res == HEV_SOCKS5_AUTH_METHOD_USER) {
+        res = hev_socks5_client_write_auth_creds (self);
+        if (res < 0)
+            return -1;
+
+        res = hev_socks5_client_read_auth_creds (self);
+        if (res < 0)
+            return -1;
+    } else if (res != HEV_SOCKS5_AUTH_METHOD_NONE) {
+        LOG_I ("%p socks5 client auth method %d", self, res);
+        return -1;
+    }
+
+    res = hev_socks5_client_write_request (self);
+    if (res < 0)
+        return -1;
+
+    res = hev_socks5_client_read_response (self);
+    if (res < 0)
+        return -1;
+
+    return 0;
+}
+
+static int
+hev_socks5_client_handshake_pipeline (HevSocks5Client *self)
+{
+    int res;
+
+    LOG_D ("%p socks5 client handshake pipeline", self);
+
+    res = hev_socks5_client_write_auth_methods (self);
+    if (res < 0)
+        return -1;
+
+    res = hev_socks5_client_write_auth_creds (self);"""
+
+SOCKS5_CLIENT_HANDSHAKE_PATCHED = """static int
+hev_socks5_client_handshake_standard (HevSocks5Client *self)
+{
+    int res;
+
+    LOG_D ("%p socks5 client handshake standard", self);
+
+    res = hev_socks5_client_write_auth_methods (self, 0);
+    if (res < 0)
+        return -1;
+
+    res = hev_socks5_client_read_auth_method (self);
+    if (res < 0)
+        return -1;
+
+    if (res == HEV_SOCKS5_AUTH_METHOD_USER) {
+        res = hev_socks5_client_write_auth_creds (self, 0);
+        if (res < 0)
+            return -1;
+
+        res = hev_socks5_client_read_auth_creds (self);
+        if (res < 0)
+            return -1;
+    } else if (res != HEV_SOCKS5_AUTH_METHOD_NONE) {
+        LOG_I ("%p socks5 client auth method %d", self, res);
+        return -1;
+    }
+
+    res = hev_socks5_client_write_request (self);
+    if (res < 0)
+        return -1;
+
+    res = hev_socks5_client_read_response (self);
+    if (res < 0)
+        return -1;
+
+    return 0;
+}
+
+static int
+hev_socks5_client_handshake_pipeline (HevSocks5Client *self)
+{
+    int res;
+
+    LOG_D ("%p socks5 client handshake pipeline", self);
+
+    res = hev_socks5_client_write_auth_methods (self, 1);
+    if (res < 0)
+        return -1;
+
+    res = hev_socks5_client_write_auth_creds (self, 1);"""
+
+
+def patch_socks5_client_content(content: str) -> tuple[str, bool]:
+    if (
+        SOCKS5_CLIENT_AUTH_PATCHED_METHODS in content
+        and SOCKS5_CLIENT_HANDSHAKE_PATCHED in content
+    ):
+        return content, False
+    if (
+        SOCKS5_CLIENT_AUTH_UNPATCHED_METHODS not in content
+        or SOCKS5_CLIENT_HANDSHAKE_UNPATCHED not in content
+    ):
+        raise PatchError("pinned HEV hev-socks5-client.c differs from the reviewed patch baseline")
+    patched = content.replace(
+        SOCKS5_CLIENT_AUTH_UNPATCHED_METHODS,
+        SOCKS5_CLIENT_AUTH_PATCHED_METHODS,
+        1,
+    ).replace(
+        SOCKS5_CLIENT_HANDSHAKE_UNPATCHED,
+        SOCKS5_CLIENT_HANDSHAKE_PATCHED,
+        1,
+    )
+    check_socks5_client_content(patched)
+    return patched, True
+
+
+def check_socks5_client_content(content: str) -> None:
+    if (
+        SOCKS5_CLIENT_AUTH_PATCHED_METHODS not in content
+        or SOCKS5_CLIENT_HANDSHAKE_PATCHED not in content
+    ):
+        raise PatchError("native SOCKS5 client MSG_MORE pipeline fix is not applied")
+
+
+DEFAULT_LWIPOPTS_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "app/src/main/jni/hev-socks5-tunnel/third-part/lwip/src/ports/include/lwipopts.h"
+)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("path", type=Path, help="path to the pinned HEV/LwIP lwipopts.h")
+    parser.add_argument(
+        "path",
+        nargs="?",
+        type=Path,
+        default=DEFAULT_LWIPOPTS_PATH,
+        help="path to the pinned HEV/LwIP lwipopts.h (defaults to the repo checkout)",
+    )
     parser.add_argument(
         "--tcp-source",
         type=Path,
         help="path to src/hev-socks5-session-tcp.c (otherwise auto-detected for the pinned checkout)",
+    )
+    parser.add_argument(
+        "--client-source",
+        type=Path,
+        help="path to src/core/src/hev-socks5-client.c (otherwise auto-detected for the pinned checkout)",
     )
     parser.add_argument(
         "--check",
@@ -311,10 +595,15 @@ def main() -> int:
         if not args.path.is_file():
             raise PatchError(f"native options file does not exist: {args.path}")
         native_source = args.tcp_source
-        if native_source is None:
-            resolved_path = args.path.resolve()
-            if len(resolved_path.parents) > 5 and resolved_path.parents[5].name == "hev-socks5-tunnel":
+        client_source = args.client_source
+        resolved_path = args.path.resolve()
+        if len(resolved_path.parents) > 5 and resolved_path.parents[5].name == "hev-socks5-tunnel":
+            if native_source is None:
                 native_source = resolved_path.parents[5] / "src" / "hev-socks5-session-tcp.c"
+            if client_source is None:
+                client_source = (
+                    resolved_path.parents[5] / "src" / "core" / "src" / "hev-socks5-client.c"
+                )
 
         original = args.path.read_text(encoding="utf-8")
         original_tcp = None
@@ -322,38 +611,60 @@ def main() -> int:
             if not native_source.is_file():
                 raise PatchError(f"native TCP session source does not exist: {native_source}")
             original_tcp = native_source.read_text(encoding="utf-8")
+        original_client = None
+        if client_source is not None:
+            if not client_source.is_file():
+                raise PatchError(f"native SOCKS5 client source does not exist: {client_source}")
+            original_client = client_source.read_text(encoding="utf-8")
 
         if args.check:
             values = check_lwip_options_content(original)
             if original_tcp is not None:
                 check_tcp_session_content(original_tcp)
+            if original_client is not None:
+                check_socks5_client_content(original_client)
             changed = False
             tcp_changed = False
+            client_changed = False
         else:
             patched, changed = patch_lwip_options_content(original)
             patched_tcp = None
             tcp_changed = False
             if original_tcp is not None:
                 patched_tcp, tcp_changed = patch_tcp_session_content(original_tcp)
+            patched_client = None
+            client_changed = False
+            if original_client is not None:
+                patched_client, client_changed = patch_socks5_client_content(original_client)
 
-            # Validate both transformations before writing either file.
+            # Validate transformations before writing any file.
             check_lwip_options_content(patched)
             if patched_tcp is not None:
                 check_tcp_session_content(patched_tcp)
+            if patched_client is not None:
+                check_socks5_client_content(patched_client)
 
             if changed:
                 args.path.write_text(patched, encoding="utf-8", newline="")
             if tcp_changed and patched_tcp is not None and native_source is not None:
                 native_source.write_text(patched_tcp, encoding="utf-8", newline="")
+            if client_changed and patched_client is not None and client_source is not None:
+                client_source.write_text(patched_client, encoding="utf-8", newline="")
 
             values = check_lwip_options_content(args.path.read_text(encoding="utf-8"))
             if native_source is not None:
                 check_tcp_session_content(native_source.read_text(encoding="utf-8"))
+            if client_source is not None:
+                check_socks5_client_content(client_source.read_text(encoding="utf-8"))
 
         digest = hashlib.sha256(args.path.read_bytes()).hexdigest()
         native_digest = (
             hashlib.sha256(native_source.read_bytes()).hexdigest()
             if native_source is not None else "not-detected"
+        )
+        client_digest = (
+            hashlib.sha256(client_source.read_bytes()).hexdigest()
+            if client_source is not None else "not-detected"
         )
         print(
             "HEV_TCP_CONFIG "
@@ -362,7 +673,9 @@ def main() -> int:
                 "PBUF_POOL_SIZE", "LWIP_WND_SCALE", "TCP_RCV_SCALE",
             ))
             + f" tcp-buffer-size=65535 splice-backpressure-patch={'verified' if native_source is not None else 'not-detected'} "
-            + f"changed={str(changed or tcp_changed).lower()} sha256={digest} native_sha256={native_digest}"
+            + f"socks5-client-msg-more-patch={'verified' if client_source is not None else 'not-detected'} "
+            + f"changed={str(changed or tcp_changed or client_changed).lower()} "
+            + f"sha256={digest} native_sha256={native_digest} client_sha256={client_digest}"
         )
         return 0
     except (OSError, PatchError) as error:

@@ -1,0 +1,43 @@
+name: Package Updated SpeedVPN Source ZIP
+
+on:
+  push:
+    branches:
+      - fix/quota-path-enforcement-20261017
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package-source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout updated project
+        uses: actions/checkout@v7
+
+      - name: Fetch pinned native tunnel sources
+        run: |
+          set -euo pipefail
+          bash ./setup.sh
+          test "$(git -C app/src/main/jni/hev-socks5-tunnel rev-parse HEAD)" = 'd9dca26c7ad0e494492244f0309e80ee583e739e'
+
+      - name: Package project ZIP
+        run: |
+          set -euo pipefail
+          zip -qr "$RUNNER_TEMP/SpeedVPN-Android-quota-fix-source.zip" . \
+            -x ".git/*" "*/.git/*" "*/.git" \
+               ".gradle/*" "*/.gradle/*" "*/build/*" \
+               "*/.idea/*" "*/local.properties" \
+               "*/captures/*" "*/.externalNativeBuild/*"
+          test -s "$RUNNER_TEMP/SpeedVPN-Android-quota-fix-source.zip"
+          ls -lh "$RUNNER_TEMP/SpeedVPN-Android-quota-fix-source.zip"
+
+      - name: Upload source ZIP
+        uses: actions/upload-artifact@v7
+        with:
+          name: SpeedVPN-Android-quota-fix-source
+          path: ${{ runner.temp }}/SpeedVPN-Android-quota-fix-source.zip
+          if-no-files-found: error
+          retention-days: 30
