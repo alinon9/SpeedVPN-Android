@@ -4,7 +4,7 @@ on:
   push:
     branches: [main, master]
   pull_request:
-    branches: [main]
+    branches: [main, 'feature/speed-plan-usage-history-export-20261023']
 
 permissions:
   contents: read
