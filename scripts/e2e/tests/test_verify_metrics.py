@@ -313,5 +313,33 @@ class VerifyMetricClassificationTests(unittest.TestCase):
         self.assertIn("retains less than 80% of baseline", result[4])
 
 
+    def test_low_rate_600_and_800_kbps_presets_use_1_0x_headroom_floor_matching_kotlin_policy(self):
+        # 600 Kbps (75 KB/s) and 800 Kbps (100 KB/s) use 1.0x headroom in SpeedVerificationPolicy.kt.
+        # A baseline between 1.0x and 1.2x (e.g. 650 Kbps for 600 Kbps, or 850 Kbps for 800 Kbps)
+        # must pass with numeric accuracy rather than failing accuracy check with expected '—'.
+        res_600 = check_metric(
+            "download",
+            values("download", "650 Kbps", "600 Kbps", "600 Kbps", STATUS_PASS, "100.0%"),
+            600,
+        )
+        self.assertEqual("PASS", res_600[4])
+
+        res_800 = check_metric(
+            "upload",
+            values("upload", "850 Kbps", "800 Kbps", "792 Kbps", STATUS_PASS, "99.0%"),
+            800,
+        )
+        self.assertEqual("PASS", res_800[4])
+
+        # Below 1.0x for 600 Kbps is still ENV_LIMITED with 1.0x floor message.
+        low_600 = check_metric(
+            "download",
+            values("download", "580 Kbps", "600 Kbps", "550 Kbps", STATUS_UNJUDGEABLE, "—"),
+            600,
+        )
+        self.assertTrue(low_600[4].startswith("ENV_LIMITED|"), low_600[4])
+        self.assertIn("1.0x verification floor", low_600[4])
+
+
 if __name__ == "__main__":
     unittest.main()
