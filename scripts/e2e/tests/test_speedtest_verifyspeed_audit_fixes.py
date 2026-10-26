@@ -66,5 +66,19 @@ class SpeedTestAndVerifySpeedAuditFixesTest(unittest.TestCase):
         )
 
 
+    def test_argon_final_audit_fixes_are_present(self) -> None:
+        verify_py = (REPO_ROOT / "scripts/e2e/verify_metrics.py").read_text(encoding="utf-8")
+        limiter_kt = (REPO_ROOT / "app/src/main/java/com/speedvpn/app/SpeedLimiter.kt").read_text(encoding="utf-8")
+        main_kt = (REPO_ROOT / "app/src/main/java/com/speedvpn/app/MainActivity.kt").read_text(encoding="utf-8")
+        vpn_kt = (REPO_ROOT / "app/src/main/java/com/speedvpn/app/SpeedVpnService.kt").read_text(encoding="utf-8")
+
+        self.assertIn("LOW_RATE_HEADROOM_TARGETS_KBPS = {600, 800}", verify_py)
+        self.assertIn("def headroom_multiplier(expected_kbps: int) -> float:", verify_py)
+        self.assertIn("if (newRate == this.bytesPerSec && newRate > 0L) {", limiter_kt)
+        self.assertIn('val dl = down.toDoubleOrNull()?.let { SpeedLimiter.toKbps(it, "Mbps") }?.takeIf { it > 0L }', main_kt)
+        self.assertIn('val ul = up.toDoubleOrNull()?.let { SpeedLimiter.toKbps(it, "Mbps") }?.takeIf { it > 0L }', main_kt)
+        self.assertIn("initialBlockedUids.isNotEmpty() && (!BuildConfig.DEBUG || !hookDisabled)", vpn_kt)
+
+
 if __name__ == "__main__":
     unittest.main()
