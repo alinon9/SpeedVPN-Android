@@ -1852,8 +1852,8 @@ class MainActivity : ComponentActivity() {
             },
             confirmButton = {
                 Button(onClick = {
-                    val dl = down.toDoubleOrNull()?.takeIf { it > 0 }?.let { (it * 1000.0).toLong() }
-                    val ul = up.toDoubleOrNull()?.takeIf { it > 0 }?.let { (it * 1000.0).toLong() }
+                    val dl = down.toDoubleOrNull()?.let { SpeedLimiter.toKbps(it, "Mbps") }?.takeIf { it > 0L }
+                    val ul = up.toDoubleOrNull()?.let { SpeedLimiter.toKbps(it, "Mbps") }?.takeIf { it > 0L }
                     onSave(enabled, dl, ul)
                 }) { Text("حفظ") }
             },
@@ -2030,11 +2030,17 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun formatPresetSpeed(kbps: Long): String =
-        if (kbps >= 1000L) {
-            val mb = kbps / 1000.0
+    private fun formatPresetSpeed(kbps: Long): String {
+        val kbPerSec = kbps / 8.0
+        return if (kbPerSec >= 1000.0) {
+            val mb = kbPerSec / 1000.0
             if (mb == mb.toLong().toDouble()) "${mb.toLong()} MB/s" else String.format(Locale.US, "%.1f MB/s", mb)
-        } else "${kbps} KB/s"
+        } else if (kbPerSec == kbPerSec.toLong().toDouble()) {
+            "${kbPerSec.toLong()} KB/s"
+        } else {
+            String.format(Locale.US, "%.1f KB/s", kbPerSec)
+        }
+    }
 
     @Composable
     private fun LimitSlider(
