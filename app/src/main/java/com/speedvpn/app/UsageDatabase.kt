@@ -1301,7 +1301,12 @@ internal object UsageRepository {
         helper(context).use { h ->
             val db = h.writableDatabase
             h.createSpeedPlanUsageSessionTable(db)
-            db.delete("speed_plan_usage_session", null, null)
+            val deleted = db.delete("speed_plan_usage_session", null, null)
+            // Reclaim pages for this explicit user-requested clear. If another database
+            // operation temporarily holds a lock, deletion still succeeds and SQLite can
+            // reuse the freed pages on later writes.
+            runCatching { db.execSQL("VACUUM") }
+            deleted
         }
 
     fun readSpeedPlanUsageSessions(context: Context, limit: Int = 50): List<SpeedPlanUsageRecord> =
