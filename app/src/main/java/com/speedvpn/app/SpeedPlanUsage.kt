@@ -314,6 +314,8 @@ object SpeedPlanUsageTracker {
     internal const val MAX_CONTIGUOUS_SAMPLE_INTERVAL_MS = 1_500L
 
     private val lock = Any()
+    // Writes queued before a clear must not restore the deleted sessions.
+    private var historyEpoch: Long = 0L
     private val ioExecutorThread = AtomicReference<Thread?>()
     private val ioExecutor = Executors.newSingleThreadExecutor { r ->
         Thread({
@@ -469,7 +471,18 @@ object SpeedPlanUsageTracker {
         ensureRecovered(context, nowMillis)
 
         val recordsToPersist = mutableListOf<SpeedPlanUsageRecord>()
+        var writeEpoch = 0L
         synchronized(lock) {
+            if (!SpeedHistorySettings.isEnabled(context)) {
+                activeSegment = null
+                pendingSegmentStart = null
+                if (activeGeneration != generation) {
+                    activeGeneration = generation
+                    highestSegmentIndexInGeneration = 0
+                }
+                return
+            }
+            writeEpoch = historyEpoch
             activeSegment?.let { prev ->
                 syncCountersFromLimiterLocked(prev, nowMillis)
                 recordsToPersist += prev.snapshotRecord(
@@ -500,7 +513,12 @@ object SpeedPlanUsageTracker {
                 nowMillis = nowMillis,
             )
         }
-        persistRecords(context.applicationContext, recordsToPersist, synchronous = false)
+        persistRecords(
+            context.applicationContext,
+            recordsToPersist,
+            synchronous = false,
+            expectedEpoch = writeEpoch,
+        )
     }
 
     fun onAppliedLimitsChanged(
@@ -511,11 +529,15 @@ object SpeedPlanUsageTracker {
     ) {
         if (SpeedLimiter.isVerificationActive()) return
         val ctx = contextOverride?.applicationContext ?: appContext ?: return
+        if (!SpeedHistorySettings.isEnabled(ctx)) return
         val normalizedDown = downloadKbps?.takeIf { it > 0L }
         val normalizedUp = uploadKbps?.takeIf { it > 0L }
 
         val recordsToPersist = mutableListOf<SpeedPlanUsageRecord>()
+        var writeEpoch = 0L
         synchronized(lock) {
+            if (!SpeedHistorySettings.isEnabled(ctx)) return
+            writeEpoch = historyEpoch
             val gen = activeGeneration
             if (gen <= 0L || !SpeedLimiter.isGenerationActive(gen)) return
 
@@ -560,7 +582,7 @@ object SpeedPlanUsageTracker {
                 nowMillis = nowMillis,
             )
         }
-        persistRecords(ctx, recordsToPersist, synchronous = false)
+        persistRecords(ctx, recordsToPersist, synchronous = false, expectedEpoch = writeEpoch)
     }
 
     /**
@@ -573,8 +595,12 @@ object SpeedPlanUsageTracker {
         nowMillis: Long = System.currentTimeMillis(),
     ) {
         val ctx = appContext ?: return
+        if (!SpeedHistorySettings.isEnabled(ctx)) return
         var closedRecord: SpeedPlanUsageRecord? = null
+        var writeEpoch = 0L
         synchronized(lock) {
+            if (!SpeedHistorySettings.isEnabled(ctx)) return
+            writeEpoch = historyEpoch
             val current = activeSegment ?: return
             syncCountersFromLimiterLocked(current, nowMillis)
             closedRecord = current.snapshotRecord(
@@ -591,7 +617,9 @@ object SpeedPlanUsageTracker {
             )
             activeSegment = null
         }
-        closedRecord?.let { persistRecords(ctx, listOf(it), synchronous = false) }
+        closedRecord?.let {
+            persistRecords(ctx, listOf(it), synchronous = false, expectedEpoch = writeEpoch)
+        }
     }
 
     fun onMeterSample(
@@ -602,10 +630,13 @@ object SpeedPlanUsageTracker {
         sampleElapsedMillis: Long,
         nowMillis: Long = System.currentTimeMillis(),
     ) {
-        if (generation <= 0L) return
+        if (generation <= 0L || !SpeedHistorySettings.isEnabled(context)) return
         registerContext(context)
         var checkpointRecord: SpeedPlanUsageRecord? = null
+        var writeEpoch = 0L
         synchronized(lock) {
+            if (!SpeedHistorySettings.isEnabled(context)) return
+            writeEpoch = historyEpoch
             if (activeGeneration != generation) {
                 activeGeneration = generation
                 highestSegmentIndexInGeneration = 0
@@ -679,7 +710,14 @@ object SpeedPlanUsageTracker {
                 )
             }
         }
-        checkpointRecord?.let { persistRecords(context.applicationContext, listOf(it), synchronous = false) }
+        checkpointRecord?.let {
+            persistRecords(
+                context.applicationContext,
+                listOf(it),
+                synchronous = false,
+                expectedEpoch = writeEpoch,
+            )
+        }
     }
 
     /**
@@ -721,9 +759,13 @@ object SpeedPlanUsageTracker {
     }
 
     fun flushActiveSegment(context: Context, nowMillis: Long = System.currentTimeMillis()) {
+        if (!SpeedHistorySettings.isEnabled(context)) return
         registerContext(context)
         var record: SpeedPlanUsageRecord? = null
+        var writeEpoch = 0L
         synchronized(lock) {
+            if (!SpeedHistorySettings.isEnabled(context)) return
+            writeEpoch = historyEpoch
             val current = activeSegment ?: return
             syncCountersFromLimiterLocked(current, nowMillis)
             current.lastPersistedAtMillis = nowMillis
@@ -735,7 +777,14 @@ object SpeedPlanUsageTracker {
                 nowMillis = nowMillis,
             )
         }
-        record?.let { persistRecords(context.applicationContext, listOf(it), synchronous = true) }
+        record?.let {
+            persistRecords(
+                context.applicationContext,
+                listOf(it),
+                synchronous = true,
+                expectedEpoch = writeEpoch,
+            )
+        }
     }
 
     fun onVpnDisconnected(
@@ -747,8 +796,15 @@ object SpeedPlanUsageTracker {
     ) {
         registerContext(context)
         var finalRecord: SpeedPlanUsageRecord? = null
+        var writeEpoch = 0L
         synchronized(lock) {
-            val current = activeSegment
+            writeEpoch = historyEpoch
+            val loggingEnabled = SpeedHistorySettings.isEnabled(context)
+            val current = if (loggingEnabled) activeSegment else null
+            if (!loggingEnabled) {
+                activeSegment = null
+                pendingSegmentStart = null
+            }
             if (current != null && (generation <= 0L || current.vpnGeneration == generation)) {
                 syncCountersFromLimiterLocked(current, nowMillis)
                 val status = if (abnormal) SpeedPlanRecordStatus.ABNORMAL_END else SpeedPlanRecordStatus.COMPLETED
@@ -768,7 +824,14 @@ object SpeedPlanUsageTracker {
         // A terminal VPN snapshot is the durable boundary for this usage segment.
         // Persist it before callers clear the limiter counters or allow the app to restart;
         // this path runs from the service's IO cleanup worker, not the UI meter loop.
-        finalRecord?.let { persistRecords(context.applicationContext, listOf(it), synchronous = true) }
+        finalRecord?.let {
+            persistRecords(
+                context.applicationContext,
+                listOf(it),
+                synchronous = true,
+                expectedEpoch = writeEpoch,
+            )
+        }
     }
 
     fun onProcessAbnormalExit(
@@ -778,7 +841,16 @@ object SpeedPlanUsageTracker {
     ) {
         registerContext(context)
         var finalRecord: SpeedPlanUsageRecord? = null
+        var writeEpoch = 0L
         synchronized(lock) {
+            if (!SpeedHistorySettings.isEnabled(context)) {
+                activeSegment = null
+                pendingSegmentStart = null
+                activeGeneration = 0L
+                highestSegmentIndexInGeneration = 0
+                return
+            }
+            writeEpoch = historyEpoch
             val current = activeSegment ?: return
             syncCountersFromLimiterLocked(current, nowMillis)
             finalRecord = current.snapshotRecord(
@@ -791,7 +863,67 @@ object SpeedPlanUsageTracker {
             activeGeneration = 0L
             highestSegmentIndexInGeneration = 0
         }
-        finalRecord?.let { persistRecords(context.applicationContext, listOf(it), synchronous = true) }
+        finalRecord?.let {
+            persistRecords(
+                context.applicationContext,
+                listOf(it),
+                synchronous = true,
+                expectedEpoch = writeEpoch,
+            )
+        }
+    }
+
+    fun setCollectionEnabled(context: Context, enabled: Boolean, nowMillis: Long = System.currentTimeMillis()) {
+        registerContext(context)
+        if (enabled) {
+            synchronized(lock) {
+                SpeedHistorySettings.setEnabled(context, true)
+            }
+            return
+        }
+
+        var finalRecord: SpeedPlanUsageRecord? = null
+        var writeEpoch = 0L
+        synchronized(lock) {
+            writeEpoch = historyEpoch
+            val current = activeSegment
+            if (current != null) {
+                syncCountersFromLimiterLocked(current, nowMillis)
+                finalRecord = current.snapshotRecord(
+                    status = SpeedPlanRecordStatus.COMPLETED,
+                    closeReason = "COLLECTION_DISABLED",
+                    endedAtMillis = nowMillis,
+                    nowMillis = nowMillis,
+                )
+            }
+            activeSegment = null
+            pendingSegmentStart = null
+            SpeedHistorySettings.setEnabled(context, false)
+        }
+        finalRecord?.let {
+            persistRecords(
+                context.applicationContext,
+                listOf(it),
+                synchronous = true,
+                expectedEpoch = writeEpoch,
+            )
+        }
+    }
+
+    fun clearHistory(context: Context): Int {
+        registerContext(context)
+        val deletion = synchronized(lock) {
+            historyEpoch += 1L
+            activeSegment = null
+            pendingSegmentStart = null
+            highestSegmentIndexInGeneration = 0
+            ioExecutor.submit<Int> {
+                val deleted = UsageRepository.clearSpeedPlanUsageSessions(context.applicationContext)
+                bumpPersistedRevision()
+                deleted
+            }
+        }
+        return deletion.get(15, java.util.concurrent.TimeUnit.SECONDS)
     }
 
     internal fun flushPendingWritesForTests() {
@@ -805,6 +937,7 @@ object SpeedPlanUsageTracker {
         synchronized(lock) {
             processToken = newProcessToken
             recoveryCompletedForToken = null
+            historyEpoch = 0L
             activeGeneration = 0L
             highestSegmentIndexInGeneration = 0
             activeSegment = null
@@ -944,9 +1077,12 @@ object SpeedPlanUsageTracker {
         context: Context,
         records: List<SpeedPlanUsageRecord>,
         synchronous: Boolean,
+        expectedEpoch: Long,
     ) {
         if (records.isEmpty()) return
         val task = Runnable {
+            val epochIsCurrent = synchronized(lock) { historyEpoch == expectedEpoch }
+            if (!epochIsCurrent) return@Runnable
             var wroteAny = false
             records.forEach { record ->
                 runCatching {

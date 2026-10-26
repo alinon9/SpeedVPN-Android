@@ -1297,6 +1297,13 @@ internal object UsageRepository {
         }
     }
 
+    fun clearSpeedPlanUsageSessions(context: Context): Int =
+        helper(context).use { h ->
+            val db = h.writableDatabase
+            h.createSpeedPlanUsageSessionTable(db)
+            db.delete("speed_plan_usage_session", null, null)
+        }
+
     fun readSpeedPlanUsageSessions(context: Context, limit: Int = 50): List<SpeedPlanUsageRecord> =
         querySpeedPlanUsageSessions(
             context = context,

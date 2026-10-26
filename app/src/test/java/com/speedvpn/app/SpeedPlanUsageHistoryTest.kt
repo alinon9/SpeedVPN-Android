@@ -45,6 +45,7 @@ class SpeedPlanUsageHistoryTest {
         SpeedLimiter.endSession(2L)
         SpeedLimiter.setOwnAppIdentityForTests(uid = 10999, packageName = "com.speedvpn.app")
         SpeedPlanUsageTracker.resetForTests("proc-test-main")
+        SpeedHistorySettings.setEnabled(context, true)
         UsageRepository.speedPlanDbReadCount.set(0L)
         UsageRepository.speedPlanDbWriteCount.set(0L)
     }
@@ -56,6 +57,7 @@ class SpeedPlanUsageHistoryTest {
         SpeedLimiter.endSession(1L)
         SpeedLimiter.endSession(2L)
         SpeedPlanUsageTracker.resetForTests("proc-test-cleanup")
+        SpeedHistorySettings.setEnabled(context, true)
         // Restore Robolectric's real package/UID so the synthetic identity cannot leak
         // into other test classes that share the SpeedLimiter singleton.
         SpeedLimiter.clearOwnAppIdentityForTests(context)
@@ -201,6 +203,63 @@ class SpeedPlanUsageHistoryTest {
                 assertEquals("speed_plan_usage_session", c.getString(0))
             }
         }
+    }
+
+    @Test
+    fun disablingSpeedHistory_pausesOnlyHistoryCollection() {
+        val gen = 1L
+        val t0 = 1_729_600_000_000L
+        SpeedLimiter.beginSession(gen)
+        SpeedLimiter.setLimitsKbps(8_000L, 4_000L)
+        SpeedPlanUsageTracker.onVpnConnected(context, gen, nowMillis = t0)
+        SpeedPlanUsageTracker.onMeterSample(
+            context = context,
+            generation = gen,
+            rawDownloadBps = 8_000L,
+            rawUploadBps = 4_000L,
+            sampleElapsedMillis = 1_000L,
+            nowMillis = t0 + 1_000L,
+        )
+        SpeedPlanUsageTracker.setCollectionEnabled(context, false, nowMillis = t0 + 1_500L)
+        SpeedPlanUsageTracker.onMeterSample(
+            context = context,
+            generation = gen,
+            rawDownloadBps = 9_000L,
+            rawUploadBps = 5_000L,
+            sampleElapsedMillis = 1_000L,
+            nowMillis = t0 + 2_000L,
+        )
+        SpeedPlanUsageTracker.onVpnDisconnected(context, gen, nowMillis = t0 + 2_500L)
+        SpeedPlanUsageTracker.flushPendingWritesForTests()
+
+        val history = UsageRepository.readAllSpeedPlanUsageSessions(context)
+        assertEquals(1, history.size)
+        assertEquals("COLLECTION_DISABLED", history.single().closeReason)
+        assertFalse(SpeedHistorySettings.isEnabled(context))
+    }
+
+    @Test
+    fun clearSpeedHistory_deletesOnlySpeedPlanRows() {
+        val gen = 1L
+        val t0 = 1_729_600_000_000L
+        SpeedLimiter.beginSession(gen)
+        SpeedLimiter.setLimitsKbps(8_000L, 4_000L)
+        SpeedPlanUsageTracker.onVpnConnected(context, gen, nowMillis = t0)
+        SpeedPlanUsageTracker.onVpnDisconnected(context, gen, nowMillis = t0 + 2_000L)
+        SpeedPlanUsageTracker.flushPendingWritesForTests()
+        assertEquals(1, UsageRepository.readAllSpeedPlanUsageSessions(context).size)
+
+        UsageRepository.upsertAppPolicy(
+            context,
+            packageName = "org.telegram.messenger",
+            label = "Telegram",
+            uid = 10150,
+            blocked = true,
+        )
+        val deleted = SpeedPlanUsageTracker.clearHistory(context)
+        assertEquals(1, deleted)
+        assertTrue(UsageRepository.readAllSpeedPlanUsageSessions(context).isEmpty())
+        assertTrue(UsageRepository.readPolicies(context).any { it.packageName == "org.telegram.messenger" })
     }
 
     @Test
