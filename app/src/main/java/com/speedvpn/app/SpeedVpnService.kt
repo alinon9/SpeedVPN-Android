@@ -639,7 +639,7 @@ class SpeedVpnService : VpnService() {
                 }
 
                 runCatching {
-                    check(TProxyService.TProxySetUidPocPolicyEnabled(currentBlockedUids.isNotEmpty())) {
+                    check(TProxyService.TProxySetUidPocPolicyEnabled(currentBlockedUids.isNotEmpty() && callback != null)) {
                         "Unable to apply native UID policy"
                     }
                 }.onFailure {
@@ -1259,7 +1259,7 @@ class SpeedVpnService : VpnService() {
             }
             val initialBlockedUids = VpnApplicationPolicy.blockedUids(this, currentBlockedPackages())
             check(TProxyService.TProxySetUidPocPolicyEnabled(
-                initialBlockedUids.isNotEmpty() && !BuildConfig.DEBUG
+                initialBlockedUids.isNotEmpty() && (!BuildConfig.DEBUG || !hookDisabled)
             )) {
                 "Unable to initialize native UID policy"
             }
