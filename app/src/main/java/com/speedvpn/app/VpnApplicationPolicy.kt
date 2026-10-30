@@ -44,6 +44,17 @@ internal object VpnApplicationPolicy {
         includeOwnPackageForVerification: Boolean,
     ): Set<String> = if (includeOwnPackageForVerification) emptySet() else setOf(vpnPackageName)
 
+    /**
+     * Native fail-closed packet filtering is Release-only until Debug UID attribution
+     * has a dedicated device-validated implementation. A callback alone must never
+     * activate the native drop policy in Debug builds.
+     */
+    fun shouldEnableNativeUidPolicy(
+        isDebugBuild: Boolean,
+        callbackRegistered: Boolean,
+        blockedUids: Set<Int>,
+    ): Boolean = !isDebugBuild && callbackRegistered && blockedUids.isNotEmpty()
+
     /** True when a resolved owner belongs to the blocked UID set. */
     fun shouldDropUid(uid: Int, blockedUids: Set<Int>): Boolean =
         uid > 0 && uid in blockedUids
