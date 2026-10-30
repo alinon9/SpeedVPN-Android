@@ -1248,8 +1248,9 @@ class SpeedVpnService : VpnService() {
             SpeedLimiter.beginSession(newGeneration)
         }
         val started = runCatching {
-            // UID attribution is required for per-app blocking and quotas in Debug as well as Release.
-            // The explicit diagnostic preference may disable the callback only for controlled testing.
+            // Keep the UID callback available for SOCKS-level attribution, but never enable
+            // native fail-closed packet drops in Debug until that path is validated on devices.
+            // The diagnostic preference may still disable the callback for controlled testing.
             val hookDisabled = getSharedPreferences(UidPocSettings.PREFS, MODE_PRIVATE)
                 .getBoolean(UidPocSettings.KEY_DISABLE_JNI_HOOK, false)
             // App blocking must also be active in Release. The test preference may disable the hook only in Debug builds.
