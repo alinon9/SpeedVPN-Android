@@ -64,6 +64,42 @@ class VpnApplicationPolicyTest {
     }
 
     @Test
+    fun nativeUidDropPolicyStaysDisabledInDebugEvenWhenBlockedAppsExist() {
+        assertFalse(
+            VpnApplicationPolicy.shouldEnableNativeUidPolicy(
+                isDebugBuild = true,
+                callbackRegistered = true,
+                blockedUids = setOf(10_249),
+            ),
+        )
+    }
+
+    @Test
+    fun nativeUidDropPolicyRequiresReleaseBuildCallbackAndBlockedUid() {
+        assertTrue(
+            VpnApplicationPolicy.shouldEnableNativeUidPolicy(
+                isDebugBuild = false,
+                callbackRegistered = true,
+                blockedUids = setOf(10_249),
+            ),
+        )
+        assertFalse(
+            VpnApplicationPolicy.shouldEnableNativeUidPolicy(
+                isDebugBuild = false,
+                callbackRegistered = false,
+                blockedUids = setOf(10_249),
+            ),
+        )
+        assertFalse(
+            VpnApplicationPolicy.shouldEnableNativeUidPolicy(
+                isDebugBuild = false,
+                callbackRegistered = true,
+                blockedUids = emptySet(),
+            ),
+        )
+    }
+
+    @Test
     fun knownBlockedUidIsDroppedButAllowedUidIsNot() {
         val blockedUids = setOf(10_249, 10_333)
         assertTrue(VpnApplicationPolicy.shouldDropUid(10_249, blockedUids))
