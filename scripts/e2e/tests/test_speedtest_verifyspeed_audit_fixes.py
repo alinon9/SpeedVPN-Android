@@ -71,13 +71,22 @@ class SpeedTestAndVerifySpeedAuditFixesTest(unittest.TestCase):
         limiter_kt = (REPO_ROOT / "app/src/main/java/com/speedvpn/app/SpeedLimiter.kt").read_text(encoding="utf-8")
         main_kt = (REPO_ROOT / "app/src/main/java/com/speedvpn/app/MainActivity.kt").read_text(encoding="utf-8")
         vpn_kt = (REPO_ROOT / "app/src/main/java/com/speedvpn/app/SpeedVpnService.kt").read_text(encoding="utf-8")
+        uid_policy_kt = (REPO_ROOT / "app/src/main/java/com/speedvpn/app/VpnApplicationPolicy.kt").read_text(encoding="utf-8")
+        uid_policy_test_kt = (REPO_ROOT / "app/src/test/java/com/speedvpn/app/VpnApplicationPolicyTest.kt").read_text(encoding="utf-8")
 
         self.assertIn("LOW_RATE_HEADROOM_TARGETS_KBPS = {600, 800}", verify_py)
         self.assertIn("def headroom_multiplier(expected_kbps: int) -> float:", verify_py)
         self.assertIn("if (newRate == this.bytesPerSec && newRate > 0L) {", limiter_kt)
         self.assertIn('val dl = down.toDoubleOrNull()?.let { SpeedLimiter.toKbps(it, "Mbps") }?.takeIf { it > 0L }', main_kt)
         self.assertIn('val ul = up.toDoubleOrNull()?.let { SpeedLimiter.toKbps(it, "Mbps") }?.takeIf { it > 0L }', main_kt)
-        self.assertIn("initialBlockedUids.isNotEmpty() && (!BuildConfig.DEBUG || !hookDisabled)", vpn_kt)
+
+        # Native UID filtering is deliberately Release-only until Debug attribution
+        # has been validated on a physical device. Startup and runtime transitions
+        # must both go through the centralized policy helper.
+        self.assertIn("VpnApplicationPolicy.shouldEnableNativeUidPolicy(", vpn_kt)
+        self.assertIn("val fenceTransition = !BuildConfig.DEBUG &&", vpn_kt)
+        self.assertIn("fun shouldEnableNativeUidPolicy(", uid_policy_kt)
+        self.assertIn("fun nativeUidDropPolicyStaysDisabledInDebugEvenWhenBlockedAppsExist()", uid_policy_test_kt)
 
 
 if __name__ == "__main__":
