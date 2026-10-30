@@ -3,7 +3,7 @@ name: Build SpeedVPN APK
 on:
   workflow_dispatch:
   push:
-    branches: [ main, master ]
+    branches: [ main, master, fix/argon-final-audit-20261026 ]
   pull_request:
     branches: [ main ]
 
