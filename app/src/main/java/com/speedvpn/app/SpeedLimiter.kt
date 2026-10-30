@@ -63,6 +63,9 @@ class TokenBucket {
     fun setRate(bytesPerSec: Long) {
         lock.withLock {
             val newRate = max(0L, bytesPerSec)
+            if (newRate == this.bytesPerSec && newRate > 0L) {
+                return
+            }
             this.bytesPerSec = newRate
             capacityBytes = burstCapacity(newRate)
             maxCreditBytes = capacityBytes * JITTER_HEADROOM_MULTIPLIER

@@ -274,9 +274,13 @@ class SpeedVpnService : VpnService() {
                 // Active app blocks and per-app quotas both require owner attribution.
                 // Otherwise an unknown-owner SOCKS session could bypass a live policy.
                 requireUidAttribution = {
-                    currentBlockedPackages().isNotEmpty() ||
-                        runCatching { QuotaEnforcementEngine.hasAnyConfiguredQuotaPolicies(this@SpeedVpnService) }
-                            .getOrDefault(true)
+                    // Do not reject ownerless sessions when no UID callback is available.
+                    // In Debug this keeps browsing functional when the diagnostic hook is disabled.
+                    uidDetectionPoc != null && (
+                        currentBlockedPackages().isNotEmpty() ||
+                            runCatching { QuotaEnforcementEngine.hasAnyConfiguredQuotaPolicies(this@SpeedVpnService) }
+                                .getOrDefault(true)
+                    )
                 },
                 onQuotaExceeded = {
                     enforceQuotaBlockImmediately(myServiceGeneration)
@@ -605,7 +609,9 @@ class SpeedVpnService : VpnService() {
                 val callback = uidDetectionPoc
                 val currentBlockedUids = VpnApplicationPolicy.blockedUids(this@SpeedVpnService, current)
                 val previousBlockedUids = VpnApplicationPolicy.blockedUids(this@SpeedVpnService, previousPackages)
-                val fenceTransition = currentBlockedUids.isNotEmpty() || previousBlockedUids.isNotEmpty()
+                // Native fail-closed UID filtering is Release-only until Debug attribution is device-validated.
+                val fenceTransition = !BuildConfig.DEBUG &&
+                    (currentBlockedUids.isNotEmpty() || previousBlockedUids.isNotEmpty())
 
                 // Fence the transition before publishing the new package snapshot. This clears
                 // old ALLOW decisions and causes all new flows to be dropped while no resolver
@@ -639,7 +645,12 @@ class SpeedVpnService : VpnService() {
                 }
 
                 runCatching {
-                    check(TProxyService.TProxySetUidPocPolicyEnabled(currentBlockedUids.isNotEmpty())) {
+                    val enableNativeUidPolicy = VpnApplicationPolicy.shouldEnableNativeUidPolicy(
+                        isDebugBuild = BuildConfig.DEBUG,
+                        callbackRegistered = callback != null,
+                        blockedUids = currentBlockedUids,
+                    )
+                    check(TProxyService.TProxySetUidPocPolicyEnabled(enableNativeUidPolicy)) {
                         "Unable to apply native UID policy"
                     }
                 }.onFailure {
@@ -1008,10 +1019,12 @@ class SpeedVpnService : VpnService() {
                     // Recovery must preserve startup's owner-attribution policy for blocks
                     // and quotas, then seed UID blocks before the relay accepts traffic.
                     requireUidAttribution = {
-                        currentBlockedPackages().isNotEmpty() ||
-                            runCatching {
-                                QuotaEnforcementEngine.hasAnyConfiguredQuotaPolicies(this@SpeedVpnService)
-                            }.getOrDefault(true)
+                        uidDetectionPoc != null && (
+                            currentBlockedPackages().isNotEmpty() ||
+                                runCatching {
+                                    QuotaEnforcementEngine.hasAnyConfiguredQuotaPolicies(this@SpeedVpnService)
+                                }.getOrDefault(true)
+                        )
                     },
                     onQuotaExceeded = {
                         enforceQuotaBlockImmediately(relayGeneration)
@@ -1235,8 +1248,9 @@ class SpeedVpnService : VpnService() {
             SpeedLimiter.beginSession(newGeneration)
         }
         val started = runCatching {
-            // UID attribution is required for per-app blocking and quotas in Debug as well as Release.
-            // The explicit diagnostic preference may disable the callback only for controlled testing.
+            // Keep the UID callback available for SOCKS-level attribution, but never enable
+            // native fail-closed packet drops in Debug until that path is validated on devices.
+            // The diagnostic preference may still disable the callback for controlled testing.
             val hookDisabled = getSharedPreferences(UidPocSettings.PREFS, MODE_PRIVATE)
                 .getBoolean(UidPocSettings.KEY_DISABLE_JNI_HOOK, false)
             // App blocking must also be active in Release. The test preference may disable the hook only in Debug builds.
@@ -1258,11 +1272,19 @@ class SpeedVpnService : VpnService() {
                 uidDetectionPoc = null
             }
             val initialBlockedUids = VpnApplicationPolicy.blockedUids(this, currentBlockedPackages())
-            check(TProxyService.TProxySetUidPocPolicyEnabled(
-                initialBlockedUids.isNotEmpty() && !BuildConfig.DEBUG
-            )) {
+            val nativeUidPolicyEnabled = VpnApplicationPolicy.shouldEnableNativeUidPolicy(
+                isDebugBuild = BuildConfig.DEBUG,
+                callbackRegistered = uidDetectionPoc != null && (!BuildConfig.DEBUG || !hookDisabled),
+                blockedUids = initialBlockedUids,
+            )
+            check(TProxyService.TProxySetUidPocPolicyEnabled(nativeUidPolicyEnabled)) {
                 "Unable to initialize native UID policy"
             }
+            UidPocDiagnostics.log(
+                this,
+                "NATIVE_UID_POLICY initialized=$nativeUidPolicyEnabled debug=${BuildConfig.DEBUG} " +
+                    "callbackRegistered=${uidDetectionPoc != null && !hookDisabled} blockedUidCount=${initialBlockedUids.size}",
+            )
             UidPocDiagnostics.log(this, "JNI_NATIVE_START_BEGIN generation=$newGeneration fd=${expectedTun.fd}")
             val nativeStarted = TProxyService.TProxyStartService(configPath, expectedTun.fd)
             UidPocDiagnostics.log(this, "JNI_NATIVE_START_RETURN started=$nativeStarted")

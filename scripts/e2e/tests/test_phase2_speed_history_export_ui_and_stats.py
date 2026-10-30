@@ -899,7 +899,12 @@ class TestPhase2SpeedHistoryExportUiAndStats(unittest.TestCase):
         terminal_idx = tracker_kt.index("fun onVpnDisconnected(")
         abnormal_idx = tracker_kt.index("fun onProcessAbnormalExit(", terminal_idx)
         terminal_body = tracker_kt[terminal_idx:abnormal_idx]
-        self.assertIn("persistRecords(context.applicationContext, listOf(it), synchronous = true)", terminal_body)
+        self.assertRegex(
+            terminal_body,
+            r"persistRecords\s*\(\s*context\.applicationContext,\s*"
+            r"listOf\(it\),\s*synchronous\s*=\s*true,\s*"
+            r"expectedEpoch\s*=\s*writeEpoch,\s*\)",
+        )
         self.assertIn("SmartSettings.setOverlayEnabled(this, false)", overlay_kt)
 
     def test_07_jvm_execution_of_limiter_and_exceedance_wave_logic(self):

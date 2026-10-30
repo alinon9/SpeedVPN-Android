@@ -594,6 +594,11 @@ class MainActivity : ComponentActivity() {
         var exportBusy by exportExcelBusyState
         val exportStatus by exportExcelStatusState
         val exportIsError by exportExcelErrorState
+        var speedHistoryEnabled by remember { mutableStateOf(SpeedHistorySettings.isEnabled(this@MainActivity)) }
+        var confirmClearSpeedHistory by remember { mutableStateOf(false) }
+        var clearHistoryBusy by remember { mutableStateOf(false) }
+        var clearHistoryStatus by remember { mutableStateOf<String?>(null) }
+        var clearHistoryIsError by remember { mutableStateOf(false) }
         val persistedHistoryRevision by SpeedPlanUsageTracker.persistedHistoryRevision.collectAsStateWithLifecycle()
         var persistedPlanHistory by remember { mutableStateOf<List<SpeedPlanUsageRecord>>(emptyList()) }
 
@@ -892,12 +897,88 @@ class MainActivity : ComponentActivity() {
             SpeedPlanUsageHistoryCard(
                 records = speedPlanHistory,
                 summary = speedPlanSummary,
+                collectionEnabled = speedHistoryEnabled,
                 exportBusy = exportBusy,
                 exportStatus = exportStatus,
                 exportIsError = exportIsError,
+                clearBusy = clearHistoryBusy,
+                managementStatus = clearHistoryStatus,
+                managementIsError = clearHistoryIsError,
                 controlsEnabled = !testBusy && !preflightBusy && !verifyBusy && !verificationInProgress,
+                onCollectionEnabledChange = { enabled ->
+                    clearHistoryStatus = null
+                    clearHistoryIsError = false
+                    speedHistoryEnabled = enabled
+                    lifecycleScope.launch {
+                        val result = runCatching {
+                            withContext(Dispatchers.IO) {
+                                SpeedPlanUsageTracker.setCollectionEnabled(this@MainActivity, enabled)
+                            }
+                        }
+                        result.onFailure { error ->
+                            speedHistoryEnabled = SpeedHistorySettings.isEnabled(this@MainActivity)
+                            clearHistoryStatus = "تعذر تغيير إعداد التسجيل: ${error.message ?: error.javaClass.simpleName}"
+                            clearHistoryIsError = true
+                        }.onSuccess {
+                            clearHistoryStatus = if (enabled) {
+                                "تم تفعيل تسجيل سجل السرعات. لن يتأثر سجل السرعات السابق."
+                            } else {
+                                "تم إيقاف تسجيل سجلات السرعة الجديدة، مع الاحتفاظ بالسجلات السابقة."
+                            }
+                        }
+                    }
+                },
                 onExportExcel = { launchSpeedHistoryExcelExport() },
+                onClearHistory = { confirmClearSpeedHistory = true },
             )
+
+            if (confirmClearSpeedHistory) {
+                AlertDialog(
+                    onDismissRequest = { if (!clearHistoryBusy) confirmClearSpeedHistory = false },
+                    title = { Text("مسح سجل السرعات؟") },
+                    text = {
+                        Text(
+                            "سيتم حذف سجل السرعات واستهلاك الخطط المحفوظ محليًا فقط. " +
+                                "لن تُحذف إعدادات السرعة أو حصص البيانات أو إحصاءات التطبيقات. لا يمكن التراجع عن الحذف.",
+                        )
+                    },
+                    confirmButton = {
+                        TextButton(
+                            enabled = !clearHistoryBusy,
+                            onClick = {
+                                confirmClearSpeedHistory = false
+                                clearHistoryBusy = true
+                                clearHistoryStatus = null
+                                clearHistoryIsError = false
+                                lifecycleScope.launch {
+                                    val result = runCatching {
+                                        withContext(Dispatchers.IO) {
+                                            SpeedPlanUsageTracker.clearHistory(this@MainActivity)
+                                        }
+                                    }
+                                    result.onSuccess { deleted ->
+                                        clearHistoryStatus = if (deleted > 0) {
+                                            "تم مسح $deleted سجل من سجل السرعات."
+                                        } else {
+                                            "لا توجد سجلات محفوظة لمسحها."
+                                        }
+                                    }.onFailure { error ->
+                                        clearHistoryStatus = "تعذر مسح السجل: ${error.message ?: error.javaClass.simpleName}"
+                                        clearHistoryIsError = true
+                                    }
+                                    clearHistoryBusy = false
+                                }
+                            },
+                        ) { Text(if (clearHistoryBusy) "جارٍ المسح…" else "مسح السجلات") }
+                    },
+                    dismissButton = {
+                        TextButton(
+                            enabled = !clearHistoryBusy,
+                            onClick = { confirmClearSpeedHistory = false },
+                        ) { Text("إلغاء") }
+                    },
+                )
+            }
 
             GlassCard {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -920,16 +1001,46 @@ class MainActivity : ComponentActivity() {
     private fun SpeedPlanUsageHistoryCard(
         records: List<SpeedPlanUsageRecord>,
         summary: SpeedHistoryReportSummary,
+        collectionEnabled: Boolean,
         exportBusy: Boolean,
         exportStatus: String?,
         exportIsError: Boolean,
+        clearBusy: Boolean,
+        managementStatus: String?,
+        managementIsError: Boolean,
         controlsEnabled: Boolean,
+        onCollectionEnabledChange: (Boolean) -> Unit,
         onExportExcel: () -> Unit,
+        onClearHistory: () -> Unit,
     ) {
         GlassCard {
             SectionLabel(
                 "سجل السرعات واستهلاك الخطط",
                 "البيانات الفعلية التي مرّت عبر VPN لكل خيار سرعة مطبق",
+            )
+            Row(
+                Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("تسجيل سجل السرعات", color = TextPrimary, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                    Text(
+                        if (collectionEnabled) "مفعّل — تُحفظ سجلات جديدة أثناء اتصال VPN."
+                        else "متوقف — السجلات السابقة محفوظة ولن تُنشأ سجلات جديدة.",
+                        color = if (collectionEnabled) Green else Amber,
+                        fontSize = 10.sp,
+                    )
+                }
+                Switch(
+                    checked = collectionEnabled,
+                    onCheckedChange = onCollectionEnabledChange,
+                    modifier = Modifier.testTag("speed_history_collection_switch"),
+                )
+            }
+            Text(
+                "هذا الخيار مستقل عن «جمع الإحصاءات» في الإعدادات. إيقافه لا يوقف VPN أو محدد السرعة ولا يحذف السجلات المحفوظة.",
+                color = TextSecondary,
+                fontSize = 10.sp,
             )
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 InfoPill("الفترات: ${summary.totalRecordsCount}", Blue, Modifier.weight(1f))
@@ -965,9 +1076,30 @@ class MainActivity : ComponentActivity() {
                 )
             }
 
+            OutlinedButton(
+                enabled = records.isNotEmpty() && !clearBusy && controlsEnabled,
+                onClick = onClearHistory,
+                modifier = Modifier.fillMaxWidth().testTag("clear_speed_history_button"),
+                shape = RoundedCornerShape(14.dp),
+            ) {
+                Text(if (clearBusy) "جاري مسح سجل السرعات…" else "مسح سجل السرعات المحفوظ")
+            }
+            managementStatus?.let { statusText ->
+                Text(
+                    text = statusText,
+                    color = if (managementIsError) Color(0xFFFF7D88) else Green,
+                    fontSize = 11.sp,
+                    modifier = Modifier.testTag("speed_history_management_status"),
+                )
+            }
+
             if (records.isEmpty()) {
                 Text(
-                    "لا توجد سجلات سرعة محفوظة بعد — يبدأ التسجيل تلقائيًا عند اتصال VPN وتطبيق خيار السرعة.",
+                    if (collectionEnabled) {
+                        "لا توجد سجلات سرعة محفوظة بعد — يبدأ التسجيل تلقائيًا عند اتصال VPN وتطبيق خيار السرعة."
+                    } else {
+                        "لا توجد سجلات محفوظة حاليًا، وتسجيل السرعات متوقف."
+                    },
                     color = TextSecondary,
                     fontSize = 11.sp,
                 )
@@ -1852,8 +1984,8 @@ class MainActivity : ComponentActivity() {
             },
             confirmButton = {
                 Button(onClick = {
-                    val dl = down.toDoubleOrNull()?.takeIf { it > 0 }?.let { (it * 1000.0).toLong() }
-                    val ul = up.toDoubleOrNull()?.takeIf { it > 0 }?.let { (it * 1000.0).toLong() }
+                    val dl = down.toDoubleOrNull()?.let { SpeedLimiter.toKbps(it, "Mbps") }?.takeIf { it > 0L }
+                    val ul = up.toDoubleOrNull()?.let { SpeedLimiter.toKbps(it, "Mbps") }?.takeIf { it > 0L }
                     onSave(enabled, dl, ul)
                 }) { Text("حفظ") }
             },
@@ -2030,11 +2162,17 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun formatPresetSpeed(kbps: Long): String =
-        if (kbps >= 1000L) {
-            val mb = kbps / 1000.0
+    private fun formatPresetSpeed(kbps: Long): String {
+        val kbPerSec = kbps / 8.0
+        return if (kbPerSec >= 1000.0) {
+            val mb = kbPerSec / 1000.0
             if (mb == mb.toLong().toDouble()) "${mb.toLong()} MB/s" else String.format(Locale.US, "%.1f MB/s", mb)
-        } else "${kbps} KB/s"
+        } else if (kbPerSec == kbPerSec.toLong().toDouble()) {
+            "${kbPerSec.toLong()} KB/s"
+        } else {
+            String.format(Locale.US, "%.1f KB/s", kbPerSec)
+        }
+    }
 
     @Composable
     private fun LimitSlider(

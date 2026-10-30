@@ -174,4 +174,49 @@ class SpeedLimiterConversionTest {
         val pacedElapsedMs = (System.nanoTime() - pacedStart) / 1_000_000L
         assertTrue("Expected third chunk beyond maxCreditBytes to pace, got ${pacedElapsedMs}ms", pacedElapsedMs >= 35L)
     }
+    @Test
+    fun idempotentSetRateDoesNotResetActiveTokenDebtOrGrantDuplicateBurst() {
+        val bucket = TokenBucket()
+        bucket.setRate(2_000L)
+        // Drain the initial 1,024-byte burst.
+        assertTrue(bucket.acquire(bucket.recommendedReadBytes()))
+        // Re-applying the exact same finite rate must not grant a duplicate free burst.
+        bucket.setRate(2_000L)
+        val start = System.nanoTime()
+        assertTrue(bucket.acquire(100))
+        val elapsedMs = (System.nanoTime() - start) / 1_000_000L
+        assertTrue("Idempotent setRate granted duplicate burst: ${elapsedMs}ms", elapsedMs >= 35L)
+    }
+
+    @Test
+    fun allNineteenSpeedPresetsConvertToExactDecimalBytesPerSecond() {
+        val expectedPresets = listOf(
+            10L to 80L,
+            25L to 200L,
+            50L to 400L,
+            75L to 600L,
+            100L to 800L,
+            130L to 1_040L,
+            250L to 2_000L,
+            500L to 4_000L,
+            750L to 6_000L,
+            950L to 7_600L,
+            1_000L to 8_000L,
+            2_000L to 16_000L,
+            3_000L to 24_000L,
+            4_000L to 32_000L,
+            5_000L to 40_000L,
+            9_000L to 72_000L,
+            10_000L to 80_000L,
+            11_000L to 88_000L,
+        )
+        for ((kbPerSec, expectedKbps) in expectedPresets) {
+            val kbps = SpeedLimiter.kilobytesPerSecondToKbps(kbPerSec)
+            assertEquals(expectedKbps, kbps)
+            assertEquals(kbPerSec * 1_000L, SpeedLimiter.kbpsToBytesPerSec(kbps))
+        }
+        assertEquals(0L, SpeedLimiter.kbpsToBytesPerSec(null))
+        assertEquals(0L, SpeedLimiter.kbpsToBytesPerSec(0L))
+    }
+
 }

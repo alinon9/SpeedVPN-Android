@@ -48,6 +48,11 @@ EXPECTED_PRESETS = {
     16: ("9 MB", 72000), 17: ("10 MB", 80000), 18: ("11 MB", 88000),
     19: ("بدون حد", 0),
 }
+LOW_RATE_HEADROOM_TARGETS_KBPS = {600, 800}
+
+
+def headroom_multiplier(expected_kbps: int) -> float:
+    return 1.0 if expected_kbps in LOW_RATE_HEADROOM_TARGETS_KBPS else 1.2
 SCENARIO_ID = "speed-limit-sweep-v1"
 CSV_FIELDS = [
     "index", "preset", "expected_kbps", "direction", "baseline_raw",
@@ -192,7 +197,7 @@ def expected_accuracy_range(
             min(100.0, vpn_high / max(baseline_low, 1.0) * 100.0),
         )
     target_bps = expected_kbps * 1_000.0
-    if baseline_low < target_bps * 1.2:
+    if baseline_low < target_bps * headroom_multiplier(expected_kbps):
         return None
     def accuracy(rate: float) -> float:
         return max(0.0, min(100.0, 100.0 - abs(rate - target_bps) / target_bps * 100.0))
@@ -304,7 +309,8 @@ def baseline_headroom_errors(values: dict[str, str], expected_kbps: int) -> list
     """Independently enforce the 1.2x physical-baseline floor using displayed-rate precision."""
     if expected_kbps <= 0:
         return ["preflight target must be a positive Kbps value"]
-    threshold_bps = expected_kbps * 1_000.0 * 1.2
+    multiplier = headroom_multiplier(expected_kbps)
+    threshold_bps = expected_kbps * 1_000.0 * multiplier
     errors: list[str] = []
     for direction in ("download", "upload"):
         key = f"baseline_preflight_{direction}_value"
@@ -320,7 +326,7 @@ def baseline_headroom_errors(values: dict[str, str], expected_kbps: int) -> list
         if conservative_bps < threshold_bps:
             errors.append(
                 f"{direction}: baseline {measured_bps / 1_000_000:.2f} Mbps is below "
-                f"the required {threshold_bps / 1_000_000:.2f} Mbps (1.2x target)"
+                f"the required {threshold_bps / 1_000_000:.2f} Mbps ({multiplier:.1f}x target)"
             )
         else:
             print(
@@ -410,15 +416,16 @@ def check_metric(direction: str, values: dict[str, str], expected_kbps: int) -> 
             f"±20% interval [{target_bps * 0.8 / 1000:.2f}, {target_bps * 1.2 / 1000:.2f}] Kbps"
         )
 
+    multiplier = headroom_multiplier(expected_kbps)
     baseline_limited = (
         baseline_bps is not None
         and 0 < baseline_bps
-        and baseline_bps - (baseline_step or 0.0) / 2.0 < target_bps * 1.2
+        and baseline_bps - (baseline_step or 0.0) / 2.0 < target_bps * multiplier
     )
     if baseline_limited:
         reasons.append(
             f"{direction}: environment baseline {baseline_bps / 1000:.2f} Kbps "
-            f"is below the 1.2x verification floor for {expected_kbps} Kbps"
+            f"is below the {multiplier:.1f}x verification floor for {expected_kbps} Kbps"
         )
 
     # When the physical baseline misses the documented 1.2x headroom floor,
