@@ -1274,7 +1274,7 @@ class SpeedVpnService : VpnService() {
             val initialBlockedUids = VpnApplicationPolicy.blockedUids(this, currentBlockedPackages())
             val nativeUidPolicyEnabled = VpnApplicationPolicy.shouldEnableNativeUidPolicy(
                 isDebugBuild = BuildConfig.DEBUG,
-                callbackRegistered = uidDetectionPoc != null && !hookDisabled,
+                callbackRegistered = uidDetectionPoc != null && (!BuildConfig.DEBUG || !hookDisabled),
                 blockedUids = initialBlockedUids,
             )
             check(TProxyService.TProxySetUidPocPolicyEnabled(nativeUidPolicyEnabled)) {
