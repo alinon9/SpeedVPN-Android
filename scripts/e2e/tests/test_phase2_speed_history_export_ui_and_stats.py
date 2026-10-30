@@ -901,9 +901,9 @@ class TestPhase2SpeedHistoryExportUiAndStats(unittest.TestCase):
         terminal_body = tracker_kt[terminal_idx:abnormal_idx]
         self.assertRegex(
             terminal_body,
-            r"persistRecords\\s*\\(\\s*context\\.applicationContext,\\s*"
-            r"listOf\\(it\\),\\s*synchronous\\s*=\\s*true,\\s*"
-            r"expectedEpoch\\s*=\\s*writeEpoch,\\s*\\)",
+            r"persistRecords\s*\(\s*context\.applicationContext,\s*"
+            r"listOf\(it\),\s*synchronous\s*=\s*true,\s*"
+            r"expectedEpoch\s*=\s*writeEpoch,\s*\)",
         )
         self.assertIn("SmartSettings.setOverlayEnabled(this, false)", overlay_kt)
 
